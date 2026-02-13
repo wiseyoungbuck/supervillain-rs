@@ -393,12 +393,24 @@ async function loadEmailDetail(emailId) {
 
 async function emailAction(type, emailId) {
     const label = type === 'archive' ? 'Archived' : 'Trashed';
+
+    // Optimistic: remove from list and show feedback immediately
+    const removedEmail = state.emails.find(e => e.id === emailId);
+    const removedIndex = state.emails.indexOf(removedEmail);
+    pushUndo(label.toLowerCase(), emailId);
+    removeEmailFromList(emailId);
+    showStatus(label, 'success');
+
     try {
         await api('POST', `/emails/${emailId}/${type}`);
-        pushUndo(label.toLowerCase(), emailId);
-        removeEmailFromList(emailId);
-        showStatus(label, 'success');
     } catch (err) {
+        // Revert: re-insert the email and remove the stale undo entry
+        state.undoStack.pop();
+        if (removedEmail) {
+            state.emails.splice(removedIndex, 0, removedEmail);
+            renderEmailList();
+            updateEmailCount();
+        }
         showStatus(label + ' failed: ' + err.message, 'error');
     }
 }
@@ -407,16 +419,23 @@ async function toggleUnread(emailId) {
     const email = state.emails.find(e => e.id === emailId);
     if (!email) return;
 
+    // Optimistic: toggle immediately
+    const wasUnread = email.isUnread;
+    email.isUnread = !wasUnread;
+    renderEmailList();
+    updateEmailCount();
+
     try {
-        if (email.isUnread) {
+        if (wasUnread) {
             await api('POST', `/emails/${emailId}/mark-read`);
-            email.isUnread = false;
         } else {
             await api('POST', `/emails/${emailId}/mark-unread`);
-            email.isUnread = true;
         }
-        renderEmailList();
     } catch (err) {
+        // Revert
+        email.isUnread = wasUnread;
+        renderEmailList();
+        updateEmailCount();
         showStatus('Failed to toggle read status', 'error');
     }
 }
@@ -425,11 +444,16 @@ async function toggleFlag(emailId) {
     const email = state.emails.find(e => e.id === emailId);
     if (!email) return;
 
+    // Optimistic: toggle immediately
+    email.isFlagged = !email.isFlagged;
+    renderEmailList();
+
     try {
         await api('POST', `/emails/${emailId}/toggle-flag`);
+    } catch (err) {
+        // Revert
         email.isFlagged = !email.isFlagged;
         renderEmailList();
-    } catch (err) {
         showStatus('Failed to toggle flag', 'error');
     }
 }
@@ -947,12 +971,15 @@ function actionSelected(type) {
 }
 
 function goToNextEmail() {
-    // Find current email index and go to next
     const currentId = state.currentEmail?.id;
     const currentIndex = state.emails.findIndex(e => e.id === currentId);
 
-    // Remove current from list
-    state.emails = state.emails.filter(e => e.id !== currentId);
+    // Remove from list if still present (may already be removed by optimistic emailAction)
+    if (currentIndex >= 0) {
+        state.emails.splice(currentIndex, 1);
+        renderEmailList();
+        updateEmailCount();
+    }
 
     if (state.emails.length === 0) {
         showView('list');
@@ -960,8 +987,9 @@ function goToNextEmail() {
         return;
     }
 
-    // Go to next (same index, or last if we were at the end)
-    const nextIndex = Math.min(currentIndex, state.emails.length - 1);
+    // Use currentIndex if we removed it here, otherwise fall back to selectedIndex
+    const baseIndex = currentIndex >= 0 ? currentIndex : state.selectedIndex;
+    const nextIndex = Math.min(baseIndex, state.emails.length - 1);
     state.selectedIndex = nextIndex;
     const nextEmail = state.emails[nextIndex];
 
@@ -1324,19 +1352,19 @@ async function performUndo() {
     const item = state.undoStack.pop();
     if (!item) return;
 
+    // Optimistic: hide toast and show feedback immediately
+    els.undoToast.classList.add('hidden');
+    showStatus('Undone', 'success');
+
     try {
-        // Move back to inbox
         const inbox = state.mailboxes.find(m => m.role === 'inbox');
         if (inbox) {
             await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
-            showStatus('Undone', 'success');
             loadEmails();
         }
     } catch (err) {
         showStatus('Undo failed', 'error');
     }
-
-    els.undoToast.classList.add('hidden');
 }
 
 // Utilities
@@ -1629,18 +1657,40 @@ function getStatusIcon(status) {
 async function rsvpToEvent(status) {
     if (!state.currentEmail) return;
 
+    const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
+    const event = state.currentEmail.calendarEvent;
+    let prevEvent = null;
+
+    // Optimistic: update RSVP buttons immediately if we have event data
+    if (event) {
+        prevEvent = JSON.parse(JSON.stringify(event));
+        const accountEmail = state.currentAccount?.email?.toLowerCase();
+        if (accountEmail && event.attendees) {
+            for (const a of event.attendees) {
+                if (a.email.toLowerCase() === accountEmail) {
+                    a.status = status;
+                    break;
+                }
+            }
+        }
+        renderCalendarCard(event);
+    }
+    showStatus(`RSVP: ${label}`, 'success');
+
     try {
         const result = await api('POST', `/emails/${state.currentEmail.id}/rsvp`, { status });
-        const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
-        showStatus(`RSVP: ${label}`, 'success');
-
-        // Update cached email and re-render calendar card with new status
         if (result.calendarEvent) {
             state.currentEmail.calendarEvent = result.calendarEvent;
             emailCache[state.currentEmail.id] = state.currentEmail;
             renderCalendarCard(result.calendarEvent);
         }
     } catch (err) {
+        // Revert optimistic update if we had one
+        if (prevEvent) {
+            state.currentEmail.calendarEvent = prevEvent;
+            emailCache[state.currentEmail.id] = state.currentEmail;
+            renderCalendarCard(prevEvent);
+        }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
     }
 }
