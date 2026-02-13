@@ -518,5 +518,48 @@ END:VCALENDAR";
         assert!(!rsvp.contains("DTEND"));
     }
 
+    // --- extract_property prefix false-positive tests ---
+
+    #[test]
+    fn property_prefix_not_confused_with_longer_name() {
+        // "UIDX:something" should NOT match when extracting "UID"
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UIDX:wrong-value\r\n\
+UID:correct-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Test\r\n\
+ORGANIZER:mailto:org@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.uid, "correct-uid@example.com");
+    }
+
+    #[test]
+    fn datetime_property_prefix_not_confused() {
+        // DTSTARTX should not match DTSTART
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:prefix-test@example.com\r\n\
+DTSTARTX:19700101T000000Z\r\n\
+DTSTART:20260301T140000Z\r\n\
+SUMMARY:Prefix Test\r\n\
+ORGANIZER:mailto:org@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.dtstart.year(), 2026);
+        assert_eq!(event.dtstart.month(), 3);
+    }
+
     use chrono::{Datelike, Timelike};
 }

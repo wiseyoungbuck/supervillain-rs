@@ -309,6 +309,18 @@ mod tests {
         assert_eq!(q.from, vec!["a@b.com", "c@d.com"]);
     }
 
+    #[test]
+    fn parse_newer_than_zero_ignored() {
+        let q = parse_query("newer_than:0d");
+        assert!(q.after.is_none());
+    }
+
+    #[test]
+    fn parse_older_than_negative_ignored() {
+        let q = parse_query("older_than:-5d");
+        assert!(q.before.is_none());
+    }
+
     // --- Translate tests ---
 
     #[test]

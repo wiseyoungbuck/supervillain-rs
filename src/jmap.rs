@@ -999,4 +999,54 @@ mod tests {
         });
         assert_eq!(find_calendar_blob_id(&body), Some("blob-case-file".into()));
     }
+
+    // --- uuid_v4 tests ---
+
+    #[test]
+    fn uuid_v4_format() {
+        let id = uuid_v4();
+        // 8-4-4-4-12 hex format
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 5, "UUID should have 5 parts: {id}");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+        // All hex chars
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "UUID should be hex: {id}"
+        );
+    }
+
+    #[test]
+    fn uuid_v4_version_bits() {
+        let id = uuid_v4();
+        // Third group should start with '4' (version 4)
+        let third = id.split('-').nth(2).unwrap();
+        assert!(
+            third.starts_with('4'),
+            "Version nibble should be 4: {third}"
+        );
+    }
+
+    #[test]
+    fn uuid_v4_variant_bits() {
+        let id = uuid_v4();
+        // Fourth group first char should be 8, 9, a, or b (variant 10xx)
+        let fourth = id.split('-').nth(3).unwrap();
+        let first_char = fourth.chars().next().unwrap();
+        assert!(
+            matches!(first_char, '8' | '9' | 'a' | 'b'),
+            "Variant nibble should be 8/9/a/b: {first_char}"
+        );
+    }
+
+    #[test]
+    fn uuid_v4_unique() {
+        let a = uuid_v4();
+        let b = uuid_v4();
+        assert_ne!(a, b, "Two UUIDs should not be identical");
+    }
 }
