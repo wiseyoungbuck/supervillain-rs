@@ -102,11 +102,9 @@ fn resolve_config_dir() -> PathBuf {
 }
 
 fn open_browser(url: &str) {
-    let is_omarchy = PathBuf::from(
-        std::env::var("HOME").unwrap_or_default(),
-    )
-    .join(".local/share/omarchy")
-    .is_dir();
+    let is_omarchy = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".local/share/omarchy")
+        .is_dir();
 
     let (cmd, args): (&str, Vec<&str>) = if is_omarchy {
         ("omarchy-launch-webapp", vec![url])
