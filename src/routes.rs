@@ -428,8 +428,11 @@ async fn unsubscribe_and_archive(
         return Err(Error::BadRequest("No sender found".into()));
     }
 
-    // Query all emails from this sender
-    let query = search::parse_query(&format!("from:{sender_email}"));
+    // Query all emails from this sender using structured filter (not string interpolation)
+    let query = crate::types::ParsedQuery {
+        from: vec![sender_email.clone()],
+        ..Default::default()
+    };
     let all_ids = jmap::query_emails(&session, None, 500, 0, Some(&query)).await?;
 
     // Archive all

@@ -1446,7 +1446,7 @@ function sanitizeHtml(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
 
     // Remove dangerous elements (style kept and sanitized separately)
-    const dangerousTags = ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'meta', 'base', 'link'];
+    const dangerousTags = ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'meta', 'base', 'link', 'svg', 'math'];
     dangerousTags.forEach(tag => {
         doc.querySelectorAll(tag).forEach(el => el.remove());
     });

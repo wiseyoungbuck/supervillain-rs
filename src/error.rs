@@ -47,14 +47,30 @@ impl From<serde_json::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let status = match &self {
-            Error::Auth(_) => StatusCode::UNAUTHORIZED,
-            Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Error::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
-            Error::Network(_) | Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, client_message) = match &self {
+            Error::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".into()),
+            Error::NotFound(msg) => (StatusCode::NOT_FOUND, format!("not found: {msg}")),
+            Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, format!("bad request: {msg}")),
+            Error::NotConnected => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not connected to email server".into(),
+            ),
+            Error::Network(msg) => {
+                tracing::warn!("Network error: {msg}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "network error".to_string(),
+                )
+            }
+            Error::Internal(msg) => {
+                tracing::warn!("Internal error: {msg}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
         };
-        let body = serde_json::json!({ "error": self.to_string() });
+        let body = serde_json::json!({ "error": client_message });
         (status, axum::Json(body)).into_response()
     }
 }

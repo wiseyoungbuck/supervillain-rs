@@ -63,16 +63,19 @@ fn extract_property(text: &str, name: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         // Match "NAME:value" or "NAME;params:value"
+        // Must verify the character after the property name is ':' or ';'
+        // to avoid false positives (e.g. "UIDX" matching "UID")
         if let Some(rest) = line.strip_prefix(name) {
             if let Some(stripped) = rest.strip_prefix(':') {
                 return Some(stripped.to_string());
             }
-            if rest.starts_with(';') {
+            if let Some(rest_after_semi) = rest.strip_prefix(';') {
                 // Has parameters — find the colon after params
-                if let Some(colon_pos) = rest.find(':') {
-                    return Some(rest[colon_pos + 1..].to_string());
+                if let Some(colon_pos) = rest_after_semi.find(':') {
+                    return Some(rest_after_semi[colon_pos + 1..].to_string());
                 }
             }
+            // If next char is neither ':' nor ';', this is a different property — skip
         }
     }
     None
@@ -82,11 +85,12 @@ fn parse_ics_datetime_property(text: &str, name: &str) -> Option<DateTime<Utc>> 
     // Find the line for this property
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
-        if !line.starts_with(name) {
-            continue;
-        }
+        let rest = match line.strip_prefix(name) {
+            Some(r) => r,
+            None => continue,
+        };
 
-        let rest = &line[name.len()..];
+        // Must start with ':' or ';' to avoid prefix false positives
         let value = if let Some(stripped) = rest.strip_prefix(':') {
             stripped
         } else if rest.starts_with(';') {

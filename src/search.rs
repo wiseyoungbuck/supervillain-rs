@@ -111,7 +111,9 @@ fn parse_relative_date(s: &str) -> Option<NaiveDate> {
 
     let (num_str, unit) = s.split_at(s.len() - 1);
     let num: i64 = num_str.parse().ok()?;
-    debug_assert!(num > 0, "relative date number must be positive: {s}");
+    if num <= 0 {
+        return None;
+    }
 
     let days = match unit {
         "d" => num,

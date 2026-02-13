@@ -795,15 +795,9 @@ pub fn find_calendar_blob_id(body_structure: &serde_json::Value) -> Option<Strin
 pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option<String>, Error> {
     debug_assert!(!email_id.is_empty(), "email_id must not be empty");
 
-    // Fetch email with body structure
-    let emails = get_emails(s, &[email_id.to_string()], true).await?;
-    let email = emails
-        .first()
-        .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-
-    // Re-fetch body structure to get blob_id (get_emails already parsed it)
-    // We need to do a separate call for the raw body structure
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+
+    // Fetch body structure with blob IDs in a single call
     let resp = jmap_call(
         s,
         vec![serde_json::json!([
@@ -819,7 +813,14 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     )
     .await?;
 
-    let body_structure = &resp["methodResponses"][0][1]["list"][0]["bodyStructure"];
+    let list = resp["methodResponses"][0][1]["list"]
+        .as_array()
+        .ok_or_else(|| Error::NotFound("Email not found".into()))?;
+    if list.is_empty() {
+        return Err(Error::NotFound("Email not found".into()));
+    }
+
+    let body_structure = &list[0]["bodyStructure"];
     let blob_id = match find_calendar_blob_id(body_structure) {
         Some(id) => id,
         None => return Ok(None),
@@ -845,7 +846,6 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     }
 
     let ics_data = resp.text().await?;
-    let _ = &email; // suppress unused warning
     Ok(Some(ics_data))
 }
 
@@ -871,20 +871,36 @@ pub async fn add_to_calendar(s: &JmapSession, ics_data: &str) -> Result<bool, Er
     Ok(resp.status().is_success())
 }
 
-/// Simple UUID v4 generation without pulling in the uuid crate.
+/// UUID v4 generation using /dev/urandom for proper randomness.
 fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seed = t.as_nanos();
+    let mut buf = [0u8; 16];
+    // Read from /dev/urandom — available on all Unix systems
+    if let Ok(bytes) = std::fs::read("/dev/urandom") {
+        let len = buf.len().min(bytes.len());
+        buf[..len].copy_from_slice(&bytes[..len]);
+    } else {
+        // Fallback: combine time + thread ID + address of stack variable for entropy
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let stack_addr = &buf as *const _ as u64;
+        let seed = t ^ (stack_addr as u128) ^ (thread_id.len() as u128 * 0x9e3779b97f4a7c15);
+        buf[..8].copy_from_slice(&(seed as u64).to_le_bytes());
+        buf[8..].copy_from_slice(&((seed >> 64) as u64).to_le_bytes());
+    }
+    // Set version (4) and variant (10xx) bits per RFC 4122
+    buf[6] = (buf[6] & 0x0F) | 0x40;
+    buf[8] = (buf[8] & 0x3F) | 0x80;
     format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (seed & 0xFFFF_FFFF) as u32,
-        ((seed >> 32) & 0xFFFF) as u16,
-        ((seed >> 48) & 0x0FFF) as u16,
-        (((seed >> 60) & 0x3F) | 0x80) as u16 | (((seed >> 66) & 0xFF) << 8) as u16,
-        (seed.wrapping_mul(6_364_136_223_846_793_005) & 0xFFFF_FFFF_FFFF) as u64,
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+        u16::from_be_bytes([buf[4], buf[5]]),
+        u16::from_be_bytes([buf[6], buf[7]]),
+        u16::from_be_bytes([buf[8], buf[9]]),
+        u64::from_be_bytes([0, 0, buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
     )
 }
 
