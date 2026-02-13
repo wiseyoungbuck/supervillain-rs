@@ -815,7 +815,7 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
 
     let list = resp["methodResponses"][0][1]["list"]
         .as_array()
-        .ok_or_else(|| Error::NotFound("Email not found".into()))?;
+        .ok_or_else(|| Error::Internal("Invalid JMAP Email/get response".into()))?;
     if list.is_empty() {
         return Err(Error::NotFound("Email not found".into()));
     }
@@ -874,20 +874,25 @@ pub async fn add_to_calendar(s: &JmapSession, ics_data: &str) -> Result<bool, Er
 /// UUID v4 generation using /dev/urandom for proper randomness.
 fn uuid_v4() -> String {
     let mut buf = [0u8; 16];
-    // Read from /dev/urandom — available on all Unix systems
-    if let Ok(bytes) = std::fs::read("/dev/urandom") {
-        let len = buf.len().min(bytes.len());
-        buf[..len].copy_from_slice(&bytes[..len]);
-    } else {
-        // Fallback: combine time + thread ID + address of stack variable for entropy
+    // Read exactly 16 bytes from /dev/urandom
+    let ok = (|| -> Result<(), std::io::Error> {
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")?;
+        f.read_exact(&mut buf)?;
+        Ok(())
+    })();
+    if ok.is_err() {
+        // Fallback: combine time + stack address + counter for entropy
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let t = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let thread_id = format!("{:?}", std::thread::current().id());
         let stack_addr = &buf as *const _ as u64;
-        let seed = t ^ (stack_addr as u128) ^ (thread_id.len() as u128 * 0x9e3779b97f4a7c15);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let seed = t ^ (stack_addr as u128) ^ ((count as u128) << 64);
         buf[..8].copy_from_slice(&(seed as u64).to_le_bytes());
         buf[8..].copy_from_slice(&((seed >> 64) as u64).to_le_bytes());
     }

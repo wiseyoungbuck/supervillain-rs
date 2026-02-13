@@ -59,7 +59,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         session: tokio::sync::RwLock::new(session),
-        splits_config_path: config_dir.join("vimmail/splits.json"),
+        splits_config_path: config_dir.join("supervillain/splits.json"),
     });
 
     let app = routes::router(state).fallback_service(

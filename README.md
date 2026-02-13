@@ -51,7 +51,7 @@ Environment variables `FASTMAIL_USERNAME` and `FASTMAIL_API_TOKEN` work as fallb
 
 ### Splits (inbox tabs)
 
-Splits let you filter your inbox into tabs (like Superhuman's splits). Config is stored at `~/.config/vimmail/splits.json`.
+Splits let you filter your inbox into tabs (like Superhuman's splits). Config is stored at `~/.config/supervillain/splits.json`.
 
 You can manage splits through the UI or edit the JSON directly:
 
