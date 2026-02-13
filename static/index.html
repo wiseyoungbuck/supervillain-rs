@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supervillain</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Status bar -->
+        <div id="statusbar">
+            <span id="mode-indicator">NORMAL</span>
+            <span id="mailbox-name">INBOX</span>
+            <span id="email-count"></span>
+            <span id="status-message"></span>
+        </div>
+
+        <!-- Main content area -->
+        <div id="main">
+            <!-- Sidebar: mailbox list -->
+            <div id="sidebar">
+                <div id="account-selector"></div>
+                <div id="mailbox-list"></div>
+            </div>
+
+            <!-- Email list view -->
+            <div id="email-list-view" class="view active">
+                <div id="split-tabs"></div>
+                <div id="email-list"></div>
+            </div>
+
+            <!-- Email detail view -->
+            <div id="email-detail-view" class="view">
+                <div id="email-header">
+                    <div id="email-subject"></div>
+                    <div id="email-meta"></div>
+                </div>
+                <!-- Calendar event card -->
+                <div id="calendar-event" class="hidden">
+                    <div class="calendar-card">
+                        <div class="cal-header">
+                            <span class="cal-icon">&#128197;</span>
+                            <span id="cal-title"></span>
+                        </div>
+                        <div id="cal-datetime"></div>
+                        <div id="cal-location"></div>
+                        <div id="cal-attendees"></div>
+                        <div class="calendar-actions">
+                            <button id="rsvp-accept" class="rsvp-btn accept">Accept</button>
+                            <button id="rsvp-maybe" class="rsvp-btn maybe">Maybe</button>
+                            <button id="rsvp-decline" class="rsvp-btn decline">Decline</button>
+                            <span class="cal-divider">|</span>
+                            <button id="cal-add" class="cal-btn">Add to Calendar</button>
+                        </div>
+                    </div>
+                </div>
+                <div id="email-body"></div>
+            </div>
+
+            <!-- Compose view -->
+            <div id="compose-view" class="view">
+                <div class="compose-field">
+                    <label>From:</label>
+                    <select id="compose-from"></select>
+                </div>
+                <div class="compose-field">
+                    <label>To:</label>
+                    <input type="text" id="compose-to" autocomplete="off">
+                </div>
+                <div class="compose-field">
+                    <label>Cc:</label>
+                    <input type="text" id="compose-cc" autocomplete="off">
+                </div>
+                <div class="compose-field">
+                    <label>Subject:</label>
+                    <input type="text" id="compose-subject" autocomplete="off">
+                </div>
+                <div class="compose-body">
+                    <textarea id="compose-body" placeholder="Write your message..."></textarea>
+                </div>
+                <div class="compose-hint">Ctrl+Enter to send | Escape to cancel</div>
+            </div>
+        </div>
+
+        <!-- Command palette -->
+        <div id="command-palette" class="hidden">
+            <input type="text" id="command-input" placeholder="Type a command...">
+            <div id="command-results"></div>
+        </div>
+
+        <!-- Search bar -->
+        <div id="search-bar" class="hidden">
+            <span class="search-prefix">/</span>
+            <input type="text" id="search-input" placeholder="from: to: has:attachment is:unread newer_than:7d">
+        </div>
+
+        <!-- Help overlay -->
+        <div id="help-overlay" class="hidden">
+            <div id="help-content">
+                <h2>Keyboard Shortcuts</h2>
+                <div class="help-section">
+                    <h3>Navigation</h3>
+                    <div class="shortcut"><kbd>j</kbd> / <kbd>k</kbd> Move down/up</div>
+                    <div class="shortcut"><kbd>g g</kbd> Go to top</div>
+                    <div class="shortcut"><kbd>G</kbd> Go to bottom</div>
+                    <div class="shortcut"><kbd>Enter</kbd> / <kbd>o</kbd> Open email</div>
+                    <div class="shortcut"><kbd>q</kbd> / <kbd>Esc</kbd> Back to list</div>
+                    <div class="shortcut"><kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> Cycle split tabs</div>
+                </div>
+                <div class="help-section">
+                    <h3>Actions</h3>
+                    <div class="shortcut"><kbd>e</kbd> Archive</div>
+                    <div class="shortcut"><kbd>#</kbd> Trash</div>
+                    <div class="shortcut"><kbd>r</kbd> Reply</div>
+                    <div class="shortcut"><kbd>a</kbd> Reply all</div>
+                    <div class="shortcut"><kbd>c</kbd> Compose</div>
+                    <div class="shortcut"><kbd>f</kbd> Forward</div>
+                    <div class="shortcut"><kbd>u</kbd> Toggle unread</div>
+                    <div class="shortcut"><kbd>U</kbd> Unsubscribe + archive all</div>
+                    <div class="shortcut"><kbd>s</kbd> Star/flag</div>
+                </div>
+                <div class="help-section">
+                    <h3>Other</h3>
+                    <div class="shortcut"><kbd>/</kbd> Search</div>
+                    <div class="shortcut"><kbd>Ctrl+k</kbd> Command palette</div>
+                    <div class="shortcut"><kbd>Ctrl+1-9</kbd> Jump to split tab</div>
+                    <div class="shortcut"><kbd>1-9</kbd> Switch account</div>
+                    <div class="shortcut"><kbd>?</kbd> This help</div>
+                    <div class="shortcut"><kbd>R</kbd> Refresh</div>
+                </div>
+                <div class="help-close">Press any key to close</div>
+            </div>
+        </div>
+
+        <!-- Undo toast -->
+        <div id="undo-toast" class="hidden">
+            <span id="undo-message"></span>
+            <button id="undo-button">Undo (z)</button>
+        </div>
+
+        <!-- Split modal -->
+        <div id="split-modal" class="hidden">
+            <div class="modal-content">
+                <h3>New Split Inbox</h3>
+                <div class="modal-field">
+                    <label>Name:</label>
+                    <input type="text" id="split-name" placeholder="e.g., Calendar" autocomplete="off">
+                </div>
+                <div class="modal-field">
+                    <label>Filter by:</label>
+                    <select id="split-filter-type">
+                        <option value="from">From (email pattern)</option>
+                        <option value="to">To/Recipient (email pattern)</option>
+                        <option value="subject">Subject (regex)</option>
+                        <option value="calendar">Calendar invites (iCal/ICS)</option>
+                    </select>
+                </div>
+                <div class="modal-field" id="split-pattern-field">
+                    <label>Pattern:</label>
+                    <input type="text" id="split-pattern" placeholder="e.g., *@calendar.google.com" autocomplete="off">
+                </div>
+                <div class="modal-hint" id="split-hint">Use * as wildcard for email patterns. Use regex for subject.</div>
+                <div class="modal-buttons">
+                    <button id="split-cancel">Cancel</button>
+                    <button id="split-save">Create Split</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
