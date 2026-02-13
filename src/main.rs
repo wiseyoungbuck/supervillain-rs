@@ -79,10 +79,13 @@ async fn main() {
         tower_http::services::ServeDir::new("static").append_index_html_on_directories(true),
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8000")
-        .await
-        .unwrap();
-    tracing::info!("Listening on http://127.0.0.1:8000");
+    let addr = "127.0.0.1:8000";
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let url = format!("http://{addr}");
+    tracing::info!("Listening on {url}");
+
+    open_browser(&url);
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -96,6 +99,25 @@ fn resolve_config_dir() -> PathBuf {
                 .ok()
         })
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn open_browser(url: &str) {
+    let is_omarchy = PathBuf::from(
+        std::env::var("HOME").unwrap_or_default(),
+    )
+    .join(".local/share/omarchy")
+    .is_dir();
+
+    let (cmd, args): (&str, Vec<&str>) = if is_omarchy {
+        ("omarchy-launch-webapp", vec![url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+
+    match std::process::Command::new(cmd).args(&args).spawn() {
+        Ok(_) => tracing::info!("Opened browser via {cmd}"),
+        Err(e) => tracing::warn!("Failed to open browser via {cmd}: {e}"),
+    }
 }
 
 /// Parse a simple key = value config file (like ghostty/omarchy).
