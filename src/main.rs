@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vimmail::{jmap, routes, types::AppState};
+use vimmail::{jmap, routes, splits, types::AppState};
 
 #[tokio::main]
 async fn main() {
@@ -57,9 +57,22 @@ async fn main() {
     }
     tracing::info!("Connected as {}, {} mailboxes", username, mailboxes.len());
 
+    let splits_config_path = config_dir.join("supervillain/splits.json");
+
+    // Auto-seed split tabs from identities on first run
+    match jmap::get_identities(&mut session).await {
+        Ok(identities) => {
+            if let Some(config) = splits::seed_from_identities(&identities, &splits_config_path) {
+                let names: Vec<_> = config.splits.iter().map(|s| s.name.as_str()).collect();
+                tracing::info!("Auto-created split tabs: {}", names.join(", "));
+            }
+        }
+        Err(e) => tracing::warn!("Failed to fetch identities for split seeding: {e}"),
+    }
+
     let state = Arc::new(AppState {
         session: tokio::sync::RwLock::new(session),
-        splits_config_path: config_dir.join("supervillain/splits.json"),
+        splits_config_path,
     });
 
     let app = routes::router(state).fallback_service(

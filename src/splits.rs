@@ -36,6 +36,84 @@ pub fn save_splits(config: &SplitsConfig, config_path: &Path) -> Result<(), Erro
 }
 
 // =============================================================================
+// Auto-seed from identities
+// =============================================================================
+
+/// Generate identity-based splits from JMAP identities, grouped by domain.
+/// Returns None if splits already exist (non-empty config file).
+pub fn seed_from_identities(
+    identities: &[crate::types::Identity],
+    config_path: &Path,
+) -> Option<SplitsConfig> {
+    // Don't overwrite existing splits
+    let existing = load_splits(config_path, None);
+    if !existing.splits.is_empty() {
+        return None;
+    }
+
+    let config = generate_splits_from_identities(identities);
+    if config.splits.is_empty() {
+        return None;
+    }
+
+    if let Err(e) = save_splits(&config, config_path) {
+        tracing::warn!("Failed to save auto-generated splits: {e}");
+        return None;
+    }
+    Some(config)
+}
+
+/// Generate split tabs from identities, one per unique domain.
+/// Skips if there's only one domain (no point in splitting).
+pub fn generate_splits_from_identities(identities: &[crate::types::Identity]) -> SplitsConfig {
+    use std::collections::BTreeSet;
+
+    // Collect unique domains
+    let mut domains = BTreeSet::new();
+    for id in identities {
+        if let Some(domain) = id.email.split('@').nth(1) {
+            domains.insert(domain.to_lowercase());
+        }
+    }
+
+    if domains.len() <= 1 {
+        return SplitsConfig::default();
+    }
+
+    // Check if short names (first label) are unique
+    let short_names_unique = {
+        let mut seen = std::collections::HashSet::new();
+        domains
+            .iter()
+            .all(|d| seen.insert(d.split('.').next().unwrap_or(d)))
+    };
+
+    let splits = domains
+        .into_iter()
+        .map(|domain| {
+            let short = domain.split('.').next().unwrap_or(&domain);
+            let (id, name) = if short_names_unique {
+                (short.to_string(), short.to_string())
+            } else {
+                (domain.replace('.', "-"), domain.clone())
+            };
+            SplitInbox {
+                id,
+                name,
+                filters: vec![SplitFilter {
+                    filter_type: FilterType::To,
+                    pattern: format!("*@{domain}"),
+                    name: None,
+                }],
+                match_mode: MatchMode::Any,
+            }
+        })
+        .collect();
+
+    SplitsConfig { splits }
+}
+
+// =============================================================================
 // Filter matching
 // =============================================================================
 
@@ -550,5 +628,162 @@ mod tests {
         assert_eq!(loaded.splits.len(), 2);
         assert_eq!(loaded.splits[0].id, "a");
         assert_eq!(loaded.splits[1].id, "b");
+    }
+
+    // --- generate_splits_from_identities ---
+
+    fn make_identity(email: &str) -> Identity {
+        Identity {
+            id: email.into(),
+            email: email.into(),
+            name: String::new(),
+        }
+    }
+
+    #[test]
+    fn generate_splits_multiple_domains() {
+        let identities = vec![
+            make_identity("user@aristoi.ai"),
+            make_identity("user@gmail.com"),
+            make_identity("user@aristotle.ai"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 3);
+
+        // BTreeMap sorts alphabetically by domain
+        assert_eq!(config.splits[0].id, "aristoi");
+        assert_eq!(config.splits[0].filters[0].pattern, "*@aristoi.ai");
+        assert_eq!(config.splits[0].filters[0].filter_type, FilterType::To);
+
+        assert_eq!(config.splits[1].id, "aristotle");
+        assert_eq!(config.splits[1].filters[0].pattern, "*@aristotle.ai");
+
+        assert_eq!(config.splits[2].id, "gmail");
+        assert_eq!(config.splits[2].filters[0].pattern, "*@gmail.com");
+    }
+
+    #[test]
+    fn generate_splits_single_domain_returns_empty() {
+        let identities = vec![
+            make_identity("user@fastmail.com"),
+            make_identity("alias@fastmail.com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert!(config.splits.is_empty());
+    }
+
+    #[test]
+    fn generate_splits_empty_identities_returns_empty() {
+        let config = generate_splits_from_identities(&[]);
+        assert!(config.splits.is_empty());
+    }
+
+    #[test]
+    fn generate_splits_deduplicates_domains() {
+        let identities = vec![
+            make_identity("alice@aristoi.ai"),
+            make_identity("bob@aristoi.ai"),
+            make_identity("user@gmail.com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 2);
+        assert_eq!(config.splits[0].id, "aristoi");
+        assert_eq!(config.splits[1].id, "gmail");
+    }
+
+    #[test]
+    fn generate_splits_case_insensitive_domains() {
+        let identities = vec![
+            make_identity("user@Aristoi.AI"),
+            make_identity("user@Gmail.Com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 2);
+        assert_eq!(config.splits[0].filters[0].pattern, "*@aristoi.ai");
+        assert_eq!(config.splits[1].filters[0].pattern, "*@gmail.com");
+    }
+
+    #[test]
+    fn generate_splits_conflicting_short_names_uses_full_domain() {
+        let identities = vec![
+            make_identity("user@aristoi.ai"),
+            make_identity("user@aristoi.com"),
+            make_identity("user@gmail.com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 3);
+        // All should use full domain since "aristoi" collides
+        assert_eq!(config.splits[0].id, "aristoi-ai");
+        assert_eq!(config.splits[0].name, "aristoi.ai");
+        assert_eq!(config.splits[1].id, "aristoi-com");
+        assert_eq!(config.splits[2].id, "gmail-com");
+    }
+
+    #[test]
+    fn generate_splits_skips_malformed_email() {
+        let identities = vec![
+            make_identity("localonly"),
+            make_identity("user@aristoi.ai"),
+            make_identity("user@gmail.com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 2);
+    }
+
+    // --- seed_from_identities ---
+
+    #[test]
+    fn seed_creates_splits_when_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splits.json");
+        let identities = vec![
+            make_identity("user@aristoi.ai"),
+            make_identity("user@gmail.com"),
+        ];
+        let result = seed_from_identities(&identities, &path);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().splits.len(), 2);
+
+        // File should have been written
+        let loaded = load_splits(&path, None);
+        assert_eq!(loaded.splits.len(), 2);
+    }
+
+    #[test]
+    fn seed_skips_when_splits_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splits.json");
+
+        // Pre-create a splits config
+        let existing = SplitsConfig {
+            splits: vec![SplitInbox {
+                id: "custom".into(),
+                name: "Custom".into(),
+                filters: vec![from_filter("*@example.com")],
+                match_mode: MatchMode::Any,
+            }],
+        };
+        save_splits(&existing, &path).unwrap();
+
+        let identities = vec![
+            make_identity("user@aristoi.ai"),
+            make_identity("user@gmail.com"),
+        ];
+        let result = seed_from_identities(&identities, &path);
+        assert!(result.is_none());
+
+        // Original config should be preserved
+        let loaded = load_splits(&path, None);
+        assert_eq!(loaded.splits.len(), 1);
+        assert_eq!(loaded.splits[0].id, "custom");
+    }
+
+    #[test]
+    fn seed_skips_single_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splits.json");
+        let identities = vec![make_identity("user@fastmail.com")];
+        let result = seed_from_identities(&identities, &path);
+        assert!(result.is_none());
     }
 }

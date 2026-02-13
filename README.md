@@ -49,30 +49,51 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 
 Environment variables `FASTMAIL_USERNAME` and `FASTMAIL_API_TOKEN` work as fallbacks.
 
+### Multiple email addresses
+
+If you have multiple identities in Fastmail (e.g. you@aristoi.ai, you@gmail.com, you@aristotle.ai), supervillain handles this automatically:
+
+- **Receiving:** Forward Gmail/Outlook/etc. to Fastmail. All mail lands in one inbox.
+- **Sending:** All Fastmail identities appear in the From dropdown. Replies auto-select the matching address.
+- **Inbox tabs:** On first run, supervillain auto-creates split tabs from your identities (one per domain). These appear as tabs across the top of the inbox, filterable with `Tab`/`Shift+Tab` or `Ctrl+1-9`.
+
+No multi-account configuration needed. One Fastmail connection, multiple addresses.
+
 ### Splits (inbox tabs)
 
-Splits let you filter your inbox into tabs (like Superhuman's splits). Config is stored at `~/.config/supervillain/splits.json`.
+Splits filter your inbox into tabs. Config is stored at `~/.config/supervillain/splits.json`.
 
-You can manage splits through the UI or edit the JSON directly:
+On first run with no splits configured, supervillain auto-generates identity-based splits from your Fastmail identities (one tab per domain). After that, you manage them yourself.
+
+**Managing splits:**
+
+- **Add via UI:** Press `Ctrl+K` to open the command palette, select "New Split". Choose a filter type (from, to, subject, calendar), enter a pattern, and save.
+- **Delete via UI:** Press `Ctrl+K`, type "delete", select the split to remove.
+- **Edit JSON directly:** Edit `~/.config/supervillain/splits.json` and refresh.
+- **Re-generate from identities:** Delete `~/.config/supervillain/splits.json` and restart. Splits will be re-created from your current Fastmail identities.
+
+Example config:
 
 ```json
 {
   "splits": [
+    {
+      "id": "aristoi",
+      "name": "aristoi",
+      "filters": [{ "type": "to", "pattern": "*@aristoi.ai" }]
+    },
+    {
+      "id": "gmail",
+      "name": "gmail",
+      "filters": [{ "type": "to", "pattern": "*@gmail.com" }]
+    },
     {
       "id": "newsletters",
       "name": "Newsletters",
       "match_mode": "any",
       "filters": [
         { "type": "from", "pattern": "*@substack.com" },
-        { "type": "from", "pattern": "noreply@medium.com" },
         { "type": "subject", "pattern": "newsletter|digest|weekly" }
-      ]
-    },
-    {
-      "id": "calendar",
-      "name": "Calendar",
-      "filters": [
-        { "type": "calendar", "pattern": "*" }
       ]
     }
   ]
@@ -84,7 +105,7 @@ You can manage splits through the UI or edit the JSON directly:
 | Type | Pattern | Matches |
 |------|---------|---------|
 | `from` | Glob (`*@example.com`) | Sender email address |
-| `to` | Glob (`team-*@company.com`) | To/CC addresses |
+| `to` | Glob (`*@aristoi.ai`) | To/CC addresses |
 | `subject` | Regex (`invite\|meeting`) | Subject line (falls back to substring if regex is invalid) |
 | `calendar` | `*` | Emails with calendar invites |
 
@@ -156,7 +177,7 @@ All endpoints are under `/api/`. The frontend at `/` communicates with these.
 cargo test
 ```
 
-119 tests covering types, glob matching, split filtering, search parsing, ICS calendar parsing, JMAP filter translation, and MIME detection.
+Tests cover types, glob matching, split filtering, identity-based split seeding, search parsing, ICS calendar parsing, JMAP filter translation, and MIME detection.
 
 ## Project structure
 
