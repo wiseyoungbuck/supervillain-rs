@@ -593,6 +593,77 @@ pub async fn archive_batch(s: &JmapSession, email_ids: &[String]) -> Result<usiz
 // Send email
 // =============================================================================
 
+fn build_draft_email(
+    sub: &EmailSubmission,
+    from_addr: &str,
+    drafts_mailbox_id: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut m: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    m.insert(
+        "mailboxIds".into(),
+        serde_json::json!({ drafts_mailbox_id: true }),
+    );
+    m.insert("from".into(), serde_json::json!([{"email": from_addr}]));
+    m.insert(
+        "to".into(),
+        serde_json::json!(
+            sub.to
+                .iter()
+                .map(|e| serde_json::json!({"email": e}))
+                .collect::<Vec<_>>()
+        ),
+    );
+    m.insert("subject".into(), serde_json::json!(sub.subject));
+    m.insert(
+        "textBody".into(),
+        serde_json::json!([{
+            "partId": "body",
+            "type": "text/plain"
+        }]),
+    );
+    m.insert(
+        "bodyValues".into(),
+        serde_json::json!({
+            "body": { "value": sub.text_body }
+        }),
+    );
+
+    if !sub.cc.is_empty() {
+        m.insert(
+            "cc".into(),
+            serde_json::json!(
+                sub.cc
+                    .iter()
+                    .map(|e| serde_json::json!({"email": e}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    if let Some(ref bcc) = sub.bcc
+        && !bcc.is_empty()
+    {
+        m.insert(
+            "bcc".into(),
+            serde_json::json!(
+                bcc.iter()
+                    .map(|e| serde_json::json!({"email": e}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    if let Some(ref reply_to) = sub.in_reply_to {
+        m.insert("inReplyTo".into(), serde_json::json!([reply_to]));
+    }
+
+    if let Some(ref refs) = sub.references {
+        m.insert("references".into(), serde_json::json!(refs));
+    }
+
+    m
+}
+
 pub async fn send_email(
     s: &mut JmapSession,
     sub: &EmailSubmission,
@@ -626,65 +697,16 @@ pub async fn send_email(
         }
     };
 
-    // Build email create
-    let mut email_create: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    email_create.insert("from".into(), serde_json::json!([{"email": from_addr}]));
-    email_create.insert(
-        "to".into(),
-        serde_json::json!(
-            sub.to
-                .iter()
-                .map(|e| serde_json::json!({"email": e}))
-                .collect::<Vec<_>>()
-        ),
-    );
-    email_create.insert("subject".into(), serde_json::json!(sub.subject));
-    email_create.insert(
-        "textBody".into(),
-        serde_json::json!([{
-            "partId": "body",
-            "type": "text/plain"
-        }]),
-    );
-    email_create.insert(
-        "bodyValues".into(),
-        serde_json::json!({
-            "body": { "value": sub.text_body }
-        }),
-    );
+    // JMAP requires mailboxIds — put the draft in Drafts
+    let drafts_id = s
+        .mailbox_cache
+        .values()
+        .find(|mb| mb.role.as_deref() == Some("drafts"))
+        .ok_or_else(|| Error::Internal("No drafts mailbox found".into()))?
+        .id
+        .clone();
 
-    if !sub.cc.is_empty() {
-        email_create.insert(
-            "cc".into(),
-            serde_json::json!(
-                sub.cc
-                    .iter()
-                    .map(|e| serde_json::json!({"email": e}))
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
-
-    if let Some(ref bcc) = sub.bcc
-        && !bcc.is_empty()
-    {
-        email_create.insert(
-            "bcc".into(),
-            serde_json::json!(
-                bcc.iter()
-                    .map(|e| serde_json::json!({"email": e}))
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
-
-    if let Some(ref reply_to) = sub.in_reply_to {
-        email_create.insert("inReplyTo".into(), serde_json::json!([reply_to]));
-    }
-
-    if let Some(ref refs) = sub.references {
-        email_create.insert("references".into(), serde_json::json!(refs));
-    }
+    let email_create = build_draft_email(sub, from_addr, &drafts_id);
 
     // Build envelope
     let mut rcpt_to: Vec<serde_json::Value> = sub
@@ -1021,6 +1043,150 @@ mod tests {
             "blobId": "blob-case-file"
         });
         assert_eq!(find_calendar_blob_id(&body), Some("blob-case-file".into()));
+    }
+
+    // --- build_draft_email tests ---
+
+    fn simple_submission() -> EmailSubmission {
+        EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "Test".into(),
+            text_body: "Hello".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+        }
+    }
+
+    #[test]
+    fn draft_includes_mailbox_ids() {
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-123");
+        let ids = draft.get("mailboxIds").expect("mailboxIds must be present");
+        assert_eq!(ids, &serde_json::json!({"mb-drafts-123": true}));
+    }
+
+    #[test]
+    fn draft_forward_includes_mailbox_ids() {
+        // Forward: no in_reply_to, subject starts with Fwd:
+        let sub = EmailSubmission {
+            to: vec!["charlie@example.com".into()],
+            cc: vec![],
+            subject: "Fwd: Important".into(),
+            text_body: "---------- Forwarded message ---------\n...".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-456");
+        let ids = draft.get("mailboxIds").expect("mailboxIds must be present");
+        assert_eq!(ids, &serde_json::json!({"mb-drafts-456": true}));
+    }
+
+    #[test]
+    fn draft_reply_includes_mailbox_ids() {
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "Re: Hello".into(),
+            text_body: "Reply body".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: Some("<msg-123@example.com>".into()),
+            references: Some(vec!["<msg-123@example.com>".into()]),
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-789");
+        assert!(draft.contains_key("mailboxIds"));
+        assert!(draft.contains_key("inReplyTo"));
+        assert!(draft.contains_key("references"));
+    }
+
+    #[test]
+    fn draft_sets_from_to_subject_body() {
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(draft["from"], serde_json::json!([{"email": "alice@example.com"}]));
+        assert_eq!(draft["to"], serde_json::json!([{"email": "bob@example.com"}]));
+        assert_eq!(draft["subject"], serde_json::json!("Test"));
+    }
+
+    #[test]
+    fn draft_omits_empty_cc_and_bcc() {
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "a@b.com", "mb");
+        assert!(!draft.contains_key("cc"));
+        assert!(!draft.contains_key("bcc"));
+    }
+
+    #[test]
+    fn draft_includes_cc_and_bcc_when_present() {
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec!["cc@example.com".into()],
+            subject: "Test".into(),
+            text_body: "Hello".into(),
+            bcc: Some(vec!["bcc@example.com".into()]),
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+        };
+        let draft = build_draft_email(&sub, "a@b.com", "mb");
+        assert_eq!(draft["cc"], serde_json::json!([{"email": "cc@example.com"}]));
+        assert_eq!(draft["bcc"], serde_json::json!([{"email": "bcc@example.com"}]));
+    }
+
+    #[test]
+    fn drafts_mailbox_lookup_fails_when_missing() {
+        let cache: HashMap<String, Mailbox> = HashMap::from([(
+            "inbox-id".into(),
+            Mailbox {
+                id: "inbox-id".into(),
+                name: "Inbox".into(),
+                role: Some("inbox".into()),
+                total_emails: 0,
+                unread_emails: 0,
+                parent_id: None,
+            },
+        )]);
+        let result = cache
+            .values()
+            .find(|mb| mb.role.as_deref() == Some("drafts"));
+        assert!(result.is_none(), "should not find drafts in cache without one");
+    }
+
+    #[test]
+    fn drafts_mailbox_lookup_succeeds() {
+        let cache: HashMap<String, Mailbox> = HashMap::from([
+            (
+                "inbox-id".into(),
+                Mailbox {
+                    id: "inbox-id".into(),
+                    name: "Inbox".into(),
+                    role: Some("inbox".into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            ),
+            (
+                "drafts-id".into(),
+                Mailbox {
+                    id: "drafts-id".into(),
+                    name: "Drafts".into(),
+                    role: Some("drafts".into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            ),
+        ]);
+        let result = cache
+            .values()
+            .find(|mb| mb.role.as_deref() == Some("drafts"));
+        assert_eq!(result.unwrap().id, "drafts-id");
     }
 
     // --- uuid_v4 tests ---
