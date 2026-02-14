@@ -868,15 +868,19 @@ function handleNormalModeKey(e) {
             break;
         case 'r':
             startReply(false);
+            e.preventDefault();
             break;
         case 'a':
             startReply(true);
+            e.preventDefault();
             break;
         case 'c':
             startCompose();
+            e.preventDefault();
             break;
         case 'f':
             startForward();
+            e.preventDefault();
             break;
         case 'u':
             toggleUnreadSelected();
