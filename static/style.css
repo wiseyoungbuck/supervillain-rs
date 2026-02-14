@@ -792,6 +792,11 @@ body:not(.light-theme) #email-body.html-content * {
     color: var(--fg-dim);
 }
 
+.loading-body {
+    padding: 20px;
+    color: var(--fg-dim);
+}
+
 @keyframes spin {
     to { transform: rotate(360deg); }
 }
@@ -898,7 +903,7 @@ body:not(.light-theme) #email-body.html-content * {
     margin-top: 10px;
 }
 
-.rsvp-btn, .cal-btn {
+.rsvp-btn {
     font-family: var(--font-mono);
     font-size: 12px;
     padding: 4px 12px;
@@ -909,7 +914,7 @@ body:not(.light-theme) #email-body.html-content * {
     transition: all 0.15s;
 }
 
-.rsvp-btn:hover, .cal-btn:hover {
+.rsvp-btn:hover {
     background: var(--border);
     border-color: var(--fg-dim);
 }
@@ -944,11 +949,4 @@ body:not(.light-theme) #email-body.html-content * {
     color: var(--bg);
 }
 
-.cal-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-}
 
-.cal-divider {
-    color: var(--fg-dim);
-}

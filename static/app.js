@@ -80,8 +80,6 @@ function init() {
     els.rsvpAccept = document.getElementById('rsvp-accept');
     els.rsvpMaybe = document.getElementById('rsvp-maybe');
     els.rsvpDecline = document.getElementById('rsvp-decline');
-    els.calAdd = document.getElementById('cal-add');
-
     // Event listeners
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
@@ -93,7 +91,15 @@ function init() {
     els.rsvpAccept.addEventListener('click', () => rsvpToEvent('ACCEPTED'));
     els.rsvpMaybe.addEventListener('click', () => rsvpToEvent('TENTATIVE'));
     els.rsvpDecline.addEventListener('click', () => rsvpToEvent('DECLINED'));
-    els.calAdd.addEventListener('click', addToCalendar);
+
+    // Single delegated click handler for email list — never re-bound, survives innerHTML updates
+    els.emailList.addEventListener('click', (e) => {
+        const row = e.target.closest('.email-row');
+        if (!row) return;
+        state.selectedIndex = parseInt(row.dataset.index);
+        renderEmailList();
+        loadEmailDetail(row.dataset.id);
+    });
 
     // Compose field listeners
     [els.composeTo, els.composeCc, els.composeSubject, els.composeBody].forEach(el => {
@@ -321,7 +327,11 @@ function buildEmailListUrl(mailboxId, { offset = 0, search = null } = {}) {
 async function loadEmails() {
     if (!state.currentMailbox) return;
 
-    els.emailList.innerHTML = '<div class="loading">Loading</div>';
+    // Only show "Loading" if the list is empty. If we already have emails
+    // (refresh, split switch), keep them visible while fetching.
+    if (state.emails.length === 0) {
+        els.emailList.innerHTML = '<div class="loading">Loading</div>';
+    }
 
     try {
         const url = buildEmailListUrl(state.currentMailbox.id, { search: state.searchQuery });
@@ -367,27 +377,76 @@ async function loadEmailDetail(emailId) {
     // Save scroll position of the email we're leaving (if any)
     saveScrollPosition();
 
-    // Use cache if available
+    // Use cache if available — render immediately, no await
     if (emailCache[emailId]) {
         state.currentEmail = emailCache[emailId];
         renderEmailDetail();
         els.emailBody.scrollTop = scrollPositions[emailId] || 0;
         showView('detail');
+        prefetchAdjacentEmails();
         return;
     }
 
-    // Immediately hide calendar card from previous email while loading
-    els.calendarEvent.classList.add('hidden');
+    // Not cached: show partial data from list immediately so the UI never feels stuck.
+    // The list item has subject, from, date — render that now, fetch body in background.
+    const listItem = state.emails.find(e => e.id === emailId);
+    if (listItem) {
+        state.currentEmail = listItem;
+        renderEmailDetailPartial(listItem);
+        showView('detail');
+    } else {
+        els.calendarEvent.classList.add('hidden');
+    }
 
     try {
         const email = await api('GET', `/emails/${emailId}`);
-        emailCache[emailId] = email;  // Cache it
-        state.currentEmail = email;
-        renderEmailDetail();
-        els.emailBody.scrollTop = 0;
+        emailCache[emailId] = email;
+        // Only render if we're still looking at this email (user may have navigated away)
+        if (state.currentEmail?.id === emailId) {
+            state.currentEmail = email;
+            renderEmailDetail();
+            els.emailBody.scrollTop = 0;
+        }
         showView('detail');
+        prefetchAdjacentEmails();
     } catch (err) {
         showStatus('Failed to load email: ' + err.message, 'error');
+    }
+}
+
+// Render what we know from list data: subject, from, date. Clear body.
+// This gives instant visual feedback while the full email loads.
+function renderEmailDetailPartial(listItem) {
+    const from = listItem.from[0];
+    const fromDisplay = from?.name ? `${from.name} <${from.email}>` : from?.email || 'Unknown';
+    const toDisplay = listItem.to ? listItem.to.map(t => t.name || t.email).join(', ') : '';
+    const date = new Date(listItem.receivedAt).toLocaleString();
+
+    els.emailSubject.textContent = listItem.subject;
+    els.emailMeta.innerHTML = `
+        <div><span class="label">From:</span> ${escapeHtml(fromDisplay)}</div>
+        ${toDisplay ? `<div><span class="label">To:</span> ${escapeHtml(toDisplay)}</div>` : ''}
+        <div><span class="label">Date:</span> ${date}</div>
+    `;
+    els.calendarEvent.classList.add('hidden');
+    els.emailBody.innerHTML = '<div class="loading-body">Loading…</div>';
+    els.emailBody.classList.remove('html-content');
+}
+
+// Prefetch next few emails so archive/navigation is instant.
+// Fire-and-forget — no awaits, no blocking the UI.
+function prefetchAdjacentEmails() {
+    const idx = state.emails.findIndex(e => e.id === state.currentEmail?.id);
+    if (idx < 0) return;
+
+    // Prefetch next 3 emails (the ones you'll hit when archiving repeatedly)
+    for (let i = 1; i <= 3; i++) {
+        const target = state.emails[idx + i];
+        if (target && !emailCache[target.id]) {
+            api('GET', `/emails/${target.id}`)
+                .then(email => { emailCache[target.id] = email; })
+                .catch(() => {}); // Swallow — prefetch is best-effort
+        }
     }
 }
 
@@ -397,7 +456,7 @@ async function emailAction(type, emailId) {
     // Optimistic: remove from list and show feedback immediately
     const removedEmail = state.emails.find(e => e.id === emailId);
     const removedIndex = state.emails.indexOf(removedEmail);
-    pushUndo(label.toLowerCase(), emailId);
+    pushUndo(label.toLowerCase(), emailId, removedEmail, removedIndex);
     removeEmailFromList(emailId);
     showStatus(label, 'success');
 
@@ -566,14 +625,6 @@ function renderEmailList() {
             </div>
         `;
     }).join('');
-
-    els.emailList.querySelectorAll('.email-row').forEach(el => {
-        el.addEventListener('click', () => {
-            state.selectedIndex = parseInt(el.dataset.index);
-            renderEmailList();
-            loadEmailDetail(el.dataset.id);
-        });
-    });
 
     scrollSelectedIntoView();
 }
@@ -919,8 +970,20 @@ function handleSearchKeyDown(e) {
 function moveSelection(delta) {
     const newIndex = state.selectedIndex + delta;
     if (newIndex < 0 || newIndex >= state.emails.length) return;
+
+    // Swap selected class directly — don't rebuild the entire list DOM.
+    // j/k should be zero-cost, not O(n) innerHTML.
+    const oldRow = els.emailList.querySelector(`.email-row[data-index="${state.selectedIndex}"]`);
+    if (oldRow) oldRow.classList.remove('selected');
+
     state.selectedIndex = newIndex;
-    renderEmailList();
+
+    const newRow = els.emailList.querySelector(`.email-row[data-index="${newIndex}"]`);
+    if (newRow) {
+        newRow.classList.add('selected');
+        newRow.scrollIntoView({ block: 'nearest' });
+    }
+
     if (state.view === 'detail') {
         loadEmailDetail(state.emails[state.selectedIndex].id);
     }
@@ -971,25 +1034,15 @@ function actionSelected(type) {
 }
 
 function goToNextEmail() {
-    const currentId = state.currentEmail?.id;
-    const currentIndex = state.emails.findIndex(e => e.id === currentId);
-
-    // Remove from list if still present (may already be removed by optimistic emailAction)
-    if (currentIndex >= 0) {
-        state.emails.splice(currentIndex, 1);
-        renderEmailList();
-        updateEmailCount();
-    }
-
+    // emailAction already removed the current email from state.emails,
+    // so just pick the next one at the same index (or clamp to end).
     if (state.emails.length === 0) {
         showView('list');
         maybeRefillEmails();
         return;
     }
 
-    // Use currentIndex if we removed it here, otherwise fall back to selectedIndex
-    const baseIndex = currentIndex >= 0 ? currentIndex : state.selectedIndex;
-    const nextIndex = Math.min(baseIndex, state.emails.length - 1);
+    const nextIndex = Math.min(state.selectedIndex, state.emails.length - 1);
     state.selectedIndex = nextIndex;
     const nextEmail = state.emails[nextIndex];
 
@@ -1015,27 +1068,47 @@ async function unsubscribeAndArchiveAll() {
     const id = getSelectedEmailId();
     if (!id) return;
 
+    // Find the sender so we can optimistically remove all their emails
+    const email = state.emails.find(e => e.id === id) || state.currentEmail;
+    const senderEmail = email?.from[0]?.email?.toLowerCase();
+
+    // Optimistic: remove all emails from this sender immediately
+    let removedEmails = [];
+    if (senderEmail) {
+        removedEmails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() === senderEmail);
+        state.emails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() !== senderEmail);
+        if (state.selectedIndex >= state.emails.length) {
+            state.selectedIndex = Math.max(0, state.emails.length - 1);
+        }
+        renderEmailList();
+        updateEmailCount();
+    }
+
     showStatus('Unsubscribing and archiving...', 'info');
+
+    // Navigate to next email immediately
+    if (state.view === 'detail') {
+        goToNextEmail();
+    }
 
     try {
         const result = await api('POST', `/emails/${id}/unsubscribe-and-archive-all`);
 
         if (result.unsubscribeUrl) {
-            // Open unsubscribe link in new tab
             window.open(result.unsubscribeUrl, '_blank');
             showStatus(`Archived ${result.archivedCount} emails from ${result.sender}. Unsubscribe page opened.`, 'success');
         } else {
             showStatus(`Archived ${result.archivedCount} emails from ${result.sender}. No unsubscribe link found.`, 'warning');
         }
-
-        // Refresh and go to next email
-        if (state.view === 'detail') {
-            await loadEmails();
-            goToNextEmail();
-        } else {
-            loadEmails();
-        }
+        maybeRefillEmails();
     } catch (err) {
+        // Revert: re-insert the removed emails
+        if (removedEmails.length > 0) {
+            state.emails = state.emails.concat(removedEmails);
+            state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+            renderEmailList();
+            updateEmailCount();
+        }
         showStatus('Unsubscribe failed: ' + err.message, 'error');
     }
 }
@@ -1335,8 +1408,8 @@ async function deleteSplit(splitId) {
 
 // Undo
 
-function pushUndo(action, emailId) {
-    state.undoStack.push({ action, emailId, timestamp: Date.now() });
+function pushUndo(action, emailId, emailData, insertIndex) {
+    state.undoStack.push({ action, emailId, emailData, insertIndex, timestamp: Date.now() });
 
     // Show toast
     els.undoMessage.textContent = action === 'archived' ? 'Email archived' : 'Email trashed';
@@ -1352,17 +1425,30 @@ async function performUndo() {
     const item = state.undoStack.pop();
     if (!item) return;
 
-    // Optimistic: hide toast and show feedback immediately
     els.undoToast.classList.add('hidden');
     showStatus('Undone', 'success');
+
+    // Optimistic: re-insert the email into the list immediately
+    if (item.emailData) {
+        const idx = Math.min(item.insertIndex, state.emails.length);
+        state.emails.splice(idx, 0, item.emailData);
+        state.selectedIndex = idx;
+        renderEmailList();
+        updateEmailCount();
+    }
 
     try {
         const inbox = state.mailboxes.find(m => m.role === 'inbox');
         if (inbox) {
             await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
-            loadEmails();
         }
     } catch (err) {
+        // Revert: remove the email we optimistically re-inserted
+        if (item.emailData) {
+            state.emails = state.emails.filter(e => e.id !== item.emailId);
+            renderEmailList();
+            updateEmailCount();
+        }
         showStatus('Undo failed', 'error');
     }
 }
@@ -1599,9 +1685,6 @@ function renderCalendarCard(event) {
         els.rsvpAccept.classList.toggle('active', userStatus === 'ACCEPTED');
         els.rsvpMaybe.classList.toggle('active', userStatus === 'TENTATIVE');
         els.rsvpDecline.classList.toggle('active', userStatus === 'DECLINED');
-
-        // Hide "Add to Calendar" if already accepted/tentative
-        els.calAdd.style.display = (userStatus === 'ACCEPTED' || userStatus === 'TENTATIVE') ? 'none' : '';
     }
 }
 
@@ -1692,17 +1775,6 @@ async function rsvpToEvent(status) {
             renderCalendarCard(prevEvent);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
-    }
-}
-
-async function addToCalendar() {
-    if (!state.currentEmail) return;
-
-    try {
-        await api('POST', `/emails/${state.currentEmail.id}/add-to-calendar`);
-        showStatus('Event added to calendar', 'success');
-    } catch (err) {
-        showStatus('Failed to add to calendar: ' + err.message, 'error');
     }
 }
 

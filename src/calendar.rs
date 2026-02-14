@@ -11,8 +11,9 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
         return None;
     }
 
-    // Extract METHOD from VCALENDAR level
-    let method = extract_property(data, "METHOD").unwrap_or_else(|| "REQUEST".into());
+    // Extract METHOD from VCALENDAR level. Default to PUBLISH (not an invitation)
+    // so that standalone .ics exports don't trigger auto-add to calendar.
+    let method = extract_property(data, "METHOD").unwrap_or_else(|| "PUBLISH".into());
 
     // Find VEVENT block
     let vevent_start = data.find("BEGIN:VEVENT")?;
@@ -559,6 +560,159 @@ END:VCALENDAR";
         let event = parse_ics(ics).unwrap();
         assert_eq!(event.dtstart.year(), 2026);
         assert_eq!(event.dtstart.month(), 3);
+    }
+
+    // --- invitation lifecycle tests ---
+    // The whole auto-add/remove/re-add flow depends on one invariant:
+    // the UID never changes across parse → rsvp → parse cycles.
+    // CalDAV uses UID as the filename, so if it drifts, we'd create
+    // orphan events or fail to delete the right one.
+
+    #[test]
+    fn uid_stable_through_full_rsvp_lifecycle() {
+        let original = parse_ics(SAMPLE_ICS).unwrap();
+        let uid = &original.uid;
+
+        // Accept → parse back
+        let accept_ics = generate_rsvp(&original, "bob@example.com", "ACCEPTED");
+        let accepted = parse_ics(&accept_ics).unwrap();
+        assert_eq!(&accepted.uid, uid);
+
+        // Decline → parse back
+        let decline_ics = generate_rsvp(&original, "bob@example.com", "DECLINED");
+        let declined = parse_ics(&decline_ics).unwrap();
+        assert_eq!(&declined.uid, uid);
+
+        // Re-accept after decline → parse back (the mis-click recovery path)
+        let reaccept_ics = generate_rsvp(&original, "bob@example.com", "ACCEPTED");
+        let reaccepted = parse_ics(&reaccept_ics).unwrap();
+        assert_eq!(&reaccepted.uid, uid);
+
+        // Tentative → parse back
+        let maybe_ics = generate_rsvp(&original, "bob@example.com", "TENTATIVE");
+        let maybe = parse_ics(&maybe_ics).unwrap();
+        assert_eq!(&maybe.uid, uid);
+    }
+
+    #[test]
+    fn rsvp_always_produces_reply_method() {
+        // RSVP responses must be METHOD:REPLY, never REQUEST.
+        // If a REPLY leaked back as REQUEST, the auto-add path
+        // would fire when viewing a sent RSVP email — creating
+        // duplicate calendar entries.
+        let event = sample_event();
+        for status in &["ACCEPTED", "TENTATIVE", "DECLINED"] {
+            let ics = generate_rsvp(&event, "bob@example.com", status);
+            let parsed = parse_ics(&ics).unwrap();
+            assert_eq!(parsed.method, "REPLY", "RSVP with status {status} must be REPLY");
+            assert_ne!(parsed.method, "REQUEST");
+        }
+    }
+
+    #[test]
+    fn cancel_method_parsed_correctly() {
+        // Auto-add gates on method == "REQUEST". Cancelled events
+        // must parse as "CANCEL" so they don't get auto-added.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:CANCEL\r\n\
+BEGIN:VEVENT\r\n\
+UID:cancel-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Cancelled Meeting\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:1\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.method, "CANCEL");
+        assert_ne!(event.method, "REQUEST");
+    }
+
+    #[test]
+    fn reply_method_not_request() {
+        // When we receive a REPLY (someone else RSVPing), it must
+        // not trigger auto-add. Verify parsing preserves the method.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REPLY\r\n\
+BEGIN:VEVENT\r\n\
+UID:reply-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Someone Replied\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.method, "REPLY");
+        assert_ne!(event.method, "REQUEST");
+    }
+
+    #[test]
+    fn no_method_defaults_not_request() {
+        // Some ICS files omit METHOD entirely (e.g. .ics file exports).
+        // These should NOT trigger auto-add.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:no-method-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:No Method\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_ne!(event.method, "REQUEST");
+    }
+
+    #[test]
+    fn uid_with_special_chars_survives_rsvp() {
+        // Real-world UIDs often contain @, dots, slashes, etc.
+        // These become part of the CalDAV filename, so they must
+        // survive the generate_rsvp → parse_ics round-trip intact.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:040000008200E00074C5B7101A82E0080000000060A7B920@calendar.google.com/extra\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Real World UID\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION:mailto:bob@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        let original_uid = event.uid.clone();
+
+        let rsvp = generate_rsvp(&event, "bob@example.com", "ACCEPTED");
+        let parsed = parse_ics(&rsvp).unwrap();
+        assert_eq!(parsed.uid, original_uid);
+    }
+
+    #[test]
+    fn decline_rsvp_still_contains_event_metadata() {
+        // When we decline and the backend calls remove_from_calendar,
+        // it needs the UID. But the RSVP handler also returns the
+        // parsed event to the frontend. Verify the decline ICS has
+        // enough data to parse fully (summary, organizer, etc).
+        let event = sample_event();
+        let ics = generate_rsvp(&event, "bob@example.com", "DECLINED");
+        let parsed = parse_ics(&ics).unwrap();
+
+        assert_eq!(parsed.uid, event.uid);
+        assert_eq!(parsed.summary, event.summary);
+        assert_eq!(parsed.organizer_email, event.organizer_email);
+        assert_eq!(parsed.method, "REPLY");
+        assert_eq!(parsed.attendees.len(), 1);
+        assert_eq!(parsed.attendees[0].status, "DECLINED");
     }
 
     use chrono::{Datelike, Timelike};

@@ -849,22 +849,44 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     Ok(Some(ics_data))
 }
 
-pub async fn add_to_calendar(s: &JmapSession, ics_data: &str) -> Result<bool, Error> {
-    // CalDAV PUT to Fastmail calendar
+pub async fn add_to_calendar(
+    s: &JmapSession,
+    ics_data: &str,
+    uid: &str,
+    only_if_new: bool,
+) -> Result<bool, Error> {
+    // CalDAV PUT to Fastmail calendar, using event UID as filename for idempotency
     let caldav_url = format!(
-        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/",
-        s.username
+        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        s.username, uid
     );
 
-    // Generate a unique event filename
-    let event_id = format!("{}.ics", uuid_v4());
+    let mut req = s
+        .client
+        .put(&caldav_url)
+        .header("Authorization", &s.auth_header)
+        .header("Content-Type", "text/calendar; charset=utf-8");
+
+    // If-None-Match: * means "only create, don't overwrite existing"
+    if only_if_new {
+        req = req.header("If-None-Match", "*");
+    }
+
+    let resp = req.body(ics_data.to_string()).send().await?;
+
+    Ok(resp.status().is_success())
+}
+
+pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
+    let caldav_url = format!(
+        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        s.username, uid
+    );
 
     let resp = s
         .client
-        .put(format!("{caldav_url}{event_id}"))
+        .delete(&caldav_url)
         .header("Authorization", &s.auth_header)
-        .header("Content-Type", "text/calendar; charset=utf-8")
-        .body(ics_data.to_string())
         .send()
         .await?;
 
@@ -872,6 +894,7 @@ pub async fn add_to_calendar(s: &JmapSession, ics_data: &str) -> Result<bool, Er
 }
 
 /// UUID v4 generation using /dev/urandom for proper randomness.
+#[cfg(test)]
 fn uuid_v4() -> String {
     let mut buf = [0u8; 16];
     // Read exactly 16 bytes from /dev/urandom

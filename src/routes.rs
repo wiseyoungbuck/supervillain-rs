@@ -209,7 +209,19 @@ async fn get_email(
     if email.has_calendar
         && let Ok(Some(ics_data)) = jmap::get_calendar_data(&session, &email_id).await
     {
-        calendar_event = calendar::parse_ics(&ics_data);
+        if let Some(event) = calendar::parse_ics(&ics_data) {
+            // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
+            if event.method == "REQUEST" {
+                let state_clone = state.clone();
+                let ics_clone = ics_data.clone();
+                let uid = event.uid.clone();
+                tokio::spawn(async move {
+                    let s = state_clone.session.read().await;
+                    let _ = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await;
+                });
+            }
+            calendar_event = Some(event);
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -379,8 +391,12 @@ async fn rsvp(
 
     let _ = jmap::send_email(&mut session_guard, &submission, &attendee_email, None).await;
 
-    // Try to add to calendar (non-fatal)
-    let _ = jmap::add_to_calendar(&session_guard, &rsvp_ics).await;
+    // Decline = remove from calendar; Accept/Maybe = upsert to calendar
+    if body.status == "DECLINED" {
+        let _ = jmap::remove_from_calendar(&session_guard, &event.uid).await;
+    } else {
+        let _ = jmap::add_to_calendar(&session_guard, &rsvp_ics, &event.uid, false).await;
+    }
 
     // Return updated event
     let updated_event = calendar::parse_ics(&rsvp_ics).unwrap_or(event);
@@ -397,7 +413,10 @@ async fn add_to_calendar(
         .await?
         .ok_or_else(|| Error::NotFound("No calendar data found".into()))?;
 
-    let success = jmap::add_to_calendar(&session, &ics_data).await?;
+    let event = calendar::parse_ics(&ics_data)
+        .ok_or_else(|| Error::Internal("Failed to parse calendar data".into()))?;
+
+    let success = jmap::add_to_calendar(&session, &ics_data, &event.uid, false).await?;
 
     if success {
         Ok(Json(serde_json::json!({"success": true})))
