@@ -11,7 +11,12 @@ async fn main() {
 
     // Load config file, then fall back to env vars
     let config = load_config(&config_path);
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let username = config
         .get("username")
@@ -108,6 +113,8 @@ fn open_browser(url: &str) {
 
     let (cmd, args): (&str, Vec<&str>) = if is_omarchy {
         ("omarchy-launch-webapp", vec![url])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url])
     } else {
         ("xdg-open", vec![url])
     };
