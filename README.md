@@ -120,11 +120,13 @@ Example config:
     {
       "id": "aristoi",
       "name": "aristoi",
+      "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/aristotle.svg",
       "filters": [{ "type": "to", "pattern": "*@aristoi.ai" }]
     },
     {
       "id": "gmail",
       "name": "gmail",
+      "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/gmail.svg",
       "filters": [{ "type": "to", "pattern": "*@gmail.com" }]
     },
     {
@@ -139,6 +141,8 @@ Example config:
   ]
 }
 ```
+
+The optional `icon` field sets a URL for the tab icon (e.g. from [dashboard-icons](https://github.com/walkxcode/dashboard-icons)). Tabs without an icon fall back to built-in icons or plain text.
 
 **Filter types:**
 
