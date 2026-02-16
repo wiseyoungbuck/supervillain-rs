@@ -12,6 +12,10 @@ use crate::error::Error;
 use crate::types::*;
 use crate::{calendar, jmap, search, splits};
 
+const INDEX_HTML: &str = include_str!("../static/index.html");
+const APP_JS: &str = include_str!("../static/app.js");
+const STYLE_CSS: &str = include_str!("../static/style.css");
+
 // =============================================================================
 // Router
 // =============================================================================
@@ -46,6 +50,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(update_split).delete(delete_split),
         )
         .with_state(state)
+        .route("/", get(index_html))
+        .route("/index.html", get(index_html))
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
+}
+
+async fn index_html() -> impl IntoResponse {
+    ([("content-type", "text/html; charset=utf-8")], INDEX_HTML)
+}
+
+async fn app_js() -> impl IntoResponse {
+    ([("content-type", "application/javascript; charset=utf-8")], APP_JS)
+}
+
+async fn style_css() -> impl IntoResponse {
+    ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
 }
 
 // =============================================================================
@@ -540,6 +560,43 @@ async fn delete_split(
     splits::save_splits(&config, &state.splits_config_path)?;
 
     Ok(Json(serde_json::json!(config.splits)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn index_html_contains_html() {
+        let resp = index_html().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("<html"), "index.html should contain <html tag");
+    }
+
+    #[tokio::test]
+    async fn app_js_contains_javascript() {
+        let resp = app_js().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "application/javascript; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty(), "app.js should not be empty");
+    }
+
+    #[tokio::test]
+    async fn style_css_contains_css() {
+        let resp = style_css().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "text/css; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty(), "style.css should not be empty");
+    }
 }
 
 // External dep for theme path

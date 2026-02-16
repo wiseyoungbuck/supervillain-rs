@@ -80,9 +80,7 @@ async fn main() {
         splits_config_path,
     });
 
-    let app = routes::router(state).fallback_service(
-        tower_http::services::ServeDir::new("static").append_index_html_on_directories(true),
-    );
+    let app = routes::router(state);
 
     let addr = "127.0.0.1:8000";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

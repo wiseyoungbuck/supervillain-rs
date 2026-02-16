@@ -24,14 +24,54 @@ username = you@fastmail.com
 api-token = fmu1-xxxxxxxxxxxxxxxx
 ```
 
-3. Build and run:
+3. Install and run:
 
 ```sh
-cargo build --release
-cargo run --release
+cargo install --path .
+supervillain
 ```
 
-Open http://127.0.0.1:8000 in your browser.
+## Installation
+
+Clone the repo, then install:
+
+### macOS
+
+```sh
+# Install Rust if needed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install supervillain
+git clone <repo-url>
+cd supervillain-rs
+cargo install --path .
+```
+
+### Omarchy Linux
+
+Rust is pre-installed on Omarchy. Just:
+
+```sh
+git clone <repo-url>
+cd supervillain-rs
+cargo install --path .
+```
+
+This puts the `supervillain` binary in `~/.cargo/bin/`, which is on your PATH. Run it from anywhere:
+
+```sh
+supervillain
+```
+
+### Updating
+
+Pull the latest changes and reinstall:
+
+```sh
+cd supervillain-rs
+git pull
+cargo install --path .
+```
 
 ## Configuration
 
