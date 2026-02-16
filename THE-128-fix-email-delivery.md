@@ -4,120 +4,122 @@ Domains: **your-domain-1.com**, **your-domain-2.com**, **your-domain-3.com**
 
 ---
 
-## Step 1: Audit DNS Records
+## DNS Audit Results (2026-02-16)
 
-For each domain, run these checks (use [MXToolbox](https://mxtoolbox.com/) or `dig`):
+### your-domain-1.com — BROKEN (pointing to Outlook)
 
-```sh
-dig +short MX your-domain-1.com
-dig +short TXT your-domain-1.com           # SPF
-dig +short TXT fm1._domainkey.your-domain-1.com  # DKIM
-dig +short TXT _dmarc.your-domain-1.com    # DMARC
-```
+| Record | Status | Current Value | Required Value |
+|--------|--------|---------------|----------------|
+| MX | **WRONG** | `0 your-domain-1-com.mail.protection.outlook.com` | `10 in1-smtp.messagingengine.com` / `20 in2-smtp.messagingengine.com` |
+| SPF | **WRONG** | `v=spf1 include:spf.protection.outlook.com include:oldprovider.co -all` | `v=spf1 include:spf.messagingengine.com ~all` |
+| DKIM fm1 | **MISSING** | (NXDOMAIN) | CNAME → `fm1.your-domain-1.com.dkim.fmhosted.com` |
+| DKIM fm2 | **MISSING** | (NXDOMAIN) | CNAME → `fm2.your-domain-1.com.dkim.fmhosted.com` |
+| DKIM fm3 | **MISSING** | (NXDOMAIN) | CNAME → `fm3.your-domain-1.com.dkim.fmhosted.com` |
+| DMARC | OK | `v=DMARC1; p=none;` | (keep, or add `rua=mailto:...` for reports) |
 
-Repeat for your-domain-2.com and your-domain-3.com.
+### your-domain-2.com — MOSTLY OK (missing DMARC)
 
----
+| Record | Status | Current Value | Required Value |
+|--------|--------|---------------|----------------|
+| MX | **OK** | `10 in1-smtp.messagingengine.com` / `20 in2-smtp.messagingengine.com` | (no change) |
+| SPF | **OK** | `v=spf1 include:spf.messagingengine.com ?all` | Consider tightening `?all` → `~all` |
+| DKIM fm1 | **OK** | CNAME → `fm1.your-domain-2.com.dkim.fmhosted.com` | (no change) |
+| DKIM fm2 | **OK** | CNAME → `fm2.your-domain-2.com.dkim.fmhosted.com` | (no change) |
+| DKIM fm3 | **OK** | CNAME → `fm3.your-domain-2.com.dkim.fmhosted.com` | (no change) |
+| DMARC | **MISSING** | (NXDOMAIN) | `v=DMARC1; p=none; rua=mailto:you@your-domain-2.com` |
 
-## Step 2: Fix MX Records
+### your-domain-3.com — BROKEN (pointing to Outlook/Sendinblue)
 
-At each domain's registrar, set the MX records to FastMail's servers:
-
-| Priority | Server |
-|----------|--------|
-| 10 | in1-smtp.messagingengine.com |
-| 20 | in2-smtp.messagingengine.com |
-
-Delete any other MX records (e.g. old Google Workspace or default registrar entries).
-
----
-
-## Step 3: Fix SPF Record
-
-Add (or replace) a single TXT record on each domain's root (`@`):
-
-```
-v=spf1 include:spf.messagingengine.com ~all
-```
-
-There must be only **one** SPF record per domain. If there's an existing one, merge it or replace it.
+| Record | Status | Current Value | Required Value |
+|--------|--------|---------------|----------------|
+| MX | **WRONG** | `0 your-domain-3-com.mail.protection.outlook.com` | `10 in1-smtp.messagingengine.com` / `20 in2-smtp.messagingengine.com` |
+| SPF | **WRONG** | `v=spf1 include:spf.protection.outlook.com include:spf.sendinblue.com mx -all` | `v=spf1 include:spf.messagingengine.com ~all` |
+| DKIM fm1 | **MISSING** | (NXDOMAIN) | CNAME → `fm1.your-domain-3.com.dkim.fmhosted.com` |
+| DKIM fm2 | **MISSING** | (NXDOMAIN) | CNAME → `fm2.your-domain-3.com.dkim.fmhosted.com` |
+| DKIM fm3 | **MISSING** | (NXDOMAIN) | CNAME → `fm3.your-domain-3.com.dkim.fmhosted.com` |
+| DMARC | STALE | `v=DMARC1; p=none; ... rua=mailto:dmarc@mailinblue.com ...` | `v=DMARC1; p=none; rua=mailto:you@your-domain-3.com` |
 
 ---
 
-## Step 4: Fix DKIM Records
+## Remediation: your-domain-1.com
 
-In FastMail, go to **Settings > Domains > [domain] > DKIM**. FastMail will show you 3 CNAME records to add. They look like:
+**Registrar:** (check — likely Namecheap, Cloudflare, or Google Domains)
 
-| Name | Type | Value |
-|------|------|-------|
-| fm1._domainkey | CNAME | fm1.your-domain.dkim.fmhosted.com |
-| fm2._domainkey | CNAME | fm2.your-domain.dkim.fmhosted.com |
-| fm3._domainkey | CNAME | fm3.your-domain.dkim.fmhosted.com |
+1. **Delete** the existing Outlook MX record
+2. **Add** MX records:
+   - `10 in1-smtp.messagingengine.com`
+   - `20 in2-smtp.messagingengine.com`
+3. **Replace** the SPF TXT record on `@` with:
+   ```
+   v=spf1 include:spf.messagingengine.com ~all
+   ```
+4. **Add** 3 DKIM CNAME records (confirm exact values in FastMail > Settings > Domains > your-domain-1.com):
+   - `fm1._domainkey` → `fm1.your-domain-1.com.dkim.fmhosted.com`
+   - `fm2._domainkey` → `fm2.your-domain-1.com.dkim.fmhosted.com`
+   - `fm3._domainkey` → `fm3.your-domain-1.com.dkim.fmhosted.com`
+5. **Update** DMARC TXT on `_dmarc` (optional but recommended):
+   ```
+   v=DMARC1; p=none; rua=mailto:you@your-domain-1.com
+   ```
 
-Copy the exact values from FastMail's domain settings page for each domain — the values differ per domain.
+## Remediation: your-domain-2.com
 
----
+1. **Add** DMARC TXT record on `_dmarc`:
+   ```
+   v=DMARC1; p=none; rua=mailto:you@your-domain-2.com
+   ```
+2. (Optional) **Tighten** SPF from `?all` to `~all` for better spam protection
 
-## Step 5: Fix DMARC Record
+## Remediation: your-domain-3.com
 
-Add a TXT record on `_dmarc` subdomain for each domain:
+**Registrar:** (check — likely wherever it was registered)
 
-```
-v=DMARC1; p=none; rua=mailto:you@your-domain.com
-```
-
-Start with `p=none` (monitor mode). Tighten to `p=quarantine` or `p=reject` once delivery is confirmed working.
-
----
-
-## Step 6: Verify in FastMail
-
-1. Go to **Settings > Domains** in FastMail
-2. Click each domain
-3. FastMail shows green checkmarks next to each DNS record type when correct
-4. Fix any that show red/yellow warnings
-5. Make sure each domain shows **Verified**
-
----
-
-## Step 7: Check Aliases and Routing
-
-In FastMail **Settings > Aliases**:
-
-- Confirm aliases exist for each address you use (e.g. you@your-domain-1.com, you@your-domain-2.com)
-- Check **Settings > Rules** for any forwarding rules — make sure they point to valid destinations
-
----
-
-## Step 8: Wait for DNS Propagation
-
-DNS changes can take up to 48 hours. Check progress at:
-- https://mxtoolbox.com/SuperTool.aspx
-- https://dnschecker.org/
-
----
-
-## Step 9: Test Email Delivery
-
-Send test emails **to and from** each domain:
-
-1. Send from Gmail/other to you@your-domain-1.com — confirm receipt
-2. Send from you@your-domain-1.com to Gmail — confirm it arrives (check spam)
-3. Repeat for your-domain-2.com and your-domain-3.com
-4. Send a calendar invite to each address — confirm it arrives
-5. Send a calendar invite from each address — confirm delivery
-
-Use https://mail-tester.com/ to check deliverability score from each domain.
+1. **Delete** the existing Outlook MX record
+2. **Add** MX records:
+   - `10 in1-smtp.messagingengine.com`
+   - `20 in2-smtp.messagingengine.com`
+3. **Replace** the SPF TXT record on `@` with:
+   ```
+   v=spf1 include:spf.messagingengine.com ~all
+   ```
+4. **Add** 3 DKIM CNAME records (confirm exact values in FastMail > Settings > Domains):
+   - `fm1._domainkey` → `fm1.your-domain-3.com.dkim.fmhosted.com`
+   - `fm2._domainkey` → `fm2.your-domain-3.com.dkim.fmhosted.com`
+   - `fm3._domainkey` → `fm3.your-domain-3.com.dkim.fmhosted.com`
+5. **Replace** DMARC TXT record on `_dmarc` with:
+   ```
+   v=DMARC1; p=none; rua=mailto:you@your-domain-3.com
+   ```
 
 ---
 
-## Step 10: Fix LinkedIn Bounce Warning
+## DMARC Policy Hardening
 
-1. Go to LinkedIn > **Settings > Sign in & security > Email addresses**
-2. Remove the bouncing email address
-3. Re-add it
-4. Confirm the verification email arrives
-5. Verify the bounce warning is gone
+All DMARC records above start with `p=none` (monitor mode only — does not block spoofed emails). Once email delivery is confirmed working for all domains:
+
+1. **Tighten to `p=quarantine`** — spoofed emails go to spam instead of inbox
+2. **Then tighten to `p=reject`** — spoofed emails are blocked entirely
+
+Monitor DMARC aggregate reports (sent to the `rua` address) for a few weeks at each level before tightening further. This prevents accidentally blocking legitimate email.
+
+---
+
+## Post-Fix Checklist
+
+After making DNS changes at the registrar(s):
+
+- [ ] Wait for DNS propagation (check at https://dnschecker.org/)
+- [ ] Verify green checkmarks in FastMail > Settings > Domains for all 3 domains
+- [ ] Confirm aliases exist in FastMail > Settings > Aliases for each address
+- [ ] Send test email TO each domain from Gmail — confirm receipt
+- [ ] Send test email FROM each domain to Gmail — confirm delivery (check spam)
+- [ ] Send calendar invite TO each domain — confirm receipt
+- [ ] Send calendar invite FROM each domain — confirm delivery
+- [ ] Check deliverability score at https://mail-tester.com/ for each domain
+- [ ] LinkedIn > Settings > Sign in & security > Email addresses — remove and re-add bouncing email
+- [ ] Confirm LinkedIn bounce warning is gone
+- [ ] After 2-4 weeks of clean DMARC reports, tighten `p=none` → `p=quarantine`
+- [ ] After another 2-4 weeks, tighten `p=quarantine` → `p=reject`
 
 ---
 
