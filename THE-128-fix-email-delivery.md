@@ -1,6 +1,6 @@
 # Fix Email Delivery for Custom Domains (FastMail)
 
-Domains: **aristotle.ai**, **mattgpt.ai**, **tangibleintelligence.com**
+Domains: **your-domain-1.com**, **your-domain-2.com**, **your-domain-3.com**
 
 ---
 
@@ -9,13 +9,13 @@ Domains: **aristotle.ai**, **mattgpt.ai**, **tangibleintelligence.com**
 For each domain, run these checks (use [MXToolbox](https://mxtoolbox.com/) or `dig`):
 
 ```sh
-dig +short MX aristotle.ai
-dig +short TXT aristotle.ai           # SPF
-dig +short TXT fm1._domainkey.aristotle.ai  # DKIM
-dig +short TXT _dmarc.aristotle.ai    # DMARC
+dig +short MX your-domain-1.com
+dig +short TXT your-domain-1.com           # SPF
+dig +short TXT fm1._domainkey.your-domain-1.com  # DKIM
+dig +short TXT _dmarc.your-domain-1.com    # DMARC
 ```
 
-Repeat for mattgpt.ai and tangibleintelligence.com.
+Repeat for your-domain-2.com and your-domain-3.com.
 
 ---
 
@@ -50,9 +50,9 @@ In FastMail, go to **Settings > Domains > [domain] > DKIM**. FastMail will show 
 
 | Name | Type | Value |
 |------|------|-------|
-| fm1._domainkey | CNAME | fm1.aristotle.ai.dkim.fmhosted.com |
-| fm2._domainkey | CNAME | fm2.aristotle.ai.dkim.fmhosted.com |
-| fm3._domainkey | CNAME | fm3.aristotle.ai.dkim.fmhosted.com |
+| fm1._domainkey | CNAME | fm1.your-domain.dkim.fmhosted.com |
+| fm2._domainkey | CNAME | fm2.your-domain.dkim.fmhosted.com |
+| fm3._domainkey | CNAME | fm3.your-domain.dkim.fmhosted.com |
 
 Copy the exact values from FastMail's domain settings page for each domain — the values differ per domain.
 
@@ -63,7 +63,7 @@ Copy the exact values from FastMail's domain settings page for each domain — t
 Add a TXT record on `_dmarc` subdomain for each domain:
 
 ```
-v=DMARC1; p=none; rua=mailto:matt@aristotle.ai
+v=DMARC1; p=none; rua=mailto:you@your-domain.com
 ```
 
 Start with `p=none` (monitor mode). Tighten to `p=quarantine` or `p=reject` once delivery is confirmed working.
@@ -84,7 +84,7 @@ Start with `p=none` (monitor mode). Tighten to `p=quarantine` or `p=reject` once
 
 In FastMail **Settings > Aliases**:
 
-- Confirm aliases exist for each address you use (e.g. matt@aristotle.ai, matt@mattgpt.ai)
+- Confirm aliases exist for each address you use (e.g. you@your-domain-1.com, you@your-domain-2.com)
 - Check **Settings > Rules** for any forwarding rules — make sure they point to valid destinations
 
 ---
@@ -101,9 +101,9 @@ DNS changes can take up to 48 hours. Check progress at:
 
 Send test emails **to and from** each domain:
 
-1. Send from Gmail/other to matt@aristotle.ai — confirm receipt
-2. Send from matt@aristotle.ai to Gmail — confirm it arrives (check spam)
-3. Repeat for mattgpt.ai and tangibleintelligence.com
+1. Send from Gmail/other to you@your-domain-1.com — confirm receipt
+2. Send from you@your-domain-1.com to Gmail — confirm it arrives (check spam)
+3. Repeat for your-domain-2.com and your-domain-3.com
 4. Send a calendar invite to each address — confirm it arrives
 5. Send a calendar invite from each address — confirm delivery
 
