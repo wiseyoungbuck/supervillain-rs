@@ -1108,8 +1108,14 @@ mod tests {
     fn draft_sets_from_to_subject_body() {
         let sub = simple_submission();
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
-        assert_eq!(draft["from"], serde_json::json!([{"email": "alice@example.com"}]));
-        assert_eq!(draft["to"], serde_json::json!([{"email": "bob@example.com"}]));
+        assert_eq!(
+            draft["from"],
+            serde_json::json!([{"email": "alice@example.com"}])
+        );
+        assert_eq!(
+            draft["to"],
+            serde_json::json!([{"email": "bob@example.com"}])
+        );
         assert_eq!(draft["subject"], serde_json::json!("Test"));
     }
 
@@ -1134,8 +1140,14 @@ mod tests {
             references: None,
         };
         let draft = build_draft_email(&sub, "a@b.com", "mb");
-        assert_eq!(draft["cc"], serde_json::json!([{"email": "cc@example.com"}]));
-        assert_eq!(draft["bcc"], serde_json::json!([{"email": "bcc@example.com"}]));
+        assert_eq!(
+            draft["cc"],
+            serde_json::json!([{"email": "cc@example.com"}])
+        );
+        assert_eq!(
+            draft["bcc"],
+            serde_json::json!([{"email": "bcc@example.com"}])
+        );
     }
 
     #[test]
@@ -1154,7 +1166,10 @@ mod tests {
         let result = cache
             .values()
             .find(|mb| mb.role.as_deref() == Some("drafts"));
-        assert!(result.is_none(), "should not find drafts in cache without one");
+        assert!(
+            result.is_none(),
+            "should not find drafts in cache without one"
+        );
     }
 
     #[test]

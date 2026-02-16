@@ -604,7 +604,10 @@ END:VCALENDAR";
         for status in &["ACCEPTED", "TENTATIVE", "DECLINED"] {
             let ics = generate_rsvp(&event, "bob@example.com", status);
             let parsed = parse_ics(&ics).unwrap();
-            assert_eq!(parsed.method, "REPLY", "RSVP with status {status} must be REPLY");
+            assert_eq!(
+                parsed.method, "REPLY",
+                "RSVP with status {status} must be REPLY"
+            );
             assert_ne!(parsed.method, "REQUEST");
         }
     }

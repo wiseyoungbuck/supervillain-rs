@@ -100,6 +100,7 @@ pub fn generate_splits_from_identities(identities: &[crate::types::Identity]) ->
             SplitInbox {
                 id,
                 name,
+                icon: None,
                 filters: vec![SplitFilter {
                     filter_type: FilterType::To,
                     pattern: format!("*@{domain}"),
@@ -414,6 +415,7 @@ mod tests {
         let split = SplitInbox {
             id: "cal".into(),
             name: "Calendar".into(),
+            icon: None,
             filters: vec![
                 from_filter("*@calendar.google.com"),
                 subject_filter("nonexistent-pattern"),
@@ -429,6 +431,7 @@ mod tests {
         let split = SplitInbox {
             id: "cal".into(),
             name: "Calendar".into(),
+            icon: None,
             filters: vec![
                 from_filter("*@calendar.google.com"),
                 subject_filter("nonexistent-pattern"),
@@ -450,6 +453,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "cal".into(),
                 name: "Calendar".into(),
+                icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
             }],
@@ -469,6 +473,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "cal".into(),
                 name: "Calendar".into(),
+                icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
             }],
@@ -487,6 +492,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "cal".into(),
                 name: "Calendar".into(),
+                icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
             }],
@@ -568,6 +574,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "new".into(),
                 name: "New".into(),
+                icon: None,
                 filters: vec![],
                 match_mode: MatchMode::Any,
             }],
@@ -585,6 +592,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "test".into(),
                 name: "Test".into(),
+                icon: None,
                 filters: vec![SplitFilter {
                     filter_type: FilterType::Header,
                     pattern: "calendar".into(),
@@ -612,12 +620,14 @@ mod tests {
                 SplitInbox {
                     id: "a".into(),
                     name: "A".into(),
+                    icon: None,
                     filters: vec![from_filter("*@example.com")],
                     match_mode: MatchMode::Any,
                 },
                 SplitInbox {
                     id: "b".into(),
                     name: "B".into(),
+                    icon: None,
                     filters: vec![subject_filter("test")],
                     match_mode: MatchMode::All,
                 },
@@ -759,6 +769,7 @@ mod tests {
             splits: vec![SplitInbox {
                 id: "custom".into(),
                 name: "Custom".into(),
+                icon: None,
                 filters: vec![from_filter("*@example.com")],
                 match_mode: MatchMode::Any,
             }],

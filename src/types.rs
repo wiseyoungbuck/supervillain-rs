@@ -165,6 +165,8 @@ pub struct SplitFilter {
 pub struct SplitInbox {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(default)]
     pub filters: Vec<SplitFilter>,
     #[serde(default)]
@@ -381,6 +383,49 @@ mod tests {
     }
 
     #[test]
+    fn split_inbox_icon_defaults_to_none() {
+        let json = r#"{"id": "test", "name": "Test"}"#;
+        let split: SplitInbox = serde_json::from_str(json).unwrap();
+        assert!(split.icon.is_none());
+    }
+
+    #[test]
+    fn split_inbox_icon_from_json() {
+        let json = r#"{"id": "gmail", "name": "Gmail", "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/gmail.svg"}"#;
+        let split: SplitInbox = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            split.icon.as_deref(),
+            Some("https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/gmail.svg")
+        );
+    }
+
+    #[test]
+    fn split_inbox_icon_none_omitted_from_json() {
+        let split = SplitInbox {
+            id: "test".into(),
+            name: "Test".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: MatchMode::Any,
+        };
+        let json = serde_json::to_string(&split).unwrap();
+        assert!(!json.contains("icon"));
+    }
+
+    #[test]
+    fn split_inbox_icon_present_in_json() {
+        let split = SplitInbox {
+            id: "test".into(),
+            name: "Test".into(),
+            icon: Some("https://example.com/icon.svg".into()),
+            filters: vec![],
+            match_mode: MatchMode::Any,
+        };
+        let json = serde_json::to_string(&split).unwrap();
+        assert!(json.contains(r#""icon":"https://example.com/icon.svg""#));
+    }
+
+    #[test]
     fn splits_config_empty_default() {
         let config = SplitsConfig::default();
         assert!(config.splits.is_empty());
@@ -393,6 +438,7 @@ mod tests {
                 SplitInbox {
                     id: "calendar".into(),
                     name: "Calendar".into(),
+                    icon: None,
                     filters: vec![
                         SplitFilter {
                             filter_type: FilterType::From,
@@ -410,6 +456,7 @@ mod tests {
                 SplitInbox {
                     id: "newsletters".into(),
                     name: "Newsletters".into(),
+                    icon: None,
                     filters: vec![SplitFilter {
                         filter_type: FilterType::From,
                         pattern: "noreply@*".into(),
