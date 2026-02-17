@@ -61,7 +61,10 @@ async fn index_html() -> impl IntoResponse {
 }
 
 async fn app_js() -> impl IntoResponse {
-    ([("content-type", "application/javascript; charset=utf-8")], APP_JS)
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        APP_JS,
+    )
 }
 
 async fn style_css() -> impl IntoResponse {
@@ -571,20 +574,37 @@ mod tests {
     async fn index_html_contains_html() {
         let resp = index_html().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "text/html; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("<html"), "index.html should contain <html tag");
+        assert!(
+            text.contains("<html"),
+            "index.html should contain <html tag"
+        );
     }
 
     #[tokio::test]
     async fn app_js_contains_javascript() {
         let resp = app_js().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "application/javascript; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(!body.is_empty(), "app.js should not be empty");
     }
 
@@ -592,9 +612,16 @@ mod tests {
     async fn style_css_contains_css() {
         let resp = style_css().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "text/css; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(!body.is_empty(), "style.css should not be empty");
     }
 }

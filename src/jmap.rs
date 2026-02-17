@@ -1204,6 +1204,253 @@ mod tests {
         assert_eq!(result.unwrap().id, "drafts-id");
     }
 
+    // --- parse_jmap_email tests (THE-153) ---
+
+    #[test]
+    fn parse_single_text_body_part() {
+        let item = serde_json::json!({
+            "id": "email-1",
+            "blobId": "blob-1",
+            "threadId": "thread-1",
+            "mailboxIds": {"inbox-id": true},
+            "keywords": {"$seen": true},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Hello",
+            "from": [{"name": "Alice", "email": "alice@example.com"}],
+            "to": [{"name": "Bob", "email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Hello there",
+            "hasAttachment": false,
+            "size": 500,
+            "textBody": [{"partId": "1", "type": "text/plain"}],
+            "htmlBody": [],
+            "bodyValues": {
+                "1": {"value": "Hello there"}
+            },
+            "bodyStructure": {"type": "text/plain"}
+        });
+        let email = parse_jmap_email(&item, true);
+        assert_eq!(email.text_body, Some("Hello there".into()));
+        assert_eq!(email.html_body, None);
+    }
+
+    #[test]
+    fn parse_single_html_body_part() {
+        let item = serde_json::json!({
+            "id": "email-2",
+            "blobId": "blob-2",
+            "threadId": "thread-2",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "HTML Email",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Hello",
+            "hasAttachment": false,
+            "size": 800,
+            "textBody": [],
+            "htmlBody": [{"partId": "1", "type": "text/html"}],
+            "bodyValues": {
+                "1": {"value": "<p>Hello</p>"}
+            },
+            "bodyStructure": {"type": "text/html"}
+        });
+        let email = parse_jmap_email(&item, true);
+        assert_eq!(email.text_body, None);
+        assert_eq!(email.html_body, Some("<p>Hello</p>".into()));
+    }
+
+    #[test]
+    fn parse_both_text_and_html_single_parts() {
+        let item = serde_json::json!({
+            "id": "email-3",
+            "blobId": "blob-3",
+            "threadId": "thread-3",
+            "mailboxIds": {"inbox": true},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Both Bodies",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Preview",
+            "hasAttachment": false,
+            "size": 1000,
+            "textBody": [{"partId": "t1", "type": "text/plain"}],
+            "htmlBody": [{"partId": "h1", "type": "text/html"}],
+            "bodyValues": {
+                "t1": {"value": "Plain text version"},
+                "h1": {"value": "<p>HTML version</p>"}
+            },
+            "bodyStructure": {"type": "multipart/alternative"}
+        });
+        let email = parse_jmap_email(&item, true);
+        assert_eq!(email.text_body, Some("Plain text version".into()));
+        assert_eq!(email.html_body, Some("<p>HTML version</p>".into()));
+    }
+
+    #[test]
+    fn parse_no_body_when_fetch_body_false() {
+        let item = serde_json::json!({
+            "id": "email-4",
+            "blobId": "blob-4",
+            "threadId": "thread-4",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "No Body",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Preview",
+            "hasAttachment": false,
+            "size": 200,
+            "textBody": [{"partId": "1"}],
+            "htmlBody": [{"partId": "2"}],
+            "bodyValues": {
+                "1": {"value": "Text"},
+                "2": {"value": "<p>HTML</p>"}
+            },
+            "bodyStructure": {"type": "multipart/alternative"}
+        });
+        let email = parse_jmap_email(&item, false);
+        assert_eq!(email.text_body, None);
+        assert_eq!(email.html_body, None);
+    }
+
+    #[test]
+    fn parse_multiple_text_body_parts_concatenated() {
+        // AC-1: Forwarded/reply emails often have multiple body parts.
+        // All parts should be concatenated, not just the first.
+        let item = serde_json::json!({
+            "id": "email-5",
+            "blobId": "blob-5",
+            "threadId": "thread-5",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Fwd: Original",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "See below",
+            "hasAttachment": false,
+            "size": 1200,
+            "textBody": [
+                {"partId": "1", "type": "text/plain"},
+                {"partId": "2", "type": "text/plain"}
+            ],
+            "htmlBody": [],
+            "bodyValues": {
+                "1": {"value": "See below forwarded message."},
+                "2": {"value": "This is the original message text."}
+            },
+            "bodyStructure": {"type": "multipart/mixed"}
+        });
+        let email = parse_jmap_email(&item, true);
+        let text = email.text_body.expect("text_body should be Some");
+        assert!(
+            text.contains("See below forwarded message."),
+            "Should contain first part: {text}"
+        );
+        assert!(
+            text.contains("This is the original message text."),
+            "Should contain second part: {text}"
+        );
+    }
+
+    #[test]
+    fn parse_multiple_html_body_parts_concatenated() {
+        // AC-1: Same as above but for htmlBody array.
+        let item = serde_json::json!({
+            "id": "email-6",
+            "blobId": "blob-6",
+            "threadId": "thread-6",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Fwd: Newsletter",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "FYI",
+            "hasAttachment": false,
+            "size": 5000,
+            "textBody": [],
+            "htmlBody": [
+                {"partId": "1", "type": "text/html"},
+                {"partId": "2", "type": "text/html"}
+            ],
+            "bodyValues": {
+                "1": {"value": "<p>FYI see below</p>"},
+                "2": {"value": "<div>Original newsletter content</div>"}
+            },
+            "bodyStructure": {"type": "multipart/mixed"}
+        });
+        let email = parse_jmap_email(&item, true);
+        let html = email.html_body.expect("html_body should be Some");
+        assert!(
+            html.contains("<p>FYI see below</p>"),
+            "Should contain first HTML part: {html}"
+        );
+        assert!(
+            html.contains("<div>Original newsletter content</div>"),
+            "Should contain second HTML part: {html}"
+        );
+    }
+
+    // --- build_draft_email html_body tests (THE-153) ---
+
+    #[test]
+    fn draft_text_only_when_no_html_body() {
+        // AC-6: Regression — existing text-only behavior unchanged
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        let text_body = &draft["textBody"];
+        assert_eq!(text_body[0]["type"], "text/plain");
+        assert_eq!(text_body[0]["partId"], "body");
+        assert_eq!(draft["bodyValues"]["body"]["value"], "Hello");
+    }
+
+    #[test]
+    fn draft_multipart_when_html_body_present() {
+        // AC-5: When html_body is Some, draft should include both
+        // text/plain and text/html parts (multipart/alternative).
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "Rich email".into(),
+            text_body: "Hello, world!".into(),
+            bcc: None,
+            html_body: Some("<p>Hello, world!</p>".into()),
+            in_reply_to: None,
+            references: None,
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        // Should have htmlBody key with text/html part
+        assert!(
+            draft.contains_key("htmlBody"),
+            "Draft should include htmlBody when html_body is Some"
+        );
+        let html_body = &draft["htmlBody"];
+        assert!(!html_body.is_null(), "htmlBody should not be null");
+        // bodyValues should contain the HTML content
+        let body_values = draft["bodyValues"]
+            .as_object()
+            .expect("bodyValues should be an object");
+        let has_html = body_values
+            .values()
+            .any(|v| v["value"].as_str() == Some("<p>Hello, world!</p>"));
+        assert!(has_html, "bodyValues should contain the HTML content");
+        // Should still have text body too
+        let has_text = body_values
+            .values()
+            .any(|v| v["value"].as_str() == Some("Hello, world!"));
+        assert!(has_text, "bodyValues should still contain the text content");
+    }
+
     // --- uuid_v4 tests ---
 
     #[test]
