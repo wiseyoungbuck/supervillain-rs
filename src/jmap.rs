@@ -1359,6 +1359,11 @@ mod tests {
             text.contains("This is the original message text."),
             "Should contain second part: {text}"
         );
+        // Parts should be separated by a newline, not jammed together
+        assert!(
+            !text.contains("message.This"),
+            "Parts should be separated, not concatenated directly: {text}"
+        );
     }
 
     #[test]
@@ -1399,6 +1404,11 @@ mod tests {
             html.contains("<div>Original newsletter content</div>"),
             "Should contain second HTML part: {html}"
         );
+        // Parts should not be jammed together without separation
+        assert!(
+            !html.contains("</p><div>"),
+            "HTML parts should be separated, not concatenated directly: {html}"
+        );
     }
 
     // --- build_draft_email html_body tests (THE-153) ---
@@ -1436,6 +1446,11 @@ mod tests {
         );
         let html_body = &draft["htmlBody"];
         assert!(!html_body.is_null(), "htmlBody should not be null");
+        // htmlBody entry should have type text/html
+        assert_eq!(
+            html_body[0]["type"], "text/html",
+            "htmlBody part should have type text/html"
+        );
         // bodyValues should contain the HTML content
         let body_values = draft["bodyValues"]
             .as_object()
