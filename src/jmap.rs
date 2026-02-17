@@ -649,11 +649,28 @@ fn build_draft_email(
                 "html": { "value": html }
             }),
         );
+        m.insert(
+            "bodyStructure".into(),
+            serde_json::json!({
+                "type": "multipart/alternative",
+                "subParts": [
+                    { "partId": "body", "type": "text/plain" },
+                    { "partId": "html", "type": "text/html" }
+                ]
+            }),
+        );
     } else {
         m.insert(
             "bodyValues".into(),
             serde_json::json!({
                 "body": { "value": sub.text_body }
+            }),
+        );
+        m.insert(
+            "bodyStructure".into(),
+            serde_json::json!({
+                "type": "text/plain",
+                "partId": "body"
             }),
         );
     }
@@ -1434,10 +1451,10 @@ mod tests {
             html.contains("<div>Original newsletter content</div>"),
             "Should contain second HTML part: {html}"
         );
-        // Parts should not be jammed together without separation
+        // Finding #3: HTML parts should be separated with a newline
         assert!(
-            !html.contains("</p><div>"),
-            "HTML parts should be separated, not concatenated directly: {html}"
+            html.contains("</p>\n<div>"),
+            "HTML parts should be separated by newline: {html}"
         );
     }
 
@@ -1452,6 +1469,15 @@ mod tests {
         assert_eq!(text_body[0]["type"], "text/plain");
         assert_eq!(text_body[0]["partId"], "body");
         assert_eq!(draft["bodyValues"]["body"]["value"], "Hello");
+        // Finding #4: text-only drafts should also have bodyStructure
+        assert!(
+            draft.contains_key("bodyStructure"),
+            "Text-only draft should have bodyStructure"
+        );
+        assert_eq!(
+            draft["bodyStructure"]["type"], "text/plain",
+            "Text-only bodyStructure should be text/plain"
+        );
     }
 
     #[test]
@@ -1494,6 +1520,21 @@ mod tests {
             .values()
             .any(|v| v["value"].as_str() == Some("Hello, world!"));
         assert!(has_text, "bodyValues should still contain the text content");
+        // Finding #1: draft should have bodyStructure with multipart/alternative
+        assert!(
+            draft.contains_key("bodyStructure"),
+            "Multipart draft should have bodyStructure"
+        );
+        assert_eq!(
+            draft["bodyStructure"]["type"], "multipart/alternative",
+            "bodyStructure type should be multipart/alternative"
+        );
+        let sub_parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("bodyStructure should have subParts array");
+        assert_eq!(sub_parts.len(), 2, "Should have text and html sub-parts");
+        assert_eq!(sub_parts[0]["type"], "text/plain");
+        assert_eq!(sub_parts[1]["type"], "text/html");
     }
 
     // --- uuid_v4 tests ---

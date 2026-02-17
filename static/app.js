@@ -1630,9 +1630,12 @@ function sanitizeHtml(html) {
     return doc.body.innerHTML;
 }
 
+// Strips HTML tags and returns plain text. Uses innerText to preserve
+// block-level boundaries (p, br, div) as newlines. Output is safe for
+// text contexts only (textarea.value) — do not insert via innerHTML.
 function htmlToPlainText(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    return doc.body.textContent || '';
+    return doc.body.innerText || '';
 }
 
 function linkifyText(text) {
