@@ -83,7 +83,9 @@ async fn main() {
     let app = routes::router(state);
 
     let addr = "127.0.0.1:8000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').last().unwrap_or("8000"));
+    });
     let url = format!("http://{addr}");
     tracing::info!("Listening on {url}");
 
