@@ -1164,7 +1164,7 @@ function startReply(replyAll) {
     // Auto-select the identity matching the To/CC of the original email
     autoSelectFromAddress(email);
 
-    const quote = email.textBody || '';
+    const quote = email.textBody || (email.htmlBody ? htmlToPlainText(email.htmlBody) : '');
     const quotedLines = quote.split('\n').map(line => '> ' + line).join('\n');
     els.composeBody.value = `\n\n${quotedLines}`;
 
@@ -1181,7 +1181,7 @@ function startForward() {
 
     const from = email.from[0];
     const header = `---------- Forwarded message ---------\nFrom: ${from?.name || ''} <${from?.email}>\nSubject: ${email.subject}\n\n`;
-    els.composeBody.value = header + (email.textBody || '');
+    els.composeBody.value = header + (email.textBody || (email.htmlBody ? htmlToPlainText(email.htmlBody) : ''));
 
     showView('compose');
 }
@@ -1628,6 +1628,11 @@ function sanitizeHtml(html) {
     });
 
     return doc.body.innerHTML;
+}
+
+function htmlToPlainText(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    return doc.body.textContent || '';
 }
 
 function linkifyText(text) {

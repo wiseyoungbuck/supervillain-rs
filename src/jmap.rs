@@ -330,17 +330,29 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
     if fetch_body {
         // Extract body values
         let body_values = &item["bodyValues"];
-        if let Some(text_parts) = item["textBody"].as_array()
-            && let Some(first) = text_parts.first()
-        {
-            let part_id = first["partId"].as_str().unwrap_or_default();
-            text_body = body_values[part_id]["value"].as_str().map(String::from);
+        if let Some(text_parts) = item["textBody"].as_array() {
+            let parts: Vec<&str> = text_parts
+                .iter()
+                .filter_map(|p| {
+                    let part_id = p["partId"].as_str().unwrap_or_default();
+                    body_values[part_id]["value"].as_str()
+                })
+                .collect();
+            if !parts.is_empty() {
+                text_body = Some(parts.join("\n"));
+            }
         }
-        if let Some(html_parts) = item["htmlBody"].as_array()
-            && let Some(first) = html_parts.first()
-        {
-            let part_id = first["partId"].as_str().unwrap_or_default();
-            html_body = body_values[part_id]["value"].as_str().map(String::from);
+        if let Some(html_parts) = item["htmlBody"].as_array() {
+            let parts: Vec<&str> = html_parts
+                .iter()
+                .filter_map(|p| {
+                    let part_id = p["partId"].as_str().unwrap_or_default();
+                    body_values[part_id]["value"].as_str()
+                })
+                .collect();
+            if !parts.is_empty() {
+                html_body = Some(parts.join("\n"));
+            }
         }
 
         // Check for calendar in body structure
@@ -621,12 +633,30 @@ fn build_draft_email(
             "type": "text/plain"
         }]),
     );
-    m.insert(
-        "bodyValues".into(),
-        serde_json::json!({
-            "body": { "value": sub.text_body }
-        }),
-    );
+
+    if let Some(ref html) = sub.html_body {
+        m.insert(
+            "htmlBody".into(),
+            serde_json::json!([{
+                "partId": "html",
+                "type": "text/html"
+            }]),
+        );
+        m.insert(
+            "bodyValues".into(),
+            serde_json::json!({
+                "body": { "value": sub.text_body },
+                "html": { "value": html }
+            }),
+        );
+    } else {
+        m.insert(
+            "bodyValues".into(),
+            serde_json::json!({
+                "body": { "value": sub.text_body }
+            }),
+        );
+    }
 
     if !sub.cc.is_empty() {
         m.insert(

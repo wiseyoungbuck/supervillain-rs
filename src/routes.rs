@@ -98,6 +98,7 @@ struct SendEmailBody {
     bcc: Vec<String>,
     subject: String,
     body: String,
+    html_body: Option<String>,
     in_reply_to: Option<String>,
     from_address: Option<String>,
 }
@@ -342,7 +343,7 @@ async fn send_email_handler(
         } else {
             Some(body.bcc)
         },
-        html_body: None,
+        html_body: body.html_body,
         in_reply_to: body.in_reply_to,
         references: None,
     };
