@@ -264,7 +264,6 @@ async fn get_email(
         "isUnread": email.is_unread(),
         "isFlagged": email.is_flagged(),
         "hasAttachment": email.has_attachment,
-        "hasAttachment": email.has_attachment,
         "hasCalendar": email.has_calendar,
         "textBody": email.text_body,
         "htmlBody": email.html_body,
@@ -273,10 +272,30 @@ async fn get_email(
     })))
 }
 
+fn is_safe_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+}
+
+fn sanitize_filename_for_header(name: &str) -> String {
+    name.chars()
+        .filter(|&c| c != '"' && c != '\r' && c != '\n')
+        .collect()
+}
+
 async fn download_attachment(
     State(state): State<Arc<AppState>>,
     Path((_email_id, blob_id, filename)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, Error> {
+    if !is_safe_path_segment(&blob_id) || !is_safe_path_segment(&filename) {
+        return Err(Error::BadRequest("Invalid blob_id or filename".into()));
+    }
+
     let session = state.session.read().await;
     let account_id = session.account_id.as_ref().ok_or(Error::NotConnected)?;
     let download_url = session.download_url.as_ref().ok_or(Error::NotConnected)?;
@@ -307,13 +326,14 @@ async fn download_attachment(
 
     let bytes = resp.bytes().await?;
 
+    let safe_filename = sanitize_filename_for_header(&filename);
     Ok((
         StatusCode::OK,
         [
             ("content-type", content_type),
             (
                 "content-disposition",
-                format!("attachment; filename=\"{}\"", filename),
+                format!("attachment; filename=\"{}\"", safe_filename),
             ),
         ],
         bytes,
@@ -690,6 +710,34 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["email"], "test@example.com");
         assert_eq!(parsed["name"], "Test User");
+    }
+
+    #[test]
+    fn safe_path_segment_rejects_traversal() {
+        assert!(!is_safe_path_segment("../etc/passwd"));
+        assert!(!is_safe_path_segment(".."));
+        assert!(!is_safe_path_segment("."));
+        assert!(!is_safe_path_segment("foo/bar"));
+        assert!(!is_safe_path_segment("foo\\bar"));
+        assert!(!is_safe_path_segment(""));
+        assert!(!is_safe_path_segment("foo\0bar"));
+    }
+
+    #[test]
+    fn safe_path_segment_accepts_valid() {
+        assert!(is_safe_path_segment("blob-abc123"));
+        assert!(is_safe_path_segment("report.pdf"));
+        assert!(is_safe_path_segment("G1234abcdef"));
+    }
+
+    #[test]
+    fn sanitize_filename_strips_dangerous_chars() {
+        assert_eq!(sanitize_filename_for_header("normal.pdf"), "normal.pdf");
+        assert_eq!(sanitize_filename_for_header("file\".txt"), "file.txt");
+        assert_eq!(
+            sanitize_filename_for_header("file\r\ninjected"),
+            "fileinjected"
+        );
     }
 
     #[test]

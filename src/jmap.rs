@@ -425,6 +425,11 @@ fn collect_attachments(part: &serde_json::Value, out: &mut Vec<Attachment>) {
         .to_lowercase();
     let name = part["name"].as_str().unwrap_or_default();
 
+    // Skip inline parts (e.g. inline images rendered in the HTML body)
+    if disposition == "inline" {
+        return;
+    }
+
     // Include if explicitly marked as attachment, or has a filename
     if disposition == "attachment" || !name.is_empty() {
         let blob_id = match part["blobId"].as_str() {
@@ -1157,6 +1162,135 @@ mod tests {
             "blobId": "blob-case-file"
         });
         assert_eq!(find_calendar_blob_id(&body), Some("blob-case-file".into()));
+    }
+
+    // --- find_attachments tests ---
+
+    #[test]
+    fn find_attachments_null_returns_empty() {
+        assert!(find_attachments(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn find_attachments_text_plain_skipped() {
+        let body = serde_json::json!({
+            "type": "text/plain",
+            "blobId": "blob-1",
+            "name": "body.txt"
+        });
+        assert!(find_attachments(&body).is_empty());
+    }
+
+    #[test]
+    fn find_attachments_pdf_with_disposition() {
+        let body = serde_json::json!({
+            "type": "application/pdf",
+            "blobId": "blob-pdf",
+            "name": "report.pdf",
+            "size": 12345,
+            "disposition": "attachment"
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].blob_id, "blob-pdf");
+        assert_eq!(atts[0].name, "report.pdf");
+        assert_eq!(atts[0].mime_type, "application/pdf");
+        assert_eq!(atts[0].size, 12345);
+    }
+
+    #[test]
+    fn find_attachments_by_filename_without_disposition() {
+        let body = serde_json::json!({
+            "type": "application/octet-stream",
+            "blobId": "blob-bin",
+            "name": "data.bin",
+            "size": 100
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "data.bin");
+    }
+
+    #[test]
+    fn find_attachments_nested_multipart() {
+        let body = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                { "type": "text/plain", "blobId": "blob-text" },
+                { "type": "text/html", "blobId": "blob-html" },
+                {
+                    "type": "application/pdf",
+                    "blobId": "blob-att",
+                    "name": "invoice.pdf",
+                    "size": 5000,
+                    "disposition": "attachment"
+                }
+            ]
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "invoice.pdf");
+    }
+
+    #[test]
+    fn find_attachments_inline_skipped() {
+        let body = serde_json::json!({
+            "type": "image/png",
+            "blobId": "blob-img",
+            "name": "logo.png",
+            "size": 2000,
+            "disposition": "inline"
+        });
+        assert!(find_attachments(&body).is_empty());
+    }
+
+    #[test]
+    fn find_attachments_no_blob_id_skipped() {
+        let body = serde_json::json!({
+            "type": "application/pdf",
+            "name": "broken.pdf",
+            "disposition": "attachment"
+        });
+        assert!(find_attachments(&body).is_empty());
+    }
+
+    #[test]
+    fn find_attachments_deeply_nested() {
+        let body = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                {
+                    "type": "multipart/alternative",
+                    "subParts": [
+                        { "type": "text/plain", "blobId": "b1" },
+                        { "type": "text/html", "blobId": "b2" }
+                    ]
+                },
+                {
+                    "type": "multipart/mixed",
+                    "subParts": [
+                        {
+                            "type": "image/jpeg",
+                            "blobId": "blob-photo",
+                            "name": "photo.jpg",
+                            "size": 30000,
+                            "disposition": "attachment"
+                        },
+                        {
+                            "type": "application/zip",
+                            "blobId": "blob-archive",
+                            "name": "files.zip",
+                            "size": 50000,
+                            "disposition": "attachment"
+                        }
+                    ]
+                }
+            ]
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0].name, "photo.jpg");
+        assert_eq!(atts[1].name, "files.zip");
     }
 
     // --- build_draft_email tests ---
