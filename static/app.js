@@ -233,7 +233,7 @@ async function loadIdentities() {
 function renderFromDropdown() {
     if (!els.composeFrom) return;
     els.composeFrom.innerHTML = state.identities.map(id =>
-        `<option value="${id.email}">${id.name ? id.name + ' <' + id.email + '>' : id.email}</option>`
+        `<option value="${id.email}">${id.email}${id.name ? ' (' + id.name + ')' : ''}</option>`
     ).join('');
 }
 
@@ -1176,6 +1176,7 @@ function startForward() {
     if (!email) return;
 
     clearCompose();
+    autoSelectFromAddress(email);
 
     els.composeSubject.value = email.subject.startsWith('Fwd:') ? email.subject : `Fwd: ${email.subject}`;
 

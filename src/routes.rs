@@ -625,6 +625,69 @@ mod tests {
             .unwrap();
         assert!(!body.is_empty(), "style.css should not be empty");
     }
+
+    #[test]
+    fn dropdown_shows_email_as_primary_label() {
+        assert!(
+            APP_JS.contains("${id.email}${id.name"),
+            "From dropdown should render email as the primary label"
+        );
+    }
+
+    #[test]
+    fn dropdown_does_not_lead_with_display_name() {
+        assert!(
+            !APP_JS.contains("id.name + ' <' + id.email + '>'"),
+            "From dropdown should not use name-first format"
+        );
+    }
+
+    #[test]
+    fn forward_auto_selects_from_identity() {
+        let forward_fn = APP_JS
+            .split("function startForward()")
+            .nth(1)
+            .expect("startForward function should exist in app.js");
+        let forward_body = forward_fn.split("function ").next().unwrap();
+        assert!(
+            forward_body.contains("autoSelectFromAddress"),
+            "startForward should call autoSelectFromAddress"
+        );
+    }
+
+    #[test]
+    fn reply_auto_selects_from_identity() {
+        let reply_fn = APP_JS
+            .split("function startReply(")
+            .nth(1)
+            .expect("startReply function should exist in app.js");
+        let reply_body = reply_fn.split("function ").next().unwrap();
+        assert!(
+            reply_body.contains("autoSelectFromAddress"),
+            "startReply should call autoSelectFromAddress"
+        );
+    }
+
+    #[test]
+    fn identity_serialization_preserves_email_field() {
+        let identity = crate::types::Identity {
+            id: "id1".into(),
+            email: "test@example.com".into(),
+            name: "Test User".into(),
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["email"], "test@example.com");
+        assert_eq!(parsed["name"], "Test User");
+    }
+
+    #[test]
+    fn compose_defaults_to_first_identity() {
+        assert!(
+            APP_JS.contains("state.identities[0].email"),
+            "clearCompose should default to the first identity's email"
+        );
+    }
 }
 
 // External dep for theme path
