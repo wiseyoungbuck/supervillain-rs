@@ -1138,7 +1138,6 @@ function startCompose() {
     showView('compose');
 }
 
-// Returns the email for compose actions, or undefined if none is selected.
 function getComposeEmail() {
     return state.view === 'detail' ? state.currentEmail : state.emails[state.selectedIndex];
 }
@@ -1166,7 +1165,6 @@ function startReply(replyAll) {
         inReplyTo: email.id,
     };
 
-    // Auto-select the identity matching the To/CC of the original email
     autoSelectFromAddress(email);
 
     const quote = email.textBody || (email.htmlBody ? htmlToPlainText(email.htmlBody) : '');
