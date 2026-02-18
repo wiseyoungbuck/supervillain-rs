@@ -1,6 +1,9 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use regex::Regex;
+use std::sync::LazyLock;
+
+static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -190,8 +193,10 @@ fn extract_param(line: &str, param_name: &str) -> Option<String> {
 // PARTSTAT Update
 // =============================================================================
 
+/// Replace the PARTSTAT value for `attendee_email` in the given ICS data.
+/// Output is always unfolded (RFC 5545 line continuations removed).
 pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus) -> String {
-    let re = Regex::new(r"PARTSTAT=\w[\w-]*").unwrap();
+    let raw_ics = unfold_lines(raw_ics);
     let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
     let email_lower = attendee_email.to_lowercase();
 
@@ -205,7 +210,7 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
                     .to_lowercase()
                     .contains(&format!("mailto:{email_lower}"))
             {
-                let updated = re.replace(trimmed, new_partstat.as_str());
+                let updated = PARTSTAT_RE.replace(trimmed, new_partstat.as_str());
                 if line.ends_with('\r') {
                     format!("{updated}\r")
                 } else {
@@ -829,7 +834,29 @@ END:VCALENDAR";
     #[test]
     fn update_partstat_no_match_returns_unchanged() {
         let result = update_partstat(SAMPLE_ICS, "nobody@example.com", &RsvpStatus::Accepted);
-        assert_eq!(result, SAMPLE_ICS);
+        // unfold_lines normalizes the output, so compare against unfolded input
+        assert_eq!(result, unfold_lines(SAMPLE_ICS));
+    }
+
+    #[test]
+    fn update_partstat_handles_folded_attendee() {
+        let folded_ics = "BEGIN:VCALENDAR\r\n\
+            VERSION:2.0\r\n\
+            METHOD:REQUEST\r\n\
+            BEGIN:VEVENT\r\n\
+            UID:folded-test@example.com\r\n\
+            DTSTART:20250115T100000Z\r\n\
+            SUMMARY:Folded Test\r\n\
+            ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+            ATTENDEE;CN=Bob;PARTSTAT=\r\n NEEDS-ACTION:mailto:bob@example.com\r\n\
+            END:VEVENT\r\n\
+            END:VCALENDAR";
+        let result = update_partstat(folded_ics, "bob@example.com", &RsvpStatus::Accepted);
+        assert!(
+            result.contains("PARTSTAT=ACCEPTED"),
+            "folded PARTSTAT should be updated: {result}"
+        );
+        assert!(result.contains("mailto:bob@example.com"));
     }
 
     use chrono::{Datelike, Timelike};

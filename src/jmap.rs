@@ -706,6 +706,10 @@ fn build_draft_email(
         }]),
     );
 
+    debug_assert!(
+        sub.calendar_ics.is_none() || sub.html_body.is_none(),
+        "calendar_ics and html_body are mutually exclusive"
+    );
     if let Some(ref calendar_ics) = sub.calendar_ics {
         // iTIP REPLY: multipart/mixed with text/plain + text/calendar
         m.insert(
@@ -1870,5 +1874,22 @@ mod tests {
             .expect("bodyValues should exist");
         assert_eq!(body_values["calendar"]["value"], ics);
         assert_eq!(body_values["body"]["value"], "Accepted");
+    }
+
+    #[test]
+    #[should_panic(expected = "calendar_ics and html_body are mutually exclusive")]
+    fn draft_rejects_calendar_ics_with_html_body() {
+        let sub = EmailSubmission {
+            to: vec!["organizer@example.com".into()],
+            cc: vec![],
+            subject: "Re: Meeting".into(),
+            text_body: "Accepted".into(),
+            bcc: None,
+            html_body: Some("<p>Should not coexist</p>".into()),
+            in_reply_to: None,
+            references: None,
+            calendar_ics: Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR".into()),
+        };
+        build_draft_email(&sub, "bob@example.com", "mb-drafts");
     }
 }
