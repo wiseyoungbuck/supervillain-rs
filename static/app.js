@@ -1138,8 +1138,13 @@ function startCompose() {
     showView('compose');
 }
 
+// Returns the email for compose actions, or undefined if none is selected.
+function getComposeEmail() {
+    return state.view === 'detail' ? state.currentEmail : state.emails[state.selectedIndex];
+}
+
 function startReply(replyAll) {
-    const email = state.view === 'detail' ? state.currentEmail : state.emails[state.selectedIndex];
+    const email = getComposeEmail();
     if (!email) return;
 
     clearCompose();
@@ -1172,7 +1177,7 @@ function startReply(replyAll) {
 }
 
 function startForward() {
-    const email = state.view === 'detail' ? state.currentEmail : state.emails[state.selectedIndex];
+    const email = getComposeEmail();
     if (!email) return;
 
     clearCompose();
@@ -1200,12 +1205,18 @@ function clearCompose() {
 
 function autoSelectFromAddress(email) {
     if (!els.composeFrom || !state.identities.length) return;
-    const myAddresses = new Set(state.identities.map(i => i.email.toLowerCase()));
-    const recipients = [...(email.to || []), ...(email.cc || [])];
-    for (const addr of recipients) {
-        if (addr.email && myAddresses.has(addr.email.toLowerCase())) {
-            els.composeFrom.value = addr.email;
-            return;
+    // Check To first, then CC — To matches always take priority over CC matches
+    const lists = [email.to || [], email.cc || []];
+    for (const list of lists) {
+        for (const r of list) {
+            if (!r.email) continue;
+            const addr = r.email.toLowerCase();
+            for (const id of state.identities) {
+                if (id.email.toLowerCase() === addr) {
+                    els.composeFrom.value = id.email;
+                    return;
+                }
+            }
         }
     }
 }
