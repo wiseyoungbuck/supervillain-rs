@@ -32,6 +32,7 @@ pub struct Email {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub has_calendar: bool,
+    pub attachments: Vec<Attachment>,
 }
 
 impl Email {
@@ -71,6 +72,18 @@ pub struct Identity {
     pub id: String,
     pub email: String,
     pub name: String,
+}
+
+// =============================================================================
+// Attachment types
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub blob_id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size: i64,
 }
 
 // =============================================================================
@@ -220,6 +233,7 @@ mod tests {
             text_body: None,
             html_body: None,
             has_calendar: false,
+            attachments: vec![],
         }
     }
 

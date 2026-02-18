@@ -80,6 +80,8 @@ function init() {
     els.rsvpAccept = document.getElementById('rsvp-accept');
     els.rsvpMaybe = document.getElementById('rsvp-maybe');
     els.rsvpDecline = document.getElementById('rsvp-decline');
+    els.attachments = document.getElementById('attachments');
+    els.attachmentsList = document.getElementById('attachments-list');
     // Event listeners
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
@@ -432,6 +434,7 @@ function renderEmailDetailPartial(listItem) {
         <div><span class="label">Date:</span> ${date}</div>
     `;
     els.calendarEvent.classList.add('hidden');
+    els.attachments.classList.add('hidden');
     els.emailBody.innerHTML = '<div class="loading-body">Loading…</div>';
     els.emailBody.classList.remove('html-content');
 }
@@ -653,6 +656,13 @@ function renderEmailDetail() {
         renderCalendarCard(e.calendarEvent);
     } else {
         els.calendarEvent.classList.add('hidden');
+    }
+
+    // Render attachments if present
+    if (e.attachments?.length) {
+        renderAttachments(e.attachments, e.id);
+    } else {
+        els.attachments.classList.add('hidden');
     }
 
     if (e.htmlBody) {
@@ -1658,6 +1668,47 @@ function linkifyText(text) {
             return `<a href="${trimmed}" target="_blank" rel="noopener noreferrer">${trimmed}</a>${suffix}`;
         }
     );
+}
+
+// Attachment functions
+
+function renderAttachments(attachments, emailId) {
+    els.attachments.classList.remove('hidden');
+    els.attachmentsList.innerHTML = attachments.map(att => {
+        const icon = getFileIcon(att.mime_type, att.name);
+        const size = formatFileSize(att.size);
+        const url = `/api/emails/${emailId}/attachments/${encodeURIComponent(att.blob_id)}/${encodeURIComponent(att.name)}`;
+        return `
+            <a class="attachment-item" href="${url}" download="${escapeHtml(att.name)}">
+                <span class="attachment-icon">${icon}</span>
+                <span class="attachment-name">${escapeHtml(att.name)}</span>
+                <span class="attachment-size">${size}</span>
+                <span class="attachment-download">&#8615;</span>
+            </a>
+        `;
+    }).join('');
+}
+
+function formatFileSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const val = bytes / Math.pow(1024, i);
+    return (i === 0 ? val : val.toFixed(1)) + ' ' + units[i];
+}
+
+function getFileIcon(mimeType, filename) {
+    const ext = filename.split('.').pop()?.toLowerCase() || '';
+    if (mimeType.startsWith('image/')) return '\u{1F5BC}';
+    if (mimeType === 'application/pdf' || ext === 'pdf') return '\u{1F4C4}';
+    if (mimeType.startsWith('audio/')) return '\u{1F3B5}';
+    if (mimeType.startsWith('video/')) return '\u{1F3AC}';
+    if (['zip', 'gz', 'tar', 'rar', '7z', 'bz2'].includes(ext)) return '\u{1F4E6}';
+    if (['xls', 'xlsx', 'csv', 'ods'].includes(ext)) return '\u{1F4CA}';
+    if (['doc', 'docx', 'odt', 'rtf'].includes(ext)) return '\u{1F4DD}';
+    if (['ppt', 'pptx', 'odp'].includes(ext)) return '\u{1F4CA}';
+    if (['txt', 'md', 'log'].includes(ext)) return '\u{1F4C3}';
+    return '\u{1F4CE}';
 }
 
 // Calendar functions

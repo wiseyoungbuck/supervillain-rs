@@ -41,6 +41,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(add_to_calendar),
         )
         .route(
+            "/api/emails/{email_id}/attachments/{blob_id}/{filename}",
+            get(download_attachment),
+        )
+        .route(
             "/api/emails/{email_id}/unsubscribe-and-archive-all",
             post(unsubscribe_and_archive),
         )
@@ -260,11 +264,60 @@ async fn get_email(
         "isUnread": email.is_unread(),
         "isFlagged": email.is_flagged(),
         "hasAttachment": email.has_attachment,
+        "hasAttachment": email.has_attachment,
         "hasCalendar": email.has_calendar,
         "textBody": email.text_body,
         "htmlBody": email.html_body,
         "calendarEvent": calendar_event,
+        "attachments": email.attachments,
     })))
+}
+
+async fn download_attachment(
+    State(state): State<Arc<AppState>>,
+    Path((_email_id, blob_id, filename)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, Error> {
+    let session = state.session.read().await;
+    let account_id = session.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let download_url = session.download_url.as_ref().ok_or(Error::NotConnected)?;
+
+    let url = download_url
+        .replace("{accountId}", account_id)
+        .replace("{blobId}", &blob_id)
+        .replace("{name}", &filename)
+        .replace("{type}", "application/octet-stream");
+
+    let resp = session
+        .client
+        .get(&url)
+        .header("Authorization", &session.auth_header)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(Error::NotFound("Attachment not found".into()));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = resp.bytes().await?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            ("content-type", content_type),
+            (
+                "content-disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        bytes,
+    ))
 }
 
 async fn archive_email(

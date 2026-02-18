@@ -220,6 +220,7 @@ mod tests {
             text_body: None,
             html_body: None,
             has_calendar: false,
+            attachments: vec![],
         }
     }
 

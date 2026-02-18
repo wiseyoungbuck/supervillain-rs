@@ -264,22 +264,29 @@ pub async fn get_emails(
         properties.extend_from_slice(&["textBody", "htmlBody", "bodyValues", "bodyStructure"]);
     }
 
-    let resp = jmap_call(
-        s,
-        vec![serde_json::json!([
-            "Email/get",
-            {
-                "accountId": account_id,
-                "ids": ids,
-                "properties": properties,
-                "fetchHTMLBodyValues": fetch_body,
-                "fetchTextBodyValues": fetch_body,
-                "maxBodyValueBytes": 1_000_000
-            },
-            "0"
-        ])],
-    )
-    .await?;
+    let mut extra_args = serde_json::Map::new();
+    extra_args.insert("accountId".into(), serde_json::json!(account_id));
+    extra_args.insert("ids".into(), serde_json::json!(ids));
+    extra_args.insert("properties".into(), serde_json::json!(properties));
+    extra_args.insert("fetchHTMLBodyValues".into(), serde_json::json!(fetch_body));
+    extra_args.insert("fetchTextBodyValues".into(), serde_json::json!(fetch_body));
+    extra_args.insert("maxBodyValueBytes".into(), serde_json::json!(1_000_000));
+    if fetch_body {
+        extra_args.insert(
+            "bodyProperties".into(),
+            serde_json::json!([
+                "partId",
+                "blobId",
+                "type",
+                "name",
+                "size",
+                "disposition",
+                "subParts"
+            ]),
+        );
+    }
+
+    let resp = jmap_call(s, vec![serde_json::json!(["Email/get", extra_args, "0"])]).await?;
 
     let list = resp["methodResponses"][0][1]["list"]
         .as_array()
@@ -359,6 +366,12 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
         has_calendar = find_calendar_blob_id(&item["bodyStructure"]).is_some();
     }
 
+    let attachments = if fetch_body {
+        find_attachments(&item["bodyStructure"])
+    } else {
+        vec![]
+    };
+
     Email {
         id: item["id"].as_str().unwrap_or_default().into(),
         blob_id: item["blobId"].as_str().unwrap_or_default().into(),
@@ -376,6 +389,60 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
         text_body,
         html_body,
         has_calendar,
+        attachments,
+    }
+}
+
+pub fn find_attachments(body_structure: &serde_json::Value) -> Vec<Attachment> {
+    let mut attachments = Vec::new();
+    collect_attachments(body_structure, &mut attachments);
+    attachments
+}
+
+fn collect_attachments(part: &serde_json::Value, out: &mut Vec<Attachment>) {
+    if part.is_null() {
+        return;
+    }
+
+    let mime_type = part["type"].as_str().unwrap_or_default().to_lowercase();
+
+    // Recurse into sub-parts for multipart types
+    if let Some(sub_parts) = part["subParts"].as_array() {
+        for sub in sub_parts {
+            collect_attachments(sub, out);
+        }
+        return;
+    }
+
+    // Skip body content types
+    if mime_type == "text/plain" || mime_type == "text/html" || mime_type == "text/calendar" {
+        return;
+    }
+
+    let disposition = part["disposition"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    let name = part["name"].as_str().unwrap_or_default();
+
+    // Include if explicitly marked as attachment, or has a filename
+    if disposition == "attachment" || !name.is_empty() {
+        let blob_id = match part["blobId"].as_str() {
+            Some(id) => id.to_string(),
+            None => return,
+        };
+        let size = part["size"].as_i64().unwrap_or(0);
+
+        out.push(Attachment {
+            blob_id,
+            name: if name.is_empty() {
+                "attachment".to_string()
+            } else {
+                name.to_string()
+            },
+            mime_type: mime_type.clone(),
+            size,
+        });
     }
 }
 
