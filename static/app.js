@@ -241,7 +241,7 @@ function renderFromDropdown() {
 
 function getSplitIcon(split) {
     if (!split.icon) return '';
-    return `<img class="split-icon" src="${escapeHtml(split.icon)}" width="14" height="14" alt="">`;
+    return `<img class="split-icon" src="${escapeHtml(split.icon)}" width="14" height="14" alt="" onerror="this.style.display='none'">`;
 }
 
 function renderSplitTabs() {
