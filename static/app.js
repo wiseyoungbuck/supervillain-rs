@@ -110,6 +110,14 @@ function init() {
         el.addEventListener('blur', () => setMode('normal'));
     });
 
+    // Auto-expand textarea as user types
+    els.composeBody.addEventListener('input', autoResizeTextarea);
+
+    function autoResizeTextarea() {
+        els.composeBody.style.height = 'auto';
+        els.composeBody.style.height = els.composeBody.scrollHeight + 'px';
+    }
+
     // Reload theme on window focus (pick up theme changes after alt-tabbing back)
     window.addEventListener('focus', loadTheme);
 
