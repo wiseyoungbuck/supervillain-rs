@@ -210,6 +210,7 @@ All endpoints are under `/api/`. The frontend at `/` communicates with these.
 | POST | `/api/emails/{id}/rsvp` | RSVP to calendar invite |
 | POST | `/api/emails/{id}/add-to-calendar` | Add invite to calendar |
 | POST | `/api/emails/{id}/unsubscribe-and-archive-all` | Archive all from sender |
+| GET | `/api/emails/{id}/attachments/{blob_id}/{filename}` | Download attachment |
 | GET | `/api/splits` | List splits |
 | POST | `/api/splits` | Create split |
 | PUT | `/api/splits/{id}` | Update split |
