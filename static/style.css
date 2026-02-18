@@ -466,6 +466,36 @@ body:not(.light-theme) #email-body.html-content * {
     min-height: 300px;
 }
 
+.compose-quote {
+    border-left: 2px solid var(--fg-dim);
+    padding-left: 12px;
+    margin-top: 12px;
+    overflow-y: auto;
+    max-height: 40vh;
+    color: var(--fg-muted);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.compose-quote.hidden {
+    display: none;
+}
+
+.compose-quote a {
+    color: var(--accent);
+}
+
+body:not(.light-theme) .compose-quote,
+body:not(.light-theme) .compose-quote * {
+    color: var(--fg-muted) !important;
+    background-color: transparent !important;
+}
+
+body:not(.light-theme) .compose-quote a,
+body:not(.light-theme) .compose-quote a * {
+    color: var(--accent) !important;
+}
+
 .compose-hint {
     margin-top: 16px;
     color: var(--fg-dim);

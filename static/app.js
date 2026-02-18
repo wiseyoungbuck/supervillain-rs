@@ -82,6 +82,7 @@ function init() {
     els.rsvpDecline = document.getElementById('rsvp-decline');
     els.attachments = document.getElementById('attachments');
     els.attachmentsList = document.getElementById('attachments-list');
+    els.composeQuote = document.getElementById('compose-quote');
     // Event listeners
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
@@ -520,19 +521,32 @@ async function sendEmail() {
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
     const fromAddress = els.composeFrom?.value || null;
     const subject = els.composeSubject.value;
-    const body = els.composeBody.value;
+    const userText = els.composeBody.value;
 
     if (!to.length) {
         showStatus('No recipients', 'error');
         return;
     }
 
+    const quotedText = state.replyContext?.quotedText;
+    const quotedHtml = state.replyContext?.quotedHtml;
+
+    const fullTextBody = quotedText
+        ? userText + '\n\n' + quotedText.split('\n').map(l => '> ' + l).join('\n')
+        : userText;
+
+    const fullHtmlBody = quotedHtml
+        ? `<div>${escapeHtml(userText).replace(/\n/g, '<br>')}</div>`
+          + `<blockquote style="border-left:2px solid #ccc;padding-left:12px;margin-left:0">${quotedHtml}</blockquote>`
+        : null;
+
     try {
         await api('POST', '/emails/send', {
             to,
             cc,
             subject,
-            body,
+            body: fullTextBody,
+            html_body: fullHtmlBody || undefined,
             in_reply_to: state.replyContext?.inReplyTo || null,
             from_address: fromAddress,
         });
@@ -1163,15 +1177,26 @@ function startReply(replyAll) {
 
     els.composeSubject.value = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
 
+    const quotedHtml = email.htmlBody ? sanitizeHtml(email.htmlBody) : null;
+    const quotedText = email.htmlBody
+        ? htmlToPlainText(email.htmlBody)
+        : (email.textBody || '');
+
     state.replyContext = {
         inReplyTo: email.id,
+        quotedHtml,
+        quotedText,
     };
 
     autoSelectFromAddress(email);
 
-    const quote = email.textBody || (email.htmlBody ? htmlToPlainText(email.htmlBody) : '');
-    const quotedLines = quote.split('\n').map(line => '> ' + line).join('\n');
-    els.composeBody.value = `\n\n${quotedLines}`;
+    const header = `On ${formatDate(email.receivedAt)}, ${from?.name || from?.email} wrote:`;
+    if (quotedHtml) {
+        els.composeQuote.innerHTML = `<p><strong>${escapeHtml(header)}</strong></p>${quotedHtml}`;
+    } else {
+        els.composeQuote.innerHTML = `<p><strong>${escapeHtml(header)}</strong></p><pre>${escapeHtml(quotedText)}</pre>`;
+    }
+    els.composeQuote.classList.remove('hidden');
 
     showView('compose');
 }
@@ -1186,8 +1211,20 @@ function startForward() {
     els.composeSubject.value = email.subject.startsWith('Fwd:') ? email.subject : `Fwd: ${email.subject}`;
 
     const from = email.from[0];
-    const header = `---------- Forwarded message ---------\nFrom: ${from?.name || ''} <${from?.email}>\nSubject: ${email.subject}\n\n`;
-    els.composeBody.value = header + (email.textBody || (email.htmlBody ? htmlToPlainText(email.htmlBody) : ''));
+    const quotedHtml = email.htmlBody ? sanitizeHtml(email.htmlBody) : null;
+    const quotedText = email.htmlBody
+        ? htmlToPlainText(email.htmlBody)
+        : (email.textBody || '');
+
+    state.replyContext = { quotedHtml, quotedText };
+
+    const headerLines = `---------- Forwarded message ---------<br>From: ${escapeHtml(from?.name || '')} &lt;${escapeHtml(from?.email)}&gt;<br>Subject: ${escapeHtml(email.subject)}`;
+    if (quotedHtml) {
+        els.composeQuote.innerHTML = `<p>${headerLines}</p>${quotedHtml}`;
+    } else {
+        els.composeQuote.innerHTML = `<p>${headerLines}</p><pre>${escapeHtml(quotedText)}</pre>`;
+    }
+    els.composeQuote.classList.remove('hidden');
 
     showView('compose');
 }
@@ -1197,6 +1234,8 @@ function clearCompose() {
     els.composeCc.value = '';
     els.composeSubject.value = '';
     els.composeBody.value = '';
+    els.composeQuote.innerHTML = '';
+    els.composeQuote.classList.add('hidden');
     if (els.composeFrom && state.identities.length) {
         els.composeFrom.value = state.identities[0].email;
     }
