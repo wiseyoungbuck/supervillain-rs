@@ -55,6 +55,8 @@ pub struct EmailSubmission {
     pub html_body: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<Vec<String>>,
+    #[serde(skip)]
+    pub calendar_ics: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +113,30 @@ pub struct CalendarEvent {
     pub sequence: i32,
     pub method: String,
     pub raw_ics: String,
+}
+
+// =============================================================================
+// RSVP types
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub enum RsvpStatus {
+    #[serde(rename = "ACCEPTED")]
+    Accepted,
+    #[serde(rename = "TENTATIVE")]
+    Tentative,
+    #[serde(rename = "DECLINED")]
+    Declined,
+}
+
+impl RsvpStatus {
+    pub fn as_ics_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "ACCEPTED",
+            Self::Tentative => "TENTATIVE",
+            Self::Declined => "DECLINED",
+        }
+    }
 }
 
 // =============================================================================
@@ -313,6 +339,7 @@ mod tests {
             html_body: Some("<p>Body</p>".into()),
             in_reply_to: Some("msg-123".into()),
             references: Some(vec!["msg-100".into(), "msg-123".into()]),
+            calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
         let deserialized: EmailSubmission = serde_json::from_str(&json).unwrap();
@@ -331,6 +358,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
         let deserialized: EmailSubmission = serde_json::from_str(&json).unwrap();
@@ -437,6 +465,38 @@ mod tests {
         };
         let json = serde_json::to_string(&split).unwrap();
         assert!(json.contains(r#""icon":"https://example.com/icon.svg""#));
+    }
+
+    // --- RsvpStatus tests ---
+
+    #[test]
+    fn rsvp_status_deserializes_accepted() {
+        let status: RsvpStatus = serde_json::from_str("\"ACCEPTED\"").unwrap();
+        assert_eq!(status, RsvpStatus::Accepted);
+    }
+
+    #[test]
+    fn rsvp_status_deserializes_tentative() {
+        let status: RsvpStatus = serde_json::from_str("\"TENTATIVE\"").unwrap();
+        assert_eq!(status, RsvpStatus::Tentative);
+    }
+
+    #[test]
+    fn rsvp_status_deserializes_declined() {
+        let status: RsvpStatus = serde_json::from_str("\"DECLINED\"").unwrap();
+        assert_eq!(status, RsvpStatus::Declined);
+    }
+
+    #[test]
+    fn rsvp_status_rejects_invalid() {
+        assert!(serde_json::from_str::<RsvpStatus>("\"BOGUS\"").is_err());
+    }
+
+    #[test]
+    fn rsvp_status_as_ics_roundtrip() {
+        assert_eq!(RsvpStatus::Accepted.as_ics_str(), "ACCEPTED");
+        assert_eq!(RsvpStatus::Tentative.as_ics_str(), "TENTATIVE");
+        assert_eq!(RsvpStatus::Declined.as_ics_str(), "DECLINED");
     }
 
     #[test]

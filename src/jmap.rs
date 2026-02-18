@@ -706,7 +706,26 @@ fn build_draft_email(
         }]),
     );
 
-    if let Some(ref html) = sub.html_body {
+    if let Some(ref calendar_ics) = sub.calendar_ics {
+        // iTIP REPLY: multipart/mixed with text/plain + text/calendar
+        m.insert(
+            "bodyValues".into(),
+            serde_json::json!({
+                "body": { "value": sub.text_body },
+                "calendar": { "value": calendar_ics }
+            }),
+        );
+        m.insert(
+            "bodyStructure".into(),
+            serde_json::json!({
+                "type": "multipart/mixed",
+                "subParts": [
+                    { "partId": "body", "type": "text/plain" },
+                    { "partId": "calendar", "type": "text/calendar; method=REPLY" }
+                ]
+            }),
+        );
+    } else if let Some(ref html) = sub.html_body {
         m.insert(
             "htmlBody".into(),
             serde_json::json!([{
@@ -1305,6 +1324,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            calendar_ics: None,
         }
     }
 
@@ -1328,6 +1348,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-456");
         let ids = draft.get("mailboxIds").expect("mailboxIds must be present");
@@ -1345,6 +1366,7 @@ mod tests {
             html_body: None,
             in_reply_to: Some("<msg-123@example.com>".into()),
             references: Some(vec!["<msg-123@example.com>".into()]),
+            calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-789");
         assert!(draft.contains_key("mailboxIds"));
@@ -1386,6 +1408,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "a@b.com", "mb");
         assert_eq!(
@@ -1694,6 +1717,7 @@ mod tests {
             html_body: Some("<p>Hello, world!</p>".into()),
             in_reply_to: None,
             references: None,
+            calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
         // Should have htmlBody key with text/html part
@@ -1786,5 +1810,65 @@ mod tests {
         let a = uuid_v4();
         let b = uuid_v4();
         assert_ne!(a, b, "Two UUIDs should not be identical");
+    }
+
+    // --- build_draft_email calendar_ics tests ---
+
+    #[test]
+    fn draft_with_calendar_ics_has_multipart_mixed() {
+        let sub = EmailSubmission {
+            to: vec!["organizer@example.com".into()],
+            cc: vec![],
+            subject: "Re: Team Standup".into(),
+            text_body: "Bob has accepted the invitation: Team Standup".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
+        };
+        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
+        assert_eq!(
+            draft["bodyStructure"]["type"], "multipart/mixed",
+            "Calendar draft should use multipart/mixed"
+        );
+        let sub_parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("Should have subParts");
+        assert_eq!(sub_parts.len(), 2);
+        assert_eq!(sub_parts[0]["type"], "text/plain");
+        assert_eq!(sub_parts[1]["type"], "text/calendar; method=REPLY");
+    }
+
+    #[test]
+    fn draft_without_calendar_ics_unchanged() {
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(
+            draft["bodyStructure"]["type"], "text/plain",
+            "Non-calendar draft should stay text/plain"
+        );
+    }
+
+    #[test]
+    fn draft_calendar_body_value_contains_ics() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nEND:VCALENDAR";
+        let sub = EmailSubmission {
+            to: vec!["organizer@example.com".into()],
+            cc: vec![],
+            subject: "Re: Meeting".into(),
+            text_body: "Accepted".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            calendar_ics: Some(ics.into()),
+        };
+        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
+        let body_values = draft["bodyValues"]
+            .as_object()
+            .expect("bodyValues should exist");
+        assert_eq!(body_values["calendar"]["value"], ics);
+        assert_eq!(body_values["body"]["value"], "Accepted");
     }
 }

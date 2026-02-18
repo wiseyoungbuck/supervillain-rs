@@ -109,7 +109,7 @@ struct SendEmailBody {
 
 #[derive(Deserialize)]
 struct RsvpBody {
-    status: String,
+    status: crate::types::RsvpStatus,
 }
 
 // =============================================================================
@@ -245,7 +245,18 @@ async fn get_email(
                 let uid = event.uid.clone();
                 tokio::spawn(async move {
                     let s = state_clone.session.read().await;
-                    let _ = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await;
+                    if let Err(e) = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await {
+                        tracing::warn!("CalDAV auto-add failed for {uid}: {e}");
+                    }
+                });
+            } else if event.method == "CANCEL" {
+                let state_clone = state.clone();
+                let uid = event.uid.clone();
+                tokio::spawn(async move {
+                    let s = state_clone.session.read().await;
+                    if let Err(e) = jmap::remove_from_calendar(&s, &uid).await {
+                        tracing::warn!("CalDAV auto-remove failed for {uid}: {e}");
+                    }
                 });
             }
             calendar_event = Some(event);
@@ -418,6 +429,7 @@ async fn send_email_handler(
         html_body: body.html_body,
         in_reply_to: body.in_reply_to,
         references: None,
+        calendar_ics: None,
     };
 
     let result = jmap::send_email(&mut session, &submission, &from_addr, None).await?;
@@ -468,7 +480,7 @@ async fn rsvp(
 
     let rsvp_ics = calendar::generate_rsvp(&event, &attendee_email, &body.status);
 
-    // Send RSVP as email to organizer
+    // Send RSVP as email to organizer with text/calendar MIME part
     let submission = EmailSubmission {
         to: vec![event.organizer_email.clone()],
         cc: vec![],
@@ -476,26 +488,45 @@ async fn rsvp(
         text_body: format!(
             "{} has {} the invitation: {}",
             attendee_email,
-            body.status.to_lowercase(),
+            body.status.as_ics_str().to_lowercase(),
             event.summary
         ),
         bcc: None,
         html_body: None,
         in_reply_to: None,
         references: None,
+        calendar_ics: Some(rsvp_ics),
     };
 
-    let _ = jmap::send_email(&mut session_guard, &submission, &attendee_email, None).await;
-
-    // Decline = remove from calendar; Accept/Maybe = upsert to calendar
-    if body.status == "DECLINED" {
-        let _ = jmap::remove_from_calendar(&session_guard, &event.uid).await;
-    } else {
-        let _ = jmap::add_to_calendar(&session_guard, &rsvp_ics, &event.uid, false).await;
+    if let Err(e) = jmap::send_email(&mut session_guard, &submission, &attendee_email, None).await {
+        tracing::warn!(
+            "Failed to send iTIP reply to {}: {e}",
+            event.organizer_email
+        );
     }
 
-    // Return updated event
-    let updated_event = calendar::parse_ics(&rsvp_ics).unwrap_or(event);
+    // Decline = remove from calendar; Accept/Maybe = upsert original ICS with updated PARTSTAT
+    if body.status == RsvpStatus::Declined {
+        if let Err(e) = jmap::remove_from_calendar(&session_guard, &event.uid).await {
+            tracing::warn!("CalDAV delete failed for {}: {e}", event.uid);
+        }
+    } else {
+        let updated_ics = calendar::update_partstat(&ics_data, &attendee_email, &body.status);
+        if let Err(e) = jmap::add_to_calendar(&session_guard, &updated_ics, &event.uid, false).await
+        {
+            tracing::warn!("CalDAV write failed for {}: {e}", event.uid);
+        }
+    }
+
+    // Update the parsed event's attendee status for the frontend response
+    let mut updated_event = event;
+    if let Some(att) = updated_event
+        .attendees
+        .iter_mut()
+        .find(|a| a.email.eq_ignore_ascii_case(&attendee_email))
+    {
+        att.status = body.status.as_ics_str().to_string();
+    }
     Ok(Json(serde_json::json!(updated_event)))
 }
 

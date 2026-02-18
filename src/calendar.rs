@@ -1,5 +1,6 @@
-use crate::types::{Attendee, CalendarEvent};
+use crate::types::{Attendee, CalendarEvent, RsvpStatus};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use regex::Regex;
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -186,10 +187,43 @@ fn extract_param(line: &str, param_name: &str) -> Option<String> {
 }
 
 // =============================================================================
+// PARTSTAT Update
+// =============================================================================
+
+pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus) -> String {
+    let re = Regex::new(r"PARTSTAT=\w[\w-]*").unwrap();
+    let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
+    let email_lower = attendee_email.to_lowercase();
+
+    // Split on \n but preserve \r if present to keep original line endings
+    raw_ics
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.starts_with("ATTENDEE")
+                && trimmed
+                    .to_lowercase()
+                    .contains(&format!("mailto:{email_lower}"))
+            {
+                let updated = re.replace(trimmed, new_partstat.as_str());
+                if line.ends_with('\r') {
+                    format!("{updated}\r")
+                } else {
+                    updated.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// =============================================================================
 // RSVP Generation
 // =============================================================================
 
-pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &str) -> String {
+pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &RsvpStatus) -> String {
     debug_assert!(
         !attendee_email.is_empty(),
         "attendee_email must not be empty"
@@ -230,7 +264,7 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &str) 
          {dtend_line}\
          SUMMARY:{summary}\r\n\
          ORGANIZER{organizer_cn}:mailto:{organizer_email}\r\n\
-         ATTENDEE{cn_param};PARTSTAT={status}:mailto:{attendee_email}\r\n\
+         ATTENDEE{cn_param};PARTSTAT={partstat}:mailto:{attendee_email}\r\n\
          SEQUENCE:{sequence}\r\n\
          END:VEVENT\r\n\
          END:VCALENDAR",
@@ -241,7 +275,7 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &str) 
         organizer_cn = organizer_cn,
         organizer_email = event.organizer_email,
         cn_param = cn_param,
-        status = status,
+        partstat = status.as_ics_str(),
         attendee_email = attendee_email,
         sequence = event.sequence,
     )
@@ -453,58 +487,62 @@ END:VCALENDAR";
 
     #[test]
     fn rsvp_method_reply() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("METHOD:REPLY"));
     }
 
     #[test]
     fn rsvp_includes_uid() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("test-uid-123@example.com"));
     }
 
     #[test]
     fn rsvp_attendee_accepted() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("bob@example.com"));
         assert!(rsvp.contains("ACCEPTED"));
     }
 
     #[test]
     fn rsvp_tentative() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "TENTATIVE");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Tentative);
         assert!(rsvp.contains("TENTATIVE"));
     }
 
     #[test]
     fn rsvp_declined() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "DECLINED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Declined);
         assert!(rsvp.contains("DECLINED"));
     }
 
     #[test]
     fn rsvp_includes_organizer() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("alice@example.com"));
     }
 
     #[test]
     fn rsvp_preserves_cn() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("CN=Bob"));
     }
 
     #[test]
     fn rsvp_unknown_attendee() {
         // Should still work even if email not in original attendees
-        let rsvp = generate_rsvp(&sample_event(), "unknown@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(
+            &sample_event(),
+            "unknown@example.com",
+            &RsvpStatus::Accepted,
+        );
         assert!(rsvp.contains("unknown@example.com"));
         assert!(rsvp.contains("ACCEPTED"));
     }
 
     #[test]
     fn rsvp_is_parseable() {
-        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.starts_with("BEGIN:VCALENDAR"));
         let parsed = parse_ics(&rsvp).unwrap();
         assert_eq!(parsed.uid, "test-uid-123@example.com");
@@ -514,7 +552,7 @@ END:VCALENDAR";
     #[test]
     fn rsvp_no_dtend() {
         let event = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
-        let rsvp = generate_rsvp(&event, "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("METHOD:REPLY"));
         assert!(!rsvp.contains("DTEND"));
     }
@@ -574,22 +612,22 @@ END:VCALENDAR";
         let uid = &original.uid;
 
         // Accept → parse back
-        let accept_ics = generate_rsvp(&original, "bob@example.com", "ACCEPTED");
+        let accept_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Accepted);
         let accepted = parse_ics(&accept_ics).unwrap();
         assert_eq!(&accepted.uid, uid);
 
         // Decline → parse back
-        let decline_ics = generate_rsvp(&original, "bob@example.com", "DECLINED");
+        let decline_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Declined);
         let declined = parse_ics(&decline_ics).unwrap();
         assert_eq!(&declined.uid, uid);
 
         // Re-accept after decline → parse back (the mis-click recovery path)
-        let reaccept_ics = generate_rsvp(&original, "bob@example.com", "ACCEPTED");
+        let reaccept_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Accepted);
         let reaccepted = parse_ics(&reaccept_ics).unwrap();
         assert_eq!(&reaccepted.uid, uid);
 
         // Tentative → parse back
-        let maybe_ics = generate_rsvp(&original, "bob@example.com", "TENTATIVE");
+        let maybe_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Tentative);
         let maybe = parse_ics(&maybe_ics).unwrap();
         assert_eq!(&maybe.uid, uid);
     }
@@ -601,12 +639,18 @@ END:VCALENDAR";
         // would fire when viewing a sent RSVP email — creating
         // duplicate calendar entries.
         let event = sample_event();
-        for status in &["ACCEPTED", "TENTATIVE", "DECLINED"] {
+        for status in &[
+            RsvpStatus::Accepted,
+            RsvpStatus::Tentative,
+            RsvpStatus::Declined,
+        ] {
             let ics = generate_rsvp(&event, "bob@example.com", status);
             let parsed = parse_ics(&ics).unwrap();
             assert_eq!(
-                parsed.method, "REPLY",
-                "RSVP with status {status} must be REPLY"
+                parsed.method,
+                "REPLY",
+                "RSVP with status {} must be REPLY",
+                status.as_ics_str()
             );
             assert_ne!(parsed.method, "REQUEST");
         }
@@ -695,7 +739,7 @@ END:VCALENDAR";
         let event = parse_ics(ics).unwrap();
         let original_uid = event.uid.clone();
 
-        let rsvp = generate_rsvp(&event, "bob@example.com", "ACCEPTED");
+        let rsvp = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Accepted);
         let parsed = parse_ics(&rsvp).unwrap();
         assert_eq!(parsed.uid, original_uid);
     }
@@ -707,7 +751,7 @@ END:VCALENDAR";
         // parsed event to the frontend. Verify the decline ICS has
         // enough data to parse fully (summary, organizer, etc).
         let event = sample_event();
-        let ics = generate_rsvp(&event, "bob@example.com", "DECLINED");
+        let ics = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Declined);
         let parsed = parse_ics(&ics).unwrap();
 
         assert_eq!(parsed.uid, event.uid);
@@ -716,6 +760,76 @@ END:VCALENDAR";
         assert_eq!(parsed.method, "REPLY");
         assert_eq!(parsed.attendees.len(), 1);
         assert_eq!(parsed.attendees[0].status, "DECLINED");
+    }
+
+    // --- update_partstat tests ---
+
+    #[test]
+    fn update_partstat_changes_matching_attendee() {
+        let result = update_partstat(SAMPLE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        // Bob's line should now have ACCEPTED
+        for line in result.lines() {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.starts_with("ATTENDEE") && trimmed.to_lowercase().contains("bob@example.com")
+            {
+                assert!(
+                    trimmed.contains("PARTSTAT=ACCEPTED"),
+                    "Bob's PARTSTAT should be ACCEPTED: {trimmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_partstat_preserves_other_attendees() {
+        let result = update_partstat(SAMPLE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        // Carol's line should still have ACCEPTED (unchanged)
+        for line in result.lines() {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.starts_with("ATTENDEE")
+                && trimmed.to_lowercase().contains("carol@example.com")
+            {
+                assert!(
+                    trimmed.contains("PARTSTAT=ACCEPTED"),
+                    "Carol's PARTSTAT should be unchanged: {trimmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_partstat_case_insensitive_email() {
+        let result = update_partstat(SAMPLE_ICS, "Bob@Example.COM", &RsvpStatus::Tentative);
+        for line in result.lines() {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.starts_with("ATTENDEE") && trimmed.to_lowercase().contains("bob@example.com")
+            {
+                assert!(
+                    trimmed.contains("PARTSTAT=TENTATIVE"),
+                    "Case-insensitive match should update PARTSTAT: {trimmed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_partstat_preserves_full_ics() {
+        let result = update_partstat(SAMPLE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        assert!(result.contains("LOCATION:Conference Room B"));
+        assert!(result.contains("DESCRIPTION:Daily standup meeting"));
+        assert!(result.contains("ORGANIZER;CN=Alice:mailto:alice@example.com"));
+        assert!(result.contains("SUMMARY:Team Standup"));
+        assert!(result.contains("UID:test-uid-123@example.com"));
+        // Should still be parseable
+        let event = parse_ics(&result).unwrap();
+        assert_eq!(event.uid, "test-uid-123@example.com");
+        assert_eq!(event.attendees.len(), 2);
+    }
+
+    #[test]
+    fn update_partstat_no_match_returns_unchanged() {
+        let result = update_partstat(SAMPLE_ICS, "nobody@example.com", &RsvpStatus::Accepted);
+        assert_eq!(result, SAMPLE_ICS);
     }
 
     use chrono::{Datelike, Timelike};
