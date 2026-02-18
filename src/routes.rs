@@ -279,12 +279,11 @@ fn is_safe_path_segment(s: &str) -> bool {
         && !s.contains('\0')
         && s != "."
         && s != ".."
-        && !s.contains("..")
 }
 
 fn sanitize_filename_for_header(name: &str) -> String {
     name.chars()
-        .filter(|&c| c != '"' && c != '\r' && c != '\n')
+        .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n')
         .collect()
 }
 
@@ -728,6 +727,7 @@ mod tests {
         assert!(is_safe_path_segment("blob-abc123"));
         assert!(is_safe_path_segment("report.pdf"));
         assert!(is_safe_path_segment("G1234abcdef"));
+        assert!(is_safe_path_segment("file..backup.pdf"));
     }
 
     #[test]
@@ -737,6 +737,10 @@ mod tests {
         assert_eq!(
             sanitize_filename_for_header("file\r\ninjected"),
             "fileinjected"
+        );
+        assert_eq!(
+            sanitize_filename_for_header("file\\\"name.txt"),
+            "filename.txt"
         );
     }
 
