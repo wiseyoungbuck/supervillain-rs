@@ -1713,7 +1713,11 @@ function linkifyText(text) {
 
 function renderAttachments(attachments, emailId) {
     els.attachments.classList.remove('hidden');
-    els.attachmentsList.innerHTML = attachments.map(att => {
+    const downloadAllBtn = attachments.length > 1
+        ? `<a class="attachments-download-all" onclick="downloadAllAttachments(event)">Download All</a>`
+        : '';
+    const header = `<div class="attachments-header"><span>📎 Attachments (${attachments.length})</span>${downloadAllBtn}</div>`;
+    const items = attachments.map(att => {
         const icon = getFileIcon(att.mime_type, att.name);
         const size = formatFileSize(att.size);
         const url = `/api/emails/${emailId}/attachments/${encodeURIComponent(att.blob_id)}/${encodeURIComponent(att.name)}`;
@@ -1726,6 +1730,15 @@ function renderAttachments(attachments, emailId) {
             </a>
         `;
     }).join('');
+    els.attachmentsList.innerHTML = header + items;
+}
+
+function downloadAllAttachments(e) {
+    e.preventDefault();
+    const links = els.attachmentsList.querySelectorAll('.attachment-item');
+    links.forEach((a, i) => {
+        setTimeout(() => a.click(), i * 200);
+    });
 }
 
 function formatFileSize(bytes) {
