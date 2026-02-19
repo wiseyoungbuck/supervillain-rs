@@ -119,8 +119,27 @@ fn open_browser(url: &str) {
         ("xdg-open", vec![url])
     };
 
-    match std::process::Command::new(cmd).args(&args).spawn() {
-        Ok(_) => tracing::info!("Opened browser via {cmd}"),
+    match std::process::Command::new(cmd)
+        .args(&args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            tracing::info!("Opened browser via {cmd}");
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                if let Some(stderr) = child.stderr.take() {
+                    for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                        if line.contains("DEPRECATED_ENDPOINT") {
+                            tracing::warn!("{line} (known Chromium issue, safe to ignore)");
+                        } else if !line.is_empty() {
+                            tracing::warn!("browser: {line}");
+                        }
+                    }
+                }
+                let _ = child.wait();
+            });
+        }
         Err(e) => tracing::warn!("Failed to open browser via {cmd}: {e}"),
     }
 }
