@@ -456,7 +456,7 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
             } else {
                 name.to_string()
             },
-            mime_type: mime_type.to_string(),
+            mime_type: mime_type.to_ascii_lowercase(),
             size,
         });
     }
