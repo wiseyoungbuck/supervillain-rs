@@ -450,12 +450,11 @@ body:not(.light-theme) #email-body.html-content * {
 }
 
 .compose-body {
-    flex: 1;
     display: flex;
 }
 
 .compose-body textarea {
-    flex: 1;
+    width: 100%;
     background: transparent;
     border: none;
     color: var(--fg);
