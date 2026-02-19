@@ -233,46 +233,8 @@
         <div id="status-bar"></div>
     </div>
 
-    <script>
-    // State
-    // Token storage: localStorage is the only viable option for a PWA that
-    // talks directly to Fastmail's JMAP API (no backend proxy). The token is
-    // scoped to this origin only. Mitigations: host on a dedicated domain,
-    // personal device, locked phone. See THE-133 risk table.
-    const STORAGE_KEY = 'supervillain_session';
-
-    function getSession() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            return raw ? JSON.parse(raw) : null;
-        } catch { return null; }
-    }
-
-    function saveSession(session) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
-    }
-
-    function clearSession() {
-        localStorage.removeItem(STORAGE_KEY);
-    }
-
-    // JMAP session discovery
-    async function connectJmap(username, token) {
-        const resp = await fetch('https://api.fastmail.com/jmap/session', {
-            headers: { 'Authorization': 'Bearer ' + token }
-        });
-        if (!resp.ok) {
-            if (resp.status === 401) throw new Error('Invalid token');
-            throw new Error('Connection failed (' + resp.status + ')');
-        }
-        const data = await resp.json();
-        return {
-            username,
-            token,
-            apiUrl: data.apiUrl,
-            accountId: data.primaryAccounts['urn:ietf:params:jmap:mail'],
-        };
-    }
+    <script type="module">
+    import { connect, getSession, saveSession, clearSession, JmapAuthError } from '/mobile/jmap.js';
 
     // UI transitions
     function showApp(session) {
@@ -292,11 +254,11 @@
         const session = getSession();
         if (session) {
             try {
-                const fresh = await connectJmap(session.username, session.token);
+                const fresh = await connect(session.username, session.token);
                 saveSession(fresh);
                 showApp(fresh);
             } catch (err) {
-                if (err.message === 'Invalid token') {
+                if (err instanceof JmapAuthError) {
                     clearSession();
                     showLogin();
                 } else {
@@ -324,7 +286,7 @@
         btn.textContent = 'Connecting...';
 
         try {
-            const session = await connectJmap(username, token);
+            const session = await connect(username, token);
             saveSession(session);
             showApp(session);
         } catch (err) {

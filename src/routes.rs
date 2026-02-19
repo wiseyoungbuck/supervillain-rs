@@ -17,6 +17,7 @@ const APP_JS: &str = include_str!("../static/app.js");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 
 const MOBILE_HTML: &str = include_str!("../static/mobile/index.html");
+const MOBILE_JMAP_JS: &str = include_str!("../static/mobile/jmap.js");
 const MOBILE_MANIFEST: &str = include_str!("../static/mobile/manifest.json");
 const MOBILE_SW: &str = include_str!("../static/mobile/sw.js");
 const MOBILE_ICON_180: &[u8] = include_bytes!("../static/mobile/icon-180.png");
@@ -69,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile", get(mobile_html))
         .route("/mobile/", get(mobile_html))
         .route("/mobile/index.html", get(mobile_html))
+        .route("/mobile/jmap.js", get(mobile_jmap_js))
         .route("/mobile/manifest.json", get(mobile_manifest))
         .route("/mobile/sw.js", get(mobile_sw))
         .route("/mobile/icon-180.png", get(mobile_icon_180))
@@ -93,6 +95,13 @@ async fn style_css() -> impl IntoResponse {
 
 async fn mobile_html() -> impl IntoResponse {
     ([("content-type", "text/html; charset=utf-8")], MOBILE_HTML)
+}
+
+async fn mobile_jmap_js() -> impl IntoResponse {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        MOBILE_JMAP_JS,
+    )
 }
 
 async fn mobile_manifest() -> impl IntoResponse {
@@ -868,29 +877,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mobile_html_has_jmap_session_discovery() {
-        let text = MOBILE_HTML;
+    #[test]
+    fn mobile_jmap_module_has_session_discovery() {
         assert!(
-            text.contains("api.fastmail.com/jmap/session"),
-            "mobile html should connect directly to Fastmail JMAP"
+            MOBILE_JMAP_JS.contains("api.fastmail.com/jmap/session"),
+            "jmap.js should connect directly to Fastmail JMAP"
         );
         assert!(
-            text.contains("Bearer"),
-            "mobile html should use Bearer token auth"
+            MOBILE_JMAP_JS.contains("Bearer"),
+            "jmap.js should use Bearer token auth"
         );
     }
 
-    #[tokio::test]
-    async fn mobile_html_handles_offline_launch() {
-        let text = MOBILE_HTML;
+    #[test]
+    fn mobile_jmap_module_handles_offline_errors() {
         assert!(
-            text.contains("Invalid token"),
-            "should distinguish auth errors from network errors"
+            MOBILE_JMAP_JS.contains("JmapAuthError"),
+            "jmap.js should throw JmapAuthError on auth failure"
         );
         assert!(
-            text.contains("Network error"),
-            "should handle offline launch with saved session"
+            MOBILE_JMAP_JS.contains("JmapNetworkError"),
+            "jmap.js should throw JmapNetworkError on network failure"
         );
     }
 
@@ -981,6 +988,116 @@ mod tests {
     #[tokio::test]
     async fn mobile_icon_512_serves_png() {
         assert_png_icon(mobile_icon_512().await.into_response(), "512").await;
+    }
+
+    #[tokio::test]
+    async fn mobile_jmap_js_serves_es_module() {
+        let resp = mobile_jmap_js().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/javascript; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("export async function connect("),
+            "jmap.js should export connect()"
+        );
+        assert!(
+            text.contains("export async function jmapCall("),
+            "jmap.js should export jmapCall()"
+        );
+        assert!(
+            text.contains("export function getSession("),
+            "jmap.js should export getSession()"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_has_error_types() {
+        assert!(
+            MOBILE_JMAP_JS.contains("export class JmapAuthError"),
+            "jmap.js should export JmapAuthError"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("export class JmapNetworkError"),
+            "jmap.js should export JmapNetworkError"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_uses_jmap_capabilities() {
+        assert!(
+            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:core"),
+            "jmap.js should declare jmap:core capability"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:mail"),
+            "jmap.js should declare jmap:mail capability"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:submission"),
+            "jmap.js should declare jmap:submission capability"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_handles_auth_errors() {
+        // 401 and 403 should throw auth errors, not network errors
+        assert!(
+            MOBILE_JMAP_JS.contains("resp.status === 401"),
+            "jmap.js should handle 401 status"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("resp.status === 403"),
+            "jmap.js should handle 403 status"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_has_blob_url_builder() {
+        assert!(
+            MOBILE_JMAP_JS.contains("export function blobUrl("),
+            "jmap.js should export blobUrl()"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("{accountId}"),
+            "blobUrl should replace accountId template"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("{blobId}"),
+            "blobUrl should replace blobId template"
+        );
+    }
+
+    #[test]
+    fn mobile_html_imports_jmap_module() {
+        assert!(
+            MOBILE_HTML.contains("type=\"module\""),
+            "mobile html script should be type=module"
+        );
+        assert!(
+            MOBILE_HTML.contains("from '/mobile/jmap.js'"),
+            "mobile html should import from jmap.js"
+        );
+        assert!(
+            MOBILE_HTML.contains("JmapAuthError"),
+            "mobile html should use JmapAuthError for auth detection"
+        );
+    }
+
+    #[test]
+    fn mobile_sw_caches_jmap_js() {
+        assert!(
+            MOBILE_SW.contains("/mobile/jmap.js"),
+            "service worker should cache jmap.js in app shell"
+        );
     }
 }
 
