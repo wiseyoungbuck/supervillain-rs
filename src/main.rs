@@ -89,7 +89,9 @@ async fn main() {
     let url = format!("http://{addr}");
     tracing::info!("Listening on {url}");
 
-    open_browser(&url);
+    if !std::env::args().any(|a| a == "--no-browser") {
+        open_browser(&url);
+    }
 
     axum::serve(listener, app).await.unwrap();
 }
