@@ -2,9 +2,10 @@
 // NOTE: iOS Safari evicts service workers after ~7 days of non-use.
 // The app must work without the service worker; it's for convenience only.
 
-const CACHE_NAME = 'supervillain-v2';
+const CACHE_NAME = 'supervillain-v3';
 const APP_SHELL = [
     '/mobile/',
+    '/mobile/app.js',
     '/mobile/jmap.js',
     '/mobile/manifest.json',
 ];

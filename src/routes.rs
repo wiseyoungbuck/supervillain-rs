@@ -17,6 +17,7 @@ const APP_JS: &str = include_str!("../static/app.js");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 
 const MOBILE_HTML: &str = include_str!("../static/mobile/index.html");
+const MOBILE_APP_JS: &str = include_str!("../static/mobile/app.js");
 const MOBILE_JMAP_JS: &str = include_str!("../static/mobile/jmap.js");
 const MOBILE_MANIFEST: &str = include_str!("../static/mobile/manifest.json");
 const MOBILE_SW: &str = include_str!("../static/mobile/sw.js");
@@ -70,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile", get(mobile_html))
         .route("/mobile/", get(mobile_html))
         .route("/mobile/index.html", get(mobile_html))
+        .route("/mobile/app.js", get(mobile_app_js))
         .route("/mobile/jmap.js", get(mobile_jmap_js))
         .route("/mobile/manifest.json", get(mobile_manifest))
         .route("/mobile/sw.js", get(mobile_sw))
@@ -95,6 +97,13 @@ async fn style_css() -> impl IntoResponse {
 
 async fn mobile_html() -> impl IntoResponse {
     ([("content-type", "text/html; charset=utf-8")], MOBILE_HTML)
+}
+
+async fn mobile_app_js() -> impl IntoResponse {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        MOBILE_APP_JS,
+    )
 }
 
 async fn mobile_jmap_js() -> impl IntoResponse {
@@ -1077,26 +1086,151 @@ mod tests {
     }
 
     #[test]
-    fn mobile_html_imports_jmap_module() {
+    fn mobile_html_imports_app_module() {
         assert!(
             MOBILE_HTML.contains("type=\"module\""),
             "mobile html script should be type=module"
         );
         assert!(
-            MOBILE_HTML.contains("from '/mobile/jmap.js'"),
-            "mobile html should import from jmap.js"
-        );
-        assert!(
-            MOBILE_HTML.contains("JmapAuthError"),
-            "mobile html should use JmapAuthError for auth detection"
+            MOBILE_HTML.contains("src=\"/mobile/app.js\""),
+            "mobile html should load app.js as ES module"
         );
     }
 
     #[test]
-    fn mobile_sw_caches_jmap_js() {
+    fn mobile_html_has_email_list_structure() {
+        assert!(
+            MOBILE_HTML.contains("id=\"email-list-wrap\""),
+            "mobile html should have email list scroll container"
+        );
+        assert!(
+            MOBILE_HTML.contains("id=\"email-list\""),
+            "mobile html should have email list element"
+        );
+        assert!(
+            MOBILE_HTML.contains("id=\"pull-indicator\""),
+            "mobile html should have pull-to-refresh indicator"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_app_js_serves_es_module() {
+        let resp = mobile_app_js().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/javascript; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("from '/mobile/jmap.js'"),
+            "app.js should import from jmap.js"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_email_list_rendering() {
+        assert!(
+            MOBILE_APP_JS.contains("renderEmailList"),
+            "app.js should have renderEmailList function"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("email-row"),
+            "app.js should render email rows"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("getDateGroup"),
+            "app.js should group emails by date"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_pull_to_refresh() {
+        assert!(
+            MOBILE_APP_JS.contains("setupPullToRefresh"),
+            "app.js should set up pull-to-refresh"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("touchstart"),
+            "pull-to-refresh should use touchstart events"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("touchend"),
+            "pull-to-refresh should use touchend events"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_infinite_scroll() {
+        assert!(
+            MOBILE_APP_JS.contains("setupInfiniteScroll"),
+            "app.js should set up infinite scroll"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("loadMoreEmails"),
+            "app.js should load more emails on scroll"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_has_data_functions() {
+        assert!(
+            MOBILE_JMAP_JS.contains("export async function getMailboxes("),
+            "jmap.js should export getMailboxes()"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("export async function getIdentities("),
+            "jmap.js should export getIdentities()"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("export async function queryEmails("),
+            "jmap.js should export queryEmails()"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("export async function getEmails("),
+            "jmap.js should export getEmails()"
+        );
+    }
+
+    #[test]
+    fn mobile_jmap_js_parses_email_keywords() {
+        assert!(
+            MOBILE_JMAP_JS.contains("$seen"),
+            "jmap.js should check $seen keyword for unread status"
+        );
+        assert!(
+            MOBILE_JMAP_JS.contains("$flagged"),
+            "jmap.js should check $flagged keyword for star status"
+        );
+    }
+
+    #[test]
+    fn mobile_sw_caches_app_shell() {
+        assert!(
+            MOBILE_SW.contains("/mobile/app.js"),
+            "service worker should cache app.js in app shell"
+        );
         assert!(
             MOBILE_SW.contains("/mobile/jmap.js"),
             "service worker should cache jmap.js in app shell"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_touch_optimized_styles() {
+        assert!(
+            MOBILE_HTML.contains("min-height: 72px"),
+            "email rows should have min-height for 44px+ touch targets"
+        );
+        assert!(
+            MOBILE_HTML.contains("-webkit-overflow-scrolling: touch"),
+            "email list should use momentum scrolling"
         );
     }
 }

@@ -177,11 +177,130 @@
             padding: 4px 8px;
         }
 
-        #app-content {
+        /* Email list */
+        #email-list-wrap {
             flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        #pull-indicator {
+            height: 0;
+            overflow: hidden;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+            line-height: 40px;
+            transition: height 0.2s, opacity 0.2s;
+        }
+
+        .date-divider {
+            padding: 6px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: var(--bg);
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        .email-row {
+            display: flex;
+            align-items: center;
+            padding: 12px 16px;
+            min-height: 72px;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+        }
+
+        .email-row:active {
+            background: var(--surface-hover);
+        }
+
+        .email-row.unread {
+            background: var(--surface);
+        }
+
+        .email-row-main {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .email-row-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 2px;
+        }
+
+        .email-from {
+            font-size: 15px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .email-row.unread .email-from {
+            color: #fff;
+        }
+
+        .email-date {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-left: 8px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .email-subject {
+            font-size: 14px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 2px;
+        }
+
+        .email-row.unread .email-subject {
+            color: #fff;
+        }
+
+        .email-preview {
+            font-size: 13px;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .email-row-indicators {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            margin-left: 8px;
+            flex-shrink: 0;
+        }
+
+        .email-row-indicators .star {
+            color: #f5a623;
+            font-size: 14px;
+        }
+
+        .email-row-indicators .attach {
+            font-size: 14px;
+        }
+
+        .empty-state {
             display: flex;
             align-items: center;
             justify-content: center;
+            height: 200px;
             color: var(--text-muted);
             font-size: 15px;
         }
@@ -192,6 +311,7 @@
             font-size: 12px;
             color: var(--text-muted);
             text-align: center;
+            min-height: 29px;
         }
     </style>
 </head>
@@ -227,89 +347,13 @@
             <span class="title">Supervillain</span>
             <button class="logout-btn" id="logout-btn">Sign out</button>
         </div>
-        <div id="app-content">
-            Connected. Email views coming soon.
+        <div id="email-list-wrap">
+            <div id="pull-indicator">Pull to refresh</div>
+            <div id="email-list"></div>
         </div>
         <div id="status-bar"></div>
     </div>
 
-    <script type="module">
-    import { connect, getSession, saveSession, clearSession, JmapAuthError } from '/mobile/jmap.js';
-
-    // UI transitions
-    function showApp(session) {
-        document.getElementById('login-screen').classList.add('hidden');
-        document.getElementById('app-shell').classList.add('active');
-        document.getElementById('status-bar').textContent =
-            'Connected as ' + session.username;
-    }
-
-    function showLogin() {
-        document.getElementById('app-shell').classList.remove('active');
-        document.getElementById('login-screen').classList.remove('hidden');
-    }
-
-    // Boot
-    async function init() {
-        const session = getSession();
-        if (session) {
-            try {
-                const fresh = await connect(session.username, session.token);
-                saveSession(fresh);
-                showApp(fresh);
-            } catch (err) {
-                if (err instanceof JmapAuthError) {
-                    clearSession();
-                    showLogin();
-                } else {
-                    // Network error — use saved session (supports offline launch)
-                    showApp(session);
-                }
-            }
-        }
-    }
-
-    // Login handler
-    document.getElementById('login-btn').addEventListener('click', async () => {
-        const username = document.getElementById('login-username').value.trim();
-        const token = document.getElementById('login-token').value.trim();
-        const errorEl = document.getElementById('login-error');
-        errorEl.textContent = '';
-
-        if (!username || !token) {
-            errorEl.textContent = 'Both fields are required.';
-            return;
-        }
-
-        const btn = document.getElementById('login-btn');
-        btn.disabled = true;
-        btn.textContent = 'Connecting...';
-
-        try {
-            const session = await connect(username, token);
-            saveSession(session);
-            showApp(session);
-        } catch (err) {
-            errorEl.textContent = err.message;
-        } finally {
-            btn.disabled = false;
-            btn.textContent = 'Connect';
-        }
-    });
-
-    // Logout handler
-    document.getElementById('logout-btn').addEventListener('click', () => {
-        clearSession();
-        showLogin();
-    });
-
-    // Register service worker
-    if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/mobile/sw.js', { scope: '/mobile/' })
-            .catch(() => {}); // SW is convenience, not required
-    }
-
-    init();
-    </script>
+    <script type="module" src="/mobile/app.js"></script>
 </body>
 </html>
