@@ -84,7 +84,12 @@ export async function connect(username, token) {
         throw new JmapNetworkError('Connection failed (' + resp.status + ')');
     }
 
-    const data = await resp.json();
+    let data;
+    try {
+        data = await resp.json();
+    } catch (err) {
+        throw new JmapNetworkError('Invalid JSON in session response');
+    }
 
     return {
         username,
@@ -141,7 +146,11 @@ export async function jmapCall(session, methodCalls) {
         throw new JmapNetworkError('JMAP call failed: HTTP ' + resp.status);
     }
 
-    return resp.json();
+    try {
+        return await resp.json();
+    } catch (err) {
+        throw new JmapNetworkError('Invalid JSON in JMAP response');
+    }
 }
 
 // ============================================================================
@@ -151,6 +160,7 @@ export async function jmapCall(session, methodCalls) {
 /**
  * Build a blob download URL from the session's downloadUrl template.
  * Mirrors src/jmap.rs download logic (lines 1007-1012).
+ * Assumes Fastmail's simple RFC 6570 URI template form ({var}).
  *
  * @param {Object} session - Session object
  * @param {string} blobId - Blob ID
