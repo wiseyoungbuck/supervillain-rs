@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+    <title>Supervillain</title>
+
+    <!-- PWA meta -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Supervillain">
+    <meta name="theme-color" content="#1a1a2e">
+    <link rel="manifest" href="/mobile/manifest.json">
+
+    <!-- Apple touch icon -->
+    <link rel="apple-touch-icon" href="/mobile/icon-180.png">
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --surface-hover: #1a2744;
+            --text: #e0e0e0;
+            --text-muted: #888;
+            --accent: #e94560;
+            --accent-dim: #b8364d;
+            --border: #2a2a4a;
+            --safe-top: env(safe-area-inset-top, 0px);
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --safe-left: env(safe-area-inset-left, 0px);
+            --safe-right: env(safe-area-inset-right, 0px);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            height: 100dvh;
+            overflow: hidden;
+            -webkit-text-size-adjust: 100%;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        /* Login screen */
+        #login-screen {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100dvh;
+            padding: 24px;
+            padding-top: calc(24px + var(--safe-top));
+        }
+
+        #login-screen.hidden { display: none; }
+
+        .login-title {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: var(--accent);
+        }
+
+        .login-subtitle {
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-bottom: 32px;
+            text-align: center;
+            line-height: 1.4;
+        }
+
+        .login-field {
+            width: 100%;
+            max-width: 360px;
+            margin-bottom: 16px;
+        }
+
+        .login-field label {
+            display: block;
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .login-field input {
+            width: 100%;
+            padding: 12px 14px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 16px; /* prevents iOS zoom on focus */
+            outline: none;
+        }
+
+        .login-field input:focus {
+            border-color: var(--accent);
+        }
+
+        .login-btn {
+            width: 100%;
+            max-width: 360px;
+            padding: 14px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+
+        .login-btn:active {
+            background: var(--accent-dim);
+        }
+
+        .login-error {
+            color: var(--accent);
+            font-size: 13px;
+            margin-top: 12px;
+            text-align: center;
+            min-height: 20px;
+        }
+
+        .login-help {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 24px;
+            text-align: center;
+            line-height: 1.5;
+            max-width: 360px;
+        }
+
+        .login-help a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        /* App shell (hidden until logged in) */
+        #app-shell {
+            display: none;
+            flex-direction: column;
+            height: 100dvh;
+            padding-top: var(--safe-top);
+            padding-bottom: var(--safe-bottom);
+            padding-left: var(--safe-left);
+            padding-right: var(--safe-right);
+        }
+
+        #app-shell.active {
+            display: flex;
+        }
+
+        #app-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            min-height: 48px;
+        }
+
+        #app-header .title {
+            font-size: 17px;
+            font-weight: 600;
+        }
+
+        #app-header .logout-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 14px;
+            cursor: pointer;
+            padding: 4px 8px;
+        }
+
+        #app-content {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            font-size: 15px;
+        }
+
+        #status-bar {
+            padding: 8px 16px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: var(--text-muted);
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <!-- Login -->
+    <div id="login-screen">
+        <div class="login-title">Supervillain</div>
+        <div class="login-subtitle">
+            Mobile email client for Fastmail.<br>
+            Enter your JMAP API credentials to get started.
+        </div>
+        <div class="login-field">
+            <label for="login-username">Fastmail username</label>
+            <input type="email" id="login-username" placeholder="you@fastmail.com" autocapitalize="off" autocorrect="off">
+        </div>
+        <div class="login-field">
+            <label for="login-token">API token</label>
+            <input type="password" id="login-token" placeholder="fmu1-...">
+        </div>
+        <button class="login-btn" id="login-btn">Connect</button>
+        <div class="login-error" id="login-error"></div>
+        <div class="login-help">
+            Generate an API token at<br>
+            <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">
+                Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; API tokens
+            </a>
+        </div>
+    </div>
+
+    <!-- App shell (shown after login) -->
+    <div id="app-shell">
+        <div id="app-header">
+            <span class="title">Supervillain</span>
+            <button class="logout-btn" id="logout-btn">Sign out</button>
+        </div>
+        <div id="app-content">
+            Connected. Email views coming soon.
+        </div>
+        <div id="status-bar" id="status-bar"></div>
+    </div>
+
+    <script>
+    // State
+    const STORAGE_KEY = 'supervillain_session';
+
+    function getSession() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+    }
+
+    function saveSession(session) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+    }
+
+    function clearSession() {
+        localStorage.removeItem(STORAGE_KEY);
+    }
+
+    // JMAP session discovery
+    async function connectJmap(username, token) {
+        const resp = await fetch('https://api.fastmail.com/jmap/session', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        });
+        if (!resp.ok) {
+            if (resp.status === 401) throw new Error('Invalid token');
+            throw new Error('Connection failed (' + resp.status + ')');
+        }
+        const data = await resp.json();
+        return {
+            username,
+            token,
+            apiUrl: data.apiUrl,
+            accountId: data.primaryAccounts['urn:ietf:params:jmap:mail'],
+        };
+    }
+
+    // UI transitions
+    function showApp(session) {
+        document.getElementById('login-screen').classList.add('hidden');
+        document.getElementById('app-shell').classList.add('active');
+        document.getElementById('status-bar').textContent =
+            'Connected as ' + session.username;
+    }
+
+    function showLogin() {
+        document.getElementById('app-shell').classList.remove('active');
+        document.getElementById('login-screen').classList.remove('hidden');
+    }
+
+    // Boot
+    async function init() {
+        const session = getSession();
+        if (session) {
+            // Verify saved session still works
+            try {
+                await connectJmap(session.username, session.token);
+                showApp(session);
+            } catch {
+                clearSession();
+                showLogin();
+            }
+        }
+    }
+
+    // Login handler
+    document.getElementById('login-btn').addEventListener('click', async () => {
+        const username = document.getElementById('login-username').value.trim();
+        const token = document.getElementById('login-token').value.trim();
+        const errorEl = document.getElementById('login-error');
+        errorEl.textContent = '';
+
+        if (!username || !token) {
+            errorEl.textContent = 'Both fields are required.';
+            return;
+        }
+
+        const btn = document.getElementById('login-btn');
+        btn.disabled = true;
+        btn.textContent = 'Connecting...';
+
+        try {
+            const session = await connectJmap(username, token);
+            saveSession(session);
+            showApp(session);
+        } catch (err) {
+            errorEl.textContent = err.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Connect';
+        }
+    });
+
+    // Logout handler
+    document.getElementById('logout-btn').addEventListener('click', () => {
+        clearSession();
+        showLogin();
+    });
+
+    // Register service worker
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/mobile/sw.js')
+            .catch(() => {}); // SW is convenience, not required
+    }
+
+    init();
+    </script>
+</body>
+</html>

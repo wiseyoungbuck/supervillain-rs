@@ -16,6 +16,13 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 
+const MOBILE_HTML: &str = include_str!("../static/mobile/index.html");
+const MOBILE_MANIFEST: &str = include_str!("../static/mobile/manifest.json");
+const MOBILE_SW: &str = include_str!("../static/mobile/sw.js");
+const MOBILE_ICON_180: &[u8] = include_bytes!("../static/mobile/icon-180.png");
+const MOBILE_ICON_192: &[u8] = include_bytes!("../static/mobile/icon-192.png");
+const MOBILE_ICON_512: &[u8] = include_bytes!("../static/mobile/icon-512.png");
+
 // =============================================================================
 // Router
 // =============================================================================
@@ -58,6 +65,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/index.html", get(index_html))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        // Mobile PWA
+        .route("/mobile", get(mobile_html))
+        .route("/mobile/", get(mobile_html))
+        .route("/mobile/index.html", get(mobile_html))
+        .route("/mobile/manifest.json", get(mobile_manifest))
+        .route("/mobile/sw.js", get(mobile_sw))
+        .route("/mobile/icon-180.png", get(mobile_icon_180))
+        .route("/mobile/icon-192.png", get(mobile_icon_192))
+        .route("/mobile/icon-512.png", get(mobile_icon_512))
 }
 
 async fn index_html() -> impl IntoResponse {
@@ -73,6 +89,39 @@ async fn app_js() -> impl IntoResponse {
 
 async fn style_css() -> impl IntoResponse {
     ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
+}
+
+async fn mobile_html() -> impl IntoResponse {
+    ([("content-type", "text/html; charset=utf-8")], MOBILE_HTML)
+}
+
+async fn mobile_manifest() -> impl IntoResponse {
+    (
+        [("content-type", "application/manifest+json; charset=utf-8")],
+        MOBILE_MANIFEST,
+    )
+}
+
+async fn mobile_sw() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("service-worker-allowed", "/mobile/"),
+        ],
+        MOBILE_SW,
+    )
+}
+
+async fn mobile_icon_180() -> impl IntoResponse {
+    ([("content-type", "image/png")], MOBILE_ICON_180)
+}
+
+async fn mobile_icon_192() -> impl IntoResponse {
+    ([("content-type", "image/png")], MOBILE_ICON_192)
+}
+
+async fn mobile_icon_512() -> impl IntoResponse {
+    ([("content-type", "image/png")], MOBILE_ICON_512)
 }
 
 // =============================================================================
