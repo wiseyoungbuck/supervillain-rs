@@ -830,6 +830,158 @@ mod tests {
             "clearCompose should default to the first identity's email"
         );
     }
+
+    // =========================================================================
+    // Mobile PWA tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn mobile_html_serves_pwa_shell() {
+        let resp = mobile_html().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("<html"),
+            "mobile html should contain <html tag"
+        );
+        assert!(
+            text.contains("apple-mobile-web-app-capable"),
+            "mobile html should have iOS PWA meta tag"
+        );
+        assert!(
+            text.contains("manifest.json"),
+            "mobile html should link to manifest"
+        );
+        assert!(
+            text.contains("viewport-fit=cover"),
+            "mobile html should use viewport-fit=cover for notch support"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_html_has_jmap_session_discovery() {
+        let text = MOBILE_HTML;
+        assert!(
+            text.contains("api.fastmail.com/jmap/session"),
+            "mobile html should connect directly to Fastmail JMAP"
+        );
+        assert!(
+            text.contains("Bearer"),
+            "mobile html should use Bearer token auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_html_handles_offline_launch() {
+        let text = MOBILE_HTML;
+        assert!(
+            text.contains("Invalid token"),
+            "should distinguish auth errors from network errors"
+        );
+        assert!(
+            text.contains("Network error"),
+            "should handle offline launch with saved session"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_manifest_serves_json() {
+        let resp = mobile_manifest().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/manifest+json; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body).expect("manifest should be valid JSON");
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["start_url"], "/mobile/");
+        assert!(
+            manifest["icons"].as_array().unwrap().len() >= 2,
+            "manifest should have at least 2 icon sizes"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_sw_serves_javascript_with_scope_header() {
+        let resp = mobile_sw().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/javascript; charset=utf-8");
+        let scope = resp
+            .headers()
+            .get("service-worker-allowed")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(scope, "/mobile/");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("api.fastmail.com"),
+            "SW should exclude JMAP API from caching"
+        );
+        assert!(
+            text.contains("resp.ok"),
+            "SW should only cache successful responses"
+        );
+    }
+
+    async fn assert_png_icon(resp: axum::response::Response, label: &str) {
+        assert_eq!(resp.status(), StatusCode::OK, "icon-{label} should be OK");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "image/png", "icon-{label} should be image/png");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "icon-{label} should have PNG magic bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_icon_180_serves_png() {
+        assert_png_icon(mobile_icon_180().await.into_response(), "180").await;
+    }
+
+    #[tokio::test]
+    async fn mobile_icon_192_serves_png() {
+        assert_png_icon(mobile_icon_192().await.into_response(), "192").await;
+    }
+
+    #[tokio::test]
+    async fn mobile_icon_512_serves_png() {
+        assert_png_icon(mobile_icon_512().await.into_response(), "512").await;
+    }
 }
 
 // External dep for theme path
