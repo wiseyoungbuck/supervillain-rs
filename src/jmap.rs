@@ -395,21 +395,26 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
 
 pub fn find_attachments(body_structure: &serde_json::Value) -> Vec<Attachment> {
     let mut attachments = Vec::new();
-    collect_attachments(body_structure, &mut attachments);
+    collect_attachments(body_structure, false, &mut attachments);
     attachments
 }
 
-fn collect_attachments(part: &serde_json::Value, out: &mut Vec<Attachment>) {
+fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec<Attachment>) {
     if part.is_null() {
         return;
     }
 
     let mime_type = part["type"].as_str().unwrap_or_default().to_lowercase();
 
-    // Recurse into sub-parts for multipart types
-    if let Some(sub_parts) = part["subParts"].as_array() {
+    // Recurse into sub-parts for multipart types.
+    // JMAP returns "subParts": [] on leaf nodes, so only treat non-empty arrays
+    // as multipart containers.
+    if let Some(sub_parts) = part["subParts"].as_array()
+        && !sub_parts.is_empty()
+    {
+        let child_in_related = mime_type == "multipart/related";
         for sub in sub_parts {
-            collect_attachments(sub, out);
+            collect_attachments(sub, in_related || child_in_related, out);
         }
         return;
     }
@@ -425,13 +430,15 @@ fn collect_attachments(part: &serde_json::Value, out: &mut Vec<Attachment>) {
         .to_lowercase();
     let name = part["name"].as_str().unwrap_or_default();
 
-    // Skip inline parts (e.g. inline images rendered in the HTML body)
-    if disposition == "inline" {
+    // Skip inline parts only when inside multipart/related (HTML-embedded images).
+    // Gmail marks user-attached photos as disposition=inline in multipart/mixed,
+    // so those should still appear as downloadable attachments.
+    if disposition == "inline" && in_related {
         return;
     }
 
-    // Include if explicitly marked as attachment, or has a filename
-    if disposition == "attachment" || !name.is_empty() {
+    // Include if explicitly marked as attachment, inline (outside related), or has a filename
+    if disposition == "attachment" || disposition == "inline" || !name.is_empty() {
         let blob_id = match part["blobId"].as_str() {
             Some(id) => id.to_string(),
             None => return,
@@ -698,13 +705,10 @@ fn build_draft_email(
         ),
     );
     m.insert("subject".into(), serde_json::json!(sub.subject));
-    m.insert(
-        "textBody".into(),
-        serde_json::json!([{
-            "partId": "body",
-            "type": "text/plain"
-        }]),
-    );
+
+    // JMAP RFC 8621: when bodyStructure is given, textBody/htmlBody MUST NOT
+    // appear at the top level.  We always set bodyStructure, so content is
+    // defined entirely through bodyStructure + bodyValues with partId refs.
 
     debug_assert!(
         sub.calendar_ics.is_none() || sub.html_body.is_none(),
@@ -730,13 +734,6 @@ fn build_draft_email(
             }),
         );
     } else if let Some(ref html) = sub.html_body {
-        m.insert(
-            "htmlBody".into(),
-            serde_json::json!([{
-                "partId": "html",
-                "type": "text/html"
-            }]),
-        );
         m.insert(
             "bodyValues".into(),
             serde_json::json!({
@@ -822,7 +819,11 @@ pub async fn send_email(
             Some(id) => id,
             None => match &s.identity_id {
                 Some(id) => id.clone(),
-                None => return Ok(None),
+                None => {
+                    return Err(Error::Internal(format!(
+                        "No identity found for {from_addr}"
+                    )));
+                }
             },
         }
     } else {
@@ -833,7 +834,7 @@ pub async fn send_email(
                 get_identities(s).await?;
                 match &s.identity_id {
                     Some(id) => id.clone(),
-                    None => return Ok(None),
+                    None => return Err(Error::Internal("No identities configured".into())),
                 }
             }
         }
@@ -899,17 +900,25 @@ pub async fn send_email(
     let email_created = &resp["methodResponses"][0][1]["created"]["draft"];
     if email_created.is_null() {
         let not_created = &resp["methodResponses"][0][1]["notCreated"];
-        if !not_created.is_null() {
-            tracing::warn!("Email creation failed: {not_created}");
-            return Ok(None);
-        }
-        return Ok(None);
+        let detail = if not_created.is_null() {
+            "no detail".into()
+        } else {
+            not_created.to_string()
+        };
+        return Err(Error::Internal(format!("Email creation failed: {detail}")));
     }
 
     let submission = &resp["methodResponses"][1][1]["created"]["send"];
     if submission.is_null() {
-        tracing::warn!("Email submission failed");
-        return Ok(None);
+        let not_created = &resp["methodResponses"][1][1]["notCreated"];
+        let detail = if not_created.is_null() {
+            "no detail".into()
+        } else {
+            not_created.to_string()
+        };
+        return Err(Error::Internal(format!(
+            "Email submission failed: {detail}"
+        )));
     }
 
     // Return the email ID
@@ -1256,15 +1265,55 @@ mod tests {
     }
 
     #[test]
-    fn find_attachments_inline_skipped() {
+    fn find_attachments_inline_skipped_in_related() {
+        // Inline images inside multipart/related are HTML-embedded and should be skipped
         let body = serde_json::json!({
-            "type": "image/png",
-            "blobId": "blob-img",
-            "name": "logo.png",
-            "size": 2000,
-            "disposition": "inline"
+            "type": "multipart/related",
+            "subParts": [
+                {
+                    "type": "text/html", "blobId": "b1", "partId": "1",
+                    "subParts": []
+                },
+                {
+                    "type": "image/png",
+                    "blobId": "blob-img",
+                    "name": "logo.png",
+                    "size": 2000,
+                    "disposition": "inline",
+                    "subParts": []
+                }
+            ]
         });
         assert!(find_attachments(&body).is_empty());
+    }
+
+    #[test]
+    fn find_attachments_inline_in_mixed_included() {
+        // Gmail marks user-attached photos as inline in multipart/mixed —
+        // these should appear as downloadable attachments
+        let body = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                {
+                    "type": "image/jpeg",
+                    "blobId": "blob-photo",
+                    "name": "image0.jpeg",
+                    "size": 148587,
+                    "disposition": "inline",
+                    "subParts": []
+                },
+                {
+                    "type": "text/plain",
+                    "blobId": "blob-text",
+                    "partId": "2",
+                    "size": 21,
+                    "subParts": []
+                }
+            ]
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "image0.jpeg");
     }
 
     #[test]
@@ -1314,6 +1363,46 @@ mod tests {
         assert_eq!(atts.len(), 2);
         assert_eq!(atts[0].name, "photo.jpg");
         assert_eq!(atts[1].name, "files.zip");
+    }
+
+    #[test]
+    fn find_attachments_leaf_with_empty_subparts() {
+        // JMAP returns "subParts": [] on leaf nodes, not absent.
+        // This previously caused attachments to be missed because the code
+        // treated any part with a subParts array as a multipart container.
+        let body = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                {
+                    "type": "multipart/related",
+                    "subParts": [
+                        {
+                            "type": "multipart/alternative",
+                            "subParts": [
+                                { "type": "text/plain", "blobId": "b1", "partId": "1.1.1", "subParts": [] },
+                                { "type": "text/html", "blobId": "b2", "partId": "1.1.2", "subParts": [] }
+                            ]
+                        },
+                        {
+                            "type": "image/jpeg", "blobId": "b3", "name": "inline.jpg",
+                            "disposition": "inline", "size": 3560, "subParts": []
+                        }
+                    ]
+                },
+                {
+                    "type": "application/pdf",
+                    "blobId": "blob-pdf",
+                    "name": "Benefits_Guide.pdf",
+                    "disposition": "attachment",
+                    "size": 739855,
+                    "subParts": []
+                }
+            ]
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "Benefits_Guide.pdf");
+        assert_eq!(atts[0].size, 739855);
     }
 
     // --- build_draft_email tests ---
@@ -1693,11 +1782,12 @@ mod tests {
         // AC-6: Regression — existing text-only behavior unchanged
         let sub = simple_submission();
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
-        let text_body = &draft["textBody"];
-        assert_eq!(text_body[0]["type"], "text/plain");
-        assert_eq!(text_body[0]["partId"], "body");
+        // RFC 8621: textBody/htmlBody must NOT appear when bodyStructure is set
+        assert!(
+            !draft.contains_key("textBody"),
+            "textBody must not be set when bodyStructure is present"
+        );
         assert_eq!(draft["bodyValues"]["body"]["value"], "Hello");
-        // Finding #4: text-only drafts should also have bodyStructure
         assert!(
             draft.contains_key("bodyStructure"),
             "Text-only draft should have bodyStructure"
@@ -1724,17 +1814,14 @@ mod tests {
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
-        // Should have htmlBody key with text/html part
+        // RFC 8621: textBody/htmlBody must NOT appear when bodyStructure is set
         assert!(
-            draft.contains_key("htmlBody"),
-            "Draft should include htmlBody when html_body is Some"
+            !draft.contains_key("textBody"),
+            "textBody must not be set when bodyStructure is present"
         );
-        let html_body = &draft["htmlBody"];
-        assert!(!html_body.is_null(), "htmlBody should not be null");
-        // htmlBody entry should have type text/html
-        assert_eq!(
-            html_body[0]["type"], "text/html",
-            "htmlBody part should have type text/html"
+        assert!(
+            !draft.contains_key("htmlBody"),
+            "htmlBody must not be set when bodyStructure is present"
         );
         // bodyValues should contain the HTML content
         let body_values = draft["bodyValues"]
@@ -1749,7 +1836,7 @@ mod tests {
             .values()
             .any(|v| v["value"].as_str() == Some("Hello, world!"));
         assert!(has_text, "bodyValues should still contain the text content");
-        // Finding #1: draft should have bodyStructure with multipart/alternative
+        // bodyStructure with multipart/alternative
         assert!(
             draft.contains_key("bodyStructure"),
             "Multipart draft should have bodyStructure"

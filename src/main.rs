@@ -84,7 +84,7 @@ async fn main() {
 
     let addr = "127.0.0.1:8000";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
-        panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').last().unwrap_or("8000"));
+        panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));
     });
     let url = format!("http://{addr}");
     tracing::info!("Listening on {url}");
@@ -129,7 +129,10 @@ fn open_browser(url: &str) {
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 if let Some(stderr) = child.stderr.take() {
-                    for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    for line in std::io::BufReader::new(stderr)
+                        .lines()
+                        .map_while(Result::ok)
+                    {
                         if line.contains("DEPRECATED_ENDPOINT") {
                             tracing::warn!("{line} (known Chromium issue, safe to ignore)");
                         } else if !line.is_empty() {

@@ -236,31 +236,30 @@ async fn get_email(
     let mut calendar_event = None;
     if email.has_calendar
         && let Ok(Some(ics_data)) = jmap::get_calendar_data(&session, &email_id).await
+        && let Some(event) = calendar::parse_ics(&ics_data)
     {
-        if let Some(event) = calendar::parse_ics(&ics_data) {
-            // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
-            if event.method == "REQUEST" {
-                let state_clone = state.clone();
-                let ics_clone = ics_data.clone();
-                let uid = event.uid.clone();
-                tokio::spawn(async move {
-                    let s = state_clone.session.read().await;
-                    if let Err(e) = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await {
-                        tracing::warn!("CalDAV auto-add failed for {uid}: {e}");
-                    }
-                });
-            } else if event.method == "CANCEL" {
-                let state_clone = state.clone();
-                let uid = event.uid.clone();
-                tokio::spawn(async move {
-                    let s = state_clone.session.read().await;
-                    if let Err(e) = jmap::remove_from_calendar(&s, &uid).await {
-                        tracing::warn!("CalDAV auto-remove failed for {uid}: {e}");
-                    }
-                });
-            }
-            calendar_event = Some(event);
+        // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
+        if event.method == "REQUEST" {
+            let state_clone = state.clone();
+            let ics_clone = ics_data.clone();
+            let uid = event.uid.clone();
+            tokio::spawn(async move {
+                let s = state_clone.session.read().await;
+                if let Err(e) = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await {
+                    tracing::warn!("CalDAV auto-add failed for {uid}: {e}");
+                }
+            });
+        } else if event.method == "CANCEL" {
+            let state_clone = state.clone();
+            let uid = event.uid.clone();
+            tokio::spawn(async move {
+                let s = state_clone.session.read().await;
+                if let Err(e) = jmap::remove_from_calendar(&s, &uid).await {
+                    tracing::warn!("CalDAV auto-remove failed for {uid}: {e}");
+                }
+            });
         }
+        calendar_event = Some(event);
     }
 
     Ok(Json(serde_json::json!({
