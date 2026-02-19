@@ -404,41 +404,45 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
         return;
     }
 
-    let mime_type = part["type"].as_str().unwrap_or_default().to_lowercase();
+    let mime_type = part["type"].as_str().unwrap_or_default();
 
     // Recurse into sub-parts for multipart types.
     // JMAP returns "subParts": [] on leaf nodes, so only treat non-empty arrays
-    // as multipart containers.
+    // as multipart containers.  Only direct children of multipart/related get
+    // the in_related flag — nested multipart/mixed subtrees reset it.
     if let Some(sub_parts) = part["subParts"].as_array()
         && !sub_parts.is_empty()
     {
-        let child_in_related = mime_type == "multipart/related";
+        let child_in_related = mime_type.eq_ignore_ascii_case("multipart/related");
         for sub in sub_parts {
-            collect_attachments(sub, in_related || child_in_related, out);
+            collect_attachments(sub, child_in_related, out);
         }
         return;
     }
 
     // Skip body content types
-    if mime_type == "text/plain" || mime_type == "text/html" || mime_type == "text/calendar" {
+    if mime_type.eq_ignore_ascii_case("text/plain")
+        || mime_type.eq_ignore_ascii_case("text/html")
+        || mime_type.eq_ignore_ascii_case("text/calendar")
+    {
         return;
     }
 
-    let disposition = part["disposition"]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
+    let disposition = part["disposition"].as_str().unwrap_or_default();
     let name = part["name"].as_str().unwrap_or_default();
 
-    // Skip inline parts only when inside multipart/related (HTML-embedded images).
+    // Skip inline parts only inside multipart/related (HTML-embedded images).
     // Gmail marks user-attached photos as disposition=inline in multipart/mixed,
     // so those should still appear as downloadable attachments.
-    if disposition == "inline" && in_related {
+    if disposition.eq_ignore_ascii_case("inline") && in_related {
         return;
     }
 
     // Include if explicitly marked as attachment, inline (outside related), or has a filename
-    if disposition == "attachment" || disposition == "inline" || !name.is_empty() {
+    if disposition.eq_ignore_ascii_case("attachment")
+        || disposition.eq_ignore_ascii_case("inline")
+        || !name.is_empty()
+    {
         let blob_id = match part["blobId"].as_str() {
             Some(id) => id.to_string(),
             None => return,
@@ -452,7 +456,7 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
             } else {
                 name.to_string()
             },
-            mime_type: mime_type.clone(),
+            mime_type: mime_type.to_string(),
             size,
         });
     }
@@ -1314,6 +1318,35 @@ mod tests {
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "image0.jpeg");
+    }
+
+    #[test]
+    fn find_attachments_mixed_inside_related_not_suppressed() {
+        // A multipart/mixed nested inside multipart/related should NOT
+        // suppress its inline attachments — in_related is scoped to
+        // direct children only.
+        let body = serde_json::json!({
+            "type": "multipart/related",
+            "subParts": [
+                { "type": "text/html", "blobId": "b1", "partId": "1", "subParts": [] },
+                {
+                    "type": "multipart/mixed",
+                    "subParts": [
+                        {
+                            "type": "image/png",
+                            "blobId": "blob-photo",
+                            "name": "photo.png",
+                            "size": 5000,
+                            "disposition": "inline",
+                            "subParts": []
+                        }
+                    ]
+                }
+            ]
+        });
+        let atts = find_attachments(&body);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].name, "photo.png");
     }
 
     #[test]
