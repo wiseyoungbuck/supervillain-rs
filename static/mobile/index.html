@@ -230,11 +230,15 @@
         <div id="app-content">
             Connected. Email views coming soon.
         </div>
-        <div id="status-bar" id="status-bar"></div>
+        <div id="status-bar"></div>
     </div>
 
     <script>
     // State
+    // Token storage: localStorage is the only viable option for a PWA that
+    // talks directly to Fastmail's JMAP API (no backend proxy). The token is
+    // scoped to this origin only. Mitigations: host on a dedicated domain,
+    // personal device, locked phone. See THE-133 risk table.
     const STORAGE_KEY = 'supervillain_session';
 
     function getSession() {
@@ -287,13 +291,18 @@
     async function init() {
         const session = getSession();
         if (session) {
-            // Verify saved session still works
             try {
-                await connectJmap(session.username, session.token);
-                showApp(session);
-            } catch {
-                clearSession();
-                showLogin();
+                const fresh = await connectJmap(session.username, session.token);
+                saveSession(fresh);
+                showApp(fresh);
+            } catch (err) {
+                if (err.message === 'Invalid token') {
+                    clearSession();
+                    showLogin();
+                } else {
+                    // Network error — use saved session (supports offline launch)
+                    showApp(session);
+                }
             }
         }
     }
@@ -334,7 +343,7 @@
 
     // Register service worker
     if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/mobile/sw.js')
+        navigator.serviceWorker.register('/mobile/sw.js', { scope: '/mobile/' })
             .catch(() => {}); // SW is convenience, not required
     }
 
