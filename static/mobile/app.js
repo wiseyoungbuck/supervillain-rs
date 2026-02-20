@@ -21,7 +21,8 @@ const state = {
     loadingMore: false,
 };
 
-const CACHE_LIMIT = 100;  // Reduced from 150 for mobile memory (per Fleury)
+const PAGE_SIZE = 50;
+const CACHE_LIMIT = 200;  // Max emails kept in memory (per Fleury, lower than desktop)
 
 // ============================================================================
 // Date formatting (reused from desktop app.js)
@@ -88,7 +89,7 @@ async function loadEmails(refresh = false) {
     state.loading = true;
     showStatus('Loading...');
     try {
-        const ids = await queryEmails(state.session, state.inboxId, CACHE_LIMIT, 0);
+        const ids = await queryEmails(state.session, state.inboxId, PAGE_SIZE, 0);
         if (ids.length) {
             state.emails = await getEmails(state.session, ids);
         } else {
@@ -115,7 +116,7 @@ async function loadMoreEmails() {
     try {
         const ids = await queryEmails(
             state.session, state.inboxId,
-            50, state.emails.length
+            PAGE_SIZE, state.emails.length
         );
         if (ids.length) {
             const existingIds = new Set(state.emails.map(e => e.id));
@@ -156,7 +157,7 @@ function renderEmailList() {
             divider = '<div class="date-divider"><span>' + escapeHtml(group) + '</span></div>';
         }
         return divider +
-            '<div class="email-row' + (email.isUnread ? ' unread' : '') + '" data-id="' + email.id + '">' +
+            '<div class="email-row' + (email.isUnread ? ' unread' : '') + '" data-id="' + escapeHtml(email.id) + '">' +
                 '<div class="email-row-main">' +
                     '<div class="email-row-top">' +
                         '<span class="email-from">' + escapeHtml(fromDisplay) + '</span>' +
@@ -219,12 +220,15 @@ function setupPullToRefresh() {
     listWrap.addEventListener('touchmove', (e) => {
         if (!pulling) return;
         const dy = e.touches[0].clientY - pullStartY;
-        const indicator = document.getElementById('pull-indicator');
-        if (dy > 0 && dy < 120) {
-            indicator.style.height = dy + 'px';
-            indicator.style.opacity = Math.min(dy / 60, 1);
+        if (dy > 0) {
+            e.preventDefault();
+            const indicator = document.getElementById('pull-indicator');
+            if (dy < 120) {
+                indicator.style.height = dy + 'px';
+                indicator.style.opacity = Math.min(dy / 60, 1);
+            }
         }
-    }, { passive: true });
+    }, { passive: false });
 
     listWrap.addEventListener('touchend', () => {
         if (!pulling) return;
@@ -285,6 +289,8 @@ async function init() {
                 showApp(session);
             }
         }
+    } else {
+        showLogin();
     }
 }
 
