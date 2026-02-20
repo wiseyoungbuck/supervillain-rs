@@ -1281,6 +1281,8 @@ function clearCompose() {
     els.composeFileInput.value = '';
 }
 
+let attachmentIdCounter = 0;
+
 function handleFileSelect() {
     const files = els.composeFileInput.files;
     if (!files.length) return;
@@ -1289,9 +1291,10 @@ function handleFileSelect() {
             showStatus(`${file.name} is too large (max 25 MB)`, 'error');
             continue;
         }
-        const index = state.pendingAttachments.length;
+        const id = ++attachmentIdCounter;
         const controller = new AbortController();
         state.pendingAttachments.push({
+            _id: id,
             name: file.name,
             mime_type: file.type || 'application/octet-stream',
             size: file.size,
@@ -1299,12 +1302,12 @@ function handleFileSelect() {
             controller,
         });
         renderComposeAttachments();
-        uploadAttachment(file, index, controller);
+        uploadAttachment(file, id, controller);
     }
     els.composeFileInput.value = '';
 }
 
-async function uploadAttachment(file, index, controller) {
+async function uploadAttachment(file, id, controller) {
     try {
         const resp = await fetch('/api/upload', {
             method: 'POST',
@@ -1317,7 +1320,7 @@ async function uploadAttachment(file, index, controller) {
         });
         if (!resp.ok) throw new Error(`Upload failed (${resp.status})`);
         const data = await resp.json();
-        const att = state.pendingAttachments[index];
+        const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.blob_id = data.blob_id;
             att.status = 'ready';
@@ -1326,7 +1329,7 @@ async function uploadAttachment(file, index, controller) {
         }
     } catch (err) {
         if (err.name === 'AbortError') return;
-        const att = state.pendingAttachments[index];
+        const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.status = 'error';
             att.controller = null;
@@ -1343,17 +1346,17 @@ function renderComposeAttachments() {
         return;
     }
     els.composeAttachments.classList.remove('hidden');
-    els.composeAttachmentsList.innerHTML = state.pendingAttachments.map((att, i) => {
+    els.composeAttachmentsList.innerHTML = state.pendingAttachments.map(att => {
         const icon = getFileIcon(att.mime_type, att.name);
         const size = formatFileSize(att.size);
         const statusIcon = att.status === 'uploading' ? '\u23F3'
             : att.status === 'error' ? '\u274C' : '\u2705';
-        return `<div class="compose-attachment-item" data-index="${i}">
+        return `<div class="compose-attachment-item" data-id="${att._id}">
             <span class="attachment-icon">${icon}</span>
             <span class="attachment-name">${escapeHtml(att.name)}</span>
             <span class="attachment-size">${size}</span>
             <span class="attachment-status">${statusIcon}</span>
-            <span class="attachment-remove" data-index="${i}">\u00D7</span>
+            <span class="attachment-remove" data-id="${att._id}">\u00D7</span>
         </div>`;
     }).join('');
 }
@@ -1361,10 +1364,12 @@ function renderComposeAttachments() {
 function handleAttachmentListClick(e) {
     const removeBtn = e.target.closest('.attachment-remove');
     if (!removeBtn) return;
-    const index = parseInt(removeBtn.dataset.index);
-    const att = state.pendingAttachments[index];
-    if (att?.controller) att.controller.abort();
-    state.pendingAttachments.splice(index, 1);
+    const id = parseInt(removeBtn.dataset.id);
+    const idx = state.pendingAttachments.findIndex(a => a._id === id);
+    if (idx === -1) return;
+    const att = state.pendingAttachments[idx];
+    if (att.controller) att.controller.abort();
+    state.pendingAttachments.splice(idx, 1);
     renderComposeAttachments();
 }
 
