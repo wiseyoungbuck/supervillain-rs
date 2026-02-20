@@ -1,7 +1,8 @@
 use axum::{
     Router,
+    body::Bytes,
     extract::{Json, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
 };
@@ -36,6 +37,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/theme", get(get_theme))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/emails", get(list_emails))
+        .route("/api/upload", post(upload_blob))
         .route("/api/emails/send", post(send_email_handler))
         .route("/api/emails/{email_id}", get(get_email))
         .route("/api/emails/{email_id}/archive", post(archive_email))
@@ -172,6 +174,8 @@ struct SendEmailBody {
     html_body: Option<String>,
     in_reply_to: Option<String>,
     from_address: Option<String>,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
 
 #[derive(Deserialize)]
@@ -495,6 +499,7 @@ async fn send_email_handler(
         html_body: body.html_body,
         in_reply_to: body.in_reply_to,
         references: None,
+        attachments: body.attachments,
         calendar_ics: None,
     };
 
@@ -504,6 +509,67 @@ async fn send_email_handler(
         Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
         None => Err(Error::Internal("Failed to send email".into())),
     }
+}
+
+const MAX_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MB
+
+async fn upload_blob(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, Error> {
+    if body.len() > MAX_UPLOAD_SIZE {
+        return Err(Error::BadRequest(format!(
+            "File too large ({} bytes, max {})",
+            body.len(),
+            MAX_UPLOAD_SIZE
+        )));
+    }
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+
+    let raw_filename = headers
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("attachment");
+    let filename = sanitize_filename_for_header(raw_filename);
+
+    let session = state.session.read().await;
+    let account_id = session.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let upload_url = session.upload_url.as_ref().ok_or(Error::NotConnected)?;
+
+    let url = upload_url.replace("{accountId}", account_id);
+
+    let resp = session
+        .client
+        .post(&url)
+        .header("Authorization", &session.auth_header)
+        .header("Content-Type", content_type)
+        .body(reqwest::Body::from(body))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::Internal(format!("Upload failed ({status}): {text}")));
+    }
+
+    let result: serde_json::Value = resp.json().await?;
+    let blob_id = result["blobId"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("Missing blobId in upload response".into()))?;
+    let size = result["size"].as_i64().unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "blob_id": blob_id,
+        "name": filename,
+        "mime_type": content_type,
+        "size": size,
+    })))
 }
 
 async fn rsvp(
@@ -561,6 +627,7 @@ async fn rsvp(
         html_body: None,
         in_reply_to: None,
         references: None,
+        attachments: vec![],
         calendar_ics: Some(rsvp_ics),
     };
 

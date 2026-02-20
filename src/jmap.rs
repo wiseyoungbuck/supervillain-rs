@@ -771,6 +771,51 @@ fn build_draft_email(
         );
     }
 
+    // Stage 2: wrap with attachments if present
+    if !sub.attachments.is_empty() {
+        let attachment_parts: Vec<serde_json::Value> = sub
+            .attachments
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "type": a.mime_type,
+                    "blobId": a.blob_id,
+                    "name": a.name,
+                    "disposition": "attachment",
+                    "size": a.size
+                })
+            })
+            .collect();
+
+        let body_structure = m.remove("bodyStructure").unwrap();
+        if body_structure["type"] == "multipart/mixed" {
+            // Calendar case: append attachment parts to existing subParts
+            let mut sub_parts = body_structure["subParts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            sub_parts.extend(attachment_parts);
+            m.insert(
+                "bodyStructure".into(),
+                serde_json::json!({
+                    "type": "multipart/mixed",
+                    "subParts": sub_parts
+                }),
+            );
+        } else {
+            // Text or HTML: wrap in new multipart/mixed
+            let mut sub_parts = vec![body_structure];
+            sub_parts.extend(attachment_parts);
+            m.insert(
+                "bodyStructure".into(),
+                serde_json::json!({
+                    "type": "multipart/mixed",
+                    "subParts": sub_parts
+                }),
+            );
+        }
+    }
+
     if !sub.cc.is_empty() {
         m.insert(
             "cc".into(),
@@ -1450,6 +1495,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: None,
         }
     }
@@ -1474,6 +1520,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-456");
@@ -1492,6 +1539,7 @@ mod tests {
             html_body: None,
             in_reply_to: Some("<msg-123@example.com>".into()),
             references: Some(vec!["<msg-123@example.com>".into()]),
+            attachments: vec![],
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-789");
@@ -1534,6 +1582,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "a@b.com", "mb");
@@ -1844,6 +1893,7 @@ mod tests {
             html_body: Some("<p>Hello, world!</p>".into()),
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -1949,6 +1999,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
         };
         let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
@@ -1986,6 +2037,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: Some(ics.into()),
         };
         let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
@@ -2008,8 +2060,152 @@ mod tests {
             html_body: Some("<p>Should not coexist</p>".into()),
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR".into()),
         };
         build_draft_email(&sub, "bob@example.com", "mb-drafts");
+    }
+
+    // --- build_draft_email attachment tests ---
+
+    fn pdf_attachment() -> Attachment {
+        Attachment {
+            blob_id: "blob-pdf-123".into(),
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 12345,
+        }
+    }
+
+    #[test]
+    fn draft_text_with_attachment_wraps_in_mixed() {
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "With attachment".into(),
+            text_body: "See attached".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![pdf_attachment()],
+            calendar_ics: None,
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
+        let parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("subParts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text/plain");
+        assert_eq!(parts[0]["partId"], "body");
+        assert_eq!(parts[1]["type"], "application/pdf");
+        assert_eq!(parts[1]["blobId"], "blob-pdf-123");
+        assert_eq!(parts[1]["name"], "report.pdf");
+        assert_eq!(parts[1]["disposition"], "attachment");
+    }
+
+    #[test]
+    fn draft_html_with_attachment_wraps_in_mixed() {
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "HTML + attachment".into(),
+            text_body: "See attached".into(),
+            bcc: None,
+            html_body: Some("<p>See attached</p>".into()),
+            in_reply_to: None,
+            references: None,
+            attachments: vec![pdf_attachment()],
+            calendar_ics: None,
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
+        let parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("subParts");
+        assert_eq!(parts.len(), 2);
+        // First part is the original multipart/alternative
+        assert_eq!(parts[0]["type"], "multipart/alternative");
+        assert_eq!(parts[0]["subParts"].as_array().unwrap().len(), 2);
+        // Second part is the attachment
+        assert_eq!(parts[1]["type"], "application/pdf");
+        assert_eq!(parts[1]["blobId"], "blob-pdf-123");
+    }
+
+    #[test]
+    fn draft_calendar_with_attachment_appends() {
+        let sub = EmailSubmission {
+            to: vec!["organizer@example.com".into()],
+            cc: vec![],
+            subject: "Re: Meeting".into(),
+            text_body: "Accepted".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![pdf_attachment()],
+            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
+        };
+        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
+        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
+        let parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("subParts");
+        // text/plain + text/calendar + attachment (appended, not double-wrapped)
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text/plain");
+        assert_eq!(parts[1]["type"], "text/calendar; method=REPLY");
+        assert_eq!(parts[2]["type"], "application/pdf");
+    }
+
+    #[test]
+    fn draft_multiple_attachments() {
+        let sub = EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "Multiple".into(),
+            text_body: "See attached".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![
+                pdf_attachment(),
+                Attachment {
+                    blob_id: "blob-img-456".into(),
+                    name: "photo.jpg".into(),
+                    mime_type: "image/jpeg".into(),
+                    size: 54321,
+                },
+                Attachment {
+                    blob_id: "blob-doc-789".into(),
+                    name: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    size: 100,
+                },
+            ],
+            calendar_ics: None,
+        };
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
+        let parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("subParts");
+        // body + 3 attachments
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "text/plain");
+        assert_eq!(parts[1]["blobId"], "blob-pdf-123");
+        assert_eq!(parts[2]["blobId"], "blob-img-456");
+        assert_eq!(parts[3]["blobId"], "blob-doc-789");
+    }
+
+    #[test]
+    fn draft_no_attachments_unchanged() {
+        // Verify that empty attachments vec doesn't change existing behavior
+        let sub = simple_submission();
+        let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
+        assert_eq!(draft["bodyStructure"]["type"], "text/plain");
+        assert!(draft["bodyStructure"].get("subParts").is_none());
     }
 }

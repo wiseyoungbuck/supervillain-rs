@@ -19,6 +19,7 @@ const state = {
     identities: [],           // send-as email addresses
     splits: [],               // split inbox definitions
     currentSplit: 'all',      // currently active split tab
+    pendingAttachments: [],   // files being uploaded for compose
 };
 
 // Simple cache: email id -> full email object with body
@@ -83,6 +84,9 @@ function init() {
     els.attachments = document.getElementById('attachments');
     els.attachmentsList = document.getElementById('attachments-list');
     els.composeQuote = document.getElementById('compose-quote');
+    els.composeAttachments = document.getElementById('compose-attachments');
+    els.composeAttachmentsList = document.getElementById('compose-attachments-list');
+    els.composeFileInput = document.getElementById('compose-file-input');
     // Event listeners
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
@@ -94,6 +98,8 @@ function init() {
     els.rsvpAccept.addEventListener('click', () => rsvpToEvent('ACCEPTED'));
     els.rsvpMaybe.addEventListener('click', () => rsvpToEvent('TENTATIVE'));
     els.rsvpDecline.addEventListener('click', () => rsvpToEvent('DECLINED'));
+    els.composeFileInput.addEventListener('change', handleFileSelect);
+    els.composeAttachmentsList.addEventListener('click', handleAttachmentListClick);
 
     // Single delegated click handler for email list — never re-bound, survives innerHTML updates
     els.emailList.addEventListener('click', (e) => {
@@ -536,6 +542,11 @@ async function sendEmail() {
         return;
     }
 
+    if (state.pendingAttachments.some(a => a.status === 'uploading')) {
+        showStatus('Wait for uploads to finish', 'error');
+        return;
+    }
+
     const quotedText = state.replyContext?.quotedText;
     const quotedHtml = state.replyContext?.quotedHtml;
 
@@ -548,6 +559,10 @@ async function sendEmail() {
           + `<blockquote style="border-left:2px solid #ccc;padding-left:12px;margin-left:0">${quotedHtml}</blockquote>`
         : null;
 
+    const readyAttachments = state.pendingAttachments
+        .filter(a => a.status === 'ready')
+        .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
+
     try {
         await api('POST', '/emails/send', {
             to,
@@ -557,6 +572,7 @@ async function sendEmail() {
             html_body: fullHtmlBody || undefined,
             in_reply_to: state.replyContext?.inReplyTo || null,
             from_address: fromAddress,
+            attachments: readyAttachments.length ? readyAttachments : undefined,
         });
         showStatus('Sent!', 'success');
         clearCompose();
@@ -808,6 +824,13 @@ function handleKeyDown(e) {
             sendEmail();
             e.preventDefault();
         }
+        return;
+    }
+
+    // Compose normal-mode: 'a' opens file picker instead of reply-all
+    if (state.view === 'compose' && state.mode === 'normal' && e.key === 'a') {
+        els.composeFileInput.click();
+        e.preventDefault();
         return;
     }
 
@@ -1248,6 +1271,101 @@ function clearCompose() {
         els.composeFrom.value = state.identities[0].email;
     }
     state.replyContext = null;
+    // Clear pending attachments and abort any in-progress uploads
+    for (const att of state.pendingAttachments) {
+        if (att.controller) att.controller.abort();
+    }
+    state.pendingAttachments = [];
+    els.composeAttachments.classList.add('hidden');
+    els.composeAttachmentsList.innerHTML = '';
+    els.composeFileInput.value = '';
+}
+
+function handleFileSelect() {
+    const files = els.composeFileInput.files;
+    if (!files.length) return;
+    for (const file of files) {
+        if (file.size > 25 * 1024 * 1024) {
+            showStatus(`${file.name} is too large (max 25 MB)`, 'error');
+            continue;
+        }
+        const index = state.pendingAttachments.length;
+        const controller = new AbortController();
+        state.pendingAttachments.push({
+            name: file.name,
+            mime_type: file.type || 'application/octet-stream',
+            size: file.size,
+            status: 'uploading',
+            controller,
+        });
+        renderComposeAttachments();
+        uploadAttachment(file, index, controller);
+    }
+    els.composeFileInput.value = '';
+}
+
+async function uploadAttachment(file, index, controller) {
+    try {
+        const resp = await fetch('/api/upload', {
+            method: 'POST',
+            headers: {
+                'Content-Type': file.type || 'application/octet-stream',
+                'X-Filename': file.name,
+            },
+            body: file,
+            signal: controller.signal,
+        });
+        if (!resp.ok) throw new Error(`Upload failed (${resp.status})`);
+        const data = await resp.json();
+        const att = state.pendingAttachments[index];
+        if (att) {
+            att.blob_id = data.blob_id;
+            att.status = 'ready';
+            att.controller = null;
+            renderComposeAttachments();
+        }
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        const att = state.pendingAttachments[index];
+        if (att) {
+            att.status = 'error';
+            att.controller = null;
+            renderComposeAttachments();
+            showStatus(`Upload failed: ${file.name}`, 'error');
+        }
+    }
+}
+
+function renderComposeAttachments() {
+    if (!state.pendingAttachments.length) {
+        els.composeAttachments.classList.add('hidden');
+        els.composeAttachmentsList.innerHTML = '';
+        return;
+    }
+    els.composeAttachments.classList.remove('hidden');
+    els.composeAttachmentsList.innerHTML = state.pendingAttachments.map((att, i) => {
+        const icon = getFileIcon(att.mime_type, att.name);
+        const size = formatFileSize(att.size);
+        const statusIcon = att.status === 'uploading' ? '\u23F3'
+            : att.status === 'error' ? '\u274C' : '\u2705';
+        return `<div class="compose-attachment-item" data-index="${i}">
+            <span class="attachment-icon">${icon}</span>
+            <span class="attachment-name">${escapeHtml(att.name)}</span>
+            <span class="attachment-size">${size}</span>
+            <span class="attachment-status">${statusIcon}</span>
+            <span class="attachment-remove" data-index="${i}">\u00D7</span>
+        </div>`;
+    }).join('');
+}
+
+function handleAttachmentListClick(e) {
+    const removeBtn = e.target.closest('.attachment-remove');
+    if (!removeBtn) return;
+    const index = parseInt(removeBtn.dataset.index);
+    const att = state.pendingAttachments[index];
+    if (att?.controller) att.controller.abort();
+    state.pendingAttachments.splice(index, 1);
+    renderComposeAttachments();
 }
 
 function autoSelectFromAddress(email) {

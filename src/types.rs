@@ -55,6 +55,8 @@ pub struct EmailSubmission {
     pub html_body: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<Vec<String>>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
     #[serde(skip)]
     pub calendar_ics: Option<String>,
 }
@@ -339,6 +341,7 @@ mod tests {
             html_body: Some("<p>Body</p>".into()),
             in_reply_to: Some("msg-123".into()),
             references: Some(vec!["msg-100".into(), "msg-123".into()]),
+            attachments: vec![],
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
@@ -358,6 +361,7 @@ mod tests {
             html_body: None,
             in_reply_to: None,
             references: None,
+            attachments: vec![],
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
