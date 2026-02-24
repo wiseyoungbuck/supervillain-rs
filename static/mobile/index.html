@@ -7,9 +7,10 @@
 
     <!-- PWA meta -->
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <meta name="apple-mobile-web-app-title" content="Supervillain">
-    <meta name="theme-color" content="#1a1a2e">
+    <meta name="theme-color" content="#1a1a2e" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#f6f6f6" media="(prefers-color-scheme: light)">
     <link rel="manifest" href="/mobile/manifest.json">
 
     <!-- Apple touch icon -->
@@ -31,6 +32,19 @@
             --safe-bottom: env(safe-area-inset-bottom, 0px);
             --safe-left: env(safe-area-inset-left, 0px);
             --safe-right: env(safe-area-inset-right, 0px);
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg: #f6f6f6;
+                --surface: #ffffff;
+                --surface-hover: #eeeeee;
+                --text: #333333;
+                --text-muted: #888;
+                --accent: #e94560;
+                --accent-dim: #b8364d;
+                --border: #dddddd;
+            }
         }
 
         body {

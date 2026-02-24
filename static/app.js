@@ -191,13 +191,18 @@ async function loadTheme() {
         }
         el.textContent = css;
 
-        // In light mode, don't force dark colors on HTML email content
-        const isLight = css.includes('--light-mode');
+        // Determine light mode: Omarchy theme takes precedence, otherwise follow OS
+        const isLight = css.trim()
+            ? css.includes('--light-mode')
+            : window.matchMedia('(prefers-color-scheme: light)').matches;
         document.body.classList.toggle('light-theme', isLight);
     } catch (err) {
         console.warn('Failed to load theme:', err);
     }
 }
+
+// Live-update when macOS appearance changes
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', loadTheme);
 
 // API calls
 

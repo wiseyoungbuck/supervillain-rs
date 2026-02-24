@@ -14,7 +14,27 @@
     --danger: #ff0000;
     --selection: #003300;
     --border: #003300;
+    --overlay: rgba(0, 0, 0, 0.9);
     --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+@media (prefers-color-scheme: light) {
+    :root {
+        --bg: #ffffff;
+        --bg-secondary: #f6f6f6;
+        --bg-tertiary: #eeeeee;
+        --fg: #333333;
+        --fg-muted: #666666;
+        --fg-dim: #999999;
+        --accent: #0088aa;
+        --accent-dim: #006688;
+        --success: #22863a;
+        --warning: #b08800;
+        --danger: #cc0000;
+        --selection: #e0f0ff;
+        --border: #dddddd;
+        --overlay: rgba(0, 0, 0, 0.5);
+    }
 }
 
 * {
@@ -715,7 +735,7 @@ body:not(.light-theme) .compose-quote a * {
 #help-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.9);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -813,7 +833,7 @@ body:not(.light-theme) .compose-quote a * {
 #split-modal {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.9);
+    background: var(--overlay);
     display: flex;
     align-items: center;
     justify-content: center;
