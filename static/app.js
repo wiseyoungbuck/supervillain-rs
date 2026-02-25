@@ -40,7 +40,6 @@ function init() {
     // Cache DOM elements
     els.modeIndicator = document.getElementById('mode-indicator');
     els.mailboxName = document.getElementById('mailbox-name');
-    els.emailCount = null;
     els.statusMessage = document.getElementById('status-message');
     els.accountSelector = document.getElementById('account-selector');
     els.mailboxList = document.getElementById('mailbox-list');
@@ -384,7 +383,7 @@ async function loadEmails() {
         state.emails = await api('GET', url);
         state.selectedIndex = 0;
         renderEmailList();
-        updateEmailCount();
+
     } catch (err) {
         showStatus('Failed to load emails: ' + err.message, 'error');
     }
@@ -410,7 +409,7 @@ async function maybeRefillEmails() {
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
             renderEmailList();
-            updateEmailCount();
+    
         }
     } catch (err) {
         console.warn('Refill failed:', err);
@@ -516,7 +515,7 @@ async function emailAction(type, emailId) {
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             renderEmailList();
-            updateEmailCount();
+    
         }
         adjustSplitCounts(+1);
         showStatus(label + ' failed: ' + err.message, 'error');
@@ -531,7 +530,6 @@ async function toggleUnread(emailId) {
     const wasUnread = email.isUnread;
     email.isUnread = !wasUnread;
     renderEmailList();
-    updateEmailCount();
 
     try {
         if (wasUnread) {
@@ -543,7 +541,7 @@ async function toggleUnread(emailId) {
         // Revert
         email.isUnread = wasUnread;
         renderEmailList();
-        updateEmailCount();
+
         showStatus('Failed to toggle read status', 'error');
     }
 }
@@ -813,9 +811,7 @@ function showStatus(message, type = 'info') {
     }, 3000);
 }
 
-function updateEmailCount() {
-    // No-op: count removed from status bar (sidebar badges are sufficient)
-}
+
 
 // Keyboard handling
 
@@ -1171,7 +1167,7 @@ async function unsubscribeAndArchiveAll() {
             state.selectedIndex = Math.max(0, state.emails.length - 1);
         }
         renderEmailList();
-        updateEmailCount();
+
     }
 
     showStatus('Unsubscribing and archiving...', 'info');
@@ -1197,7 +1193,7 @@ async function unsubscribeAndArchiveAll() {
             state.emails = state.emails.concat(removedEmails);
             state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
             renderEmailList();
-            updateEmailCount();
+    
         }
         showStatus('Unsubscribe failed: ' + err.message, 'error');
     }
@@ -1209,7 +1205,6 @@ function removeEmailFromList(emailId) {
         state.selectedIndex = Math.max(0, state.emails.length - 1);
     }
     renderEmailList();
-    updateEmailCount();
     maybeRefillEmails();
 }
 
@@ -1659,7 +1654,7 @@ async function performUndo() {
         state.emails.splice(idx, 0, item.emailData);
         state.selectedIndex = idx;
         renderEmailList();
-        updateEmailCount();
+
     }
     adjustSplitCounts(+1);
 
@@ -1673,7 +1668,7 @@ async function performUndo() {
         if (item.emailData) {
             state.emails = state.emails.filter(e => e.id !== item.emailId);
             renderEmailList();
-            updateEmailCount();
+    
         }
         adjustSplitCounts(-1);
         showStatus('Undo failed', 'error');
