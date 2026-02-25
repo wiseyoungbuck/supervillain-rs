@@ -6,9 +6,11 @@ LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DRY_RUN=false
 
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=true
-fi
+for arg in "$@"; do
+    if [[ "$arg" == "--dry-run" ]]; then
+        DRY_RUN=true
+    fi
+done
 
 run() {
     if $DRY_RUN; then
@@ -32,11 +34,7 @@ stop_server() {
         return
     fi
     echo "Stopping supervillain on port $PORT..."
-    if command -v fuser &>/dev/null; then
-        run fuser -k "$PORT/tcp" 2>/dev/null || true
-    else
-        run kill $(lsof -ti ":$PORT" 2>/dev/null) 2>/dev/null || true
-    fi
+    run pkill -x supervillain || true
     run sleep 0.5
 }
 
