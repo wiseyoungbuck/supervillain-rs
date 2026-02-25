@@ -347,10 +347,8 @@ function renderSplitTabs() {
         const countBadge = count != null ? `<span class="split-count">${escapeHtml(String(count))}</span>` : '';
         return `
         <div class="split-tab ${state.currentSplit === split.id ? 'active' : ''}"
-             data-split="${split.id}">
-            ${getSplitIcon(split)}
-            ${escapeHtml(split.name)}${countBadge}
-            <span class="split-shortcut">^${idx + 1}</span>
+             data-split="${split.id}" title="Ctrl+${idx + 1}">
+            <span class="split-name">${getSplitIcon(split)}${escapeHtml(split.name)}</span>${countBadge}
         </div>
     `;
     }).join('');
@@ -1636,12 +1634,13 @@ function closeSearch() {
 function getSearchQuery() {
     return state.searchTokens.map(t => {
         const sanitized = t.value.replace(/"/g, '');
+        if (!sanitized) return '';
         if (t.type === 'text') {
             return sanitized.includes(' ') ? `"${sanitized}"` : sanitized;
         }
         const val = sanitized.includes(' ') ? `"${sanitized}"` : sanitized;
         return `${t.type}:${val}`;
-    }).join(' ');
+    }).filter(Boolean).join(' ');
 }
 
 function commitCurrentInput() {
@@ -1662,7 +1661,7 @@ function commitCurrentInput() {
                 const parts = knownOp.op.split(':');
                 state.searchTokens.push({ type: parts[0], value: parts.slice(1).join(':') });
             } else if (value) {
-                state.searchTokens.push({ type: prefix, value });
+                state.searchTokens.push({ type: knownOp.op.split(':')[0], value });
             } else {
                 // Operator typed but no value yet — leave in input
                 return;
