@@ -756,8 +756,7 @@ async fn split_counts(
         jmap::query_emails(&session, Some(&params.mailbox_id), fetch_limit, 0, None).await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
-    let all_emails =
-        jmap::get_emails(&session, &email_ids, false, Some(minimal_props)).await?;
+    let all_emails = jmap::get_emails(&session, &email_ids, false, Some(minimal_props)).await?;
 
     let mut counts = serde_json::Map::new();
     for split in &config.splits {
