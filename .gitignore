@@ -1,1 +1,4 @@
 /target
+
+# Large source artwork (regenerate icons via ImageMagick)
+static/Gemini_Generated_Image_*.png

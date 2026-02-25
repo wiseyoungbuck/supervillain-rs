@@ -24,9 +24,11 @@ const MOBILE_APP_JS: &str = include_str!("../static/mobile/app.js");
 const MOBILE_JMAP_JS: &str = include_str!("../static/mobile/jmap.js");
 const MOBILE_MANIFEST: &str = include_str!("../static/mobile/manifest.json");
 const MOBILE_SW: &str = include_str!("../static/mobile/sw.js");
-const MOBILE_ICON_180: &[u8] = include_bytes!("../static/mobile/icon-180.png");
-const MOBILE_ICON_192: &[u8] = include_bytes!("../static/mobile/icon-192.png");
-const MOBILE_ICON_512: &[u8] = include_bytes!("../static/mobile/icon-512.png");
+const FAVICON_32: &[u8] = include_bytes!("../static/favicon-32.png");
+const ICON_180: &[u8] = include_bytes!("../static/icon-180.png");
+const ICON_192: &[u8] = include_bytes!("../static/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../static/icon-512.png");
+const SUPERVILLAIN_JPG: &[u8] = include_bytes!("../static/supervillain.jpg");
 
 // =============================================================================
 // Router
@@ -72,6 +74,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/index.html", get(index_html))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/favicon-32.png", get(favicon_32))
+        .route("/icon-180.png", get(icon_180))
+        .route("/icon-192.png", get(icon_192))
+        .route("/icon-512.png", get(icon_512))
+        .route("/supervillain.jpg", get(supervillain_jpg))
         // Mobile PWA
         .route("/mobile", get(mobile_html))
         .route("/mobile/", get(mobile_html))
@@ -80,9 +87,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/jmap.js", get(mobile_jmap_js))
         .route("/mobile/manifest.json", get(mobile_manifest))
         .route("/mobile/sw.js", get(mobile_sw))
-        .route("/mobile/icon-180.png", get(mobile_icon_180))
-        .route("/mobile/icon-192.png", get(mobile_icon_192))
-        .route("/mobile/icon-512.png", get(mobile_icon_512))
+        .route("/mobile/icon-180.png", get(icon_180))
+        .route("/mobile/icon-192.png", get(icon_192))
+        .route("/mobile/icon-512.png", get(icon_512))
 }
 
 async fn index_html() -> impl IntoResponse {
@@ -135,16 +142,24 @@ async fn mobile_sw() -> impl IntoResponse {
     )
 }
 
-async fn mobile_icon_180() -> impl IntoResponse {
-    ([("content-type", "image/png")], MOBILE_ICON_180)
+async fn favicon_32() -> impl IntoResponse {
+    ([("content-type", "image/png")], FAVICON_32)
 }
 
-async fn mobile_icon_192() -> impl IntoResponse {
-    ([("content-type", "image/png")], MOBILE_ICON_192)
+async fn icon_180() -> impl IntoResponse {
+    ([("content-type", "image/png")], ICON_180)
 }
 
-async fn mobile_icon_512() -> impl IntoResponse {
-    ([("content-type", "image/png")], MOBILE_ICON_512)
+async fn icon_192() -> impl IntoResponse {
+    ([("content-type", "image/png")], ICON_192)
+}
+
+async fn icon_512() -> impl IntoResponse {
+    ([("content-type", "image/png")], ICON_512)
+}
+
+async fn supervillain_jpg() -> impl IntoResponse {
+    ([("content-type", "image/jpeg")], SUPERVILLAIN_JPG)
 }
 
 // =============================================================================
@@ -1105,18 +1120,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_icon_180_serves_png() {
-        assert_png_icon(mobile_icon_180().await.into_response(), "180").await;
+    async fn favicon_32_serves_png() {
+        assert_png_icon(favicon_32().await.into_response(), "32").await;
     }
 
     #[tokio::test]
-    async fn mobile_icon_192_serves_png() {
-        assert_png_icon(mobile_icon_192().await.into_response(), "192").await;
+    async fn icon_180_serves_png() {
+        assert_png_icon(icon_180().await.into_response(), "180").await;
     }
 
     #[tokio::test]
-    async fn mobile_icon_512_serves_png() {
-        assert_png_icon(mobile_icon_512().await.into_response(), "512").await;
+    async fn icon_192_serves_png() {
+        assert_png_icon(icon_192().await.into_response(), "192").await;
+    }
+
+    #[tokio::test]
+    async fn icon_512_serves_png() {
+        assert_png_icon(icon_512().await.into_response(), "512").await;
     }
 
     #[tokio::test]
