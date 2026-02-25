@@ -387,6 +387,7 @@ body:not(.light-theme) #email-body.html-content,
 body:not(.light-theme) #email-body.html-content * {
     color: var(--fg) !important;
     background-color: transparent !important;
+    border-color: var(--border) !important;
 }
 
 /* Links stay cyan */
@@ -398,19 +399,18 @@ body:not(.light-theme) #email-body.html-content * {
 /* Quoted text (replies) - dimmer */
 #email-body.html-content blockquote,
 #email-body.html-content .gmail_quote {
-    border-left: 2px solid var(--fg-dim);
+    border-left: 2px solid var(--fg-dim) !important;
     padding-left: 12px;
     color: var(--fg-muted) !important;
 }
 
-/* Tables get visible borders */
+/* Email tables: collapse for sender-styled borders */
 #email-body.html-content table {
     border-collapse: collapse;
 }
 
 #email-body.html-content td,
 #email-body.html-content th {
-    border: 1px solid var(--border) !important;
     padding: 4px 8px;
 }
 
@@ -488,6 +488,7 @@ body:not(.light-theme) .compose-quote,
 body:not(.light-theme) .compose-quote * {
     color: var(--fg-muted) !important;
     background-color: transparent !important;
+    border-color: var(--border) !important;
 }
 
 body:not(.light-theme) .compose-quote a,

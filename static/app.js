@@ -1698,9 +1698,7 @@ function escapeHtml(text) {
 function stripColorStyles(styleString) {
     const colorProps = [
         'color', 'background', 'background-color', 'background-image',
-        'border-color', 'border-top-color', 'border-right-color',
-        'border-bottom-color', 'border-left-color', 'outline-color',
-        'text-decoration-color', 'text-shadow', 'box-shadow'
+        'outline-color', 'text-decoration-color', 'text-shadow', 'box-shadow'
     ];
     return styleString.split(';')
         .map(d => d.trim())
