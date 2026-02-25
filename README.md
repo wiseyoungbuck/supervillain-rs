@@ -65,11 +65,17 @@ supervillain
 
 ### Updating
 
-Pull the latest changes and reinstall:
+Pull the latest changes and upgrade (stops running server, rebuilds, restarts):
 
 ```sh
 cd supervillain-rs
 git pull
+./scripts/upgrade.sh
+```
+
+To rebuild without restarting:
+
+```sh
 cargo install --path .
 ```
 
