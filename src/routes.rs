@@ -59,6 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/emails/{email_id}/unsubscribe-and-archive-all",
             post(unsubscribe_and_archive),
         )
+        .route("/api/split-counts", get(split_counts))
         .route("/api/splits", get(list_splits).post(create_split))
         .route(
             "/api/splits/{split_id}",
@@ -251,7 +252,7 @@ async fn list_emails(
     )
     .await?;
 
-    let mut emails = jmap::get_emails(&session, &email_ids, false).await?;
+    let mut emails = jmap::get_emails(&session, &email_ids, false, None).await?;
 
     // Apply split filtering
     if let Some(ref split_id) = params.split_id {
@@ -293,7 +294,7 @@ async fn get_email(
 ) -> Result<impl IntoResponse, Error> {
     let session = state.session.read().await;
 
-    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true).await?;
+    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -591,7 +592,7 @@ async fn rsvp(
     let attendee_email = {
         // Try To addresses first, then CC, then username
         let emails =
-            jmap::get_emails(&session_guard, std::slice::from_ref(&email_id), false).await?;
+            jmap::get_emails(&session_guard, std::slice::from_ref(&email_id), false, None).await?;
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -692,7 +693,7 @@ async fn unsubscribe_and_archive(
     let session = state.session.read().await;
 
     // Get the email to find the sender
-    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true).await?;
+    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -727,6 +728,56 @@ async fn unsubscribe_and_archive(
 // =============================================================================
 // Splits CRUD
 // =============================================================================
+
+#[derive(Deserialize)]
+struct SplitCountsParams {
+    mailbox_id: String,
+}
+
+async fn split_counts(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SplitCountsParams>,
+) -> Result<impl IntoResponse, Error> {
+    let start = std::time::Instant::now();
+
+    let config = splits::load_splits(
+        &state.splits_config_path,
+        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+    );
+    if config.splits.is_empty() {
+        return Ok(Json(serde_json::json!({})));
+    }
+
+    let session = state.session.read().await;
+
+    let email_ids = jmap::query_emails(&session, Some(&params.mailbox_id), 5000, 0, None).await?;
+
+    let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
+    let mut all_emails = Vec::new();
+    for batch in email_ids.chunks(500) {
+        let batch_owned: Vec<String> = batch.to_vec();
+        let emails = jmap::get_emails(&session, &batch_owned, false, Some(minimal_props)).await?;
+        all_emails.extend(emails);
+    }
+
+    let mut counts = serde_json::Map::new();
+    for split in &config.splits {
+        let count = all_emails
+            .iter()
+            .filter(|e| splits::matches_split(e, split))
+            .count();
+        counts.insert(split.id.clone(), serde_json::json!(count));
+    }
+
+    tracing::debug!(
+        "split-counts: {} emails, {} splits, {:.0}ms",
+        all_emails.len(),
+        config.splits.len(),
+        start.elapsed().as_millis()
+    );
+
+    Ok(Json(serde_json::Value::Object(counts)))
+}
 
 async fn list_splits(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = splits::load_splits(

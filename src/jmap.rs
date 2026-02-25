@@ -238,6 +238,7 @@ pub async fn get_emails(
     s: &JmapSession,
     ids: &[String],
     fetch_body: bool,
+    properties_override: Option<&[&str]>,
 ) -> Result<Vec<Email>, Error> {
     if ids.is_empty() {
         return Ok(vec![]);
@@ -245,21 +246,25 @@ pub async fn get_emails(
 
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
-    let mut properties = vec![
-        "id",
-        "blobId",
-        "threadId",
-        "mailboxIds",
-        "keywords",
-        "receivedAt",
-        "subject",
-        "from",
-        "to",
-        "cc",
-        "preview",
-        "hasAttachment",
-        "size",
-    ];
+    let mut properties = if let Some(overrides) = properties_override {
+        overrides.to_vec()
+    } else {
+        vec![
+            "id",
+            "blobId",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "receivedAt",
+            "subject",
+            "from",
+            "to",
+            "cc",
+            "preview",
+            "hasAttachment",
+            "size",
+        ]
+    };
     if fetch_body {
         properties.extend_from_slice(&["textBody", "htmlBody", "bodyValues", "bodyStructure"]);
     }
@@ -537,7 +542,7 @@ pub async fn mark_unread(s: &JmapSession, email_id: &str) -> Result<bool, Error>
 
 pub async fn toggle_flag(s: &JmapSession, email_id: &str) -> Result<bool, Error> {
     // First get current state
-    let emails = get_emails(s, &[email_id.to_string()], false).await?;
+    let emails = get_emails(s, &[email_id.to_string()], false, None).await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;

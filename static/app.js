@@ -20,6 +20,7 @@ const state = {
     splits: [],               // split inbox definitions
     currentSplit: 'all',      // currently active split tab
     pendingAttachments: [],   // files being uploaded for compose
+    splitCounts: {},          // email counts per split tab
 };
 
 // Simple cache: email id -> full email object with body
@@ -231,10 +232,31 @@ async function loadSplits() {
     try {
         state.splits = await fetch('/api/splits').then(r => r.json());
         renderSplitTabs();
+        loadSplitCounts();
     } catch (err) {
         console.warn('Failed to load splits:', err);
         state.splits = [];
     }
+}
+
+async function loadSplitCounts() {
+    if (state.currentMailbox?.role !== 'inbox' || state.splits.length === 0) return;
+    const mailboxId = state.currentMailbox.id;
+    try {
+        const counts = await api('GET', `/split-counts?mailbox_id=${mailboxId}`);
+        if (state.currentMailbox?.id !== mailboxId) return; // stale response guard
+        state.splitCounts = counts;
+        state.splitCounts.all = state.currentMailbox.total_emails;
+        renderSplitTabs();
+    } catch (err) { console.warn('Failed to load split counts:', err); }
+}
+
+function adjustSplitCounts(delta) {
+    if (state.splitCounts.all != null) state.splitCounts.all += delta;
+    if (state.currentSplit && state.currentSplit !== 'all' && state.splitCounts[state.currentSplit] != null) {
+        state.splitCounts[state.currentSplit] += delta;
+    }
+    renderSplitTabs();
 }
 
 async function loadIdentities() {
@@ -275,14 +297,18 @@ function renderSplitTabs() {
         ...state.splits
     ];
 
-    els.splitTabs.innerHTML = tabs.map((split, idx) => `
+    els.splitTabs.innerHTML = tabs.map((split, idx) => {
+        const count = state.splitCounts[split.id];
+        const countBadge = count != null ? `<span class="split-count">${count}</span>` : '';
+        return `
         <div class="split-tab ${state.currentSplit === split.id ? 'active' : ''}"
              data-split="${split.id}">
             ${getSplitIcon(split)}
-            ${escapeHtml(split.name)}
+            ${escapeHtml(split.name)}${countBadge}
             <span class="split-shortcut">^${idx + 1}</span>
         </div>
-    `).join('');
+    `;
+    }).join('');
 
     els.splitTabs.querySelectorAll('.split-tab').forEach(el => {
         el.addEventListener('click', () => selectSplit(el.dataset.split));
@@ -471,6 +497,7 @@ async function emailAction(type, emailId) {
     const removedIndex = state.emails.indexOf(removedEmail);
     pushUndo(label.toLowerCase(), emailId, removedEmail, removedIndex);
     removeEmailFromList(emailId);
+    adjustSplitCounts(-1);
     showStatus(label, 'success');
 
     try {
@@ -483,6 +510,7 @@ async function emailAction(type, emailId) {
             renderEmailList();
             updateEmailCount();
         }
+        adjustSplitCounts(+1);
         showStatus(label + ' failed: ' + err.message, 'error');
     }
 }
@@ -754,10 +782,12 @@ function selectMailbox(mailbox) {
     state.currentMailbox = mailbox;
     state.searchQuery = '';
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
+    state.splitCounts = {};
     els.mailboxName.textContent = mailbox.name.toUpperCase();
     renderMailboxes();
     renderSplitTabs();
     loadEmails();
+    if (mailbox.role === 'inbox') loadSplitCounts();
 }
 
 function setMode(mode) {
@@ -1625,6 +1655,7 @@ async function performUndo() {
         renderEmailList();
         updateEmailCount();
     }
+    adjustSplitCounts(+1);
 
     try {
         const inbox = state.mailboxes.find(m => m.role === 'inbox');
@@ -1638,6 +1669,7 @@ async function performUndo() {
             renderEmailList();
             updateEmailCount();
         }
+        adjustSplitCounts(-1);
         showStatus('Undo failed', 'error');
     }
 }
