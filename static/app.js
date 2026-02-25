@@ -11,7 +11,8 @@ const state = {
     emails: [],
     selectedIndex: 0,
     currentEmail: null,
-    searchQuery: '',
+    searchTokens: [],
+    autocompleteIndex: 0,
     undoStack: [],
     pendingG: false,          // for gg command
     commandPaletteIndex: 0,
@@ -32,6 +33,20 @@ const scrollPositions = {};
 const CACHE_LIMIT = 150;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
+
+const SEARCH_OPERATORS = [
+    { op: 'from:', hint: 'Sender email', needsValue: true },
+    { op: 'to:', hint: 'Recipient', needsValue: true },
+    { op: 'subject:', hint: 'Subject line', needsValue: true },
+    { op: 'has:attachment', hint: 'Has attachments', needsValue: false },
+    { op: 'is:unread', hint: 'Unread only', needsValue: false },
+    { op: 'is:read', hint: 'Read only', needsValue: false },
+    { op: 'is:starred', hint: 'Starred only', needsValue: false },
+    { op: 'newer_than:', hint: '7d, 2w, 3m, or MM-DD-YY', needsValue: true },
+    { op: 'older_than:', hint: '7d, 2w, 3m, or MM-DD-YY', needsValue: true },
+    { op: 'before:', hint: 'YYYY-MM-DD', needsValue: true },
+    { op: 'after:', hint: 'YYYY-MM-DD', needsValue: true },
+];
 
 // DOM elements
 const els = {};
@@ -60,6 +75,11 @@ function init() {
     els.commandResults = document.getElementById('command-results');
     els.searchBar = document.getElementById('search-bar');
     els.searchInput = document.getElementById('search-input');
+    els.searchTokens = document.getElementById('search-tokens');
+    els.searchAutocomplete = document.getElementById('search-autocomplete');
+    els.activeFilters = document.getElementById('active-filters');
+    els.activeFilterChips = document.getElementById('active-filter-chips');
+    els.clearAllFilters = document.getElementById('clear-all-filters');
     els.helpOverlay = document.getElementById('help-overlay');
     els.undoToast = document.getElementById('undo-toast');
     els.undoMessage = document.getElementById('undo-message');
@@ -91,6 +111,24 @@ function init() {
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
+    els.searchInput.addEventListener('input', handleSearchInputChange);
+    els.searchTokens.addEventListener('click', (e) => {
+        const btn = e.target.closest('.chip-remove');
+        if (!btn) return;
+        const idx = parseInt(btn.dataset.index);
+        state.searchTokens.splice(idx, 1);
+        renderSearchChips();
+        els.searchInput.focus();
+    });
+    els.activeFilterChips.addEventListener('click', (e) => {
+        const btn = e.target.closest('.chip-remove');
+        if (!btn) return;
+        const idx = parseInt(btn.dataset.index);
+        state.searchTokens.splice(idx, 1);
+        updateActiveFilters();
+        loadEmails();
+    });
+    els.clearAllFilters.addEventListener('click', clearAllFilters);
     els.undoButton.addEventListener('click', performUndo);
     els.splitCancel.addEventListener('click', closeSplitModal);
     els.splitSave.addEventListener('click', saveSplit);
@@ -359,12 +397,13 @@ async function loadMailboxes() {
     }
 }
 
-function buildEmailListUrl(mailboxId, { offset = 0, search = null } = {}) {
+function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
     let url = `/emails?mailbox_id=${mailboxId}&limit=${CACHE_LIMIT}`;
     if (offset > 0) url += `&offset=${offset}`;
     if (state.currentMailbox?.role === 'inbox' && state.currentSplit && state.currentSplit !== 'all' && state.splits.length > 0) {
         url += `&split_id=${state.currentSplit}`;
     }
+    const search = getSearchQuery();
     if (search) url += `&search=${encodeURIComponent(search)}`;
     return url;
 }
@@ -379,7 +418,7 @@ async function loadEmails() {
     }
 
     try {
-        const url = buildEmailListUrl(state.currentMailbox.id, { search: state.searchQuery });
+        const url = buildEmailListUrl(state.currentMailbox.id);
         state.emails = await api('GET', url);
         state.selectedIndex = 0;
         renderEmailList();
@@ -394,15 +433,15 @@ async function maybeRefillEmails() {
     if (!state.currentMailbox) return;
 
     const mailboxId = state.currentMailbox.id;
-    const searchQuery = state.searchQuery;
+    const searchQuery = getSearchQuery();
 
     refillInFlight = true;
     try {
-        const url = buildEmailListUrl(mailboxId, { offset: state.emails.length, search: searchQuery });
+        const url = buildEmailListUrl(mailboxId, { offset: state.emails.length });
         const fresh = await api('GET', url);
 
         // Discard results if context changed during fetch
-        if (state.currentMailbox?.id !== mailboxId || state.searchQuery !== searchQuery) return;
+        if (state.currentMailbox?.id !== mailboxId || getSearchQuery() !== searchQuery) return;
 
         const existingIds = new Set(state.emails.map(e => e.id));
         const newEmails = fresh.filter(e => !existingIds.has(e.id));
@@ -784,12 +823,13 @@ function showView(view) {
 
 function selectMailbox(mailbox) {
     state.currentMailbox = mailbox;
-    state.searchQuery = '';
+    state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
     els.mailboxName.textContent = mailbox.name.toUpperCase();
     renderMailboxes();
     renderSplitTabs();
+    updateActiveFilters();
     loadEmails();
     if (mailbox.role === 'inbox') loadSplitCounts();
 }
@@ -1040,13 +1080,80 @@ function handleCommandInput() {
 }
 
 function handleSearchKeyDown(e) {
+    const acVisible = !els.searchAutocomplete.classList.contains('hidden');
+    const inputVal = els.searchInput.value;
+
     if (e.key === 'Enter') {
-        state.searchQuery = els.searchInput.value;
-        closeSearch();
-        loadEmails();
+        if (acVisible) {
+            acceptAutocomplete();
+            e.preventDefault();
+        } else if (inputVal.trim()) {
+            commitCurrentInput();
+        } else if (state.searchTokens.length > 0) {
+            // Empty input + tokens exist = apply search
+            closeSearch();
+            loadEmails();
+        }
+        e.preventDefault();
     } else if (e.key === 'Escape') {
         closeSearch();
+        e.preventDefault();
+    } else if (e.key === 'Backspace' && !inputVal) {
+        if (state.searchTokens.length > 0) {
+            state.searchTokens.pop();
+            renderSearchChips();
+        }
+    } else if (e.key === 'Tab') {
+        if (acVisible) {
+            acceptAutocomplete();
+            e.preventDefault();
+        }
+    } else if (e.key === 'ArrowDown') {
+        if (acVisible) {
+            const items = els.searchAutocomplete.querySelectorAll('.autocomplete-item');
+            state.autocompleteIndex = Math.min(state.autocompleteIndex + 1, items.length - 1);
+            renderAutocompleteHighlight();
+            e.preventDefault();
+        }
+    } else if (e.key === 'ArrowUp') {
+        if (acVisible) {
+            state.autocompleteIndex = Math.max(0, state.autocompleteIndex - 1);
+            renderAutocompleteHighlight();
+            e.preventDefault();
+        }
     }
+}
+
+function handleSearchInputChange() {
+    const val = els.searchInput.value.toLowerCase();
+    if (!val) {
+        els.searchAutocomplete.classList.add('hidden');
+        return;
+    }
+
+    const matches = SEARCH_OPERATORS.filter(o => o.op.startsWith(val));
+    if (matches.length === 0) {
+        els.searchAutocomplete.classList.add('hidden');
+        return;
+    }
+
+    state.autocompleteIndex = 0;
+    els.searchAutocomplete.innerHTML = matches.map((m, idx) =>
+        `<div class="autocomplete-item ${idx === 0 ? 'selected' : ''}" data-index="${idx}">
+            <span>${escapeHtml(m.op)}</span>
+            <span class="ac-hint">${escapeHtml(m.hint)}</span>
+        </div>`
+    ).join('');
+    els.searchAutocomplete.classList.remove('hidden');
+
+    // Click handler for autocomplete items
+    els.searchAutocomplete.querySelectorAll('.autocomplete-item').forEach(el => {
+        el.addEventListener('mousedown', (e) => {
+            e.preventDefault(); // prevent blur
+            state.autocompleteIndex = parseInt(el.dataset.index);
+            acceptAutocomplete();
+        });
+    });
 }
 
 // Navigation actions
@@ -1512,14 +1619,128 @@ function executeCommand(action) {
 
 function openSearch() {
     els.searchBar.classList.remove('hidden');
-    els.searchInput.value = state.searchQuery;
+    els.searchInput.value = '';
+    renderSearchChips();
+    els.searchAutocomplete.classList.add('hidden');
     els.searchInput.focus();
-    setMode('command');
+    setMode('search');
 }
 
 function closeSearch() {
     els.searchBar.classList.add('hidden');
+    els.searchAutocomplete.classList.add('hidden');
+    updateActiveFilters();
     setMode('normal');
+}
+
+function getSearchQuery() {
+    return state.searchTokens.map(t => {
+        if (t.type === 'text') {
+            return t.value.includes(' ') ? `"${t.value}"` : t.value;
+        }
+        const val = t.value.includes(' ') ? `"${t.value}"` : t.value;
+        return `${t.type}:${val}`;
+    }).join(' ');
+}
+
+function commitCurrentInput() {
+    const raw = els.searchInput.value.trim();
+    if (!raw) return;
+
+    // Check if input matches operator:value pattern
+    const colonIdx = raw.indexOf(':');
+    if (colonIdx > 0) {
+        const prefix = raw.substring(0, colonIdx);
+        const value = raw.substring(colonIdx + 1);
+        // Check if it's a known operator
+        const knownOp = SEARCH_OPERATORS.find(o => o.op === prefix + ':' || o.op === raw);
+        if (knownOp) {
+            if (!knownOp.needsValue) {
+                // Complete token like has:attachment
+                const parts = raw.split(':');
+                state.searchTokens.push({ type: parts[0], value: parts.slice(1).join(':') });
+            } else if (value) {
+                state.searchTokens.push({ type: prefix, value });
+            } else {
+                // Operator typed but no value yet — leave in input
+                return;
+            }
+            els.searchInput.value = '';
+            renderSearchChips();
+            return;
+        }
+        // Even if not a known op prefix, if there's a value, treat it as operator:value
+        if (value) {
+            state.searchTokens.push({ type: prefix, value });
+            els.searchInput.value = '';
+            renderSearchChips();
+            return;
+        }
+    }
+
+    // Plain text token
+    state.searchTokens.push({ type: 'text', value: raw });
+    els.searchInput.value = '';
+    renderSearchChips();
+}
+
+function acceptAutocomplete() {
+    const items = els.searchAutocomplete.querySelectorAll('.autocomplete-item');
+    if (items.length === 0) return;
+
+    const idx = Math.min(state.autocompleteIndex, items.length - 1);
+    const opText = items[idx].querySelector('span').textContent;
+    const op = SEARCH_OPERATORS.find(o => o.op === opText);
+
+    if (op && !op.needsValue) {
+        // Complete token — e.g. has:attachment, is:unread
+        const parts = op.op.split(':');
+        state.searchTokens.push({ type: parts[0], value: parts.slice(1).join(':') });
+        els.searchInput.value = '';
+        renderSearchChips();
+    } else {
+        // Needs value — put operator in input for user to type value
+        els.searchInput.value = opText;
+        // Move cursor to end
+        els.searchInput.setSelectionRange(opText.length, opText.length);
+    }
+    els.searchAutocomplete.classList.add('hidden');
+}
+
+function renderAutocompleteHighlight() {
+    const items = els.searchAutocomplete.querySelectorAll('.autocomplete-item');
+    items.forEach((el, idx) => {
+        el.classList.toggle('selected', idx === state.autocompleteIndex);
+    });
+}
+
+function renderChips(tokens, container, opts = {}) {
+    container.innerHTML = tokens.map((t, idx) => {
+        const label = t.type === 'text' ? t.value : `${t.type}:${t.value}`;
+        const removeBtn = opts.removable !== false
+            ? `<span class="chip-remove" data-index="${idx}">&times;</span>`
+            : '';
+        return `<span class="search-chip">${escapeHtml(label)}${removeBtn}</span>`;
+    }).join('');
+}
+
+function renderSearchChips() {
+    renderChips(state.searchTokens, els.searchTokens);
+}
+
+function updateActiveFilters() {
+    if (state.searchTokens.length > 0) {
+        renderChips(state.searchTokens, els.activeFilterChips);
+        els.activeFilters.classList.remove('hidden');
+    } else {
+        els.activeFilters.classList.add('hidden');
+    }
+}
+
+function clearAllFilters() {
+    state.searchTokens = [];
+    updateActiveFilters();
+    loadEmails();
 }
 
 // Split management

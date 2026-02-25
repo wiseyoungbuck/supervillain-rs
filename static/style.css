@@ -562,9 +562,11 @@ body:not(.light-theme) .compose-quote a * {
     right: 0;
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     padding: 8px 16px;
     background: var(--bg-secondary);
     border-top: 1px solid var(--border);
+    gap: 4px;
 }
 
 #search-bar.hidden {
@@ -573,17 +575,135 @@ body:not(.light-theme) .compose-quote a * {
 
 .search-prefix {
     color: var(--accent);
-    margin-right: 8px;
+    margin-right: 4px;
+}
+
+#search-tokens {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
 }
 
 #search-input {
     flex: 1;
+    min-width: 120px;
     background: transparent;
     border: none;
     color: var(--fg);
     font-family: var(--font-mono);
     font-size: 14px;
     outline: none;
+}
+
+/* Search chips (shared by search bar and active filter bar) */
+.search-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--accent);
+    padding: 2px 8px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    white-space: nowrap;
+}
+
+.search-chip .chip-remove {
+    cursor: pointer;
+    color: var(--fg-dim);
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+}
+
+.search-chip .chip-remove:hover {
+    color: var(--danger);
+}
+
+/* Autocomplete dropdown */
+#search-autocomplete {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    max-height: 300px;
+    overflow-y: auto;
+    z-index: 100;
+}
+
+#search-autocomplete.hidden {
+    display: none;
+}
+
+.autocomplete-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 16px;
+    cursor: pointer;
+    color: var(--fg);
+}
+
+.autocomplete-item:hover,
+.autocomplete-item.selected {
+    background: var(--selection);
+    color: var(--accent);
+}
+
+.autocomplete-item .ac-hint {
+    color: var(--fg-dim);
+    font-size: 12px;
+}
+
+/* Active filter bar */
+#active-filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+}
+
+#active-filters.hidden {
+    display: none;
+}
+
+.filter-label {
+    color: var(--fg-dim);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+
+#active-filter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 1;
+}
+
+.clear-filters-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.clear-filters-btn:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+/* Search mode indicator */
+#mode-indicator.search {
+    background: var(--accent);
 }
 
 /* Help overlay */

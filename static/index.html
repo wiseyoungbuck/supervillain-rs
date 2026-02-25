@@ -26,6 +26,11 @@
             <!-- Email list view -->
             <div id="email-list-view" class="view active">
                 <div id="split-tabs"></div>
+                <div id="active-filters" class="hidden">
+                    <span class="filter-label">FILTER</span>
+                    <div id="active-filter-chips"></div>
+                    <button id="clear-all-filters" class="clear-filters-btn">Clear</button>
+                </div>
                 <div id="email-list"></div>
             </div>
 
@@ -97,7 +102,9 @@
         <!-- Search bar -->
         <div id="search-bar" class="hidden">
             <span class="search-prefix">/</span>
-            <input type="text" id="search-input" placeholder="from: to: has:attachment is:unread newer_than:7d">
+            <div id="search-tokens"></div>
+            <input type="text" id="search-input" placeholder="Type a filter (from: to: has:attachment ...)">
+            <div id="search-autocomplete" class="hidden"></div>
         </div>
 
         <!-- Help overlay -->
@@ -127,7 +134,7 @@
                 </div>
                 <div class="help-section">
                     <h3>Other</h3>
-                    <div class="shortcut"><kbd>/</kbd> Search</div>
+                    <div class="shortcut"><kbd>/</kbd> Search (from: to: subject: has:attachment is:unread newer_than:)</div>
                     <div class="shortcut"><kbd>Ctrl+k</kbd> Command palette</div>
                     <div class="shortcut"><kbd>Ctrl+1-9</kbd> Jump to split tab</div>
                     <div class="shortcut"><kbd>1-9</kbd> Switch account</div>

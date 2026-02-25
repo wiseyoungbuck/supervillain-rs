@@ -109,21 +109,26 @@ fn parse_relative_date(s: &str) -> Option<NaiveDate> {
         return None;
     }
 
+    // Try relative format first: Nd, Nw, Nm
     let (num_str, unit) = s.split_at(s.len() - 1);
-    let num: i64 = num_str.parse().ok()?;
-    if num <= 0 {
-        return None;
+    if let Ok(num) = num_str.parse::<i64>()
+        && num > 0
+    {
+        let days = match unit {
+            "d" => Some(num),
+            "w" => Some(num * 7),
+            "m" => Some(num * 30),
+            _ => None,
+        };
+        if let Some(days) = days {
+            return Some(chrono::Utc::now().date_naive() - chrono::Duration::days(days));
+        }
     }
 
-    let days = match unit {
-        "d" => num,
-        "w" => num * 7,
-        "m" => num * 30,
-        _ => return None,
-    };
-
-    let result = chrono::Utc::now().date_naive() - chrono::Duration::days(days);
-    Some(result)
+    // Fallback: absolute date MM-DD-YY or MM-DD-YYYY
+    NaiveDate::parse_from_str(s, "%m-%d-%y")
+        .or_else(|_| NaiveDate::parse_from_str(s, "%m-%d-%Y"))
+        .ok()
 }
 
 // =============================================================================
@@ -406,6 +411,52 @@ mod tests {
         };
         let filter = to_jmap_filter(Some(&q), None);
         assert_eq!(filter, serde_json::json!({"after": "2026-01-15T00:00:00Z"}));
+    }
+
+    // --- Absolute date tests ---
+
+    #[test]
+    fn parse_newer_than_absolute_mm_dd_yy() {
+        let q = parse_query("newer_than:01-15-25");
+        assert_eq!(q.after, Some(NaiveDate::from_ymd_opt(2025, 1, 15).unwrap()));
+    }
+
+    #[test]
+    fn parse_newer_than_absolute_mm_dd_yyyy() {
+        let q = parse_query("newer_than:01-15-2025");
+        assert_eq!(q.after, Some(NaiveDate::from_ymd_opt(2025, 1, 15).unwrap()));
+    }
+
+    #[test]
+    fn parse_older_than_absolute_mm_dd_yy() {
+        let q = parse_query("older_than:06-30-25");
+        assert_eq!(
+            q.before,
+            Some(NaiveDate::from_ymd_opt(2025, 6, 30).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_older_than_absolute_mm_dd_yyyy() {
+        let q = parse_query("older_than:06-30-2025");
+        assert_eq!(
+            q.before,
+            Some(NaiveDate::from_ymd_opt(2025, 6, 30).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_newer_than_relative_still_works() {
+        let q = parse_query("newer_than:7d");
+        assert!(q.after.is_some());
+        let expected = chrono::Utc::now().date_naive() - chrono::Duration::days(7);
+        assert_eq!(q.after.unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_newer_than_invalid_absolute_date() {
+        let q = parse_query("newer_than:13-40-25");
+        assert!(q.after.is_none());
     }
 
     #[test]
