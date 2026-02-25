@@ -755,12 +755,12 @@ async fn split_counts(
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
     let mut all_emails = Vec::new();
     for batch in email_ids.chunks(500) {
-        let batch_owned: Vec<String> = batch.to_vec();
-        let emails = jmap::get_emails(&session, &batch_owned, false, Some(minimal_props)).await?;
+        let emails = jmap::get_emails(&session, batch, false, Some(minimal_props)).await?;
         all_emails.extend(emails);
     }
 
     let mut counts = serde_json::Map::new();
+    counts.insert("all".into(), serde_json::json!(all_emails.len()));
     for split in &config.splits {
         let count = all_emails
             .iter()

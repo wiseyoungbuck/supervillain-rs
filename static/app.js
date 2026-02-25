@@ -157,12 +157,13 @@ async function loadTheme() {
 
 // API calls
 
-async function api(method, path, body = null) {
+async function api(method, path, body = null, signal = null) {
     const opts = {
         method,
         headers: { 'Content-Type': 'application/json' },
     };
     if (body) opts.body = JSON.stringify(body);
+    if (signal) opts.signal = signal;
 
     // Add account parameter if we have a current account
     let url = '/api' + path;
@@ -239,16 +240,23 @@ async function loadSplits() {
     }
 }
 
+let splitCountsController = null;
+
 async function loadSplitCounts() {
     if (state.currentMailbox?.role !== 'inbox' || state.splits.length === 0) return;
+    if (splitCountsController) splitCountsController.abort();
+    splitCountsController = new AbortController();
     const mailboxId = state.currentMailbox.id;
     try {
-        const counts = await api('GET', `/split-counts?mailbox_id=${mailboxId}`);
+        const counts = await api('GET', `/split-counts?mailbox_id=${mailboxId}`, null, splitCountsController.signal);
         if (state.currentMailbox?.id !== mailboxId) return; // stale response guard
         state.splitCounts = counts;
-        state.splitCounts.all = state.currentMailbox.total_emails;
         renderSplitTabs();
-    } catch (err) { console.warn('Failed to load split counts:', err); }
+    } catch (err) {
+        if (err.name !== 'AbortError') console.warn('Failed to load split counts:', err);
+    } finally {
+        splitCountsController = null;
+    }
 }
 
 function adjustSplitCounts(delta) {
@@ -299,7 +307,7 @@ function renderSplitTabs() {
 
     els.splitTabs.innerHTML = tabs.map((split, idx) => {
         const count = state.splitCounts[split.id];
-        const countBadge = count != null ? `<span class="split-count">${count}</span>` : '';
+        const countBadge = count != null ? `<span class="split-count">${escapeHtml(String(count))}</span>` : '';
         return `
         <div class="split-tab ${state.currentSplit === split.id ? 'active' : ''}"
              data-split="${split.id}">
