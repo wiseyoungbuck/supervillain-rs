@@ -40,7 +40,7 @@ function init() {
     // Cache DOM elements
     els.modeIndicator = document.getElementById('mode-indicator');
     els.mailboxName = document.getElementById('mailbox-name');
-    els.emailCount = document.getElementById('email-count');
+    els.emailCount = null;
     els.statusMessage = document.getElementById('status-message');
     els.accountSelector = document.getElementById('account-selector');
     els.mailboxList = document.getElementById('mailbox-list');
@@ -814,9 +814,7 @@ function showStatus(message, type = 'info') {
 }
 
 function updateEmailCount() {
-    const total = state.emails.length;
-    const unread = state.emails.filter(e => e.isUnread).length;
-    els.emailCount.textContent = unread > 0 ? `${unread}/${total}` : `${total}`;
+    // No-op: count removed from status bar (sidebar badges are sufficient)
 }
 
 // Keyboard handling
