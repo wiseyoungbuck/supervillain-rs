@@ -409,7 +409,6 @@ async function maybeRefillEmails() {
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
             renderEmailList();
-    
         }
     } catch (err) {
         console.warn('Refill failed:', err);
@@ -515,7 +514,6 @@ async function emailAction(type, emailId) {
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             renderEmailList();
-    
         }
         adjustSplitCounts(+1);
         showStatus(label + ' failed: ' + err.message, 'error');
@@ -1193,7 +1191,6 @@ async function unsubscribeAndArchiveAll() {
             state.emails = state.emails.concat(removedEmails);
             state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
             renderEmailList();
-    
         }
         showStatus('Unsubscribe failed: ' + err.message, 'error');
     }
@@ -1668,7 +1665,6 @@ async function performUndo() {
         if (item.emailData) {
             state.emails = state.emails.filter(e => e.id !== item.emailId);
             renderEmailList();
-    
         }
         adjustSplitCounts(-1);
         showStatus('Undo failed', 'error');

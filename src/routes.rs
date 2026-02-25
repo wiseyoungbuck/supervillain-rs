@@ -13,6 +13,8 @@ use crate::error::Error;
 use crate::types::*;
 use crate::{calendar, jmap, search, splits};
 
+const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
+
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const STYLE_CSS: &str = include_str!("../static/style.css");
@@ -236,9 +238,8 @@ async fn list_emails(
     let query = params.search.as_deref().map(search::parse_query);
     let query_ref = query.as_ref();
 
-    // Overfetch 10x when filtering by split to fill the screen even for sparse splits
     let fetch_limit = if params.split_id.is_some() {
-        limit * 10
+        limit * SPLIT_OVERFETCH_MULTIPLIER
     } else {
         limit
     };
@@ -750,13 +751,16 @@ async fn split_counts(
 
     let session = state.session.read().await;
 
-    // Use the same window as the list view (150 * 10 = 1500) so counts match what's shown
-    let fetch_limit = 1500;
+    let fetch_limit = 150 * SPLIT_OVERFETCH_MULTIPLIER;
     let email_ids =
         jmap::query_emails(&session, Some(&params.mailbox_id), fetch_limit, 0, None).await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
-    let all_emails = jmap::get_emails(&session, &email_ids, false, Some(minimal_props)).await?;
+    let mut all_emails = Vec::new();
+    for batch in email_ids.chunks(500) {
+        let emails = jmap::get_emails(&session, batch, false, Some(minimal_props)).await?;
+        all_emails.extend(emails);
+    }
 
     let mut counts = serde_json::Map::new();
     for split in &config.splits {
