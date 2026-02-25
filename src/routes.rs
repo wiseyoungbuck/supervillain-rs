@@ -760,7 +760,6 @@ async fn split_counts(
     }
 
     let mut counts = serde_json::Map::new();
-    counts.insert("all".into(), serde_json::json!(all_emails.len()));
     for split in &config.splits {
         let count = all_emails
             .iter()
