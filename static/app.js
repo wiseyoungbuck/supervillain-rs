@@ -1635,10 +1635,11 @@ function closeSearch() {
 
 function getSearchQuery() {
     return state.searchTokens.map(t => {
+        const sanitized = t.value.replace(/"/g, '');
         if (t.type === 'text') {
-            return t.value.includes(' ') ? `"${t.value}"` : t.value;
+            return sanitized.includes(' ') ? `"${sanitized}"` : sanitized;
         }
-        const val = t.value.includes(' ') ? `"${t.value}"` : t.value;
+        const val = sanitized.includes(' ') ? `"${sanitized}"` : sanitized;
         return `${t.type}:${val}`;
     }).join(' ');
 }
@@ -1650,14 +1651,15 @@ function commitCurrentInput() {
     // Check if input matches operator:value pattern
     const colonIdx = raw.indexOf(':');
     if (colonIdx > 0) {
-        const prefix = raw.substring(0, colonIdx);
+        const prefix = raw.substring(0, colonIdx).toLowerCase();
         const value = raw.substring(colonIdx + 1);
+        const rawLower = raw.toLowerCase();
         // Check if it's a known operator
-        const knownOp = SEARCH_OPERATORS.find(o => o.op === prefix + ':' || o.op === raw);
+        const knownOp = SEARCH_OPERATORS.find(o => o.op === prefix + ':' || o.op === rawLower);
         if (knownOp) {
             if (!knownOp.needsValue) {
                 // Complete token like has:attachment
-                const parts = raw.split(':');
+                const parts = knownOp.op.split(':');
                 state.searchTokens.push({ type: parts[0], value: parts.slice(1).join(':') });
             } else if (value) {
                 state.searchTokens.push({ type: prefix, value });
@@ -1669,16 +1671,9 @@ function commitCurrentInput() {
             renderSearchChips();
             return;
         }
-        // Even if not a known op prefix, if there's a value, treat it as operator:value
-        if (value) {
-            state.searchTokens.push({ type: prefix, value });
-            els.searchInput.value = '';
-            renderSearchChips();
-            return;
-        }
     }
 
-    // Plain text token
+    // Plain text token (including unknown operator-like input)
     state.searchTokens.push({ type: 'text', value: raw });
     els.searchInput.value = '';
     renderSearchChips();

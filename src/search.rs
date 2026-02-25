@@ -47,8 +47,8 @@ pub fn parse_query(raw: &str) -> ParsedQuery {
                     },
                     "before" => query.before = parse_date(&value),
                     "after" => query.after = parse_date(&value),
-                    "newer_than" => query.after = parse_relative_date(&value),
-                    "older_than" => query.before = parse_relative_date(&value),
+                    "newer_than" => query.after = parse_date_offset(&value),
+                    "older_than" => query.before = parse_date_offset(&value),
                     _ => {}
                 }
 
@@ -103,7 +103,7 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
-fn parse_relative_date(s: &str) -> Option<NaiveDate> {
+fn parse_date_offset(s: &str) -> Option<NaiveDate> {
     let s = s.trim();
     if s.len() < 2 {
         return None;
@@ -456,6 +456,18 @@ mod tests {
     #[test]
     fn parse_newer_than_invalid_absolute_date() {
         let q = parse_query("newer_than:13-40-25");
+        assert!(q.after.is_none());
+    }
+
+    #[test]
+    fn parse_newer_than_zero_weeks_ignored() {
+        let q = parse_query("newer_than:0w");
+        assert!(q.after.is_none());
+    }
+
+    #[test]
+    fn parse_newer_than_invalid_unit() {
+        let q = parse_query("newer_than:1x");
         assert!(q.after.is_none());
     }
 
