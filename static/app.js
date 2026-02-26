@@ -383,7 +383,7 @@ function selectSplit(splitId) {
     // Show cached split data instantly — no network wait
     const key = splitCacheKey();
     if (splitListCache[key]) {
-        state.emails = splitListCache[key];
+        state.emails = [...splitListCache[key]];
         state.selectedIndex = 0;
         renderEmailList();
     }
@@ -455,7 +455,7 @@ async function loadEmails() {
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
-        splitListCache[context] = emails;
+        splitListCache[context] = [...emails];
         state.emails = emails;
         state.selectedIndex = 0;
         renderEmailList();
@@ -484,7 +484,7 @@ async function maybeRefillEmails() {
         const newEmails = fresh.filter(e => !existingIds.has(e.id));
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
-            splitListCache[context] = state.emails;
+            splitListCache[context] = [...state.emails];
             renderEmailList();
         }
     } catch (err) {
