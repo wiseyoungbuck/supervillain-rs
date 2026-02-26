@@ -34,6 +34,11 @@ const CACHE_LIMIT = 150;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
 
+// Per-split email list cache for instant split switching
+// Key: "accountId:mailboxId:splitId:search" -> email array
+const splitListCache = {};
+let loadEmailsController = null;
+
 const SEARCH_OPERATORS = [
     { op: 'from:', hint: 'Sender email', needsValue: true },
     { op: 'to:', hint: 'Recipient', needsValue: true },
@@ -261,6 +266,7 @@ function selectAccount(account) {
     state.currentMailbox = null;
     state.selectedIndex = 0;
     state.currentSplit = 'all';
+    clearSplitListCache();
     renderAccounts();
     loadMailboxes();
     loadIdentities();
@@ -358,9 +364,30 @@ function renderSplitTabs() {
     });
 }
 
+function splitCacheKey() {
+    return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${getSearchQuery()}`;
+}
+
+function clearSplitListCache() {
+    Object.keys(splitListCache).forEach(k => delete splitListCache[k]);
+}
+
+function invalidateSplitListCache() {
+    delete splitListCache[splitCacheKey()];
+}
+
 function selectSplit(splitId) {
     state.currentSplit = splitId;
     renderSplitTabs();
+
+    // Show cached split data instantly — no network wait
+    const key = splitCacheKey();
+    if (splitListCache[key]) {
+        state.emails = splitListCache[key];
+        state.selectedIndex = 0;
+        renderEmailList();
+    }
+
     loadEmails();
 }
 
@@ -409,20 +436,33 @@ function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
 async function loadEmails() {
     if (!state.currentMailbox) return;
 
-    // Only show "Loading" if the list is empty. If we already have emails
-    // (refresh, split switch), keep them visible while fetching.
+    // Cancel any in-flight email fetch
+    if (loadEmailsController) loadEmailsController.abort();
+    loadEmailsController = new AbortController();
+
+    // Snapshot context at request time for stale detection
+    const context = splitCacheKey();
+
+    // Show loading only if we have no data (cache miss)
     if (state.emails.length === 0) {
         els.emailList.innerHTML = '<div class="loading">Loading</div>';
     }
 
     try {
         const url = buildEmailListUrl(state.currentMailbox.id);
-        state.emails = await api('GET', url);
+        const emails = await api('GET', url, null, loadEmailsController.signal);
+
+        // Stale response guard: discard if context changed during fetch
+        if (splitCacheKey() !== context) return;
+
+        splitListCache[context] = emails;
+        state.emails = emails;
         state.selectedIndex = 0;
         renderEmailList();
-
     } catch (err) {
-        showStatus('Failed to load emails: ' + err.message, 'error');
+        if (err.name !== 'AbortError') {
+            showStatus('Failed to load emails: ' + err.message, 'error');
+        }
     }
 }
 
@@ -430,21 +470,21 @@ async function maybeRefillEmails() {
     if (refillInFlight || state.emails.length >= REFILL_THRESHOLD) return;
     if (!state.currentMailbox) return;
 
-    const mailboxId = state.currentMailbox.id;
-    const searchQuery = getSearchQuery();
+    const context = splitCacheKey();
 
     refillInFlight = true;
     try {
-        const url = buildEmailListUrl(mailboxId, { offset: state.emails.length });
+        const url = buildEmailListUrl(state.currentMailbox.id, { offset: state.emails.length });
         const fresh = await api('GET', url);
 
-        // Discard results if context changed during fetch
-        if (state.currentMailbox?.id !== mailboxId || getSearchQuery() !== searchQuery) return;
+        // Discard results if context changed during fetch (mailbox, split, or search)
+        if (splitCacheKey() !== context) return;
 
         const existingIds = new Set(state.emails.map(e => e.id));
         const newEmails = fresh.filter(e => !existingIds.has(e.id));
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
+            splitListCache[context] = state.emails;
             renderEmailList();
         }
     } catch (err) {
@@ -550,6 +590,7 @@ async function emailAction(type, emailId) {
         state.undoStack.pop();
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
+            invalidateSplitListCache();
             renderEmailList();
         }
         adjustSplitCounts(+1);
@@ -824,6 +865,7 @@ function selectMailbox(mailbox) {
     state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
+    clearSplitListCache();
     els.mailboxName.textContent = mailbox.name.toUpperCase();
     renderMailboxes();
     renderSplitTabs();
@@ -1266,6 +1308,7 @@ async function unsubscribeAndArchiveAll() {
     if (senderEmail) {
         removedEmails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() === senderEmail);
         state.emails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() !== senderEmail);
+        invalidateSplitListCache();
         if (state.selectedIndex >= state.emails.length) {
             state.selectedIndex = Math.max(0, state.emails.length - 1);
         }
@@ -1295,6 +1338,7 @@ async function unsubscribeAndArchiveAll() {
         if (removedEmails.length > 0) {
             state.emails = state.emails.concat(removedEmails);
             state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+            invalidateSplitListCache();
             renderEmailList();
         }
         showStatus('Unsubscribe failed: ' + err.message, 'error');
@@ -1303,6 +1347,7 @@ async function unsubscribeAndArchiveAll() {
 
 function removeEmailFromList(emailId) {
     state.emails = state.emails.filter(e => e.id !== emailId);
+    invalidateSplitListCache();
     if (state.selectedIndex >= state.emails.length) {
         state.selectedIndex = Math.max(0, state.emails.length - 1);
     }
@@ -1865,6 +1910,7 @@ async function performUndo() {
         const idx = Math.min(item.insertIndex, state.emails.length);
         state.emails.splice(idx, 0, item.emailData);
         state.selectedIndex = idx;
+        invalidateSplitListCache();
         renderEmailList();
 
     }
@@ -1879,6 +1925,7 @@ async function performUndo() {
         // Revert: remove the email we optimistically re-inserted
         if (item.emailData) {
             state.emails = state.emails.filter(e => e.id !== item.emailId);
+            invalidateSplitListCache();
             renderEmailList();
         }
         adjustSplitCounts(-1);
