@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::types::*;
-use crate::{calendar, jmap, search, splits};
+use crate::{calendar, jmap, search, splits, theme};
 
 const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
 
@@ -221,19 +221,30 @@ async fn list_identities(State(state): State<Arc<AppState>>) -> Result<impl Into
 }
 
 async fn get_theme() -> impl IntoResponse {
-    // Try to load system theme
-    let theme_path = dirs_next::config_dir()
+    let theme_dir = dirs_next::config_dir()
         .unwrap_or_default()
-        .join("omarchy/current/theme/supervillain.css");
+        .join("omarchy/current/theme");
 
-    match std::fs::read_to_string(&theme_path) {
-        Ok(css) => (StatusCode::OK, [("content-type", "text/css")], css),
-        Err(_) => (
-            StatusCode::OK,
-            [("content-type", "text/css")],
-            String::new(),
-        ),
+    // 1. Prefer supervillain.css (template-generated for colors.toml themes)
+    if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
+        && !css.is_empty()
+    {
+        return (StatusCode::OK, [("content-type", "text/css")], css);
     }
+
+    // 2. Parse terminal color config (ghostty.conf → alacritty.toml)
+    if let Some(colors) = theme::load_from_theme_dir(&theme_dir) {
+        let is_light = theme::is_light_theme(&theme_dir);
+        let css = theme::generate_theme_css(&colors, is_light);
+        return (StatusCode::OK, [("content-type", "text/css")], css);
+    }
+
+    // 3. No theme available — base CSS defaults apply
+    (
+        StatusCode::OK,
+        [("content-type", "text/css")],
+        String::new(),
+    )
 }
 
 async fn list_mailboxes(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, Error> {
@@ -1392,6 +1403,120 @@ mod tests {
             MOBILE_HTML.contains("-webkit-overflow-scrolling: touch"),
             "email list should use momentum scrolling"
         );
+    }
+
+    // =========================================================================
+    // Theme tests
+    // =========================================================================
+
+    #[test]
+    fn style_css_no_undefined_variables() {
+        assert!(
+            !STYLE_CSS.contains("--text-primary"),
+            "style.css should not reference undefined --text-primary"
+        );
+        assert!(
+            !STYLE_CSS.contains("--text-secondary"),
+            "style.css should not reference undefined --text-secondary"
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_endpoint_returns_css_content_type() {
+        let resp = get_theme().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/css");
+    }
+
+    #[test]
+    fn theme_fallback_generates_css_from_ghostty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ghostty.conf"),
+            "\
+background =#1d2021
+foreground =#d5c4a1
+palette = 0=#1d2021
+palette = 1=#cc241d
+palette = 2=#b8bb26
+palette = 3=#d79921
+palette = 4=#83a598
+palette = 5=#d3869b
+palette = 6=#8ec07c
+palette = 7=#d5c4a1
+palette = 8=#665c54
+palette = 9=#cc241d
+palette = 10=#b8bb26
+palette = 11=#d79921
+palette = 12=#83a598
+palette = 13=#d3869b
+palette = 14=#b8bb26
+palette = 15=#ebdbb2
+",
+        )
+        .unwrap();
+
+        let colors = theme::load_from_theme_dir(dir.path()).unwrap();
+        let css = theme::generate_theme_css(&colors, false);
+        assert!(css.contains("--bg: #1d2021;"));
+        assert!(css.contains("--fg: #d5c4a1;"));
+        assert!(css.contains("--accent: #8ec07c;"));
+        assert!(css.contains("#help-overlay"));
+        assert!(css.contains("#split-modal"));
+    }
+
+    #[test]
+    fn theme_fallback_generates_css_from_alacritty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("alacritty.toml"),
+            "\
+[colors.primary]
+background = '#fdf6e3'
+foreground = '#586e75'
+
+[colors.normal]
+black   = '#073642'
+red     = '#dc322f'
+green   = '#859900'
+yellow  = '#b58900'
+blue    = '#268bd2'
+magenta = '#d33682'
+cyan    = '#2aa198'
+white   = '#eee8d5'
+
+[colors.bright]
+black   = '#002b36'
+red     = '#cb4b16'
+green   = '#586e75'
+yellow  = '#657b83'
+blue    = '#839496'
+magenta = '#6c71c4'
+cyan    = '#93a1a1'
+white   = '#fdf6e3'
+",
+        )
+        .unwrap();
+
+        let colors = theme::load_from_theme_dir(dir.path()).unwrap();
+        let css = theme::generate_theme_css(&colors, false);
+        assert!(css.contains("--bg: #fdf6e3;"));
+        assert!(css.contains("--accent: #2aa198;"));
+    }
+
+    #[test]
+    fn theme_light_mode_detected_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!theme::is_light_theme(dir.path()));
+
+        std::fs::write(dir.path().join("light.mode"), "").unwrap();
+        assert!(theme::is_light_theme(dir.path()));
     }
 }
 

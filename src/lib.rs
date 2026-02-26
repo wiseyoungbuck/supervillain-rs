@@ -5,5 +5,6 @@ pub mod jmap;
 pub mod routes;
 pub mod search;
 pub mod splits;
+pub mod theme;
 pub mod types;
 pub mod validate;
