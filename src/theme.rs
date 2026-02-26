@@ -16,9 +16,20 @@ pub struct ThemeColors {
 
 /// Normalize a hex color value from various terminal config formats.
 /// Handles `'#fdf6e3'`, `"0x1d2021"`, `=#aabbcc` (ghostty), bare `#hex`.
+/// Strips inline comments (e.g., `'#fdf6e3' # solarized light`).
 /// Returns `#rrggbb` or None if invalid.
 fn normalize_hex(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+    let trimmed = raw.trim();
+    // Extract quoted value, or strip inline `# comment` from unquoted value
+    let s = if (trimmed.starts_with('\'') || trimmed.starts_with('"'))
+        && let Some(end) = trimmed[1..].find(trimmed.as_bytes()[0] as char)
+    {
+        &trimmed[1..=end]
+    } else if let Some(pos) = trimmed.find(" #") {
+        trimmed[..pos].trim()
+    } else {
+        trimmed
+    };
     let hex = s
         .strip_prefix('#')
         .or_else(|| s.strip_prefix("0x"))
@@ -287,6 +298,7 @@ pub fn generate_theme_css(colors: &ThemeColors, is_light: bool) -> String {
     );
 
     if is_light {
+        // Frontend detects light themes via css.includes('--light-mode') in app.js
         css.push_str("\n\n/* --light-mode */");
     }
 
@@ -421,6 +433,19 @@ palette = 15=#ebdbb2
     fn normalize_hex_bare_hash() {
         // ghostty format: =#hex (no quotes)
         assert_eq!(normalize_hex("#1d2021"), Some("#1d2021".into()));
+    }
+
+    #[test]
+    fn normalize_hex_strips_inline_comments() {
+        assert_eq!(
+            normalize_hex("'#fdf6e3' # solarized light"),
+            Some("#fdf6e3".into())
+        );
+        assert_eq!(normalize_hex("#1d2021 # dark bg"), Some("#1d2021".into()));
+        assert_eq!(
+            normalize_hex("\"0x1d2021\" # gruvbox"),
+            Some("#1d2021".into())
+        );
     }
 
     #[test]
