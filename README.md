@@ -1,6 +1,12 @@
-# Supervillain
+<p align="center">
+  <img src="static/supervillain.jpg" width="200" alt="Supervillain">
+</p>
 
-A keyboard-driven email client with vim keybindings. Rust backend + vanilla JS frontend, connecting to Fastmail via JMAP.
+<h1 align="center">Supervillain</h1>
+
+<p align="center">
+  Email for people who'd rather be typing. Vim-native, zero-Electron, talks JMAP to Fastmail.
+</p>
 
 ## Requirements
 
