@@ -1140,6 +1140,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervillain_jpg_serves_jpeg() {
+        let resp = supervillain_jpg().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "image/jpeg");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "supervillain.jpg should have JPEG magic bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn mobile_jmap_js_serves_es_module() {
         let resp = mobile_jmap_js().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
