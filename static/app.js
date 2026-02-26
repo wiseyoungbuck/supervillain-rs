@@ -1120,15 +1120,23 @@ function handleCommandInput() {
 }
 
 function handleSearchKeyDown(e) {
+    // This handler owns all keydown events while search is open.
+    // Without this, closeSearch() hides the bar mid-event and the
+    // document handler sees the bar as hidden, forwarding keys to
+    // normal-mode handlers (e.g. Enter -> openSelected).
+    e.stopPropagation();
+
     const acVisible = !els.searchAutocomplete.classList.contains('hidden');
     const inputVal = els.searchInput.value;
 
     if (e.key === 'Enter') {
         if (acVisible) {
             acceptAutocomplete();
-            e.preventDefault();
         } else if (inputVal.trim()) {
+            // Commit token and immediately apply the search
             commitCurrentInput();
+            closeSearch();
+            loadEmails();
         } else if (state.searchTokens.length > 0) {
             // Empty input + tokens exist = apply search
             closeSearch();
