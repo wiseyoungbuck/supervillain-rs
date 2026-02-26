@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/supervillain.jpg" width="200" alt="Supervillain">
+  <img src="static/icon-512.png" width="200" alt="Supervillain">
 </p>
 
 <h1 align="center">Supervillain</h1>
