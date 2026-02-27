@@ -1203,6 +1203,7 @@ body:not(.light-theme) .compose-quote a * {
 }
 
 .compose-attachment-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -1230,4 +1231,24 @@ body:not(.light-theme) .compose-quote a * {
 
 .attachment-remove:hover {
     color: var(--accent);
+}
+
+.attachment-progress {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--border);
+}
+
+.attachment-progress-bar {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.15s ease;
+}
+
+#compose-view.drag-over {
+    outline: 2px dashed var(--accent);
+    outline-offset: -4px;
 }

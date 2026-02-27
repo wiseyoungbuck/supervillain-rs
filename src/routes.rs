@@ -392,7 +392,7 @@ fn is_safe_path_segment(s: &str) -> bool {
 
 fn sanitize_filename_for_header(name: &str) -> String {
     name.chars()
-        .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n')
+        .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n' && c != '\0')
         .collect()
 }
 
@@ -1517,6 +1517,151 @@ white   = '#fdf6e3'
 
         std::fs::write(dir.path().join("light.mode"), "").unwrap();
         assert!(theme::is_light_theme(dir.path()));
+    }
+
+    // =========================================================================
+    // Attachment tests
+    // =========================================================================
+
+    #[test]
+    fn send_email_body_deserializes_without_attachments() {
+        let json = r#"{"to":["a@b.com"],"subject":"Hi","body":"Hello"}"#;
+        let body: SendEmailBody = serde_json::from_str(json).unwrap();
+        assert!(body.attachments.is_empty());
+    }
+
+    #[test]
+    fn send_email_body_deserializes_with_attachments() {
+        let json = r#"{"to":["a@b.com"],"subject":"Hi","body":"Hello","attachments":[{"blob_id":"B1","name":"doc.pdf","mime_type":"application/pdf","size":1024}]}"#;
+        let body: SendEmailBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.attachments.len(), 1);
+        assert_eq!(body.attachments[0].blob_id, "B1");
+        assert_eq!(body.attachments[0].name, "doc.pdf");
+        assert_eq!(body.attachments[0].mime_type, "application/pdf");
+        assert_eq!(body.attachments[0].size, 1024);
+    }
+
+    #[test]
+    fn upload_max_size_constant() {
+        assert_eq!(MAX_UPLOAD_SIZE, 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sanitize_filename_unicode() {
+        assert_eq!(sanitize_filename_for_header("résumé.pdf"), "résumé.pdf");
+    }
+
+    #[test]
+    fn sanitize_filename_null_bytes() {
+        assert_eq!(
+            sanitize_filename_for_header("file\0name.pdf"),
+            "filename.pdf"
+        );
+    }
+
+    #[test]
+    fn sanitize_filename_empty() {
+        assert_eq!(sanitize_filename_for_header(""), "");
+    }
+
+    #[test]
+    fn app_js_has_attachment_upload() {
+        assert!(
+            APP_JS.contains("/api/upload"),
+            "app.js should call the upload endpoint"
+        );
+    }
+
+    #[test]
+    fn app_js_has_attachment_size_validation() {
+        assert!(
+            APP_JS.contains("25 * 1024 * 1024"),
+            "app.js should validate 25 MB size limit"
+        );
+    }
+
+    #[test]
+    fn app_js_has_attachment_list_rendering() {
+        assert!(
+            APP_JS.contains("renderComposeAttachments"),
+            "app.js should render the compose attachment list"
+        );
+    }
+
+    #[test]
+    fn app_js_blocks_send_during_upload() {
+        assert!(
+            APP_JS.contains("status === 'uploading'"),
+            "app.js should block send while uploads are in progress"
+        );
+    }
+
+    #[test]
+    fn app_js_clears_attachments_on_cancel() {
+        assert!(
+            APP_JS.contains("pendingAttachments = []"),
+            "app.js should clear attachments when compose is cancelled"
+        );
+    }
+
+    #[test]
+    fn app_js_has_abort_controller() {
+        assert!(
+            APP_JS.contains("AbortController"),
+            "app.js should support cancelling uploads"
+        );
+    }
+
+    // =========================================================================
+    // P1 feature tests
+    // =========================================================================
+
+    #[test]
+    fn app_js_has_drag_and_drop() {
+        assert!(
+            APP_JS.contains("dragenter"),
+            "app.js should handle dragenter events"
+        );
+        assert!(
+            APP_JS.contains("dataTransfer"),
+            "app.js should read dropped files from dataTransfer"
+        );
+    }
+
+    #[test]
+    fn app_js_has_clipboard_paste() {
+        assert!(
+            APP_JS.contains("clipboardData"),
+            "app.js should read pasted files from clipboardData"
+        );
+        assert!(
+            APP_JS.contains("pasted-image"),
+            "app.js should generate names for pasted images"
+        );
+    }
+
+    #[test]
+    fn app_js_has_upload_progress() {
+        assert!(
+            APP_JS.contains("upload.onprogress") || APP_JS.contains("onprogress"),
+            "app.js should track upload progress"
+        );
+    }
+
+    #[test]
+    fn app_js_has_attach_keyboard_shortcut() {
+        assert!(
+            APP_JS.contains("shiftKey"),
+            "app.js should have Ctrl+Shift+A shortcut for attaching files"
+        );
+    }
+
+    #[test]
+    fn style_css_has_drag_over_style() {
+        assert!(
+            STYLE_CSS.contains("drag-over"),
+            "style.css should style the drag-over state"
+        );
     }
 }
 

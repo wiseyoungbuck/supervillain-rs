@@ -143,6 +143,8 @@ function init() {
     els.rsvpDecline.addEventListener('click', () => rsvpToEvent('DECLINED'));
     els.composeFileInput.addEventListener('change', handleFileSelect);
     els.composeAttachmentsList.addEventListener('click', handleAttachmentListClick);
+    setupComposeDragDrop();
+    els.composeBody.addEventListener('paste', handleComposePaste);
 
     // Single delegated click handler for email list — never re-bound, survives innerHTML updates
     els.emailList.addEventListener('click', (e) => {
@@ -933,6 +935,9 @@ function handleKeyDown(e) {
         } else if (e.key === 'Enter' && e.ctrlKey) {
             sendEmail();
             e.preventDefault();
+        } else if (e.key === 'A' && e.ctrlKey && e.shiftKey) {
+            els.composeFileInput.click();
+            e.preventDefault();
         }
         return;
     }
@@ -1472,49 +1477,48 @@ let attachmentIdCounter = 0;
 function handleFileSelect() {
     const files = els.composeFileInput.files;
     if (!files.length) return;
-    for (const file of files) {
-        if (file.size > 25 * 1024 * 1024) {
-            showStatus(`${file.name} is too large (max 25 MB)`, 'error');
-            continue;
-        }
-        const id = ++attachmentIdCounter;
-        const controller = new AbortController();
-        state.pendingAttachments.push({
-            _id: id,
-            name: file.name,
-            mime_type: file.type || 'application/octet-stream',
-            size: file.size,
-            status: 'uploading',
-            controller,
-        });
-        renderComposeAttachments();
-        uploadAttachment(file, id, controller);
-    }
+    addFiles(files);
     els.composeFileInput.value = '';
 }
 
-async function uploadAttachment(file, id, controller) {
-    try {
-        const resp = await fetch('/api/upload', {
-            method: 'POST',
-            headers: {
-                'Content-Type': file.type || 'application/octet-stream',
-                'X-Filename': file.name,
-            },
-            body: file,
-            signal: controller.signal,
-        });
-        if (!resp.ok) throw new Error(`Upload failed (${resp.status})`);
-        const data = await resp.json();
+function uploadAttachment(file, id, controller) {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.setRequestHeader('X-Filename', file.name);
+
+    xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const att = state.pendingAttachments.find(a => a._id === id);
+        if (att) {
+            att.progress = Math.round((e.loaded / e.total) * 100);
+            renderComposeAttachments();
+        }
+    };
+
+    xhr.onload = () => {
+        if (xhr.status < 200 || xhr.status >= 300) {
+            const att = state.pendingAttachments.find(a => a._id === id);
+            if (att) {
+                att.status = 'error';
+                att.controller = null;
+                renderComposeAttachments();
+                showStatus(`Upload failed: ${file.name}`, 'error');
+            }
+            return;
+        }
+        const data = JSON.parse(xhr.responseText);
         const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.blob_id = data.blob_id;
             att.status = 'ready';
+            att.progress = 100;
             att.controller = null;
             renderComposeAttachments();
         }
-    } catch (err) {
-        if (err.name === 'AbortError') return;
+    };
+
+    xhr.onerror = () => {
         const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.status = 'error';
@@ -1522,7 +1526,12 @@ async function uploadAttachment(file, id, controller) {
             renderComposeAttachments();
             showStatus(`Upload failed: ${file.name}`, 'error');
         }
-    }
+    };
+
+    // Wire abort through the controller
+    controller.signal.addEventListener('abort', () => xhr.abort());
+
+    xhr.send(file);
 }
 
 function renderComposeAttachments() {
@@ -1537,12 +1546,16 @@ function renderComposeAttachments() {
         const size = formatFileSize(att.size);
         const statusIcon = att.status === 'uploading' ? '\u23F3'
             : att.status === 'error' ? '\u274C' : '\u2705';
+        const progressBar = att.status === 'uploading'
+            ? `<div class="attachment-progress"><div class="attachment-progress-bar" style="width: ${att.progress || 0}%"></div></div>`
+            : '';
         return `<div class="compose-attachment-item" data-id="${att._id}">
             <span class="attachment-icon">${icon}</span>
             <span class="attachment-name">${escapeHtml(att.name)}</span>
             <span class="attachment-size">${size}</span>
             <span class="attachment-status">${statusIcon}</span>
             <span class="attachment-remove" data-id="${att._id}">\u00D7</span>
+            ${progressBar}
         </div>`;
     }).join('');
 }
@@ -1557,6 +1570,67 @@ function handleAttachmentListClick(e) {
     if (att.controller) att.controller.abort();
     state.pendingAttachments.splice(idx, 1);
     renderComposeAttachments();
+}
+
+function setupComposeDragDrop() {
+    els.composeView.addEventListener('dragenter', (e) => {
+        if (state.view !== 'compose') return;
+        e.preventDefault();
+        els.composeView.classList.add('drag-over');
+    });
+    els.composeView.addEventListener('dragover', (e) => {
+        if (state.view !== 'compose') return;
+        e.preventDefault();
+        els.composeView.classList.add('drag-over');
+    });
+    els.composeView.addEventListener('dragleave', (e) => {
+        if (e.target !== els.composeView && els.composeView.contains(e.relatedTarget)) return;
+        els.composeView.classList.remove('drag-over');
+    });
+    els.composeView.addEventListener('drop', (e) => {
+        e.preventDefault();
+        els.composeView.classList.remove('drag-over');
+        if (state.view !== 'compose') return;
+        const files = e.dataTransfer.files;
+        if (!files.length) return;
+        addFiles(files);
+    });
+}
+
+function handleComposePaste(e) {
+    const files = e.clipboardData.files;
+    if (!files.length) return;
+    e.preventDefault();
+    const toAdd = [];
+    for (const file of files) {
+        const name = file.name && file.name !== 'image.png'
+            ? file.name
+            : `pasted-image-${Date.now()}.png`;
+        toAdd.push(new File([file], name, { type: file.type }));
+    }
+    addFiles(toAdd);
+}
+
+function addFiles(files) {
+    for (const file of files) {
+        if (file.size > 25 * 1024 * 1024) {
+            showStatus(`${file.name} is too large (max 25 MB)`, 'error');
+            continue;
+        }
+        const id = ++attachmentIdCounter;
+        const controller = new AbortController();
+        state.pendingAttachments.push({
+            _id: id,
+            name: file.name,
+            mime_type: file.type || 'application/octet-stream',
+            size: file.size,
+            status: 'uploading',
+            progress: 0,
+            controller,
+        });
+        renderComposeAttachments();
+        uploadAttachment(file, id, controller);
+    }
 }
 
 function autoSelectFromAddress(email) {
