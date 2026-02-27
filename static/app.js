@@ -1507,7 +1507,12 @@ function uploadAttachment(file, id, controller) {
             }
             return;
         }
-        const data = JSON.parse(xhr.responseText);
+        let data;
+        try { data = JSON.parse(xhr.responseText); } catch {
+            const att = state.pendingAttachments.find(a => a._id === id);
+            if (att) { att.status = 'error'; att.controller = null; renderComposeAttachments(); showStatus(`Upload failed: ${file.name}`, 'error'); }
+            return;
+        }
         const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.blob_id = data.blob_id;
@@ -1598,8 +1603,8 @@ function setupComposeDragDrop() {
 }
 
 function handleComposePaste(e) {
-    const files = e.clipboardData.files;
-    if (!files.length) return;
+    const files = e.clipboardData?.files;
+    if (!files || !files.length) return;
     e.preventDefault();
     const toAdd = [];
     for (const file of files) {

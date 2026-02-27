@@ -1651,7 +1651,7 @@ white   = '#fdf6e3'
     #[test]
     fn app_js_has_attach_keyboard_shortcut() {
         assert!(
-            APP_JS.contains("shiftKey"),
+            APP_JS.contains("e.ctrlKey && e.shiftKey"),
             "app.js should have Ctrl+Shift+A shortcut for attaching files"
         );
     }
