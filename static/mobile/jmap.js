@@ -39,7 +39,10 @@ export class JmapNetworkError extends Error {
 export function getSession() {
     try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        return raw ? JSON.parse(raw) : null;
+        if (!raw) return null;
+        const s = JSON.parse(raw);
+        if (!s.apiUrl || !s.accountId || !s.token) return null;
+        return s;
     } catch {
         return null;
     }
