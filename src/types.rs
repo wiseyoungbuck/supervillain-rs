@@ -66,8 +66,11 @@ pub struct Mailbox {
     pub id: String,
     pub name: String,
     pub role: Option<String>,
+    #[serde(alias = "totalEmails")]
     pub total_emails: i64,
+    #[serde(alias = "unreadEmails")]
     pub unread_emails: i64,
+    #[serde(alias = "parentId")]
     pub parent_id: Option<String>,
 }
 
@@ -76,6 +79,94 @@ pub struct Identity {
     pub id: String,
     pub email: String,
     pub name: String,
+}
+
+// =============================================================================
+// JMAP response types (deserialize-only)
+// =============================================================================
+
+/// JMAP session discovery response
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmapSessionResponse {
+    pub api_url: Option<String>,
+    pub upload_url: Option<String>,
+    pub download_url: Option<String>,
+    #[serde(default)]
+    pub primary_accounts: HashMap<String, String>,
+}
+
+/// Recursive MIME body structure part
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyStructurePart {
+    #[serde(rename = "type", default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub blob_id: Option<String>,
+    #[serde(default)]
+    pub part_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub disposition: Option<String>,
+    #[serde(default)]
+    pub cid: Option<String>,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub sub_parts: Vec<BodyStructurePart>,
+}
+
+/// Body part reference (for textBody/htmlBody arrays)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyPartRef {
+    #[serde(default)]
+    pub part_id: String,
+}
+
+/// Body value entry from the bodyValues map
+#[derive(Debug, Clone, Deserialize)]
+pub struct BodyValue {
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Raw JMAP Email/get response item. Converted to Email after body processing.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmapEmailRaw {
+    pub id: String,
+    pub blob_id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub mailbox_ids: HashMap<String, bool>,
+    #[serde(default)]
+    pub keywords: HashMap<String, bool>,
+    #[serde(default)]
+    pub received_at: Option<String>,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub from: Vec<EmailAddress>,
+    #[serde(default)]
+    pub to: Vec<EmailAddress>,
+    #[serde(default)]
+    pub cc: Vec<EmailAddress>,
+    #[serde(default)]
+    pub preview: String,
+    #[serde(default)]
+    pub has_attachment: bool,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub text_body: Vec<BodyPartRef>,
+    #[serde(default)]
+    pub html_body: Vec<BodyPartRef>,
+    #[serde(default)]
+    pub body_values: HashMap<String, BodyValue>,
+    pub body_structure: Option<BodyStructurePart>,
 }
 
 // =============================================================================
@@ -627,5 +718,78 @@ mod tests {
         assert_eq!(deserialized.splits[0].match_mode, MatchMode::All);
         assert_eq!(deserialized.splits[1].id, "newsletters");
         assert_eq!(deserialized.splits[1].match_mode, MatchMode::Any);
+    }
+
+    #[test]
+    fn mailbox_from_jmap_camel_case() {
+        let json = r#"{
+            "id": "mb-1",
+            "name": "Inbox",
+            "role": "inbox",
+            "totalEmails": 42,
+            "unreadEmails": 5,
+            "parentId": null
+        }"#;
+        let mailbox: Mailbox = serde_json::from_str(json).unwrap();
+        assert_eq!(mailbox.id, "mb-1");
+        assert_eq!(mailbox.total_emails, 42);
+        assert_eq!(mailbox.unread_emails, 5);
+        assert!(mailbox.parent_id.is_none());
+    }
+
+    #[test]
+    fn mailbox_from_snake_case_still_works() {
+        let mailbox = Mailbox {
+            id: "mb-1".into(),
+            name: "Inbox".into(),
+            role: Some("inbox".into()),
+            total_emails: 42,
+            unread_emails: 5,
+            parent_id: None,
+        };
+        let json = serde_json::to_string(&mailbox).unwrap();
+        let deserialized: Mailbox = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.total_emails, 42);
+        assert_eq!(deserialized.unread_emails, 5);
+    }
+
+    #[test]
+    fn body_structure_part_from_jmap() {
+        let json = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                {
+                    "type": "text/plain",
+                    "partId": "1",
+                    "blobId": "b1",
+                    "size": 100
+                },
+                {
+                    "type": "application/pdf",
+                    "partId": "2",
+                    "blobId": "b2",
+                    "name": "report.pdf",
+                    "disposition": "attachment",
+                    "size": 5000
+                }
+            ]
+        });
+        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
+        assert_eq!(part.mime_type, "multipart/mixed");
+        assert_eq!(part.sub_parts.len(), 2);
+        assert_eq!(part.sub_parts[0].mime_type, "text/plain");
+        assert_eq!(part.sub_parts[1].name.as_deref(), Some("report.pdf"));
+        assert_eq!(part.sub_parts[1].size, 5000);
+    }
+
+    #[test]
+    fn body_structure_part_defaults_on_missing_fields() {
+        let json = serde_json::json!({});
+        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
+        assert_eq!(part.mime_type, "");
+        assert!(part.blob_id.is_none());
+        assert!(part.name.is_none());
+        assert!(part.sub_parts.is_empty());
+        assert_eq!(part.size, 0);
     }
 }

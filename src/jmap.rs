@@ -60,19 +60,16 @@ pub async fn connect(s: &mut JmapSession) -> Result<(), Error> {
         code => return Err(Error::Network(format!("HTTP {code}"))),
     }
 
-    let body: serde_json::Value = resp.json().await?;
+    let session: JmapSessionResponse = resp.json().await?;
 
-    s.api_url = body["apiUrl"].as_str().map(String::from);
-    s.upload_url = body["uploadUrl"].as_str().map(String::from);
-    s.download_url = body["downloadUrl"].as_str().map(String::from);
+    s.api_url = session.api_url;
+    s.upload_url = session.upload_url;
+    s.download_url = session.download_url;
 
-    // Extract primary account ID
-    if let Some(accounts) = body["primaryAccounts"].as_object() {
-        s.account_id = accounts
-            .get("urn:ietf:params:jmap:mail")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-    }
+    s.account_id = session
+        .primary_accounts
+        .get("urn:ietf:params:jmap:mail")
+        .cloned();
 
     debug_assert!(s.api_url.is_some(), "JMAP session must have apiUrl");
     debug_assert!(s.account_id.is_some(), "JMAP session must have accountId");
@@ -115,6 +112,29 @@ async fn jmap_call(
     Ok(body)
 }
 
+/// Extract and deserialize the `list` array from a JMAP method response.
+fn extract_list<T: serde::de::DeserializeOwned>(
+    resp: &serde_json::Value,
+    index: usize,
+    method_name: &str,
+) -> Result<Vec<T>, Error> {
+    let list = resp["methodResponses"][index][1]
+        .get("list")
+        .ok_or_else(|| Error::Internal(format!("Invalid {method_name} response: missing list")))?
+        .clone();
+    serde_json::from_value(list)
+        .map_err(|e| Error::Internal(format!("Failed to parse {method_name}: {e}")))
+}
+
+/// Filter empty name strings to None in EmailAddress lists.
+fn fix_empty_names(addrs: &mut [EmailAddress]) {
+    for addr in addrs {
+        if addr.name.as_deref() == Some("") {
+            addr.name = None;
+        }
+    }
+}
+
 pub async fn get_mailboxes(s: &JmapSession) -> Result<Vec<Mailbox>, Error> {
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
@@ -128,23 +148,7 @@ pub async fn get_mailboxes(s: &JmapSession) -> Result<Vec<Mailbox>, Error> {
     )
     .await?;
 
-    let list = resp["methodResponses"][0][1]["list"]
-        .as_array()
-        .ok_or_else(|| Error::Internal("Invalid Mailbox/get response".into()))?;
-
-    let mut mailboxes = Vec::new();
-    for item in list {
-        mailboxes.push(Mailbox {
-            id: item["id"].as_str().unwrap_or_default().into(),
-            name: item["name"].as_str().unwrap_or_default().into(),
-            role: item["role"].as_str().map(String::from),
-            total_emails: item["totalEmails"].as_i64().unwrap_or(0),
-            unread_emails: item["unreadEmails"].as_i64().unwrap_or(0),
-            parent_id: item["parentId"].as_str().map(String::from),
-        });
-    }
-
-    Ok(mailboxes)
+    extract_list::<Mailbox>(&resp, 0, "Mailbox/get")
 }
 
 pub async fn get_identities(s: &mut JmapSession) -> Result<Vec<Identity>, Error> {
@@ -164,22 +168,12 @@ pub async fn get_identities(s: &mut JmapSession) -> Result<Vec<Identity>, Error>
     )
     .await?;
 
-    let list = resp["methodResponses"][0][1]["list"]
-        .as_array()
-        .ok_or_else(|| Error::Internal("Invalid Identity/get response".into()))?;
+    let identities: Vec<Identity> = extract_list(&resp, 0, "Identity/get")?;
 
-    let mut identities = Vec::new();
-    for item in list {
-        let id = item["id"].as_str().unwrap_or_default().to_string();
-        let email = item["email"].as_str().unwrap_or_default().to_string();
-        let name = item["name"].as_str().unwrap_or_default().to_string();
-
-        // Set default identity
-        if s.identity_id.is_none() {
-            s.identity_id = Some(id.clone());
-        }
-
-        identities.push(Identity { id, email, name });
+    if s.identity_id.is_none()
+        && let Some(first) = identities.first()
+    {
+        s.identity_id = Some(first.id.clone());
     }
 
     s.identities = Some(identities.clone());
@@ -225,12 +219,12 @@ pub async fn query_emails(
     )
     .await?;
 
-    let ids = resp["methodResponses"][0][1]["ids"]
-        .as_array()
-        .ok_or_else(|| Error::Internal("Invalid Email/query response".into()))?
-        .iter()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
+    let ids_value = resp["methodResponses"][0][1]
+        .get("ids")
+        .ok_or_else(|| Error::Internal("Invalid Email/query response: missing ids".into()))?
+        .clone();
+    let ids: Vec<String> = serde_json::from_value(ids_value)
+        .map_err(|e| Error::Internal(format!("Failed to parse Email/query ids: {e}")))?;
 
     Ok(ids)
 }
@@ -295,44 +289,23 @@ pub async fn get_emails(
 
     let resp = jmap_call(s, vec![serde_json::json!(["Email/get", extra_args, "0"])]).await?;
 
-    let list = resp["methodResponses"][0][1]["list"]
-        .as_array()
-        .ok_or_else(|| Error::Internal("Invalid Email/get response".into()))?;
-
-    let mut emails = Vec::new();
-    for item in list {
-        let email = parse_jmap_email(item, fetch_body);
-        emails.push(email);
-    }
+    let raw_emails: Vec<JmapEmailRaw> = extract_list(&resp, 0, "Email/get")?;
+    let emails = raw_emails
+        .into_iter()
+        .map(|raw| parse_jmap_email_from_raw(raw, fetch_body))
+        .collect();
 
     Ok(emails)
 }
 
-fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
-    let keywords: HashMap<String, bool> = item["keywords"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| (k.clone(), v.as_bool().unwrap_or(true)))
-                .collect()
-        })
-        .unwrap_or_default();
+fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
+    fix_empty_names(&mut raw.from);
+    fix_empty_names(&mut raw.to);
+    fix_empty_names(&mut raw.cc);
 
-    let mailbox_ids: HashMap<String, bool> = item["mailboxIds"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| (k.clone(), v.as_bool().unwrap_or(true)))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let from = parse_addresses(&item["from"]);
-    let to = parse_addresses(&item["to"]);
-    let cc = parse_addresses(&item["cc"]);
-
-    let received_at = item["receivedAt"]
-        .as_str()
+    let received_at = raw
+        .received_at
+        .as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
@@ -341,46 +314,41 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
     let mut html_body = None;
     let mut has_calendar = false;
 
+    let default_bs = BodyStructurePart::default();
+    let body_structure = raw.body_structure.as_ref().unwrap_or(&default_bs);
+
     if fetch_body {
-        // Extract body values
-        let body_values = &item["bodyValues"];
-        if let Some(text_parts) = item["textBody"].as_array() {
-            let parts: Vec<&str> = text_parts
-                .iter()
-                .filter_map(|p| {
-                    let part_id = p["partId"].as_str().unwrap_or_default();
-                    body_values[part_id]["value"].as_str()
-                })
-                .collect();
-            if !parts.is_empty() {
-                text_body = Some(parts.join("\n"));
-            }
+        // Extract text body from body values
+        let parts: Vec<&str> = raw
+            .text_body
+            .iter()
+            .filter_map(|p| raw.body_values.get(&p.part_id).map(|v| v.value.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            text_body = Some(parts.join("\n"));
         }
-        if let Some(html_parts) = item["htmlBody"].as_array() {
-            let parts: Vec<&str> = html_parts
-                .iter()
-                .filter_map(|p| {
-                    let part_id = p["partId"].as_str().unwrap_or_default();
-                    body_values[part_id]["value"].as_str()
-                })
-                .collect();
-            if !parts.is_empty() {
-                html_body = Some(parts.join("\n"));
-            }
+
+        // Extract HTML body from body values
+        let parts: Vec<&str> = raw
+            .html_body
+            .iter()
+            .filter_map(|p| raw.body_values.get(&p.part_id).map(|v| v.value.as_str()))
+            .collect();
+        if !parts.is_empty() {
+            html_body = Some(parts.join("\n"));
         }
 
         // Resolve cid: URLs to download URLs for inline images
-        let email_id = item["id"].as_str().unwrap_or_default();
         if let Some(ref mut html) = html_body
             && html.to_ascii_lowercase().contains("cid:")
         {
             let mut cids = Vec::new();
-            collect_inline_cids(&item["bodyStructure"], &mut cids);
+            collect_inline_cids(body_structure, &mut cids);
             for (cid, blob_id, name) in &cids {
                 let encoded_name = percent_encode_path(name);
                 let download_url = format!(
                     "/api/emails/{}/attachments/{}/{}",
-                    email_id, blob_id, encoded_name
+                    raw.id, blob_id, encoded_name
                 );
                 // HTML-escape the URL for safe injection into src="..." attributes
                 let safe_url = download_url
@@ -393,29 +361,29 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
         }
 
         // Check for calendar in body structure
-        has_calendar = find_calendar_blob_id(&item["bodyStructure"]).is_some();
+        has_calendar = find_calendar_blob_id(body_structure).is_some();
     }
 
     let attachments = if fetch_body {
-        find_attachments(&item["bodyStructure"])
+        find_attachments(body_structure)
     } else {
         vec![]
     };
 
     Email {
-        id: item["id"].as_str().unwrap_or_default().into(),
-        blob_id: item["blobId"].as_str().unwrap_or_default().into(),
-        thread_id: item["threadId"].as_str().unwrap_or_default().into(),
-        mailbox_ids,
-        keywords,
+        id: raw.id,
+        blob_id: raw.blob_id,
+        thread_id: raw.thread_id,
+        mailbox_ids: raw.mailbox_ids,
+        keywords: raw.keywords,
         received_at,
-        subject: item["subject"].as_str().unwrap_or_default().into(),
-        from,
-        to,
-        cc,
-        preview: item["preview"].as_str().unwrap_or_default().into(),
-        has_attachment: item["hasAttachment"].as_bool().unwrap_or(false),
-        size: item["size"].as_i64().unwrap_or(0),
+        subject: raw.subject,
+        from: raw.from,
+        to: raw.to,
+        cc: raw.cc,
+        preview: raw.preview,
+        has_attachment: raw.has_attachment,
+        size: raw.size,
         text_body,
         html_body,
         has_calendar,
@@ -423,28 +391,31 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
     }
 }
 
-pub fn find_attachments(body_structure: &serde_json::Value) -> Vec<Attachment> {
+/// Test-only wrapper: deserializes JSON then delegates to typed parsing.
+/// Preserves existing test compatibility while adding deserialization validation.
+#[cfg(test)]
+fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
+    let raw: JmapEmailRaw = serde_json::from_value(item.clone())
+        .unwrap_or_else(|e| panic!("Failed to deserialize JMAP email: {e}"));
+    parse_jmap_email_from_raw(raw, fetch_body)
+}
+
+pub fn find_attachments(body_structure: &BodyStructurePart) -> Vec<Attachment> {
     let mut attachments = Vec::new();
     collect_attachments(body_structure, false, &mut attachments);
     attachments
 }
 
-fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec<Attachment>) {
-    if part.is_null() {
-        return;
-    }
-
-    let mime_type = part["type"].as_str().unwrap_or_default();
+fn collect_attachments(part: &BodyStructurePart, in_related: bool, out: &mut Vec<Attachment>) {
+    let mime_type = &part.mime_type;
 
     // Recurse into sub-parts for multipart types.
     // JMAP returns "subParts": [] on leaf nodes, so only treat non-empty arrays
     // as multipart containers.  Only direct children of multipart/related get
     // the in_related flag — nested multipart/mixed subtrees reset it.
-    if let Some(sub_parts) = part["subParts"].as_array()
-        && !sub_parts.is_empty()
-    {
+    if !part.sub_parts.is_empty() {
         let child_in_related = mime_type.eq_ignore_ascii_case("multipart/related");
-        for sub in sub_parts {
+        for sub in &part.sub_parts {
             collect_attachments(sub, child_in_related, out);
         }
         return;
@@ -458,8 +429,8 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
         return;
     }
 
-    let disposition = part["disposition"].as_str().unwrap_or_default();
-    let name = part["name"].as_str().unwrap_or_default();
+    let disposition = part.disposition.as_deref().unwrap_or_default();
+    let name = part.name.as_deref().unwrap_or_default();
 
     // Skip inline parts only inside multipart/related (HTML-embedded images).
     // Gmail marks user-attached photos as disposition=inline in multipart/mixed,
@@ -473,11 +444,10 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
         || disposition.eq_ignore_ascii_case("inline")
         || !name.is_empty()
     {
-        let blob_id = match part["blobId"].as_str() {
+        let blob_id = match part.blob_id.as_deref() {
             Some(id) => id.to_string(),
             None => return,
         };
-        let size = part["size"].as_i64().unwrap_or(0);
 
         out.push(Attachment {
             blob_id,
@@ -487,7 +457,7 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
                 name.to_string()
             },
             mime_type: mime_type.to_ascii_lowercase(),
-            size,
+            size: part.size,
         });
     }
 }
@@ -526,44 +496,21 @@ fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> 
 }
 
 /// Walk bodyStructure collecting (content_id, blob_id, filename) for inline parts.
-fn collect_inline_cids(part: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
-    if part.is_null() {
-        return;
-    }
-
-    if let Some(sub_parts) = part["subParts"].as_array()
-        && !sub_parts.is_empty()
-    {
-        for sub in sub_parts {
+fn collect_inline_cids(part: &BodyStructurePart, out: &mut Vec<(String, String, String)>) {
+    if !part.sub_parts.is_empty() {
+        for sub in &part.sub_parts {
             collect_inline_cids(sub, out);
         }
         return;
     }
 
-    if let Some(cid) = part["cid"].as_str()
+    if let Some(cid) = part.cid.as_deref()
         && !cid.is_empty()
-        && let Some(blob_id) = part["blobId"].as_str()
+        && let Some(blob_id) = part.blob_id.as_deref()
     {
-        let name = part["name"].as_str().unwrap_or("inline");
+        let name = part.name.as_deref().unwrap_or("inline");
         out.push((cid.to_string(), blob_id.to_string(), name.to_string()));
     }
-}
-
-fn parse_addresses(value: &serde_json::Value) -> Vec<EmailAddress> {
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|a| EmailAddress {
-                    name: a["name"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from),
-                    email: a["email"].as_str().unwrap_or_default().into(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // =============================================================================
@@ -1089,31 +1036,22 @@ pub async fn send_email(
 // Calendar
 // =============================================================================
 
-pub fn find_calendar_blob_id(body_structure: &serde_json::Value) -> Option<String> {
-    if body_structure.is_null() {
-        return None;
-    }
-
-    // Check this part
-    let mime_type = body_structure["type"]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
-    let filename = body_structure["name"]
-        .as_str()
+pub fn find_calendar_blob_id(body_structure: &BodyStructurePart) -> Option<String> {
+    let mime_type = body_structure.mime_type.to_lowercase();
+    let filename = body_structure
+        .name
+        .as_deref()
         .unwrap_or_default()
         .to_lowercase();
 
     if mime_type == "text/calendar" || filename.ends_with(".ics") {
-        return body_structure["blobId"].as_str().map(String::from);
+        return body_structure.blob_id.clone();
     }
 
     // Recurse into sub-parts
-    if let Some(parts) = body_structure["subParts"].as_array() {
-        for part in parts {
-            if let Some(blob_id) = find_calendar_blob_id(part) {
-                return Some(blob_id);
-            }
+    for part in &body_structure.sub_parts {
+        if let Some(blob_id) = find_calendar_blob_id(part) {
+            return Some(blob_id);
         }
     }
 
@@ -1148,8 +1086,12 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
         return Err(Error::NotFound("Email not found".into()));
     }
 
-    let body_structure = &list[0]["bodyStructure"];
-    let blob_id = match find_calendar_blob_id(body_structure) {
+    let body_structure: BodyStructurePart = match list[0].get("bodyStructure") {
+        Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+            .map_err(|e| Error::Internal(format!("Failed to parse bodyStructure: {e}")))?,
+        _ => return Ok(None),
+    };
+    let blob_id = match find_calendar_blob_id(&body_structure) {
         Some(id) => id,
         None => return Ok(None),
     };
@@ -1361,86 +1303,91 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
 
+    fn deser_bs(json: serde_json::Value) -> BodyStructurePart {
+        serde_json::from_value(json).unwrap()
+    }
+
     // --- find_calendar_blob_id tests ---
 
     #[test]
     fn detect_text_calendar_mime() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "text/calendar",
             "blobId": "blob-cal-1"
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-cal-1".into()));
     }
 
     #[test]
     fn detect_ics_filename() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "application/octet-stream",
             "name": "invite.ics",
             "blobId": "blob-cal-2"
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-cal-2".into()));
     }
 
     #[test]
     fn detect_nested_calendar() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/alternative",
             "subParts": [
                 { "type": "text/plain", "blobId": "blob-text" },
                 { "type": "text/calendar", "blobId": "blob-cal-3" }
             ]
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-cal-3".into()));
     }
 
     #[test]
     fn no_calendar_returns_none() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/mixed",
             "subParts": [
                 { "type": "text/plain", "blobId": "blob-text" },
                 { "type": "text/html", "blobId": "blob-html" }
             ]
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), None);
     }
 
     #[test]
     fn null_body_returns_none() {
-        assert_eq!(find_calendar_blob_id(&serde_json::Value::Null), None);
+        assert_eq!(find_calendar_blob_id(&BodyStructurePart::default()), None);
     }
 
     #[test]
     fn empty_object_returns_none() {
-        assert_eq!(find_calendar_blob_id(&serde_json::json!({})), None);
+        let body = deser_bs(serde_json::json!({}));
+        assert_eq!(find_calendar_blob_id(&body), None);
     }
 
     #[test]
     fn top_level_calendar() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "text/calendar",
             "blobId": "blob-top"
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-top".into()));
     }
 
     #[test]
     fn case_insensitive_mime() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "Text/Calendar",
             "blobId": "blob-case"
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-case".into()));
     }
 
     #[test]
     fn case_insensitive_filename() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "application/octet-stream",
             "name": "Meeting.ICS",
             "blobId": "blob-case-file"
-        });
+        }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-case-file".into()));
     }
 
@@ -1448,28 +1395,28 @@ mod tests {
 
     #[test]
     fn find_attachments_null_returns_empty() {
-        assert!(find_attachments(&serde_json::Value::Null).is_empty());
+        assert!(find_attachments(&BodyStructurePart::default()).is_empty());
     }
 
     #[test]
     fn find_attachments_text_plain_skipped() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "text/plain",
             "blobId": "blob-1",
             "name": "body.txt"
-        });
+        }));
         assert!(find_attachments(&body).is_empty());
     }
 
     #[test]
     fn find_attachments_pdf_with_disposition() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "application/pdf",
             "blobId": "blob-pdf",
             "name": "report.pdf",
             "size": 12345,
             "disposition": "attachment"
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].blob_id, "blob-pdf");
@@ -1480,12 +1427,12 @@ mod tests {
 
     #[test]
     fn find_attachments_by_filename_without_disposition() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "application/octet-stream",
             "blobId": "blob-bin",
             "name": "data.bin",
             "size": 100
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "data.bin");
@@ -1493,7 +1440,7 @@ mod tests {
 
     #[test]
     fn find_attachments_nested_multipart() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/mixed",
             "subParts": [
                 { "type": "text/plain", "blobId": "blob-text" },
@@ -1506,7 +1453,7 @@ mod tests {
                     "disposition": "attachment"
                 }
             ]
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "invoice.pdf");
@@ -1515,7 +1462,7 @@ mod tests {
     #[test]
     fn find_attachments_inline_skipped_in_related() {
         // Inline images inside multipart/related are HTML-embedded and should be skipped
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/related",
             "subParts": [
                 {
@@ -1531,7 +1478,7 @@ mod tests {
                     "subParts": []
                 }
             ]
-        });
+        }));
         assert!(find_attachments(&body).is_empty());
     }
 
@@ -1539,7 +1486,7 @@ mod tests {
     fn find_attachments_inline_in_mixed_included() {
         // Gmail marks user-attached photos as inline in multipart/mixed —
         // these should appear as downloadable attachments
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/mixed",
             "subParts": [
                 {
@@ -1558,7 +1505,7 @@ mod tests {
                     "subParts": []
                 }
             ]
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "image0.jpeg");
@@ -1569,7 +1516,7 @@ mod tests {
         // A multipart/mixed nested inside multipart/related should NOT
         // suppress its inline attachments — in_related is scoped to
         // direct children only.
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/related",
             "subParts": [
                 { "type": "text/html", "blobId": "b1", "partId": "1", "subParts": [] },
@@ -1587,7 +1534,7 @@ mod tests {
                     ]
                 }
             ]
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "photo.png");
@@ -1595,17 +1542,17 @@ mod tests {
 
     #[test]
     fn find_attachments_no_blob_id_skipped() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "application/pdf",
             "name": "broken.pdf",
             "disposition": "attachment"
-        });
+        }));
         assert!(find_attachments(&body).is_empty());
     }
 
     #[test]
     fn find_attachments_deeply_nested() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/mixed",
             "subParts": [
                 {
@@ -1635,7 +1582,7 @@ mod tests {
                     ]
                 }
             ]
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 2);
         assert_eq!(atts[0].name, "photo.jpg");
@@ -1647,7 +1594,7 @@ mod tests {
         // JMAP returns "subParts": [] on leaf nodes, not absent.
         // This previously caused attachments to be missed because the code
         // treated any part with a subParts array as a multipart container.
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/mixed",
             "subParts": [
                 {
@@ -1675,7 +1622,7 @@ mod tests {
                     "subParts": []
                 }
             ]
-        });
+        }));
         let atts = find_attachments(&body);
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "Benefits_Guide.pdf");
@@ -1767,7 +1714,7 @@ END:VCALENDAR";
 
     #[test]
     fn collect_inline_cids_finds_cid_parts() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "multipart/related",
             "subParts": [
                 { "type": "text/html", "partId": "1", "blobId": "b1", "subParts": [] },
@@ -1780,7 +1727,7 @@ END:VCALENDAR";
                     "disposition": "inline", "cid": "photo456@example.com", "subParts": []
                 }
             ]
-        });
+        }));
         let mut cids = Vec::new();
         collect_inline_cids(&body, &mut cids);
         assert_eq!(cids.len(), 2);
@@ -1793,10 +1740,10 @@ END:VCALENDAR";
 
     #[test]
     fn collect_inline_cids_skips_parts_without_cid() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "image/png", "blobId": "b1", "name": "att.png",
             "disposition": "attachment", "subParts": []
-        });
+        }));
         let mut cids = Vec::new();
         collect_inline_cids(&body, &mut cids);
         assert!(cids.is_empty());
@@ -1805,16 +1752,16 @@ END:VCALENDAR";
     #[test]
     fn collect_inline_cids_null_returns_empty() {
         let mut cids = Vec::new();
-        collect_inline_cids(&serde_json::Value::Null, &mut cids);
+        collect_inline_cids(&BodyStructurePart::default(), &mut cids);
         assert!(cids.is_empty());
     }
 
     #[test]
     fn collect_inline_cids_defaults_name_to_inline() {
-        let body = serde_json::json!({
+        let body = deser_bs(serde_json::json!({
             "type": "image/png", "blobId": "b1",
             "disposition": "inline", "cid": "abc@example.com", "subParts": []
-        });
+        }));
         let mut cids = Vec::new();
         collect_inline_cids(&body, &mut cids);
         assert_eq!(cids.len(), 1);
