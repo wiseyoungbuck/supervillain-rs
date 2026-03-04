@@ -376,9 +376,18 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
             let mut cids = Vec::new();
             collect_inline_cids(&item["bodyStructure"], &mut cids);
             for (cid, blob_id, name) in &cids {
-                let download_url =
-                    format!("/api/emails/{}/attachments/{}/{}", email_id, blob_id, name);
-                *html = html.replace(&format!("cid:{cid}"), &download_url);
+                let encoded_name = percent_encode_path(name);
+                let download_url = format!(
+                    "/api/emails/{}/attachments/{}/{}",
+                    email_id, blob_id, encoded_name
+                );
+                // HTML-escape the URL for safe injection into src="..." attributes
+                let safe_url = download_url
+                    .replace('&', "&amp;")
+                    .replace('"', "&quot;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                *html = html.replace(&format!("cid:{cid}"), &safe_url);
             }
         }
 
@@ -480,6 +489,24 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
             size,
         });
     }
+}
+
+/// Percent-encode a string for use as a URL path segment.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
+                out.push(char::from(b"0123456789ABCDEF"[(b & 0x0F) as usize]));
+            }
+        }
+    }
+    out
 }
 
 /// Walk bodyStructure collecting (content_id, blob_id, filename) for inline parts.
@@ -1527,6 +1554,21 @@ mod tests {
         assert_eq!(atts[0].size, 739855);
     }
 
+    // --- percent_encode_path tests ---
+
+    #[test]
+    fn percent_encode_path_passes_safe_chars() {
+        assert_eq!(percent_encode_path("logo.png"), "logo.png");
+        assert_eq!(percent_encode_path("my-file_v2.jpg"), "my-file_v2.jpg");
+    }
+
+    #[test]
+    fn percent_encode_path_encodes_spaces_and_special() {
+        assert_eq!(percent_encode_path("my photo.png"), "my%20photo.png");
+        assert_eq!(percent_encode_path("file#1.png"), "file%231.png");
+        assert_eq!(percent_encode_path("a?b=c"), "a%3Fb%3Dc");
+    }
+
     // --- collect_inline_cids tests ---
 
     #[test]
@@ -1866,6 +1908,114 @@ mod tests {
         let email = parse_jmap_email(&item, false);
         assert_eq!(email.text_body, None);
         assert_eq!(email.html_body, None);
+    }
+
+    #[test]
+    fn parse_email_resolves_cid_urls() {
+        let item = serde_json::json!({
+            "id": "email-cid",
+            "blobId": "blob-cid",
+            "threadId": "thread-cid",
+            "mailboxIds": {"inbox": true},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Inline Images",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Preview",
+            "hasAttachment": false,
+            "size": 5000,
+            "textBody": [],
+            "htmlBody": [{"partId": "1", "type": "text/html"}],
+            "bodyValues": {
+                "1": {"value": "<p>Hello</p><img src=\"cid:logo123@example.com\">"}
+            },
+            "bodyStructure": {
+                "type": "multipart/related",
+                "subParts": [
+                    { "type": "text/html", "partId": "1", "blobId": "b1", "subParts": [] },
+                    {
+                        "type": "image/png", "blobId": "blob-img1", "name": "logo.png",
+                        "disposition": "inline", "cid": "logo123@example.com", "subParts": []
+                    }
+                ]
+            }
+        });
+        let email = parse_jmap_email(&item, true);
+        let html = email.html_body.unwrap();
+        assert!(!html.contains("cid:"), "cid: references should be resolved");
+        assert!(
+            html.contains("/api/emails/email-cid/attachments/blob-img1/logo.png"),
+            "should contain download URL, got: {html}"
+        );
+    }
+
+    #[test]
+    fn parse_email_no_cid_unchanged() {
+        let item = serde_json::json!({
+            "id": "email-nocid",
+            "blobId": "blob-nocid",
+            "threadId": "thread-nocid",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "No CID",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Preview",
+            "hasAttachment": false,
+            "size": 500,
+            "textBody": [],
+            "htmlBody": [{"partId": "1", "type": "text/html"}],
+            "bodyValues": {
+                "1": {"value": "<p>No inline images</p>"}
+            },
+            "bodyStructure": {"type": "text/html"}
+        });
+        let email = parse_jmap_email(&item, true);
+        assert_eq!(email.html_body, Some("<p>No inline images</p>".into()));
+    }
+
+    #[test]
+    fn parse_email_cid_with_special_filename() {
+        let item = serde_json::json!({
+            "id": "email-sp",
+            "blobId": "blob-sp",
+            "threadId": "thread-sp",
+            "mailboxIds": {},
+            "keywords": {},
+            "receivedAt": "2024-01-15T10:30:00Z",
+            "subject": "Special Filename",
+            "from": [{"email": "alice@example.com"}],
+            "to": [{"email": "bob@example.com"}],
+            "cc": [],
+            "preview": "Preview",
+            "hasAttachment": false,
+            "size": 500,
+            "textBody": [],
+            "htmlBody": [{"partId": "1", "type": "text/html"}],
+            "bodyValues": {
+                "1": {"value": "<img src=\"cid:sp@example.com\">"}
+            },
+            "bodyStructure": {
+                "type": "multipart/related",
+                "subParts": [
+                    { "type": "text/html", "partId": "1", "blobId": "b1", "subParts": [] },
+                    {
+                        "type": "image/png", "blobId": "blob-sp1", "name": "my photo.png",
+                        "disposition": "inline", "cid": "sp@example.com", "subParts": []
+                    }
+                ]
+            }
+        });
+        let email = parse_jmap_email(&item, true);
+        let html = email.html_body.unwrap();
+        assert!(
+            html.contains("my%20photo.png"),
+            "filename with spaces should be percent-encoded, got: {html}"
+        );
     }
 
     #[test]

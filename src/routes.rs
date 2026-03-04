@@ -1704,7 +1704,7 @@ white   = '#fdf6e3'
         let linkify_fn = APP_JS
             .find("function linkifyText")
             .expect("should have linkifyText");
-        let fn_body = &APP_JS[linkify_fn..linkify_fn + 300];
+        let fn_body = &APP_JS[linkify_fn..APP_JS.len().min(linkify_fn + 300)];
         assert!(
             !fn_body.contains("escapeHtml(text)"),
             "linkifyText must not bulk-escape the input text before URL parsing"
