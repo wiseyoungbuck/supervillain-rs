@@ -2371,14 +2371,16 @@ function renderCalendarCard(event) {
         els.calAttendees.style.display = 'none';
     }
 
+    // Find current user's RSVP status
+    const userStatus = event.user_rsvp_status || getUserRsvpStatus(event);
+
     // Hide RSVP actions for cancelled events
     const actions = els.calendarEvent.querySelector('.calendar-actions');
     if (cancelled) {
         actions.style.display = 'none';
     } else {
         actions.style.display = '';
-        // Find current user's RSVP status and highlight active button
-        const userStatus = event.user_rsvp_status || getUserRsvpStatus(event);
+        // Highlight active button
         els.rsvpAccept.classList.toggle('active', userStatus === 'ACCEPTED');
         els.rsvpMaybe.classList.toggle('active', userStatus === 'TENTATIVE');
         els.rsvpDecline.classList.toggle('active', userStatus === 'DECLINED');

@@ -1216,7 +1216,8 @@ pub async fn add_to_calendar(
     // CalDAV PUT to Fastmail calendar, using event UID as filename for idempotency
     let caldav_url = format!(
         "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
-        s.username, uid
+        s.username,
+        percent_encode_path(uid)
     );
 
     let mut req = s
@@ -1245,7 +1246,8 @@ pub async fn add_to_calendar(
 pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
     let caldav_url = format!(
         "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
-        s.username, uid
+        s.username,
+        percent_encode_path(uid)
     );
 
     let resp = s
@@ -1268,7 +1270,8 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
 pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -> Option<String> {
     let caldav_url = format!(
         "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
-        s.username, uid
+        s.username,
+        percent_encode_path(uid)
     );
 
     let resp = match s

@@ -1964,10 +1964,28 @@ white   = '#fdf6e3'
     // =========================================================================
 
     #[test]
+    #[test]
     fn app_js_has_user_rsvp_status_preference() {
         assert!(
             APP_JS.contains("event.user_rsvp_status || getUserRsvpStatus(event)"),
             "renderCalendarCard should prefer server-authoritative user_rsvp_status"
+        );
+    }
+
+    #[test]
+    fn app_js_user_status_not_block_scoped() {
+        // userStatus must be declared before the cancelled if/else, not inside the else block
+        let pos = APP_JS
+            .find("const userStatus = event.user_rsvp_status")
+            .expect("should declare userStatus");
+        let after = &APP_JS[pos..];
+        let cancelled_pos = after
+            .find("if (cancelled)")
+            .expect("should have cancelled check");
+        // userStatus declaration should come BEFORE the cancelled check
+        assert!(
+            cancelled_pos > 0,
+            "userStatus should be declared before the cancelled if/else block"
         );
     }
 
