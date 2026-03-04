@@ -322,7 +322,119 @@ function parseEmail(item, fetchBody) {
             .map(p => bv[p.partId]?.value).filter(Boolean);
         email.textBody = textParts.length ? textParts.join('\n') : null;
         email.htmlBody = htmlParts.length ? htmlParts.join('\n') : null;
+        email.attachments = findAttachments(item.bodyStructure);
+        email.hasCalendar = !!findCalendarBlobId(item.bodyStructure);
     }
 
     return email;
+}
+
+// ============================================================================
+// Attachments — ported from src/jmap.rs:425-492
+// ============================================================================
+
+/**
+ * Extract downloadable attachments from JMAP bodyStructure.
+ * @param {Object|null} bodyStructure - JMAP bodyStructure tree
+ * @returns {Array<{blobId: string, name: string, mimeType: string, size: number}>}
+ */
+export function findAttachments(bodyStructure) {
+    const out = [];
+    collectAttachments(bodyStructure, false, out);
+    return out;
+}
+
+function collectAttachments(part, inRelated, out) {
+    if (!part) return;
+
+    const mimeType = (part.type || '').toLowerCase();
+
+    // Recurse into sub-parts for multipart types.
+    // Fastmail returns "subParts": [] on leaf nodes, so only treat non-empty
+    // arrays as multipart containers. Only direct children of multipart/related
+    // get inRelated — nested subtrees reset it.
+    const subParts = part.subParts;
+    if (Array.isArray(subParts) && subParts.length > 0) {
+        const childInRelated = mimeType === 'multipart/related';
+        for (const sub of subParts) {
+            collectAttachments(sub, childInRelated, out);
+        }
+        return;
+    }
+
+    // Skip body content types
+    if (mimeType === 'text/plain' || mimeType === 'text/html' || mimeType === 'text/calendar') {
+        return;
+    }
+
+    const disposition = (part.disposition || '').toLowerCase();
+    const name = part.name || '';
+
+    // Skip inline parts only inside multipart/related (HTML-embedded images).
+    // Gmail marks user-attached photos as disposition=inline in multipart/mixed,
+    // so those should still appear as downloadable attachments.
+    if (disposition === 'inline' && inRelated) return;
+
+    // Include if explicitly marked as attachment, inline (outside related), or has filename
+    if (disposition === 'attachment' || disposition === 'inline' || name) {
+        if (!part.blobId) return;
+        out.push({
+            blobId: part.blobId,
+            name: name || 'attachment',
+            mimeType,
+            size: part.size || 0,
+        });
+    }
+}
+
+// ============================================================================
+// Calendar detection — ported from src/jmap.rs:1057-1086
+// ============================================================================
+
+/**
+ * Walk MIME tree looking for text/calendar type or .ics filename.
+ * @param {Object|null} bodyStructure
+ * @returns {string|null} blobId or null
+ */
+export function findCalendarBlobId(bodyStructure) {
+    if (!bodyStructure) return null;
+
+    const mimeType = (bodyStructure.type || '').toLowerCase();
+    const filename = (bodyStructure.name || '').toLowerCase();
+
+    if (mimeType === 'text/calendar' || filename.endsWith('.ics')) {
+        return bodyStructure.blobId || null;
+    }
+
+    if (Array.isArray(bodyStructure.subParts)) {
+        for (const part of bodyStructure.subParts) {
+            const found = findCalendarBlobId(part);
+            if (found) return found;
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Mark read — ported from src/jmap.rs:587-596
+// ============================================================================
+
+/**
+ * Mark an email as read ($seen).
+ * @param {Object} session
+ * @param {string} emailId
+ * @returns {Promise<boolean>}
+ */
+export async function markRead(session, emailId) {
+    const resp = await jmapCall(session, [
+        ['Email/set', {
+            accountId: session.accountId,
+            update: {
+                [emailId]: { 'keywords/$seen': true },
+            },
+        }, '0'],
+    ]);
+    const updated = resp.methodResponses?.[0]?.[1]?.updated;
+    return !!(updated && updated[emailId] !== undefined);
 }

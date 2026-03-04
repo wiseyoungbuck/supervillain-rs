@@ -327,6 +327,132 @@
             text-align: center;
             min-height: 29px;
         }
+
+        /* Email detail view */
+        #email-detail {
+            display: none;
+            flex-direction: column;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        #detail-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            min-height: 48px;
+            position: sticky;
+            top: 0;
+            background: var(--bg);
+            z-index: 10;
+        }
+
+        #back-btn {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 16px;
+            cursor: pointer;
+            padding: 8px;
+            min-width: 44px;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        #detail-subject {
+            font-size: 17px;
+            font-weight: 600;
+            flex: 1;
+            min-width: 0;
+            overflow-wrap: break-word;
+        }
+
+        #detail-meta {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        #detail-from {
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 2px;
+        }
+
+        #detail-recipients {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        #detail-date {
+            color: var(--text-muted);
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        /* Attachments */
+        #detail-attachments .att-header {
+            padding: 8px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .att-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 16px;
+            min-height: 44px;
+            border-bottom: 1px solid var(--border);
+            text-decoration: none;
+            color: var(--text);
+        }
+
+        .att-item:active { background: var(--surface-hover); }
+        .att-icon { font-size: 18px; flex-shrink: 0; }
+        .att-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+        .att-size { color: var(--text-muted); font-size: 12px; flex-shrink: 0; }
+
+        /* Calendar indicator */
+        .calendar-indicator {
+            padding: 10px 16px;
+            font-size: 13px;
+            color: var(--accent);
+            border-bottom: 1px solid var(--border);
+        }
+
+        /* Email body */
+        #email-body {
+            flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 12px 16px;
+            font-size: 15px;
+            line-height: 1.5;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+        }
+
+        #email-body img { max-width: 100%; height: auto; }
+        #email-body table { max-width: 100%; overflow-x: auto; display: block; }
+        #email-body pre { white-space: pre-wrap; overflow-x: auto; }
+        #email-body a { color: var(--accent); }
+        #email-body blockquote {
+            border-left: 3px solid var(--border);
+            margin: 8px 0;
+            padding: 4px 12px;
+            color: var(--text-muted);
+        }
+
+        .plain-text-body { white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -364,6 +490,20 @@
         <div id="email-list-wrap">
             <div id="pull-indicator">Pull to refresh</div>
             <div id="email-list"></div>
+        </div>
+        <div id="email-detail">
+            <div id="detail-header">
+                <button id="back-btn">&larr;</button>
+                <div id="detail-subject"></div>
+            </div>
+            <div id="detail-meta">
+                <div id="detail-from"></div>
+                <div id="detail-recipients"></div>
+                <div id="detail-date"></div>
+            </div>
+            <div id="detail-attachments"></div>
+            <div id="detail-calendar"></div>
+            <div id="email-body"></div>
         </div>
         <div id="status-bar"></div>
     </div>
