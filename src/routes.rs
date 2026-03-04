@@ -1671,8 +1671,8 @@ white   = '#fdf6e3'
     #[test]
     fn app_js_has_segment_urls_helper() {
         assert!(
-            APP_JS.contains("function segmentUrls(text)"),
-            "app.js should have a shared segmentUrls helper"
+            APP_JS.contains("function segmentUrls(text, raw)"),
+            "app.js should have a shared segmentUrls helper with raw parameter"
         );
     }
 
@@ -1722,6 +1722,19 @@ white   = '#fdf6e3'
         assert!(
             after_walker.contains("noopener noreferrer"),
             "linkified URLs in sanitizeHtml should have rel=noopener noreferrer"
+        );
+    }
+
+    #[test]
+    fn app_js_segment_urls_raw_mode_allows_ampersand() {
+        assert!(
+            APP_JS.contains("segmentUrls(node.textContent, true)"),
+            "sanitizeHtml should pass raw=true to segmentUrls for unescaped text nodes"
+        );
+        // The raw regex should not exclude &
+        assert!(
+            APP_JS.contains(r#"? /https?:\/\/[^\s<>"')\]]+/g"#),
+            "raw mode regex should allow & in URLs for query strings"
         );
     }
 

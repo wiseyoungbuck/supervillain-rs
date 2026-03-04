@@ -2185,7 +2185,7 @@ function sanitizeHtml(html) {
     while (walker.nextNode()) textNodes.push(walker.currentNode);
     for (const node of textNodes) {
         if (node.parentElement && node.parentElement.closest('a')) continue;
-        const segments = segmentUrls(node.textContent);
+        const segments = segmentUrls(node.textContent, true);
         if (segments.length <= 1 && !segments[0]?.url) continue;
         const frag = doc.createDocumentFragment();
         for (const seg of segments) {
@@ -2220,8 +2220,8 @@ function htmlToPlainText(html) {
     return doc.body.innerText || '';
 }
 
-function segmentUrls(text) {
-    const re = /https?:\/\/[^\s<>&"')\]]+/g;
+function segmentUrls(text, raw) {
+    const re = raw ? /https?:\/\/[^\s<>"')\]]+/g : /https?:\/\/[^\s<>&"')\]]+/g;
     const parts = [];
     let last = 0, m;
     while ((m = re.exec(text)) !== null) {
