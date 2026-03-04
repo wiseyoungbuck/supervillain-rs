@@ -2236,10 +2236,9 @@ function segmentUrls(text, raw) {
 }
 
 function linkifyText(text) {
-    const escaped = escapeHtml(text);
-    return segmentUrls(escaped).map(p => p.url
-        ? `<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.url}</a>`
-        : p.text
+    return segmentUrls(text, true).map(p => p.url
+        ? `<a href="${escapeHtml(p.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(p.url)}</a>`
+        : escapeHtml(p.text)
     ).join('');
 }
 

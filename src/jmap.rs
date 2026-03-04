@@ -286,7 +286,8 @@ pub async fn get_emails(
                 "name",
                 "size",
                 "disposition",
-                "subParts"
+                "subParts",
+                "cid"
             ]),
         );
     }
@@ -364,6 +365,20 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
                 .collect();
             if !parts.is_empty() {
                 html_body = Some(parts.join("\n"));
+            }
+        }
+
+        // Resolve cid: URLs to download URLs for inline images
+        let email_id = item["id"].as_str().unwrap_or_default();
+        if let Some(ref mut html) = html_body
+            && html.contains("cid:")
+        {
+            let mut cids = Vec::new();
+            collect_inline_cids(&item["bodyStructure"], &mut cids);
+            for (cid, blob_id, name) in &cids {
+                let download_url =
+                    format!("/api/emails/{}/attachments/{}/{}", email_id, blob_id, name);
+                *html = html.replace(&format!("cid:{cid}"), &download_url);
             }
         }
 
@@ -464,6 +479,30 @@ fn collect_attachments(part: &serde_json::Value, in_related: bool, out: &mut Vec
             mime_type: mime_type.to_ascii_lowercase(),
             size,
         });
+    }
+}
+
+/// Walk bodyStructure collecting (content_id, blob_id, filename) for inline parts.
+fn collect_inline_cids(part: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
+    if part.is_null() {
+        return;
+    }
+
+    if let Some(sub_parts) = part["subParts"].as_array()
+        && !sub_parts.is_empty()
+    {
+        for sub in sub_parts {
+            collect_inline_cids(sub, out);
+        }
+        return;
+    }
+
+    if let Some(cid) = part["cid"].as_str()
+        && !cid.is_empty()
+        && let Some(blob_id) = part["blobId"].as_str()
+    {
+        let name = part["name"].as_str().unwrap_or("inline");
+        out.push((cid.to_string(), blob_id.to_string(), name.to_string()));
     }
 }
 
@@ -1486,6 +1525,64 @@ mod tests {
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "Benefits_Guide.pdf");
         assert_eq!(atts[0].size, 739855);
+    }
+
+    // --- collect_inline_cids tests ---
+
+    #[test]
+    fn collect_inline_cids_finds_cid_parts() {
+        let body = serde_json::json!({
+            "type": "multipart/related",
+            "subParts": [
+                { "type": "text/html", "partId": "1", "blobId": "b1", "subParts": [] },
+                {
+                    "type": "image/png", "blobId": "blob-img1", "name": "logo.png",
+                    "disposition": "inline", "cid": "logo123@example.com", "subParts": []
+                },
+                {
+                    "type": "image/jpeg", "blobId": "blob-img2", "name": "photo.jpg",
+                    "disposition": "inline", "cid": "photo456@example.com", "subParts": []
+                }
+            ]
+        });
+        let mut cids = Vec::new();
+        collect_inline_cids(&body, &mut cids);
+        assert_eq!(cids.len(), 2);
+        assert_eq!(cids[0].0, "logo123@example.com");
+        assert_eq!(cids[0].1, "blob-img1");
+        assert_eq!(cids[0].2, "logo.png");
+        assert_eq!(cids[1].0, "photo456@example.com");
+        assert_eq!(cids[1].1, "blob-img2");
+    }
+
+    #[test]
+    fn collect_inline_cids_skips_parts_without_cid() {
+        let body = serde_json::json!({
+            "type": "image/png", "blobId": "b1", "name": "att.png",
+            "disposition": "attachment", "subParts": []
+        });
+        let mut cids = Vec::new();
+        collect_inline_cids(&body, &mut cids);
+        assert!(cids.is_empty());
+    }
+
+    #[test]
+    fn collect_inline_cids_null_returns_empty() {
+        let mut cids = Vec::new();
+        collect_inline_cids(&serde_json::Value::Null, &mut cids);
+        assert!(cids.is_empty());
+    }
+
+    #[test]
+    fn collect_inline_cids_defaults_name_to_inline() {
+        let body = serde_json::json!({
+            "type": "image/png", "blobId": "b1",
+            "disposition": "inline", "cid": "abc@example.com", "subParts": []
+        });
+        let mut cids = Vec::new();
+        collect_inline_cids(&body, &mut cids);
+        assert_eq!(cids.len(), 1);
+        assert_eq!(cids[0].2, "inline");
     }
 
     // --- build_draft_email tests ---

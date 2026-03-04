@@ -1679,8 +1679,35 @@ white   = '#fdf6e3'
     #[test]
     fn app_js_linkify_text_uses_segment_urls() {
         assert!(
-            APP_JS.contains("segmentUrls(escaped)"),
-            "linkifyText should delegate to segmentUrls"
+            APP_JS.contains("segmentUrls(text, true)"),
+            "linkifyText should find URLs in raw text before escaping"
+        );
+        assert!(
+            APP_JS.contains("escapeHtml(p.url)"),
+            "linkifyText should escape URLs individually for safe HTML output"
+        );
+    }
+
+    #[test]
+    fn app_js_linkify_text_escapes_non_url_text() {
+        assert!(
+            APP_JS.contains("escapeHtml(p.text)"),
+            "linkifyText should escape non-URL text segments individually"
+        );
+    }
+
+    #[test]
+    fn app_js_linkify_text_no_bulk_escape() {
+        // The old pattern was: escapeHtml(text) then segmentUrls(escaped, false).
+        // Now we find URLs in raw text first, then escape each segment.
+        // Verify there's no `escapeHtml(text)` call followed by non-raw segmentUrls.
+        let linkify_fn = APP_JS
+            .find("function linkifyText")
+            .expect("should have linkifyText");
+        let fn_body = &APP_JS[linkify_fn..linkify_fn + 300];
+        assert!(
+            !fn_body.contains("escapeHtml(text)"),
+            "linkifyText must not bulk-escape the input text before URL parsing"
         );
     }
 
