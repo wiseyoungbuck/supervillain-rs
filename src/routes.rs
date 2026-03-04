@@ -376,11 +376,11 @@ async fn get_email(
     // Check for calendar event
     let mut calendar_event = None;
     if email.has_calendar
-        && let Ok(Some(ics_data)) = jmap::get_calendar_data(&session, &email_id).await
+        && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
         && let Some(mut event) = calendar::parse_ics(&ics_data)
     {
-        // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
         if event.method == "REQUEST" {
+            // Auto-add to calendar (non-blocking, won't overwrite existing)
             let state_clone = state.clone();
             let ics_clone = ics_data.clone();
             let uid = event.uid.clone();
@@ -406,10 +406,8 @@ async fn get_email(
                 }
             });
         }
-<<<<<<< HEAD
         // Merge current PARTSTAT from calendar (CalDAV/Graph) so the UI
         // reflects the user's actual RSVP status, not the stale email ICS
-        let mut event = event;
         match provider::get_calendar_event(&session, &event.uid).await {
             Ok(Some(cal_event)) => {
                 for att in &mut event.attendees {
@@ -431,14 +429,17 @@ async fn get_email(
                     "Calendar fetch failed for {}, falling back to email ICS: {e}",
                     event.uid
                 );
-=======
-        // Query CalDAV for persisted RSVP status
+            }
+        }
+        // Set user_rsvp_status from the (now-merged) attendee list
         if event.method == "REQUEST" {
-            let attendee_email = determine_attendee_email(email, &event, &session.username);
-            if let Some(status) = jmap::get_rsvp_status(&session, &event.uid, &attendee_email).await
+            let attendee_email = determine_attendee_email(email, &event, session.username());
+            if let Some(att) = event
+                .attendees
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(&attendee_email))
             {
-                event.user_rsvp_status = Some(status);
->>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
+                event.user_rsvp_status = Some(att.status.clone());
             }
         }
         calendar_event = Some(event);
@@ -690,23 +691,7 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-<<<<<<< HEAD
-
-        let mut found = None;
-        for addr in email.to.iter().chain(email.cc.iter()) {
-            if event
-                .attendees
-                .iter()
-                .any(|a| a.email.eq_ignore_ascii_case(&addr.email))
-            {
-                found = Some(addr.email.clone());
-                break;
-            }
-        }
-        found.unwrap_or_else(|| session_guard.username().to_string())
-=======
-        determine_attendee_email(email, &event, &session_guard.username)
->>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
+        determine_attendee_email(email, &event, session_guard.username())
     };
 
     // Dispatch full RSVP flow to provider (Fastmail: iTIP email + CalDAV, Outlook: Graph API)
@@ -728,10 +713,7 @@ async fn rsvp(
     {
         att.status = body.status.as_ics_str().to_string();
     }
-<<<<<<< HEAD
-=======
     updated_event.user_rsvp_status = Some(body.status.as_ics_str().to_string());
->>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
     Ok(Json(serde_json::json!({ "calendarEvent": updated_event })))
 }
 

@@ -505,13 +505,11 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
     let summary = event_json["subject"].as_str().unwrap_or("").to_string();
 
     // Parse start/end datetimes (Graph returns ISO 8601 without timezone, always UTC when timeZone is UTC)
-    let dtstart = event_json["start"]["dateTime"]
-        .as_str()
-        .and_then(|s| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                .ok()
-                .map(|dt| dt.and_utc())
-        })?;
+    let dtstart = event_json["start"]["dateTime"].as_str().and_then(|s| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(|dt| dt.and_utc())
+    })?;
 
     let dtend = event_json["end"]["dateTime"].as_str().and_then(|s| {
         chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
@@ -542,6 +540,7 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
         sequence: 0,
         method: "REQUEST".to_string(),
         raw_ics: String::new(),
+        user_rsvp_status: None,
     })
 }
 
@@ -730,6 +729,7 @@ mod tests {
             sequence: 0,
             method: "REQUEST".into(),
             raw_ics: String::new(),
+            user_rsvp_status: None,
         };
         let json = build_graph_event(&event);
         assert_eq!(json["subject"], "Team Meeting");
@@ -753,6 +753,7 @@ mod tests {
             sequence: 0,
             method: "REQUEST".into(),
             raw_ics: String::new(),
+            user_rsvp_status: None,
         };
         let json = build_graph_event(&event);
         assert!(json["end"]["dateTime"].is_string());
@@ -784,6 +785,7 @@ mod tests {
             sequence: 0,
             method: "REQUEST".into(),
             raw_ics: String::new(),
+            user_rsvp_status: None,
         };
         let json = build_graph_event(&event);
         let attendees = json["attendees"].as_array().unwrap();
@@ -808,6 +810,7 @@ mod tests {
             sequence: 0,
             method: "REQUEST".into(),
             raw_ics: String::new(),
+            user_rsvp_status: None,
         };
         let json = build_graph_event(&event);
         assert!(json.get("location").is_none());
@@ -828,6 +831,7 @@ mod tests {
             sequence: 0,
             method: "REQUEST".into(),
             raw_ics: String::new(),
+            user_rsvp_status: None,
         };
         let json = build_graph_event(&event);
         assert_eq!(json["body"]["content"], "");

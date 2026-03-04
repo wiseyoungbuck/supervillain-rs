@@ -1300,7 +1300,12 @@ pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -
         }
     };
 
-    let event = crate::calendar::parse_ics(&ics_data)?;
+    attendee_status_from_ics(&ics_data, attendee_email)
+}
+
+/// Parse ICS data and extract a specific attendee's PARTSTAT.
+fn attendee_status_from_ics(ics_data: &str, attendee_email: &str) -> Option<String> {
+    let event = crate::calendar::parse_ics(ics_data)?;
     let email_lower = attendee_email.to_lowercase();
     event
         .attendees
@@ -1690,6 +1695,72 @@ mod tests {
         assert_eq!(percent_encode_path("my photo.png"), "my%20photo.png");
         assert_eq!(percent_encode_path("file#1.png"), "file%231.png");
         assert_eq!(percent_encode_path("a?b=c"), "a%3Fb%3Dc");
+    }
+
+    // --- attendee_status_from_ics tests ---
+
+    const RSVP_TEST_ICS: &str = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:rsvp-test@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Test\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
+ATTENDEE;CN=Carol;PARTSTAT=TENTATIVE:mailto:carol@example.com\r\n\
+ATTENDEE;CN=Dave;PARTSTAT=NEEDS-ACTION:mailto:dave@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+    #[test]
+    fn attendee_status_finds_accepted() {
+        assert_eq!(
+            attendee_status_from_ics(RSVP_TEST_ICS, "bob@example.com"),
+            Some("ACCEPTED".into())
+        );
+    }
+
+    #[test]
+    fn attendee_status_finds_tentative() {
+        assert_eq!(
+            attendee_status_from_ics(RSVP_TEST_ICS, "carol@example.com"),
+            Some("TENTATIVE".into())
+        );
+    }
+
+    #[test]
+    fn attendee_status_finds_needs_action() {
+        assert_eq!(
+            attendee_status_from_ics(RSVP_TEST_ICS, "dave@example.com"),
+            Some("NEEDS-ACTION".into())
+        );
+    }
+
+    #[test]
+    fn attendee_status_case_insensitive_email() {
+        assert_eq!(
+            attendee_status_from_ics(RSVP_TEST_ICS, "Bob@Example.COM"),
+            Some("ACCEPTED".into())
+        );
+    }
+
+    #[test]
+    fn attendee_status_unknown_email_returns_none() {
+        assert_eq!(
+            attendee_status_from_ics(RSVP_TEST_ICS, "nobody@example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn attendee_status_invalid_ics_returns_none() {
+        assert_eq!(
+            attendee_status_from_ics("not valid ics", "bob@example.com"),
+            None
+        );
     }
 
     // --- collect_inline_cids tests ---
