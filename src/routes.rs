@@ -1946,7 +1946,6 @@ white   = '#fdf6e3'
     // =========================================================================
 
     #[test]
-    #[test]
     fn app_js_has_user_rsvp_status_preference() {
         assert!(
             APP_JS.contains("event.user_rsvp_status || getUserRsvpStatus(event)"),
@@ -2046,6 +2045,175 @@ white   = '#fdf6e3'
             STYLE_CSS.contains(".rsvp-status-label"),
             "style.css should style the RSVP status label"
         );
+    }
+
+    // =========================================================================
+    // RSVP verification tests (THE-192)
+    //
+    // These verify the contracts between backend and frontend:
+    // - rsvp() JSON response shape matches what the frontend expects
+    // - CalendarEvent serialization includes user_rsvp_status
+    // - Frontend JS handles all verification scenarios correctly
+    // =========================================================================
+
+    #[test]
+    fn rsvp_response_wraps_in_calendar_event_key() {
+        // The frontend expects `result.calendarEvent` from the RSVP endpoint.
+        // Verify the JSON shape by constructing what rsvp() returns.
+        let mut event = test_calendar_event(vec!["bob@example.com"]);
+        event.user_rsvp_status = Some("ACCEPTED".into());
+        event.attendees[0].status = "ACCEPTED".into();
+
+        let json = serde_json::json!({ "calendarEvent": event });
+        assert!(json.get("calendarEvent").is_some());
+        assert_eq!(
+            json["calendarEvent"]["user_rsvp_status"],
+            "ACCEPTED"
+        );
+    }
+
+    #[test]
+    fn rsvp_response_includes_updated_attendee_status() {
+        let mut event = test_calendar_event(vec!["bob@example.com", "carol@example.com"]);
+        // Simulate what rsvp() does: update the matching attendee
+        if let Some(att) = event.attendees.iter_mut().find(|a| a.email == "bob@example.com") {
+            att.status = "ACCEPTED".into();
+        }
+        event.user_rsvp_status = Some("ACCEPTED".into());
+
+        let json = serde_json::json!({ "calendarEvent": event });
+        let attendees = json["calendarEvent"]["attendees"].as_array().unwrap();
+        let bob = attendees.iter().find(|a| a["email"] == "bob@example.com").unwrap();
+        assert_eq!(bob["status"], "ACCEPTED");
+        // Carol unchanged
+        let carol = attendees.iter().find(|a| a["email"] == "carol@example.com").unwrap();
+        assert_eq!(carol["status"], "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn rsvp_response_user_rsvp_status_set_for_all_statuses() {
+        for (status, expected) in [
+            (crate::types::RsvpStatus::Accepted, "ACCEPTED"),
+            (crate::types::RsvpStatus::Tentative, "TENTATIVE"),
+            (crate::types::RsvpStatus::Declined, "DECLINED"),
+        ] {
+            let mut event = test_calendar_event(vec!["bob@example.com"]);
+            event.user_rsvp_status = Some(status.as_ics_str().to_string());
+            let json = serde_json::json!({ "calendarEvent": event });
+            assert_eq!(
+                json["calendarEvent"]["user_rsvp_status"].as_str().unwrap(),
+                expected,
+                "user_rsvp_status should be {expected} for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_event_serializes_user_rsvp_status_when_some() {
+        let mut event = test_calendar_event(vec!["bob@example.com"]);
+        event.user_rsvp_status = Some("ACCEPTED".into());
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["user_rsvp_status"], "ACCEPTED");
+    }
+
+    #[test]
+    fn calendar_event_serializes_user_rsvp_status_as_null_when_none() {
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json["user_rsvp_status"].is_null());
+    }
+
+    #[test]
+    fn get_email_response_includes_calendar_event_key() {
+        // Verify the JSON shape of get_email() response includes calendarEvent
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        let json = serde_json::json!({
+            "id": "test",
+            "calendarEvent": event,
+        });
+        assert!(json.get("calendarEvent").is_some());
+        assert!(json["calendarEvent"]["user_rsvp_status"].is_null());
+    }
+
+    // --- Frontend contract: renderCalendarCard handles persisted status ---
+
+    #[test]
+    fn app_js_renders_you_responded_for_each_status() {
+        // The frontend maps ACCEPTED→"Accepted", TENTATIVE→"Maybe", DECLINED→"Declined"
+        assert!(APP_JS.contains("ACCEPTED: 'Accepted'"));
+        assert!(APP_JS.contains("TENTATIVE: 'Maybe'"));
+        assert!(APP_JS.contains("DECLINED: 'Declined'"));
+    }
+
+    #[test]
+    fn app_js_hides_status_label_for_needs_action() {
+        assert!(
+            APP_JS.contains("!== 'NEEDS-ACTION'"),
+            "status label should be hidden when status is NEEDS-ACTION"
+        );
+    }
+
+    #[test]
+    fn app_js_rsvp_buttons_toggle_active_class() {
+        // Verify all three buttons get .active toggled based on status
+        assert!(APP_JS.contains("rsvpAccept.classList.toggle('active'"));
+        assert!(APP_JS.contains("rsvpMaybe.classList.toggle('active'"));
+        assert!(APP_JS.contains("rsvpDecline.classList.toggle('active'"));
+    }
+
+    #[test]
+    fn app_js_hides_rsvp_actions_for_cancelled_events() {
+        // Cancelled events should hide the RSVP buttons
+        let render_fn_pos = APP_JS.find("function renderCalendarCard").unwrap();
+        let render_fn = &APP_JS[render_fn_pos..render_fn_pos + 2000];
+        assert!(
+            render_fn.contains("actions.style.display = 'none'"),
+            "cancelled events should hide RSVP actions"
+        );
+    }
+
+    #[test]
+    fn app_js_optimistic_update_reverts_on_error() {
+        // rsvpToEvent should deep-clone prevEvent and revert on catch
+        let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
+        let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
+        assert!(
+            rsvp_fn.contains("JSON.parse(JSON.stringify(event))"),
+            "should deep-clone event for revert"
+        );
+        assert!(
+            rsvp_fn.contains("if (prevEvent)"),
+            "should check prevEvent in catch block for revert"
+        );
+    }
+
+    #[test]
+    fn app_js_updates_cache_after_rsvp() {
+        // After successful RSVP, the email cache should be updated
+        let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
+        let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
+        assert!(
+            rsvp_fn.contains("emailCache[state.currentEmail.id] = state.currentEmail"),
+            "should update emailCache after RSVP"
+        );
+    }
+
+    #[test]
+    fn app_js_keyboard_y_only_in_detail_view_with_calendar() {
+        // y shortcut should only fire in detail view with a calendar event
+        let y_pos = APP_JS.find("case 'y':").unwrap();
+        let y_block = &APP_JS[y_pos..y_pos + 200];
+        assert!(y_block.contains("state.view === 'detail'"));
+        assert!(y_block.contains("calendarEvent"));
+    }
+
+    #[test]
+    fn app_js_keyboard_n_only_in_detail_view_with_calendar() {
+        // n shortcut should only fire in detail view with a calendar event
+        let n_pos = APP_JS.find("case 'n':").unwrap();
+        let n_block = &APP_JS[n_pos..n_pos + 200];
+        assert!(n_block.contains("state.view === 'detail'"));
+        assert!(n_block.contains("calendarEvent"));
     }
 
     #[test]

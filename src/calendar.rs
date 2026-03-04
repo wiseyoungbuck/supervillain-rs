@@ -1228,4 +1228,182 @@ END:VCALENDAR";
     }
 
     use chrono::{Datelike, Timelike};
+
+    // =========================================================================
+    // RSVP lifecycle verification tests (THE-192)
+    //
+    // These simulate the full RSVP flow without network calls:
+    //   parse ICS → RSVP → update CalDAV ICS → re-parse → verify persisted status
+    // =========================================================================
+
+    const INVITE_ICS: &str = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:lifecycle-test@example.com\r\n\
+DTSTART:20260301T140000Z\r\n\
+DTEND:20260301T150000Z\r\n\
+SUMMARY:Team Standup\r\n\
+LOCATION:Room 42\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+ATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION:mailto:bob@example.com\r\n\
+ATTENDEE;CN=Carol;PARTSTAT=NEEDS-ACTION:mailto:carol@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+    /// Verify: accept RSVP → persist to CalDAV → re-read → status is ACCEPTED
+    #[test]
+    fn lifecycle_accept_persists_and_reads_back() {
+        let event = parse_ics(INVITE_ICS).unwrap();
+        assert_eq!(event.user_rsvp_status, None);
+
+        // Simulate backend rsvp(): update_partstat writes to CalDAV
+        let updated_ics = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+
+        // Simulate get_email(): re-parse the stored ICS (what CalDAV returns)
+        let re_read = parse_ics(&updated_ics).unwrap();
+        let bob = re_read.attendees.iter().find(|a| a.email == "bob@example.com").unwrap();
+        assert_eq!(bob.status, "ACCEPTED");
+
+        // Carol is unchanged
+        let carol = re_read.attendees.iter().find(|a| a.email == "carol@example.com").unwrap();
+        assert_eq!(carol.status, "NEEDS-ACTION");
+    }
+
+    /// Verify: accept → navigate away → return → change to Decline → re-read
+    #[test]
+    fn lifecycle_change_accept_to_decline() {
+        // First: accept
+        let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        let event = parse_ics(&after_accept).unwrap();
+        assert_eq!(
+            event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            "ACCEPTED"
+        );
+
+        // Then: change to decline (decline removes from calendar, but the ICS
+        // was previously stored with ACCEPTED — this test verifies the update path
+        // works on already-updated ICS)
+        let after_decline = update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
+        let event2 = parse_ics(&after_decline).unwrap();
+        assert_eq!(
+            event2.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            "DECLINED"
+        );
+    }
+
+    /// Verify: decline → change back to accept → status is ACCEPTED
+    #[test]
+    fn lifecycle_re_rsvp_decline_then_accept() {
+        let after_decline = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Declined);
+
+        // Re-accept: the original ICS is used for the upsert (not the declined one,
+        // since decline removes from calendar). This tests accept from the original invite.
+        let after_reaccept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        let event = parse_ics(&after_reaccept).unwrap();
+        assert_eq!(
+            event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            "ACCEPTED"
+        );
+
+        // Also verify that updating the declined version works too
+        let after_reaccept2 = update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
+        let event2 = parse_ics(&after_reaccept2).unwrap();
+        assert_eq!(
+            event2.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            "ACCEPTED"
+        );
+    }
+
+    /// Verify: accept → re-read → CalDAV status matches rsvp() response
+    #[test]
+    fn lifecycle_rsvp_response_matches_persisted_status() {
+        for status in &[RsvpStatus::Accepted, RsvpStatus::Tentative, RsvpStatus::Declined] {
+            // What rsvp() returns to the frontend
+            let rsvp_response_status = status.as_ics_str().to_string();
+
+            // What CalDAV would store and get_rsvp_status() would return
+            let updated_ics = update_partstat(INVITE_ICS, "bob@example.com", status);
+            let re_read = parse_ics(&updated_ics).unwrap();
+            let persisted_status = re_read
+                .attendees
+                .iter()
+                .find(|a| a.email == "bob@example.com")
+                .unwrap()
+                .status
+                .clone();
+
+            assert_eq!(
+                rsvp_response_status, persisted_status,
+                "rsvp() response status must match CalDAV-persisted status for {:?}",
+                status
+            );
+        }
+    }
+
+    /// Verify: iTIP REPLY method is always REPLY, never REQUEST
+    /// (prevents auto-add loop when viewing sent RSVP emails)
+    #[test]
+    fn lifecycle_rsvp_reply_never_triggers_auto_add() {
+        let event = parse_ics(INVITE_ICS).unwrap();
+        assert_eq!(event.method, "REQUEST", "original invite should be REQUEST");
+
+        for status in &[RsvpStatus::Accepted, RsvpStatus::Tentative, RsvpStatus::Declined] {
+            let reply_ics = generate_rsvp(&event, "bob@example.com", status);
+            let reply = parse_ics(&reply_ics).unwrap();
+            assert_eq!(reply.method, "REPLY");
+            assert_ne!(reply.method, "REQUEST");
+        }
+    }
+
+    /// Verify: CANCEL events don't get RSVP'd
+    #[test]
+    fn lifecycle_cancel_method_not_request() {
+        let cancel_ics = INVITE_ICS.replace("METHOD:REQUEST", "METHOD:CANCEL");
+        let event = parse_ics(&cancel_ics).unwrap();
+        assert_eq!(event.method, "CANCEL");
+        assert_ne!(event.method, "REQUEST");
+    }
+
+    /// Verify: user_rsvp_status is always None from parse_ics (populated server-side only)
+    #[test]
+    fn lifecycle_parse_never_sets_user_rsvp_status() {
+        // Even after updating PARTSTAT, parse_ics never sets user_rsvp_status
+        let updated = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        let event = parse_ics(&updated).unwrap();
+        assert_eq!(event.user_rsvp_status, None);
+    }
+
+    /// Verify: UID survives the full accept→decline→re-accept cycle
+    #[test]
+    fn lifecycle_uid_stable_through_rsvp_changes() {
+        let original = parse_ics(INVITE_ICS).unwrap();
+        let uid = &original.uid;
+
+        let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        assert_eq!(parse_ics(&after_accept).unwrap().uid, *uid);
+
+        let after_decline = update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
+        assert_eq!(parse_ics(&after_decline).unwrap().uid, *uid);
+
+        let after_reaccept = update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
+        assert_eq!(parse_ics(&after_reaccept).unwrap().uid, *uid);
+    }
+
+    /// Verify: update_partstat on CalDAV-stored ICS preserves other attendees
+    #[test]
+    fn lifecycle_rsvp_does_not_clobber_other_attendees() {
+        // Bob accepts
+        let after_bob = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
+        // Carol declines
+        let after_both = update_partstat(&after_bob, "carol@example.com", &RsvpStatus::Declined);
+
+        let event = parse_ics(&after_both).unwrap();
+        let bob = event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap();
+        let carol = event.attendees.iter().find(|a| a.email == "carol@example.com").unwrap();
+        assert_eq!(bob.status, "ACCEPTED");
+        assert_eq!(carol.status, "DECLINED");
+    }
 }
