@@ -366,22 +366,32 @@ function showStatus(msg) {
 // ============================================================================
 
 async function showEmail(emailId) {
+    // Only pushState when transitioning from list; replaceState when navigating
+    // between emails to avoid unbounded history growth.
+    if (state.currentView === 'detail') {
+        history.replaceState({ view: 'detail', emailId }, '');
+    } else {
+        state.listScrollTop = document.getElementById('email-list-wrap').scrollTop;
+        history.pushState({ view: 'detail', emailId }, '');
+    }
+
     state.currentView = 'detail';
     state.currentEmailId = emailId;
-    state.listScrollTop = document.getElementById('email-list-wrap').scrollTop;
 
     document.getElementById('email-list-wrap').style.display = 'none';
     document.getElementById('app-header').style.display = 'none';
     document.getElementById('email-detail').style.display = 'flex';
 
-    history.pushState({ view: 'detail', emailId }, '');
-
     // Render partial detail from list data immediately
     const listEmail = state.emails.find(e => e.id === emailId);
     if (listEmail) renderEmailDetailPartial(listEmail);
 
-    // Full body: use cache or fetch
+    // Full body: use cache or fetch (delete+reinsert to promote in LRU)
     let full = state.emailCache[emailId];
+    if (full) {
+        delete state.emailCache[emailId];
+        state.emailCache[emailId] = full;
+    }
     if (!full) {
         try {
             const fetched = await getEmails(state.session, [emailId], true);
@@ -438,15 +448,7 @@ function renderEmailDetailPartial(email) {
 }
 
 function renderEmailDetail(email) {
-    const from = email.from[0];
-    const fromDisplay = from?.name
-        ? `${escapeHtml(from.name)} <${escapeHtml(from.email)}>`
-        : escapeHtml(from?.email || 'Unknown');
-
-    document.getElementById('detail-subject').textContent = email.subject;
-    document.getElementById('detail-from').innerHTML = fromDisplay;
-    document.getElementById('detail-date').textContent = formatDetailDate(email.receivedAt);
-    document.getElementById('detail-recipients').innerHTML = formatRecipients(email);
+    renderEmailDetailPartial(email);
 
     // Attachments
     const attachments = email.attachments || [];
@@ -683,8 +685,8 @@ document.getElementById('logout-btn').addEventListener('click', () => {
     showLogin();
 });
 
-// Back button (detail → list)
-document.getElementById('back-btn').addEventListener('click', () => showList());
+// Back button (detail → list) — use history.back() to pop the pushState entry
+document.getElementById('back-btn').addEventListener('click', () => history.back());
 
 // Email row click → detail view
 document.getElementById('email-list').addEventListener('click', (e) => {
