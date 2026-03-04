@@ -1663,6 +1663,98 @@ white   = '#fdf6e3'
             "style.css should style the drag-over state"
         );
     }
+
+    // =========================================================================
+    // URL linkification tests
+    // =========================================================================
+
+    #[test]
+    fn app_js_has_segment_urls_helper() {
+        assert!(
+            APP_JS.contains("function segmentUrls(text)"),
+            "app.js should have a shared segmentUrls helper"
+        );
+    }
+
+    #[test]
+    fn app_js_linkify_text_uses_segment_urls() {
+        assert!(
+            APP_JS.contains("segmentUrls(escaped)"),
+            "linkifyText should delegate to segmentUrls"
+        );
+    }
+
+    #[test]
+    fn app_js_segment_urls_trims_trailing_punctuation() {
+        assert!(
+            APP_JS.contains(r#"replace(/[.,;:!?]+$/"#),
+            "segmentUrls should trim trailing punctuation from URLs"
+        );
+    }
+
+    #[test]
+    fn app_js_sanitize_html_linkifies_bare_urls() {
+        assert!(
+            APP_JS.contains("createTreeWalker"),
+            "sanitizeHtml should walk text nodes to linkify bare URLs"
+        );
+        assert!(
+            APP_JS.contains("NodeFilter.SHOW_TEXT"),
+            "sanitizeHtml should filter for text nodes only"
+        );
+    }
+
+    #[test]
+    fn app_js_sanitize_html_skips_existing_links() {
+        assert!(
+            APP_JS.contains("closest('a')"),
+            "sanitizeHtml should not double-linkify URLs already inside <a> tags"
+        );
+    }
+
+    #[test]
+    fn app_js_sanitize_html_sets_link_security_attrs() {
+        // The TreeWalker block sets target and rel on created <a> elements
+        let tree_walker_section = APP_JS
+            .find("createTreeWalker")
+            .expect("should have TreeWalker");
+        let after_walker = &APP_JS[tree_walker_section..];
+        assert!(
+            after_walker.contains("noopener noreferrer"),
+            "linkified URLs in sanitizeHtml should have rel=noopener noreferrer"
+        );
+    }
+
+    #[test]
+    fn style_css_email_links_no_underline_by_default() {
+        assert!(
+            STYLE_CSS.contains("#email-body a"),
+            "style.css should style email body links"
+        );
+        assert!(
+            STYLE_CSS.contains("text-decoration: none"),
+            "email body links should have no underline by default"
+        );
+    }
+
+    #[test]
+    fn style_css_email_links_underline_on_hover() {
+        assert!(
+            STYLE_CSS.contains("#email-body a:hover"),
+            "style.css should have hover state for email links"
+        );
+        // Verify the hover rule contains underline
+        let hover_pos = STYLE_CSS
+            .find("#email-body a:hover")
+            .expect("should have hover rule");
+        let after_hover = &STYLE_CSS[hover_pos..];
+        let block_end = after_hover.find('}').expect("should close rule");
+        let hover_block = &after_hover[..block_end];
+        assert!(
+            hover_block.contains("text-decoration: underline"),
+            "email links should underline on hover"
+        );
+    }
 }
 
 // External dep for theme path

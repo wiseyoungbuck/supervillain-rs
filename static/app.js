@@ -2179,6 +2179,30 @@ function sanitizeHtml(html) {
         });
     });
 
+    // Linkify bare URLs in text nodes
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+    for (const node of textNodes) {
+        if (node.parentElement && node.parentElement.closest('a')) continue;
+        const segments = segmentUrls(node.textContent);
+        if (segments.length <= 1 && !segments[0]?.url) continue;
+        const frag = doc.createDocumentFragment();
+        for (const seg of segments) {
+            if (seg.url) {
+                const a = doc.createElement('a');
+                a.href = seg.url;
+                a.textContent = seg.url;
+                a.setAttribute('target', '_blank');
+                a.setAttribute('rel', 'noopener noreferrer');
+                frag.appendChild(a);
+            } else {
+                frag.appendChild(doc.createTextNode(seg.text));
+            }
+        }
+        node.parentNode.replaceChild(frag, node);
+    }
+
     // Make all links open in a new tab
     doc.querySelectorAll('a[href]').forEach(el => {
         el.setAttribute('target', '_blank');
@@ -2196,16 +2220,27 @@ function htmlToPlainText(html) {
     return doc.body.innerText || '';
 }
 
+function segmentUrls(text) {
+    const re = /https?:\/\/[^\s<>&"')\]]+/g;
+    const parts = [];
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+        const url = m[0].replace(/[.,;:!?]+$/, '');
+        if (m.index > last) parts.push({ text: text.slice(last, m.index) });
+        parts.push({ text: url, url });
+        last = m.index + url.length;
+        re.lastIndex = last;
+    }
+    if (last < text.length) parts.push({ text: text.slice(last) });
+    return parts;
+}
+
 function linkifyText(text) {
     const escaped = escapeHtml(text);
-    return escaped.replace(
-        /https?:\/\/[^\s<>&"')\]]+/g,
-        url => {
-            const trimmed = url.replace(/[.,;:!?]+$/, '');
-            const suffix = url.slice(trimmed.length);
-            return `<a href="${trimmed}" target="_blank" rel="noopener noreferrer">${trimmed}</a>${suffix}`;
-        }
-    );
+    return segmentUrls(escaped).map(p => p.url
+        ? `<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.url}</a>`
+        : p.text
+    ).join('');
 }
 
 // Attachment functions

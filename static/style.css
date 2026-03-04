@@ -382,10 +382,11 @@ body {
 
 #email-body a {
     color: var(--accent);
+    text-decoration: none;
 }
 
-#email-body.html-content a {
-    color: var(--accent);
+#email-body a:hover {
+    text-decoration: underline;
 }
 
 /* Force dark theme on HTML emails - override sender's colors */
