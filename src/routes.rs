@@ -2066,27 +2066,34 @@ white   = '#fdf6e3'
 
         let json = serde_json::json!({ "calendarEvent": event });
         assert!(json.get("calendarEvent").is_some());
-        assert_eq!(
-            json["calendarEvent"]["user_rsvp_status"],
-            "ACCEPTED"
-        );
+        assert_eq!(json["calendarEvent"]["user_rsvp_status"], "ACCEPTED");
     }
 
     #[test]
     fn rsvp_response_includes_updated_attendee_status() {
         let mut event = test_calendar_event(vec!["bob@example.com", "carol@example.com"]);
         // Simulate what rsvp() does: update the matching attendee
-        if let Some(att) = event.attendees.iter_mut().find(|a| a.email == "bob@example.com") {
+        if let Some(att) = event
+            .attendees
+            .iter_mut()
+            .find(|a| a.email == "bob@example.com")
+        {
             att.status = "ACCEPTED".into();
         }
         event.user_rsvp_status = Some("ACCEPTED".into());
 
         let json = serde_json::json!({ "calendarEvent": event });
         let attendees = json["calendarEvent"]["attendees"].as_array().unwrap();
-        let bob = attendees.iter().find(|a| a["email"] == "bob@example.com").unwrap();
+        let bob = attendees
+            .iter()
+            .find(|a| a["email"] == "bob@example.com")
+            .unwrap();
         assert_eq!(bob["status"], "ACCEPTED");
         // Carol unchanged
-        let carol = attendees.iter().find(|a| a["email"] == "carol@example.com").unwrap();
+        let carol = attendees
+            .iter()
+            .find(|a| a["email"] == "carol@example.com")
+            .unwrap();
         assert_eq!(carol["status"], "NEEDS-ACTION");
     }
 

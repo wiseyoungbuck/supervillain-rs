@@ -1264,11 +1264,19 @@ END:VCALENDAR";
 
         // Simulate get_email(): re-parse the stored ICS (what CalDAV returns)
         let re_read = parse_ics(&updated_ics).unwrap();
-        let bob = re_read.attendees.iter().find(|a| a.email == "bob@example.com").unwrap();
+        let bob = re_read
+            .attendees
+            .iter()
+            .find(|a| a.email == "bob@example.com")
+            .unwrap();
         assert_eq!(bob.status, "ACCEPTED");
 
         // Carol is unchanged
-        let carol = re_read.attendees.iter().find(|a| a.email == "carol@example.com").unwrap();
+        let carol = re_read
+            .attendees
+            .iter()
+            .find(|a| a.email == "carol@example.com")
+            .unwrap();
         assert_eq!(carol.status, "NEEDS-ACTION");
     }
 
@@ -1279,17 +1287,28 @@ END:VCALENDAR";
         let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
         let event = parse_ics(&after_accept).unwrap();
         assert_eq!(
-            event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            event
+                .attendees
+                .iter()
+                .find(|a| a.email == "bob@example.com")
+                .unwrap()
+                .status,
             "ACCEPTED"
         );
 
         // Then: change to decline (decline removes from calendar, but the ICS
         // was previously stored with ACCEPTED — this test verifies the update path
         // works on already-updated ICS)
-        let after_decline = update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
+        let after_decline =
+            update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
         let event2 = parse_ics(&after_decline).unwrap();
         assert_eq!(
-            event2.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            event2
+                .attendees
+                .iter()
+                .find(|a| a.email == "bob@example.com")
+                .unwrap()
+                .status,
             "DECLINED"
         );
     }
@@ -1304,15 +1323,26 @@ END:VCALENDAR";
         let after_reaccept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
         let event = parse_ics(&after_reaccept).unwrap();
         assert_eq!(
-            event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            event
+                .attendees
+                .iter()
+                .find(|a| a.email == "bob@example.com")
+                .unwrap()
+                .status,
             "ACCEPTED"
         );
 
         // Also verify that updating the declined version works too
-        let after_reaccept2 = update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
+        let after_reaccept2 =
+            update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
         let event2 = parse_ics(&after_reaccept2).unwrap();
         assert_eq!(
-            event2.attendees.iter().find(|a| a.email == "bob@example.com").unwrap().status,
+            event2
+                .attendees
+                .iter()
+                .find(|a| a.email == "bob@example.com")
+                .unwrap()
+                .status,
             "ACCEPTED"
         );
     }
@@ -1320,7 +1350,11 @@ END:VCALENDAR";
     /// Verify: accept → re-read → CalDAV status matches rsvp() response
     #[test]
     fn lifecycle_rsvp_response_matches_persisted_status() {
-        for status in &[RsvpStatus::Accepted, RsvpStatus::Tentative, RsvpStatus::Declined] {
+        for status in &[
+            RsvpStatus::Accepted,
+            RsvpStatus::Tentative,
+            RsvpStatus::Declined,
+        ] {
             // What rsvp() returns to the frontend
             let rsvp_response_status = status.as_ics_str().to_string();
 
@@ -1350,7 +1384,11 @@ END:VCALENDAR";
         let event = parse_ics(INVITE_ICS).unwrap();
         assert_eq!(event.method, "REQUEST", "original invite should be REQUEST");
 
-        for status in &[RsvpStatus::Accepted, RsvpStatus::Tentative, RsvpStatus::Declined] {
+        for status in &[
+            RsvpStatus::Accepted,
+            RsvpStatus::Tentative,
+            RsvpStatus::Declined,
+        ] {
             let reply_ics = generate_rsvp(&event, "bob@example.com", status);
             let reply = parse_ics(&reply_ics).unwrap();
             assert_eq!(reply.method, "REPLY");
@@ -1385,10 +1423,12 @@ END:VCALENDAR";
         let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
         assert_eq!(parse_ics(&after_accept).unwrap().uid, *uid);
 
-        let after_decline = update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
+        let after_decline =
+            update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
         assert_eq!(parse_ics(&after_decline).unwrap().uid, *uid);
 
-        let after_reaccept = update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
+        let after_reaccept =
+            update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
         assert_eq!(parse_ics(&after_reaccept).unwrap().uid, *uid);
     }
 
@@ -1401,8 +1441,16 @@ END:VCALENDAR";
         let after_both = update_partstat(&after_bob, "carol@example.com", &RsvpStatus::Declined);
 
         let event = parse_ics(&after_both).unwrap();
-        let bob = event.attendees.iter().find(|a| a.email == "bob@example.com").unwrap();
-        let carol = event.attendees.iter().find(|a| a.email == "carol@example.com").unwrap();
+        let bob = event
+            .attendees
+            .iter()
+            .find(|a| a.email == "bob@example.com")
+            .unwrap();
+        let carol = event
+            .attendees
+            .iter()
+            .find(|a| a.email == "carol@example.com")
+            .unwrap();
         assert_eq!(bob.status, "ACCEPTED");
         assert_eq!(carol.status, "DECLINED");
     }
