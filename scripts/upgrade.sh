@@ -24,7 +24,7 @@ is_running() {
     if command -v ss &>/dev/null; then
         ss -tlnp 2>/dev/null | grep ":$PORT " | grep -q supervillain
     else
-        lsof -i ":$PORT" -sTCP:LISTEN 2>/dev/null | grep -q supervillain
+        lsof -i ":$PORT" -sTCP:LISTEN 2>/dev/null | grep -q supervill
     fi
 }
 
