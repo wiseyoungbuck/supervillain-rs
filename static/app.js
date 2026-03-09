@@ -924,7 +924,7 @@ function handleKeyDown(e) {
         if (e.key === 'Escape') {
             closeSplitModal();
             e.preventDefault();
-        } else if (e.key === 'Enter' && e.ctrlKey) {
+        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
             saveSplit();
             e.preventDefault();
         }
@@ -937,7 +937,7 @@ function handleKeyDown(e) {
             e.target.blur();
             setMode('normal');
             e.preventDefault();
-        } else if (e.key === 'Enter' && e.ctrlKey) {
+        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
             sendEmail();
             e.preventDefault();
         } else if (e.key === 'A' && e.ctrlKey && e.shiftKey) {
