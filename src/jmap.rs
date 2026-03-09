@@ -960,12 +960,20 @@ pub async fn send_email(
         }
     };
 
-    // JMAP requires mailboxIds — put the draft in Drafts
+    // JMAP requires mailboxIds — put the draft in Drafts, move to Sent on success
     let drafts_id = s
         .mailbox_cache
         .values()
         .find(|mb| mb.role.as_deref() == Some("drafts"))
         .ok_or_else(|| Error::Internal("No drafts mailbox found".into()))?
+        .id
+        .clone();
+
+    let sent_id = s
+        .mailbox_cache
+        .values()
+        .find(|mb| mb.role.as_deref() == Some("sent"))
+        .ok_or_else(|| Error::Internal("No sent mailbox found".into()))?
         .id
         .clone();
 
@@ -995,23 +1003,34 @@ pub async fn send_email(
                 },
                 "0"
             ]),
-            serde_json::json!([
-                "EmailSubmission/set",
-                {
-                    "accountId": &account_id,
-                    "create": {
-                        "send": {
-                            "emailId": "#draft",
-                            "identityId": identity_id,
-                            "envelope": {
-                                "mailFrom": { "email": from_addr },
-                                "rcptTo": rcpt_to
+            {
+                // Build the patch to move from Drafts → Sent and clear $draft keyword
+                let mut patch = serde_json::Map::new();
+                patch.insert(format!("mailboxIds/{drafts_id}"), serde_json::Value::Null);
+                patch.insert(format!("mailboxIds/{sent_id}"), serde_json::json!(true));
+                patch.insert("keywords/$draft".into(), serde_json::Value::Null);
+
+                serde_json::json!([
+                    "EmailSubmission/set",
+                    {
+                        "accountId": &account_id,
+                        "create": {
+                            "send": {
+                                "emailId": "#draft",
+                                "identityId": identity_id,
+                                "envelope": {
+                                    "mailFrom": { "email": from_addr },
+                                    "rcptTo": rcpt_to
+                                }
                             }
+                        },
+                        "onSuccessUpdateEmail": {
+                            "#send": patch
                         }
-                    }
-                },
-                "1"
-            ]),
+                    },
+                    "1"
+                ])
+            },
         ],
     )
     .await?;
