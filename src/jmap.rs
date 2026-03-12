@@ -371,7 +371,7 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
         // Resolve cid: URLs to download URLs for inline images
         let email_id = item["id"].as_str().unwrap_or_default();
         if let Some(ref mut html) = html_body
-            && html.contains("cid:")
+            && html.to_ascii_lowercase().contains("cid:")
         {
             let mut cids = Vec::new();
             collect_inline_cids(&item["bodyStructure"], &mut cids);
@@ -387,7 +387,7 @@ fn parse_jmap_email(item: &serde_json::Value, fetch_body: bool) -> Email {
                     .replace('"', "&quot;")
                     .replace('<', "&lt;")
                     .replace('>', "&gt;");
-                *html = html.replace(&format!("cid:{cid}"), &safe_url);
+                *html = replace_case_insensitive(html, &format!("cid:{cid}"), &safe_url);
             }
         }
 
@@ -507,6 +507,21 @@ fn percent_encode_path(s: &str) -> String {
         }
     }
     out
+}
+
+/// Replace all occurrences of `needle` in `haystack` using case-insensitive matching.
+fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut result = String::with_capacity(haystack.len());
+    let mut start = 0;
+    while let Some(pos) = lower_haystack[start..].find(&lower_needle) {
+        result.push_str(&haystack[start..start + pos]);
+        result.push_str(replacement);
+        start += pos + needle.len();
+    }
+    result.push_str(&haystack[start..]);
+    result
 }
 
 /// Walk bodyStructure collecting (content_id, blob_id, filename) for inline parts.
@@ -2478,5 +2493,45 @@ mod tests {
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
         assert_eq!(draft["bodyStructure"]["type"], "text/plain");
         assert!(draft["bodyStructure"].get("subParts").is_none());
+    }
+
+    // --- replace_case_insensitive tests ---
+
+    #[test]
+    fn replace_case_insensitive_basic() {
+        assert_eq!(
+            replace_case_insensitive(r#"src="cid:abc123""#, "cid:abc123", "/img/1.png"),
+            r#"src="/img/1.png""#
+        );
+    }
+
+    #[test]
+    fn replace_case_insensitive_mixed_case() {
+        assert_eq!(
+            replace_case_insensitive(r#"src="CID:abc123""#, "cid:abc123", "/img/1.png"),
+            r#"src="/img/1.png""#
+        );
+        assert_eq!(
+            replace_case_insensitive(r#"src="Cid:abc123""#, "cid:abc123", "/img/1.png"),
+            r#"src="/img/1.png""#
+        );
+    }
+
+    #[test]
+    fn replace_case_insensitive_multiple_occurrences() {
+        let html = r#"<img src="CID:x"><img src="cid:x">"#;
+        assert_eq!(
+            replace_case_insensitive(html, "cid:x", "/img/x.png"),
+            r#"<img src="/img/x.png"><img src="/img/x.png">"#
+        );
+    }
+
+    #[test]
+    fn replace_case_insensitive_no_match() {
+        let html = "no cids here";
+        assert_eq!(
+            replace_case_insensitive(html, "cid:abc", "/img/1.png"),
+            "no cids here"
+        );
     }
 }

@@ -2080,7 +2080,7 @@ function escapeHtml(text) {
 // Preserves layout (margin, padding, display) while removing colors.
 function stripColorStyles(styleString) {
     const colorProps = [
-        'color', 'background', 'background-color', 'background-image',
+        'color', 'background-color',
         'outline-color', 'text-decoration-color', 'text-shadow', 'box-shadow'
     ];
     return styleString.split(';')
@@ -2088,7 +2088,14 @@ function stripColorStyles(styleString) {
         .filter(d => {
             if (!d) return false;
             const propName = d.split(':')[0]?.trim().toLowerCase();
-            return propName && !colorProps.some(cp => propName === cp || propName.startsWith(cp + '-'));
+            if (!propName) return false;
+            // Always preserve background-image (contains url())
+            if (propName === 'background-image') return true;
+            // For background shorthand: preserve if it contains url(), strip if color-only
+            if (propName === 'background') {
+                return /url\s*\(/i.test(d);
+            }
+            return !colorProps.some(cp => propName === cp || propName.startsWith(cp + '-'));
         })
         .join('; ');
 }
@@ -2098,8 +2105,8 @@ function sanitizeStyleContent(css) {
     css = css.replace(/@import\b[^;]*;?/gi, '');
     // Remove @font-face rules (external resource loading)
     css = css.replace(/@font-face\s*\{[^}]*\}/gi, '');
-    // Remove url() references (external resource loading / tracking)
-    css = css.replace(/url\s*\([^)]*\)/gi, '');
+    // url() in regular properties (e.g. background-image) is preserved —
+    // @import and @font-face (the main tracking/loading vectors) are already stripped above.
     // Remove expression() (IE CSS expressions)
     css = css.replace(/expression\s*\([^)]*\)/gi, '');
     // Remove -moz-binding (Firefox XBL)
