@@ -2085,17 +2085,19 @@ function stripColorStyles(styleString) {
     ];
     return styleString.split(';')
         .map(d => d.trim())
-        .filter(d => {
-            if (!d) return false;
+        .flatMap(d => {
+            if (!d) return [];
             const propName = d.split(':')[0]?.trim().toLowerCase();
-            if (!propName) return false;
+            if (!propName) return [];
             // Always preserve background-image (contains url())
-            if (propName === 'background-image') return true;
-            // For background shorthand: preserve if it contains url(), strip if color-only
+            if (propName === 'background-image') return [d];
+            // For background shorthand: extract url() as background-image, strip color parts
             if (propName === 'background') {
-                return /url\s*\(/i.test(d);
+                const urlMatch = d.match(/url\s*\([^)]*\)/i);
+                return urlMatch ? ['background-image: ' + urlMatch[0]] : [];
             }
-            return !colorProps.some(cp => propName === cp || propName.startsWith(cp + '-'));
+            if (colorProps.some(cp => propName === cp || propName.startsWith(cp + '-'))) return [];
+            return [d];
         })
         .join('; ');
 }
@@ -2105,8 +2107,8 @@ function sanitizeStyleContent(css) {
     css = css.replace(/@import\b[^;]*;?/gi, '');
     // Remove @font-face rules (external resource loading)
     css = css.replace(/@font-face\s*\{[^}]*\}/gi, '');
-    // url() in regular properties (e.g. background-image) is preserved —
-    // @import and @font-face (the main tracking/loading vectors) are already stripped above.
+    // Strip external url() references (tracking pixels) but preserve cid: URLs (inline images)
+    css = css.replace(/url\s*\(\s*(?!['"]?cid:)[^)]*\)/gi, '');
     // Remove expression() (IE CSS expressions)
     css = css.replace(/expression\s*\([^)]*\)/gi, '');
     // Remove -moz-binding (Firefox XBL)
