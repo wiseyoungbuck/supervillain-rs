@@ -798,4 +798,70 @@ mod tests {
         let result = seed_from_identities(&identities, &path);
         assert!(result.is_none());
     }
+
+    // --- O365 via FastMail relay ---
+
+    #[test]
+    fn generate_splits_fastmail_plus_o365() {
+        let identities = vec![
+            make_identity("matt@fastmail.com"),
+            make_identity("matt@company.onmicrosoft.com"),
+        ];
+        let config = generate_splits_from_identities(&identities);
+        assert_eq!(config.splits.len(), 2);
+        let o365_split = config
+            .splits
+            .iter()
+            .find(|s| s.filters[0].pattern.contains("onmicrosoft.com"));
+        assert!(o365_split.is_some());
+        assert_eq!(o365_split.unwrap().filters[0].filter_type, FilterType::To);
+    }
+
+    #[test]
+    fn forwarded_o365_mail_matches_split_by_to() {
+        let email = make_email_with_to("sender@external.com", "matt@company.onmicrosoft.com", &[]);
+        let split = SplitInbox {
+            id: "company".into(),
+            name: "Company".into(),
+            icon: None,
+            filters: vec![to_filter("*@company.onmicrosoft.com")],
+            match_mode: MatchMode::Any,
+        };
+        assert!(matches_split(&email, &split));
+    }
+
+    // Documents the known limitation: if O365 rewrites To: to the FastMail
+    // address during forwarding, the split filter won't match.
+    #[test]
+    fn forwarded_o365_mail_rewritten_to_does_not_match() {
+        let email = make_email_with_to("sender@external.com", "matt@fastmail.com", &[]);
+        let split = SplitInbox {
+            id: "company".into(),
+            name: "Company".into(),
+            icon: None,
+            filters: vec![to_filter("*@company.onmicrosoft.com")],
+            match_mode: MatchMode::Any,
+        };
+        assert!(!matches_split(&email, &split));
+    }
+
+    #[test]
+    fn primary_split_excludes_o365_mail() {
+        let emails = vec![
+            make_email_with_to("alice@x.com", "matt@company.onmicrosoft.com", &[]),
+            make_email_with_to("bob@y.com", "matt@fastmail.com", &[]),
+        ];
+        let config = SplitsConfig {
+            splits: vec![SplitInbox {
+                id: "company".into(),
+                name: "Company".into(),
+                icon: None,
+                filters: vec![to_filter("*@company.onmicrosoft.com")],
+                match_mode: MatchMode::Any,
+            }],
+        };
+        let primary = filter_by_split(emails, "primary", &config);
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].to[0].email, "matt@fastmail.com");
+    }
 }
