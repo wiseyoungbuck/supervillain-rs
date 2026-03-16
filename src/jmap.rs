@@ -1,3 +1,4 @@
+use crate::calendar;
 use crate::error::Error;
 use crate::types::ParsedQuery;
 use crate::types::*;
@@ -1182,6 +1183,10 @@ pub async fn add_to_calendar(
     uid: &str,
     only_if_new: bool,
 ) -> Result<bool, Error> {
+    // Strip METHOD before storing — RFC 4791: stored calendar objects must not
+    // contain METHOD (it's an iTIP transport property, not a storage property)
+    let ics_data = calendar::strip_method(ics_data);
+
     // CalDAV PUT to Fastmail calendar, using event UID as filename for idempotency
     let caldav_url = format!(
         "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
@@ -1199,9 +1204,16 @@ pub async fn add_to_calendar(
         req = req.header("If-None-Match", "*");
     }
 
-    let resp = req.body(ics_data.to_string()).send().await?;
+    let resp = req.body(ics_data).send().await?;
 
-    Ok(resp.status().is_success())
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!("CalDAV PUT {caldav_url} failed: {status} — {body}");
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
@@ -1217,7 +1229,14 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
         .send()
         .await?;
 
-    Ok(resp.status().is_success())
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!("CalDAV DELETE {caldav_url} failed: {status} — {body}");
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// UUID v4 generation using /dev/urandom for proper randomness.

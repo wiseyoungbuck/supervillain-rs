@@ -290,6 +290,18 @@ fn format_ics_datetime(dt: DateTime<Utc>) -> String {
     dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
+/// RFC 4791: stored calendar objects must not contain METHOD.
+/// METHOD is an iTIP transport property (RFC 5546) — it tells recipients
+/// how to process the message (REQUEST = invitation, REPLY = response).
+/// CalDAV servers may misinterpret METHOD:REQUEST as a new scheduling
+/// action rather than a simple event store.
+pub fn strip_method(ics: &str) -> String {
+    ics.lines()
+        .filter(|line| !line.trim_end_matches('\r').starts_with("METHOD:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -857,6 +869,33 @@ END:VCALENDAR";
             "folded PARTSTAT should be updated: {result}"
         );
         assert!(result.contains("mailto:bob@example.com"));
+    }
+
+    // --- strip_method tests ---
+
+    #[test]
+    fn strip_method_removes_method_request() {
+        let ics =
+            "BEGIN:VCALENDAR\nVERSION:2.0\nMETHOD:REQUEST\nBEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR";
+        let result = strip_method(ics);
+        assert!(!result.contains("METHOD:"));
+        assert!(result.contains("BEGIN:VCALENDAR"));
+        assert!(result.contains("BEGIN:VEVENT"));
+    }
+
+    #[test]
+    fn strip_method_no_method_unchanged() {
+        let ics = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR";
+        let result = strip_method(ics);
+        assert_eq!(result, ics);
+    }
+
+    #[test]
+    fn strip_method_crlf_line_endings() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let result = strip_method(ics);
+        assert!(!result.contains("METHOD:"));
+        assert!(result.contains("BEGIN:VCALENDAR"));
     }
 
     use chrono::{Datelike, Timelike};
