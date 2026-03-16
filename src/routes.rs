@@ -704,12 +704,17 @@ async fn add_to_calendar(
     let event = calendar::parse_ics(&ics_data)
         .ok_or_else(|| Error::Internal("Failed to parse calendar data".into()))?;
 
-    let success = jmap::add_to_calendar(&session, &ics_data, &event.uid, false).await?;
+    // Cancellations should remove, not add
+    let success = if event.method == "CANCEL" {
+        jmap::remove_from_calendar(&session, &event.uid).await?
+    } else {
+        jmap::add_to_calendar(&session, &ics_data, &event.uid, false).await?
+    };
 
     if success {
         Ok(Json(serde_json::json!({"success": true})))
     } else {
-        Err(Error::Internal("Failed to add to calendar".into()))
+        Err(Error::Internal("Failed to update calendar".into()))
     }
 }
 

@@ -38,8 +38,19 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
     let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART")?;
     let dtend = parse_ics_datetime_property(&unfolded, "DTEND");
 
+    let status = extract_property(&unfolded, "STATUS");
+
     let (organizer_email, organizer_name) = parse_organizer(&unfolded);
     let attendees = parse_attendees(&unfolded);
+
+    // Some services (e.g. Lumo) send METHOD:REQUEST with STATUS:CANCELLED
+    // inside the VEVENT instead of using METHOD:CANCEL at the calendar level.
+    // Normalize to METHOD=CANCEL so callers only need to check one field.
+    let method = if status.as_deref() == Some("CANCELLED") {
+        "CANCEL".into()
+    } else {
+        method
+    };
 
     Some(CalendarEvent {
         uid,
@@ -869,6 +880,56 @@ END:VCALENDAR";
             "folded PARTSTAT should be updated: {result}"
         );
         assert!(result.contains("mailto:bob@example.com"));
+    }
+
+    // --- STATUS:CANCELLED normalization tests ---
+
+    #[test]
+    fn status_cancelled_normalizes_method_to_cancel() {
+        // Services like Lumo send METHOD:REQUEST with STATUS:CANCELLED
+        // in the VEVENT. We normalize to method == "CANCEL" so the
+        // auto-remove path fires correctly.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:lumo-cancel-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Cancelled via Lumo\r\n\
+STATUS:CANCELLED\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:1\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.method, "CANCEL");
+    }
+
+    #[test]
+    fn status_confirmed_preserves_method() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:confirmed-uid@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Confirmed Meeting\r\n\
+STATUS:CONFIRMED\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.method, "REQUEST");
+    }
+
+    #[test]
+    fn no_status_preserves_method() {
+        // Most normal invitations have no STATUS field
+        let event = parse_ics(SAMPLE_ICS).unwrap();
+        assert_eq!(event.method, "REQUEST");
     }
 
     // --- strip_method tests ---
