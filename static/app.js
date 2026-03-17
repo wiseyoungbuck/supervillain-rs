@@ -1331,13 +1331,7 @@ async function unsubscribeAndArchiveAll() {
     let removedEmails = [];
     if (senderEmail) {
         removedEmails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() === senderEmail);
-        state.emails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() !== senderEmail);
-        invalidateSplitListCache();
-        if (state.selectedIndex >= state.emails.length) {
-            state.selectedIndex = Math.max(0, state.emails.length - 1);
-        }
-        renderEmailList();
-        adjustSplitCounts(-removedEmails.length);
+        removeEmailsFromList(e => e.from[0]?.email?.toLowerCase() !== senderEmail, removedEmails.length);
     }
 
     showStatus('Unsubscribing and archiving...', 'info');
@@ -1372,8 +1366,12 @@ async function unsubscribeAndArchiveAll() {
 }
 
 function removeEmailFromList(emailId) {
-    state.emails = state.emails.filter(e => e.id !== emailId);
-    adjustSplitCounts(-1);
+    removeEmailsFromList(e => e.id !== emailId, 1);
+}
+
+function removeEmailsFromList(keepFn, expectedRemoved) {
+    state.emails = state.emails.filter(keepFn);
+    adjustSplitCounts(-expectedRemoved);
     invalidateSplitListCache();
     if (state.selectedIndex >= state.emails.length) {
         state.selectedIndex = Math.max(0, state.emails.length - 1);
@@ -2026,11 +2024,8 @@ async function performUndo() {
     } catch (err) {
         // Revert: remove the email we optimistically re-inserted
         if (item.emailData) {
-            state.emails = state.emails.filter(e => e.id !== item.emailId);
-            invalidateSplitListCache();
-            renderEmailList();
+            removeEmailFromList(item.emailId);
         }
-        adjustSplitCounts(-1);
         showStatus('Undo failed', 'error');
     }
 }
