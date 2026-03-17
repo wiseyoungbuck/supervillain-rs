@@ -310,9 +310,15 @@ async function loadSplitCounts() {
 }
 
 function adjustSplitCounts(delta) {
-    if (state.splitCounts.all != null) state.splitCounts.all += delta;
+    if (state.splitCounts.all != null) {
+        const next = state.splitCounts.all + delta;
+        if (next < 0) console.warn('split count underflow: all', state.splitCounts.all, delta);
+        state.splitCounts.all = Math.max(0, next);
+    }
     if (state.currentSplit && state.currentSplit !== 'all' && state.splitCounts[state.currentSplit] != null) {
-        state.splitCounts[state.currentSplit] += delta;
+        const next = state.splitCounts[state.currentSplit] + delta;
+        if (next < 0) console.warn('split count underflow:', state.currentSplit, state.splitCounts[state.currentSplit], delta);
+        state.splitCounts[state.currentSplit] = Math.max(0, next);
     }
     renderSplitTabs();
 }
@@ -587,11 +593,11 @@ async function emailAction(type, emailId) {
     const removedIndex = state.emails.indexOf(removedEmail);
     pushUndo(label.toLowerCase(), emailId, removedEmail, removedIndex);
     removeEmailFromList(emailId);
-    adjustSplitCounts(-1);
     showStatus(label, 'success');
 
     try {
         await api('POST', `/emails/${emailId}/${type}`);
+        loadSplitCounts(); // resync with server truth
     } catch (err) {
         // Revert: re-insert the email and remove the stale undo entry
         state.undoStack.pop();
@@ -1331,7 +1337,7 @@ async function unsubscribeAndArchiveAll() {
             state.selectedIndex = Math.max(0, state.emails.length - 1);
         }
         renderEmailList();
-
+        adjustSplitCounts(-removedEmails.length);
     }
 
     showStatus('Unsubscribing and archiving...', 'info');
@@ -1350,6 +1356,7 @@ async function unsubscribeAndArchiveAll() {
         } else {
             showStatus(`Archived ${result.archivedCount} emails from ${result.sender}. No unsubscribe link found.`, 'warning');
         }
+        loadSplitCounts(); // resync with server truth
         maybeRefillEmails();
     } catch (err) {
         // Revert: re-insert the removed emails
@@ -1358,6 +1365,7 @@ async function unsubscribeAndArchiveAll() {
             state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
             invalidateSplitListCache();
             renderEmailList();
+            adjustSplitCounts(+removedEmails.length);
         }
         showStatus('Unsubscribe failed: ' + err.message, 'error');
     }
@@ -1365,6 +1373,7 @@ async function unsubscribeAndArchiveAll() {
 
 function removeEmailFromList(emailId) {
     state.emails = state.emails.filter(e => e.id !== emailId);
+    adjustSplitCounts(-1);
     invalidateSplitListCache();
     if (state.selectedIndex >= state.emails.length) {
         state.selectedIndex = Math.max(0, state.emails.length - 1);
@@ -2013,6 +2022,7 @@ async function performUndo() {
         if (inbox) {
             await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
         }
+        loadSplitCounts(); // resync with server truth
     } catch (err) {
         // Revert: remove the email we optimistically re-inserted
         if (item.emailData) {
