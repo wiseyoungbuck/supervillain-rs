@@ -6,7 +6,7 @@
 
 <p align="center">
   Email for people who'd rather be typing.<br>
-  Vim-native, zero-Electron, talks JMAP to Fastmail.
+  Vim-native, zero-Electron, talks to Fastmail, Gmail, and Outlook.
 </p>
 
 <p align="center">
@@ -18,15 +18,18 @@
 
 ---
 
-Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks [JMAP](https://jmap.io/) to [Fastmail](https://www.fastmail.com/). No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
+Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, REST API for Gmail, Microsoft Graph for Outlook. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
 
 ## Features
 
+- **Multi-provider** — Fastmail (JMAP), Gmail (REST API), Outlook (Microsoft Graph)
+- **Multi-account** — Switch between accounts with `1`-`9` keys
+- **Calendar sync per provider** — CalDAV (Fastmail), Google Calendar API, Outlook Calendar API
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
-- **Split inbox** — Filterable tabs by sender, recipient, subject, or calendar invites. Auto-generated from your Fastmail identities on first run
+- **Split inbox** — Filterable tabs by sender, recipient, subject, or calendar invites. Auto-generated from your identities on first run
 - **Gmail-style search** — `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `before:`, `newer_than:`, and more
 - **Command palette** — `Ctrl+K` for quick actions
-- **Multiple identities** — All your Fastmail addresses in one inbox. Replies auto-select the matching From address
+- **Multiple identities** — All your addresses in one inbox. Replies auto-select the matching From address
 - **Calendar invites** — View ICS details and RSVP directly from email
 - **Attachments** — Download inline or as files
 - **Undo** — `z` to reverse archive, trash, and read-state changes
@@ -47,6 +50,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 | `Space` / `Shift+Space` | Page down / up in detail view |
 | `Tab` / `Shift+Tab` | Next / previous split tab |
 | `Ctrl+1-9` | Jump to split tab |
+| `1`-`9` | Switch account |
 | `R` | Refresh |
 | `?` | Show keyboard shortcuts |
 
@@ -77,11 +81,17 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 ## Requirements
 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
-- A [Fastmail](https://www.fastmail.com/) account with an API token
+- A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
+- Google OAuth2 credentials (for Gmail)
+- Microsoft app registration (for Outlook)
 
 ## Quick start
 
-**1. Create a Fastmail API token** at Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
+**1. Create credentials for your provider:**
+
+- **Fastmail** — Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
+- **Gmail** — Create OAuth2 credentials in Google Cloud Console with Gmail and Calendar scopes.
+- **Outlook** — Register an app in Azure AD with Mail.ReadWrite and Calendars.ReadWrite permissions.
 
 **2. Create the config file:**
 
@@ -91,8 +101,28 @@ mkdir -p ~/.config/supervillain
 
 ```ini
 # ~/.config/supervillain/config
+
+# Single Fastmail account (simplest config)
 username = you@fastmail.com
 api-token = fmu1-xxxxxxxxxxxxxxxx
+
+# Or: multiple accounts with [sections]
+# [fastmail]
+# provider = fastmail
+# username = you@fastmail.com
+# api-token = fmu1-xxxxxxxxxxxxxxxx
+#
+# [gmail]
+# provider = gmail
+# username = you@gmail.com
+# client-id = xxxx.apps.googleusercontent.com
+# client-secret = GOCSPX-xxxx
+#
+# [outlook]
+# provider = outlook
+# username = you@company.com
+# client-id = xxxx-xxxx-xxxx
+# tenant-id = common
 ```
 
 **3. Build and run:**
@@ -105,6 +135,8 @@ supervillain
 ```
 
 This installs the `supervillain` binary to `~/.cargo/bin/` (on your PATH) and opens `http://127.0.0.1:8000` in your browser.
+
+For Gmail and Outlook accounts, first run opens a browser for OAuth2 authorization. Tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry.
 
 ## Installation
 
@@ -152,13 +184,38 @@ cargo install --path .
 
 `~/.config/supervillain/config` (or `$XDG_CONFIG_HOME/supervillain/config`)
 
-Simple `key = value` format. Lines starting with `#` are comments.
+Two formats supported:
+
+**Simple format** — single Fastmail account, `key = value` pairs. Lines starting with `#` are comments.
 
 ```ini
 # Fastmail credentials
 username = you@fastmail.com
 api-token = fmu1-xxxxxxxxxxxxxxxx
 ```
+
+**Multi-account format** — INI-style `[sections]`, each with a `provider` field.
+
+```ini
+[fastmail]
+provider = fastmail
+username = you@fastmail.com
+api-token = fmu1-xxxxxxxxxxxxxxxx
+
+[gmail]
+provider = gmail
+username = you@gmail.com
+client-id = xxxx.apps.googleusercontent.com
+client-secret = GOCSPX-xxxx
+
+[outlook]
+provider = outlook
+username = you@company.com
+client-id = xxxx-xxxx-xxxx
+tenant-id = common
+```
+
+The sectionless format is fully backward compatible — it's treated as a single Fastmail account.
 
 ### Multiple identities
 
@@ -174,7 +231,7 @@ No multi-account configuration needed.
 
 Splits filter your inbox into tabs. Stored at `~/.config/supervillain/splits.json`.
 
-On first run with no splits configured, Supervillain auto-generates one tab per email domain from your Fastmail identities.
+On first run with no splits configured, Supervillain auto-generates one tab per email domain from your identities.
 
 **Managing splits:**
 
@@ -254,24 +311,61 @@ Operators combine with free text: `from:@github.com is:unread pull request`
 
 ## Architecture
 
-Supervillain is a single Rust binary that runs a local [Axum](https://github.com/tokio-rs/axum) web server on `127.0.0.1:8000`.
+Supervillain is a single Rust binary that runs a local [Axum](https://github.com/tokio-rs/axum) web server on `127.0.0.1:8000`. Every API endpoint takes an optional `?account={id}` parameter that selects which provider session to use.
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Browser (localhost:8000)                        │
-│  Vanilla JS + CSS — no build step                │
-└────────────────────┬────────────────────────────┘
-                     │ REST API (/api/*)
-┌────────────────────┴────────────────────────────┐
-│  Axum HTTP Server                                │
-│  Routes, search parsing, split filtering         │
-└────────────────────┬────────────────────────────┘
-                     │ JMAP over HTTPS
-┌────────────────────┴────────────────────────────┐
-│  Fastmail                                        │
-│  Email, contacts, calendars                      │
-└─────────────────────────────────────────────────┘
+Browser (localhost:8000)
+    │ REST API (/api/*?account={id})
+Axum HTTP Server
+    │ resolve_account() → match ProviderSession
+    ├── Fastmail → JMAP + CalDAV
+    ├── Gmail → Gmail REST API + Google Calendar API
+    └── Outlook → Microsoft Graph (Mail + Calendar)
 ```
+
+### Provider dispatch
+
+No traits, no vtables. Three providers = three match arms on a concrete enum:
+
+```rust
+enum Provider { Fastmail, Gmail, Outlook }
+
+enum ProviderSession {
+    Fastmail(jmap::JmapSession),
+    Gmail(gmail::GmailSession),
+    Outlook(outlook::OutlookSession),
+}
+```
+
+Each provider module exports plain functions (`gmail::list_emails()`, `outlook::list_emails()`) that take a session struct and return the same `Email`/`Mailbox`/`Identity` types. The route handler has the match statement.
+
+### Data normalization
+
+All providers return the same types — no provider-specific structs leak into the frontend:
+
+- Gmail labels → `Mailbox` with roles (INBOX→inbox, SENT→sent, etc.)
+- Outlook folders → `Mailbox` with roles (inbox, sentitems→sent, etc.)
+- Gmail UNREAD label → `$seen` keyword absent
+- Outlook `isRead: false` → `$seen` keyword absent
+
+### Calendar dispatch
+
+- **Fastmail** — CalDAV PUT/DELETE (existing)
+- **Gmail** — Google Calendar REST API (`POST /calendars/primary/events`, lookup by `iCalUID`)
+- **Outlook** — Microsoft Graph (`POST /me/events`, lookup by `iCalUId` filter)
+
+### Search dispatch
+
+- **Fastmail** — `to_jmap_filter()` (existing)
+- **Gmail** — `to_gmail_query()` (Gmail's query syntax is nearly identical to what we already parse)
+- **Outlook** — `to_graph_filter()` (OData `$filter` + `$search`)
+
+### OAuth2 flow (Gmail, Outlook)
+
+- First run: local callback server on random port, browser opens auth URL, exchange code for tokens
+- Tokens saved to `~/.config/supervillain/tokens/{account_id}.json`
+- Auto-refresh before expiry on each API call
+- Same pattern as `gcloud auth login` / `gh auth login`
 
 ### Tech stack
 
@@ -279,12 +373,13 @@ Supervillain is a single Rust binary that runs a local [Axum](https://github.com
 |-------|------------|
 | Backend | Rust, Axum 0.8, Tokio, reqwest |
 | Frontend | Vanilla JS, CSS3 (no framework, no build step) |
-| Protocol | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)) |
-| Provider | Fastmail |
+| Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Gmail REST API, Microsoft Graph API |
+| Auth | Bearer token (Fastmail), OAuth2 (Gmail, Outlook) |
+| Providers | Fastmail, Gmail, Outlook |
 
 ## API
 
-All endpoints live under `/api/`. The frontend communicates exclusively through these.
+All endpoints live under `/api/`. The frontend communicates exclusively through these. Multi-account endpoints accept `?account={id}`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -317,9 +412,12 @@ src/
   lib.rs           Module declarations
   types.rs         Data types (Email, Mailbox, Identity, Attachment, etc.)
   error.rs         Error enum + HTTP response mapping
-  jmap.rs          JMAP client (connect, query, send, calendar, MIME parsing)
-  routes.rs        HTTP handlers + split management
-  search.rs        Search query parser + JMAP filter translation
+  jmap.rs          JMAP client — Fastmail (connect, query, send, calendar, MIME parsing)
+  gmail.rs         Gmail REST API client
+  outlook.rs       Microsoft Graph client (Mail + Calendar)
+  oauth.rs         OAuth2 token management (shared by Gmail, Outlook)
+  routes.rs        HTTP handlers + split management + provider dispatch
+  search.rs        Search query parser + multi-provider filter translation
   splits.rs        Split inbox filtering + persistence
   calendar.rs      ICS parsing + RSVP generation
   glob.rs          Glob pattern matching
@@ -363,9 +461,9 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 
 ## Roadmap
 
+- **Multi-provider support** — Gmail and Outlook integration (in progress)
 - Threading / conversation grouping
 - Drafts
-- HTML email rendering (currently text-only)
 - Contact suggestions / address book
 - Email signatures
 - Offline mode
