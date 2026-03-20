@@ -1,6 +1,7 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
@@ -27,6 +28,10 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
     // Unfold lines (RFC 5545: continuation lines start with space or tab)
     let unfolded = unfold_lines(vevent);
 
+    // Extract VTIMEZONE UTC offsets from the full calendar data so we can
+    // resolve TZID references on DTSTART/DTEND inside the VEVENT.
+    let tz_offsets = parse_vtimezone_offsets(data);
+
     let uid = extract_property(&unfolded, "UID")?;
     let summary = extract_property(&unfolded, "SUMMARY").unwrap_or_default();
     let location = extract_property(&unfolded, "LOCATION");
@@ -35,8 +40,8 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART")?;
-    let dtend = parse_ics_datetime_property(&unfolded, "DTEND");
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", &tz_offsets)?;
+    let dtend = parse_ics_datetime_property(&unfolded, "DTEND", &tz_offsets);
 
     let status = extract_property(&unfolded, "STATUS");
 
@@ -97,8 +102,71 @@ fn extract_property(text: &str, name: &str) -> Option<String> {
     None
 }
 
-fn parse_ics_datetime_property(text: &str, name: &str) -> Option<DateTime<Utc>> {
-    // Find the line for this property
+/// Parse VTIMEZONE blocks from the full ICS data. Returns a map from TZID
+/// to the STANDARD component's UTCOFFSETTO (the offset most events care about).
+/// We grab STANDARD over DAYLIGHT because it's the baseline; for events that
+/// fall in DST, the VTIMEZONE also contains DAYLIGHT with DTSTART ranges —
+/// but resolving DST transitions correctly is complex. Using STANDARD is a
+/// reasonable 80/20: most calendar providers send times already converted to
+/// UTC (with a Z suffix), and VTIMEZONE+TZID is the fallback path.
+fn parse_vtimezone_offsets(data: &str) -> HashMap<String, FixedOffset> {
+    let mut offsets = HashMap::new();
+    let unfolded = unfold_lines(data);
+
+    // Walk through each VTIMEZONE block
+    let mut search_from = 0;
+    while let Some(tz_start) = unfolded[search_from..].find("BEGIN:VTIMEZONE") {
+        let tz_start = search_from + tz_start;
+        let Some(tz_end) = unfolded[tz_start..].find("END:VTIMEZONE") else {
+            break;
+        };
+        let tz_block = &unfolded[tz_start..tz_start + tz_end];
+        search_from = tz_start + tz_end;
+
+        let Some(tzid) = extract_property(tz_block, "TZID") else {
+            continue;
+        };
+
+        // Prefer STANDARD offset; fall back to DAYLIGHT if no STANDARD block
+        let offset = extract_sub_block_offset(tz_block, "STANDARD")
+            .or_else(|| extract_sub_block_offset(tz_block, "DAYLIGHT"));
+
+        if let Some(offset) = offset {
+            offsets.insert(tzid, offset);
+        }
+    }
+    offsets
+}
+
+/// Extract UTCOFFSETTO from a STANDARD or DAYLIGHT sub-block within a VTIMEZONE.
+fn extract_sub_block_offset(tz_block: &str, sub_name: &str) -> Option<FixedOffset> {
+    let begin = format!("BEGIN:{sub_name}");
+    let start = tz_block.find(&begin)?;
+    let end_marker = format!("END:{sub_name}");
+    let end = tz_block[start..].find(&end_marker)?;
+    let sub_block = &tz_block[start..start + end];
+    let offset_str = extract_property(sub_block, "UTCOFFSETTO")?;
+    parse_utc_offset(&offset_str)
+}
+
+/// Parse an ICS UTC offset string like "+0530", "-0800", "+0000" into a FixedOffset.
+fn parse_utc_offset(s: &str) -> Option<FixedOffset> {
+    let s = s.trim();
+    if s.len() < 5 {
+        return None;
+    }
+    let sign: i32 = if s.starts_with('-') { -1 } else { 1 };
+    let hours: i32 = s[1..3].parse().ok()?;
+    let minutes: i32 = s[3..5].parse().ok()?;
+    let total_seconds = sign * (hours * 3600 + minutes * 60);
+    FixedOffset::east_opt(total_seconds)
+}
+
+fn parse_ics_datetime_property(
+    text: &str,
+    name: &str,
+    tz_offsets: &HashMap<String, FixedOffset>,
+) -> Option<DateTime<Utc>> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         let rest = match line.strip_prefix(name) {
@@ -107,17 +175,18 @@ fn parse_ics_datetime_property(text: &str, name: &str) -> Option<DateTime<Utc>> 
         };
 
         // Must start with ':' or ';' to avoid prefix false positives
-        let value = if let Some(stripped) = rest.strip_prefix(':') {
-            stripped
+        let (params, value) = if let Some(stripped) = rest.strip_prefix(':') {
+            ("", stripped)
         } else if rest.starts_with(';') {
-            rest.find(':').map(|i| &rest[i + 1..])?
+            let colon = rest.find(':')?;
+            (&rest[1..colon], &rest[colon + 1..])
         } else {
             continue;
         };
 
-        // Check if VALUE=DATE (all-day event)
-        let is_date_only = rest.contains("VALUE=DATE") && !rest.contains("VALUE=DATE-TIME");
-        let is_date_only = is_date_only || value.len() == 8; // YYYYMMDD
+        // All-day events: VALUE=DATE — no timezone conversion needed
+        let is_date_only = params.contains("VALUE=DATE") && !params.contains("VALUE=DATE-TIME");
+        let is_date_only = is_date_only || value.len() == 8;
 
         if is_date_only {
             let date = NaiveDate::parse_from_str(value.trim(), "%Y%m%d").ok()?;
@@ -125,12 +194,42 @@ fn parse_ics_datetime_property(text: &str, name: &str) -> Option<DateTime<Utc>> 
             return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
         }
 
-        // Full datetime: 20260215T100000Z or 20260215T100000
-        let value = value.trim().trim_end_matches('Z');
+        let value = value.trim();
+
+        // Case 1: Explicit UTC — trailing Z
+        if value.ends_with('Z') {
+            let dt =
+                NaiveDateTime::parse_from_str(value.trim_end_matches('Z'), "%Y%m%dT%H%M%S").ok()?;
+            return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+        }
+
         let dt = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
-        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+
+        // Case 2: TZID parameter — look up offset from VTIMEZONE block
+        if let Some(tzid) = extract_param_from_str(params, "TZID")
+            && let Some(offset) = tz_offsets.get(&tzid)
+        {
+            let local = offset.from_local_datetime(&dt).earliest()?;
+            return Some(local.with_timezone(&Utc));
+        }
+
+        // Case 3: Floating time (no Z, no TZID) — interpret as system local tz
+        let local = Local::now().offset().from_local_datetime(&dt).earliest()?;
+        return Some(local.with_timezone(&Utc));
     }
     None
+}
+
+/// Extract a parameter value from the params portion of an ICS property line.
+/// e.g. extract_param_from_str("TZID=America/New_York;VALUE=DATE-TIME", "TZID")
+/// returns Some("America/New_York")
+fn extract_param_from_str(params: &str, param_name: &str) -> Option<String> {
+    let search = format!("{param_name}=");
+    let pos = params.find(&search)?;
+    let start = pos + search.len();
+    let rest = &params[start..];
+    let end = rest.find(';').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 fn parse_organizer(text: &str) -> (String, Option<String>) {
@@ -957,6 +1056,152 @@ END:VCALENDAR";
         let result = strip_method(ics);
         assert!(!result.contains("METHOD:"));
         assert!(result.contains("BEGIN:VCALENDAR"));
+    }
+
+    // --- timezone handling tests ---
+
+    #[test]
+    fn parse_utc_z_suffix_unchanged() {
+        // Z suffix = already UTC, should parse as-is
+        let event = parse_ics(SAMPLE_ICS).unwrap();
+        assert_eq!(event.dtstart.hour(), 10);
+        assert_eq!(event.dtstart.minute(), 0);
+    }
+
+    #[test]
+    fn parse_tzid_converts_to_utc() {
+        // DTSTART with TZID=America/New_York and a VTIMEZONE block.
+        // 10:00 EST (UTC-5) should become 15:00 UTC.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:America/New_York\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:19701101T020000\r\n\
+UTCOFFSETTO:-0500\r\n\
+UTCOFFSETFROM:-0400\r\n\
+END:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\n\
+DTSTART:19700308T020000\r\n\
+UTCOFFSETTO:-0400\r\n\
+UTCOFFSETFROM:-0500\r\n\
+END:DAYLIGHT\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:tz-test@example.com\r\n\
+DTSTART;TZID=America/New_York:20260215T100000\r\n\
+DTEND;TZID=America/New_York:20260215T110000\r\n\
+SUMMARY:Eastern Time Meeting\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        // 10:00 EST = 15:00 UTC
+        assert_eq!(event.dtstart.hour(), 15);
+        assert_eq!(event.dtstart.minute(), 0);
+        // 11:00 EST = 16:00 UTC
+        let dtend = event.dtend.unwrap();
+        assert_eq!(dtend.hour(), 16);
+    }
+
+    #[test]
+    fn parse_tzid_positive_offset() {
+        // TZID=Asia/Kolkata (UTC+0530). 10:00 IST should become 04:30 UTC.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Asia/Kolkata\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:19700101T000000\r\n\
+UTCOFFSETTO:+0530\r\n\
+UTCOFFSETFROM:+0530\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:ist-test@example.com\r\n\
+DTSTART;TZID=Asia/Kolkata:20260215T100000\r\n\
+SUMMARY:IST Meeting\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.dtstart.hour(), 4);
+        assert_eq!(event.dtstart.minute(), 30);
+    }
+
+    #[test]
+    fn parse_floating_time_uses_local_tz() {
+        // No Z, no TZID — floating time. Should be interpreted as system local.
+        // We can't assert the exact UTC hour (depends on where tests run),
+        // but we can verify it parses and the offset is applied.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:floating-test@example.com\r\n\
+DTSTART:20260215T100000\r\n\
+SUMMARY:Floating Time\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event = parse_ics(ics).unwrap();
+        // Verify the local offset was applied: 10:00 local != 10:00 UTC
+        // unless we're in UTC. Compute expected value from system tz.
+        let local_offset = Local::now().offset().local_minus_utc();
+        let expected_utc_hour = (10 - local_offset / 3600 + 24) % 24;
+        assert_eq!(event.dtstart.hour() as i32, expected_utc_hour);
+    }
+
+    #[test]
+    fn parse_vtimezone_offsets_extracts_multiple() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:America/New_York\r\n\
+BEGIN:STANDARD\r\n\
+UTCOFFSETTO:-0500\r\n\
+UTCOFFSETFROM:-0400\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Europe/London\r\n\
+BEGIN:STANDARD\r\n\
+UTCOFFSETTO:+0000\r\n\
+UTCOFFSETFROM:+0100\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+END:VCALENDAR";
+        let offsets = parse_vtimezone_offsets(ics);
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets["America/New_York"].local_minus_utc(), -5 * 3600);
+        assert_eq!(offsets["Europe/London"].local_minus_utc(), 0);
+    }
+
+    #[test]
+    fn parse_utc_offset_various_formats() {
+        assert_eq!(parse_utc_offset("+0000").unwrap().local_minus_utc(), 0);
+        assert_eq!(
+            parse_utc_offset("-0500").unwrap().local_minus_utc(),
+            -5 * 3600
+        );
+        assert_eq!(
+            parse_utc_offset("+0530").unwrap().local_minus_utc(),
+            5 * 3600 + 30 * 60
+        );
+        assert_eq!(
+            parse_utc_offset("+1200").unwrap().local_minus_utc(),
+            12 * 3600
+        );
+        assert!(parse_utc_offset("bad").is_none());
+        assert!(parse_utc_offset("").is_none());
     }
 
     use chrono::{Datelike, Timelike};

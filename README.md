@@ -6,7 +6,7 @@
 
 <p align="center">
   Email for people who'd rather be typing.<br>
-  Vim-native, zero-Electron, talks to Fastmail, Gmail, and Outlook.
+  Vim-native, zero-Electron, talks to Fastmail and Outlook (calendar).
 </p>
 
 <p align="center">
@@ -18,13 +18,13 @@
 
 ---
 
-Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, REST API for Gmail, Microsoft Graph for Outlook. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
+Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook calendar. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
 
 ## Features
 
-- **Multi-provider** — Fastmail (JMAP), Gmail (REST API), Outlook (Microsoft Graph)
+- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph). Gmail planned.
 - **Multi-account** — Switch between accounts with `1`-`9` keys
-- **Calendar sync per provider** — CalDAV (Fastmail), Google Calendar API, Outlook Calendar API
+- **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
 - **Split inbox** — Filterable tabs by sender, recipient, subject, or calendar invites. Auto-generated from your identities on first run
 - **Gmail-style search** — `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `before:`, `newer_than:`, and more
@@ -82,16 +82,14 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
 - A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
-- Google OAuth2 credentials (for Gmail)
-- Microsoft app registration (for Outlook)
+- Microsoft app registration (for Outlook calendar — email support planned for Phase 2)
 
 ## Quick start
 
 **1. Create credentials for your provider:**
 
 - **Fastmail** — Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
-- **Gmail** — Create OAuth2 credentials in Google Cloud Console with Gmail and Calendar scopes.
-- **Outlook** — Register an app in Azure AD with Mail.ReadWrite and Calendars.ReadWrite permissions.
+- **Outlook** — Register an app in Azure AD with Calendars.ReadWrite permissions (see [Azure AD setup](#azure-ad-app-registration) below).
 
 **2. Create the config file:**
 
@@ -112,17 +110,11 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 # username = you@fastmail.com
 # api-token = fmu1-xxxxxxxxxxxxxxxx
 #
-# [gmail]
-# provider = gmail
-# username = you@gmail.com
-# client-id = xxxx.apps.googleusercontent.com
-# client-secret = GOCSPX-xxxx
-#
 # [outlook]
 # provider = outlook
 # username = you@company.com
 # client-id = xxxx-xxxx-xxxx
-# tenant-id = common
+# # Phase 1: calendar only. Email support coming in Phase 2.
 ```
 
 **3. Build and run:**
@@ -136,7 +128,7 @@ supervillain
 
 This installs the `supervillain` binary to `~/.cargo/bin/` (on your PATH) and opens `http://127.0.0.1:8000` in your browser.
 
-For Gmail and Outlook accounts, first run opens a browser for OAuth2 authorization. Tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry.
+For Outlook accounts, first run opens a browser for OAuth2 authorization. Tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry.
 
 ## Installation
 
@@ -202,20 +194,36 @@ provider = fastmail
 username = you@fastmail.com
 api-token = fmu1-xxxxxxxxxxxxxxxx
 
-[gmail]
-provider = gmail
-username = you@gmail.com
-client-id = xxxx.apps.googleusercontent.com
-client-secret = GOCSPX-xxxx
-
 [outlook]
 provider = outlook
 username = you@company.com
 client-id = xxxx-xxxx-xxxx
-tenant-id = common
+# Phase 1: calendar only
 ```
 
 The sectionless format is fully backward compatible — it's treated as a single Fastmail account.
+
+### Azure AD App Registration
+
+To use Outlook calendar sync, register an app in Azure AD:
+
+1. Go to [Azure Portal > App registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
+2. Click **New registration**
+3. Name: "Supervillain" (or whatever you like)
+4. Supported account types: "Accounts in any organizational directory and personal Microsoft accounts"
+5. Redirect URI: **Web** → `http://localhost:8400/callback`
+6. After creation, copy the **Application (client) ID** — this is your `client-id`
+7. Under **API permissions**, add: `Calendars.ReadWrite` (delegated)
+8. No client secret needed — Supervillain uses PKCE (public client)
+
+Put the client ID in your config:
+
+```ini
+[outlook]
+provider = outlook
+username = you@company.com
+client-id = your-application-client-id
+```
 
 ### Multiple identities
 
@@ -319,53 +327,39 @@ Browser (localhost:8000)
 Axum HTTP Server
     │ resolve_account() → match ProviderSession
     ├── Fastmail → JMAP + CalDAV
-    ├── Gmail → Gmail REST API + Google Calendar API
-    └── Outlook → Microsoft Graph (Mail + Calendar)
+    └── Outlook → Microsoft Graph (Calendar only)
 ```
 
 ### Provider dispatch
 
-No traits, no vtables. Three providers = three match arms on a concrete enum:
+No traits, no vtables. Two providers = two match arms on a concrete enum:
 
 ```rust
-enum Provider { Fastmail, Gmail, Outlook }
-
 enum ProviderSession {
     Fastmail(jmap::JmapSession),
-    Gmail(gmail::GmailSession),
     Outlook(outlook::OutlookSession),
 }
 ```
 
-Each provider module exports plain functions (`gmail::list_emails()`, `outlook::list_emails()`) that take a session struct and return the same `Email`/`Mailbox`/`Identity` types. The route handler has the match statement.
-
-### Data normalization
-
-All providers return the same types — no provider-specific structs leak into the frontend:
-
-- Gmail labels → `Mailbox` with roles (INBOX→inbox, SENT→sent, etc.)
-- Outlook folders → `Mailbox` with roles (inbox, sentitems→sent, etc.)
-- Gmail UNREAD label → `$seen` keyword absent
-- Outlook `isRead: false` → `$seen` keyword absent
+Each provider module exports plain functions (`jmap::list_emails()`, `outlook::add_to_calendar()`) that take a session struct and return the same `Email`/`Mailbox`/`Identity` types. The route handler has the match statement.
 
 ### Calendar dispatch
 
 - **Fastmail** — CalDAV PUT/DELETE (existing)
-- **Gmail** — Google Calendar REST API (`POST /calendars/primary/events`, lookup by `iCalUID`)
 - **Outlook** — Microsoft Graph (`POST /me/events`, lookup by `iCalUId` filter)
 
 ### Search dispatch
 
 - **Fastmail** — `to_jmap_filter()` (existing)
-- **Gmail** — `to_gmail_query()` (Gmail's query syntax is nearly identical to what we already parse)
-- **Outlook** — `to_graph_filter()` (OData `$filter` + `$search`)
+- Outlook search planned for Phase 2
 
-### OAuth2 flow (Gmail, Outlook)
+### OAuth2 flow (Outlook)
 
-- First run: local callback server on random port, browser opens auth URL, exchange code for tokens
+- First run: local callback server on port 8400, browser opens auth URL with PKCE, exchange code for tokens
 - Tokens saved to `~/.config/supervillain/tokens/{account_id}.json`
-- Auto-refresh before expiry on each API call
+- Auto-refresh before expiry on each API call via interior mutability
 - Same pattern as `gcloud auth login` / `gh auth login`
+- Gmail OAuth planned for Phase 3
 
 ### Tech stack
 
@@ -373,9 +367,9 @@ All providers return the same types — no provider-specific structs leak into t
 |-------|------------|
 | Backend | Rust, Axum 0.8, Tokio, reqwest |
 | Frontend | Vanilla JS, CSS3 (no framework, no build step) |
-| Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Gmail REST API, Microsoft Graph API |
-| Auth | Bearer token (Fastmail), OAuth2 (Gmail, Outlook) |
-| Providers | Fastmail, Gmail, Outlook |
+| Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph API (calendar) |
+| Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook) |
+| Providers | Fastmail (email + calendar), Outlook (calendar only) |
 
 ## API
 
@@ -413,11 +407,10 @@ src/
   types.rs         Data types (Email, Mailbox, Identity, Attachment, etc.)
   error.rs         Error enum + HTTP response mapping
   jmap.rs          JMAP client — Fastmail (connect, query, send, calendar, MIME parsing)
-  gmail.rs         Gmail REST API client
-  outlook.rs       Microsoft Graph client (Mail + Calendar)
-  oauth.rs         OAuth2 token management (shared by Gmail, Outlook)
-  routes.rs        HTTP handlers + split management + provider dispatch
-  search.rs        Search query parser + multi-provider filter translation
+  outlook.rs       Microsoft Graph client (Calendar)
+  provider.rs      Provider dispatch — routes call provider::*, which dispatches per-provider
+  routes.rs        HTTP handlers + split management
+  search.rs        Search query parser + JMAP filter translation
   splits.rs        Split inbox filtering + persistence
   calendar.rs      ICS parsing + RSVP generation
   glob.rs          Glob pattern matching
@@ -450,7 +443,7 @@ cargo fmt
 cargo run
 ```
 
-Tests cover JMAP types, glob matching, split filtering, identity-based split seeding, Gmail-style search parsing, ICS calendar parsing, JMAP filter translation, and MIME type detection.
+Tests cover JMAP types, glob matching, split filtering, identity-based split seeding, Gmail-style search parsing, ICS calendar parsing, JMAP filter translation, MIME type detection, config parsing, and provider dispatch.
 
 ## Contributing
 
@@ -461,7 +454,8 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 
 ## Roadmap
 
-- **Multi-provider support** — Gmail and Outlook integration (in progress)
+- **Outlook email** — Mail.ReadWrite + Mail.Send via Microsoft Graph (Phase 2)
+- **Gmail email + calendar** — Gmail REST API + Google Calendar API (Phase 3)
 - Threading / conversation grouping
 - Drafts
 - Contact suggestions / address book

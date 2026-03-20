@@ -225,7 +225,9 @@ pub struct SplitsConfig {
 // =============================================================================
 
 pub struct AppState {
-    pub session: tokio::sync::RwLock<crate::jmap::JmapSession>,
+    pub sessions:
+        std::collections::HashMap<String, tokio::sync::RwLock<crate::provider::ProviderSession>>,
+    pub default_account: String,
     pub splits_config_path: PathBuf,
 }
 

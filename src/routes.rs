@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::types::*;
-use crate::{calendar, jmap, search, splits, theme};
+use crate::{calendar, provider, search, splits, theme};
 
 const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
 
@@ -173,6 +173,7 @@ struct ListEmailsParams {
     offset: Option<usize>,
     split_id: Option<String>,
     search: Option<String>,
+    account: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -201,22 +202,50 @@ struct RsvpBody {
     status: crate::types::RsvpStatus,
 }
 
+#[derive(Deserialize, Default)]
+struct AccountParam {
+    account: Option<String>,
+}
+
+// =============================================================================
+// Account resolution
+// =============================================================================
+
+fn resolve_session<'a>(
+    state: &'a AppState,
+    account: Option<&str>,
+) -> Result<&'a tokio::sync::RwLock<crate::provider::ProviderSession>, Error> {
+    let key = account.unwrap_or(&state.default_account);
+    state
+        .sessions
+        .get(key)
+        .ok_or_else(|| Error::BadRequest(format!("Unknown account: {key}")))
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
 
 async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let session = state.session.read().await;
-    Json(serde_json::json!([{
-        "id": "fastmail",
-        "username": session.username,
-        "is_default": true
-    }]))
+    let mut accounts = Vec::new();
+    for (name, session_lock) in &state.sessions {
+        let session = session_lock.read().await;
+        accounts.push(serde_json::json!({
+            "id": name,
+            "username": session.username(),
+            "is_default": *name == state.default_account
+        }));
+    }
+    Json(serde_json::json!(accounts))
 }
 
-async fn list_identities(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, Error> {
-    let mut session = state.session.write().await;
-    let identities = jmap::get_identities(&mut session).await?;
+async fn list_identities(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+) -> Result<impl IntoResponse, Error> {
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let mut session = session_lock.write().await;
+    let identities = provider::get_identities(&mut session).await?;
     Ok(Json(serde_json::json!(identities)))
 }
 
@@ -247,9 +276,13 @@ async fn get_theme() -> impl IntoResponse {
     )
 }
 
-async fn list_mailboxes(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let mailboxes = jmap::get_mailboxes(&session).await?;
+async fn list_mailboxes(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+) -> Result<impl IntoResponse, Error> {
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let mailboxes = provider::get_mailboxes(&session).await?;
     Ok(Json(serde_json::json!(mailboxes)))
 }
 
@@ -257,7 +290,8 @@ async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
     let limit = params.limit.unwrap_or(150);
     let offset = params.offset.unwrap_or(0);
 
@@ -270,7 +304,7 @@ async fn list_emails(
         limit
     };
 
-    let email_ids = jmap::query_emails(
+    let email_ids = provider::query_emails(
         &session,
         params.mailbox_id.as_deref(),
         fetch_limit,
@@ -279,7 +313,7 @@ async fn list_emails(
     )
     .await?;
 
-    let mut emails = jmap::get_emails(&session, &email_ids, false, None).await?;
+    let mut emails = provider::get_emails(&session, &email_ids, false, None).await?;
 
     // Apply split filtering
     if let Some(ref split_id) = params.split_id {
@@ -318,23 +352,31 @@ async fn list_emails(
 async fn get_email(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
+    let account_key = params
+        .account
+        .as_deref()
+        .unwrap_or(&state.default_account)
+        .to_string();
+    let session_lock = resolve_session(&state, Some(&account_key))?;
+    let session = session_lock.read().await;
 
-    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
+    let emails =
+        provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;
 
     // Auto mark-read
     if email.is_unread() {
-        let _ = jmap::mark_read(&session, &email_id).await;
+        let _ = provider::mark_read(&session, &email_id).await;
     }
 
     // Check for calendar event
     let mut calendar_event = None;
     if email.has_calendar
-        && let Ok(Some(ics_data)) = jmap::get_calendar_data(&session, &email_id).await
+        && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
         && let Some(event) = calendar::parse_ics(&ics_data)
     {
         // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
@@ -342,19 +384,25 @@ async fn get_email(
             let state_clone = state.clone();
             let ics_clone = ics_data.clone();
             let uid = event.uid.clone();
+            let acct = account_key.clone();
             tokio::spawn(async move {
-                let s = state_clone.session.read().await;
-                if let Err(e) = jmap::add_to_calendar(&s, &ics_clone, &uid, true).await {
-                    tracing::warn!("CalDAV auto-add failed for {uid}: {e}");
+                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)) {
+                    let s = s_lock.read().await;
+                    if let Err(e) = provider::add_to_calendar(&s, &ics_clone, &uid, true).await {
+                        tracing::warn!("Calendar auto-add failed for {uid}: {e}");
+                    }
                 }
             });
         } else if event.method == "CANCEL" {
             let state_clone = state.clone();
             let uid = event.uid.clone();
+            let acct = account_key.clone();
             tokio::spawn(async move {
-                let s = state_clone.session.read().await;
-                if let Err(e) = jmap::remove_from_calendar(&s, &uid).await {
-                    tracing::warn!("CalDAV auto-remove failed for {uid}: {e}");
+                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)) {
+                    let s = s_lock.read().await;
+                    if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
+                        tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
+                    }
                 }
             });
         }
@@ -399,40 +447,16 @@ fn sanitize_filename_for_header(name: &str) -> String {
 async fn download_attachment(
     State(state): State<Arc<AppState>>,
     Path((_email_id, blob_id, filename)): Path<(String, String, String)>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
     if !is_safe_path_segment(&blob_id) || !is_safe_path_segment(&filename) {
         return Err(Error::BadRequest("Invalid blob_id or filename".into()));
     }
 
-    let session = state.session.read().await;
-    let account_id = session.account_id.as_ref().ok_or(Error::NotConnected)?;
-    let download_url = session.download_url.as_ref().ok_or(Error::NotConnected)?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
 
-    let url = download_url
-        .replace("{accountId}", account_id)
-        .replace("{blobId}", &blob_id)
-        .replace("{name}", &filename)
-        .replace("{type}", "application/octet-stream");
-
-    let resp = session
-        .client
-        .get(&url)
-        .header("Authorization", &session.auth_header)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return Err(Error::NotFound("Attachment not found".into()));
-    }
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let bytes = resp.bytes().await?;
+    let (content_type, bytes) = provider::download_blob(&session, &blob_id, &filename).await?;
 
     let safe_filename = sanitize_filename_for_header(&filename);
     Ok((
@@ -451,67 +475,81 @@ async fn download_attachment(
 async fn archive_email(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::archive(&session, &email_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::archive(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn trash_email(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::trash(&session, &email_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::trash(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn mark_read(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::mark_read(&session, &email_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::mark_read(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn mark_unread(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::mark_unread(&session, &email_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::mark_unread(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn toggle_flag(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::toggle_flag(&session, &email_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::toggle_flag(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn move_email(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
     Json(body): Json<MoveBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
-    let success = jmap::move_to_mailbox(&session, &email_id, &body.mailbox_id).await?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
+    let success = provider::move_to_mailbox(&session, &email_id, &body.mailbox_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
 async fn send_email_handler(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
     Json(body): Json<SendEmailBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let mut session = state.session.write().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let mut session = session_lock.write().await;
     let from_addr = body
         .from_address
         .as_deref()
-        .unwrap_or(&session.username)
+        .unwrap_or(session.username())
         .to_string();
 
     let submission = EmailSubmission {
@@ -531,7 +569,7 @@ async fn send_email_handler(
         calendar_ics: None,
     };
 
-    let result = jmap::send_email(&mut session, &submission, &from_addr, None).await?;
+    let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
 
     match result {
         Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
@@ -543,6 +581,7 @@ const MAX_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
 async fn upload_blob(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Error> {
@@ -565,32 +604,10 @@ async fn upload_blob(
         .unwrap_or("attachment");
     let filename = sanitize_filename_for_header(raw_filename);
 
-    let session = state.session.read().await;
-    let account_id = session.account_id.as_ref().ok_or(Error::NotConnected)?;
-    let upload_url = session.upload_url.as_ref().ok_or(Error::NotConnected)?;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
 
-    let url = upload_url.replace("{accountId}", account_id);
-
-    let resp = session
-        .client
-        .post(&url)
-        .header("Authorization", &session.auth_header)
-        .header("Content-Type", content_type)
-        .body(reqwest::Body::from(body))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(Error::Internal(format!("Upload failed ({status}): {text}")));
-    }
-
-    let result: serde_json::Value = resp.json().await?;
-    let blob_id = result["blobId"]
-        .as_str()
-        .ok_or_else(|| Error::Internal("Missing blobId in upload response".into()))?;
-    let size = result["size"].as_i64().unwrap_or(0);
+    let (blob_id, size) = provider::upload_blob(&session, content_type, &body).await?;
 
     Ok(Json(serde_json::json!({
         "blob_id": blob_id,
@@ -603,12 +620,14 @@ async fn upload_blob(
 async fn rsvp(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
     Json(body): Json<RsvpBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let mut session_guard = state.session.write().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let mut session_guard = session_lock.write().await;
 
     // Get calendar data
-    let ics_data = jmap::get_calendar_data(&session_guard, &email_id)
+    let ics_data = provider::get_calendar_data(&session_guard, &email_id)
         .await?
         .ok_or_else(|| Error::NotFound("No calendar data found".into()))?;
 
@@ -617,9 +636,9 @@ async fn rsvp(
 
     // Determine attendee email (use account username)
     let attendee_email = {
-        // Try To addresses first, then CC, then username
         let emails =
-            jmap::get_emails(&session_guard, std::slice::from_ref(&email_id), false, None).await?;
+            provider::get_emails(&session_guard, std::slice::from_ref(&email_id), false, None)
+                .await?;
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -635,49 +654,18 @@ async fn rsvp(
                 break;
             }
         }
-        found.unwrap_or_else(|| session_guard.username.clone())
+        found.unwrap_or_else(|| session_guard.username().to_string())
     };
 
-    let rsvp_ics = calendar::generate_rsvp(&event, &attendee_email, &body.status);
-
-    // Send RSVP as email to organizer with text/calendar MIME part
-    let submission = EmailSubmission {
-        to: vec![event.organizer_email.clone()],
-        cc: vec![],
-        subject: format!("Re: {}", event.summary),
-        text_body: format!(
-            "{} has {} the invitation: {}",
-            attendee_email,
-            body.status.as_ics_str().to_lowercase(),
-            event.summary
-        ),
-        bcc: None,
-        html_body: None,
-        in_reply_to: None,
-        references: None,
-        attachments: vec![],
-        calendar_ics: Some(rsvp_ics),
-    };
-
-    if let Err(e) = jmap::send_email(&mut session_guard, &submission, &attendee_email, None).await {
-        tracing::warn!(
-            "Failed to send iTIP reply to {}: {e}",
-            event.organizer_email
-        );
-    }
-
-    // Decline = remove from calendar; Accept/Maybe = upsert original ICS with updated PARTSTAT
-    if body.status == RsvpStatus::Declined {
-        if let Err(e) = jmap::remove_from_calendar(&session_guard, &event.uid).await {
-            tracing::warn!("CalDAV delete failed for {}: {e}", event.uid);
-        }
-    } else {
-        let updated_ics = calendar::update_partstat(&ics_data, &attendee_email, &body.status);
-        if let Err(e) = jmap::add_to_calendar(&session_guard, &updated_ics, &event.uid, false).await
-        {
-            tracing::warn!("CalDAV write failed for {}: {e}", event.uid);
-        }
-    }
+    // Dispatch full RSVP flow to provider (Fastmail: iTIP email + CalDAV, Outlook: Graph API)
+    provider::rsvp(
+        &mut session_guard,
+        &ics_data,
+        &event,
+        &attendee_email,
+        &body.status,
+    )
+    .await?;
 
     // Update the parsed event's attendee status for the frontend response
     let mut updated_event = event;
@@ -694,10 +682,12 @@ async fn rsvp(
 async fn add_to_calendar(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
 
-    let ics_data = jmap::get_calendar_data(&session, &email_id)
+    let ics_data = provider::get_calendar_data(&session, &email_id)
         .await?
         .ok_or_else(|| Error::NotFound("No calendar data found".into()))?;
 
@@ -706,9 +696,9 @@ async fn add_to_calendar(
 
     // Cancellations should remove, not add
     let success = if event.method == "CANCEL" {
-        jmap::remove_from_calendar(&session, &event.uid).await?
+        provider::remove_from_calendar(&session, &event.uid).await?
     } else {
-        jmap::add_to_calendar(&session, &ics_data, &event.uid, false).await?
+        provider::add_to_calendar(&session, &ics_data, &event.uid, false).await?
     };
 
     if success {
@@ -721,11 +711,14 @@ async fn add_to_calendar(
 async fn unsubscribe_and_archive(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session = state.session.read().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
 
     // Get the email to find the sender
-    let emails = jmap::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
+    let emails =
+        provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -745,10 +738,10 @@ async fn unsubscribe_and_archive(
         from: vec![sender_email.clone()],
         ..Default::default()
     };
-    let all_ids = jmap::query_emails(&session, None, 500, 0, Some(&query)).await?;
+    let all_ids = provider::query_emails(&session, None, 500, 0, Some(&query)).await?;
 
     // Archive all
-    let archived = jmap::archive_batch(&session, &all_ids).await?;
+    let archived = provider::archive_batch(&session, &all_ids).await?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -764,6 +757,7 @@ async fn unsubscribe_and_archive(
 #[derive(Deserialize)]
 struct SplitCountsParams {
     mailbox_id: String,
+    account: Option<String>,
 }
 
 async fn split_counts(
@@ -780,16 +774,17 @@ async fn split_counts(
         return Ok(Json(serde_json::json!({})));
     }
 
-    let session = state.session.read().await;
+    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session = session_lock.read().await;
 
     let fetch_limit = 150 * SPLIT_OVERFETCH_MULTIPLIER;
     let email_ids =
-        jmap::query_emails(&session, Some(&params.mailbox_id), fetch_limit, 0, None).await?;
+        provider::query_emails(&session, Some(&params.mailbox_id), fetch_limit, 0, None).await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
     let mut all_emails = Vec::new();
     for batch in email_ids.chunks(500) {
-        let emails = jmap::get_emails(&session, batch, false, Some(minimal_props)).await?;
+        let emails = provider::get_emails(&session, batch, false, Some(minimal_props)).await?;
         all_emails.extend(emails);
     }
 
