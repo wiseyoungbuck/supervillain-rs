@@ -221,8 +221,9 @@ fn open_browser(url: &str) {
 // Config parsing
 // =============================================================================
 
-/// Parse a simple key = value config file (like ghostty/omarchy).
+/// Parse top-level key = value pairs from the config file (like ghostty/omarchy).
 /// Lines starting with # are comments. Blank lines are ignored.
+/// Stops at the first [section] header — keys inside sections are handled by parse_accounts.
 fn load_config(path: &PathBuf) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let content = match std::fs::read_to_string(path) {
@@ -233,6 +234,10 @@ fn load_config(path: &PathBuf) -> HashMap<String, String> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        // Stop at first section header — only collect top-level keys
+        if line.starts_with('[') && line.ends_with(']') {
+            break;
         }
         if let Some((key, value)) = line.split_once('=') {
             map.insert(key.trim().to_string(), value.trim().to_string());

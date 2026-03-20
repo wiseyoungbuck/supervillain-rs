@@ -103,12 +103,13 @@ fn extract_property(text: &str, name: &str) -> Option<String> {
 }
 
 /// Parse VTIMEZONE blocks from the full ICS data. Returns a map from TZID
-/// to the STANDARD component's UTCOFFSETTO (the offset most events care about).
-/// We grab STANDARD over DAYLIGHT because it's the baseline; for events that
-/// fall in DST, the VTIMEZONE also contains DAYLIGHT with DTSTART ranges —
-/// but resolving DST transitions correctly is complex. Using STANDARD is a
-/// reasonable 80/20: most calendar providers send times already converted to
-/// UTC (with a Z suffix), and VTIMEZONE+TZID is the fallback path.
+/// to the STANDARD component's UTCOFFSETTO (falls back to DAYLIGHT if no STANDARD).
+///
+/// Known limitation: this picks a single offset per TZID and uses it for all events,
+/// so events during DST will be off by ~1 hour. In practice, most calendar providers
+/// send times with a trailing Z (already UTC), making this the rare fallback path.
+/// Correct DST resolution would require checking whether the event date falls within
+/// the DAYLIGHT period using DTSTART/RRULE from each sub-block.
 fn parse_vtimezone_offsets(data: &str) -> HashMap<String, FixedOffset> {
     let mut offsets = HashMap::new();
     let unfolded = unfold_lines(data);
@@ -213,8 +214,9 @@ fn parse_ics_datetime_property(
             return Some(local.with_timezone(&Utc));
         }
 
-        // Case 3: Floating time (no Z, no TZID) — interpret as system local tz
-        let local = Local::now().offset().from_local_datetime(&dt).earliest()?;
+        // Case 3: Floating time (no Z, no TZID) — interpret as system local tz.
+        // Use from_local_datetime on the event's date to get the correct DST offset.
+        let local = Local.from_local_datetime(&dt).earliest()?;
         return Some(local.with_timezone(&Utc));
     }
     None
@@ -1155,7 +1157,18 @@ END:VCALENDAR";
         let event = parse_ics(ics).unwrap();
         // Verify the local offset was applied: 10:00 local != 10:00 UTC
         // unless we're in UTC. Compute expected value from system tz.
-        let local_offset = Local::now().offset().local_minus_utc();
+        // Use the offset at the event's date (Feb 15), not the current date,
+        // so this test is correct across DST boundaries.
+        let event_date = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        );
+        let local_offset = Local
+            .from_local_datetime(&event_date)
+            .earliest()
+            .unwrap()
+            .offset()
+            .local_minus_utc();
         let expected_utc_hour = (10 - local_offset / 3600 + 24) % 24;
         assert_eq!(event.dtstart.hour() as i32, expected_utc_hour);
     }

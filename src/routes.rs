@@ -356,9 +356,8 @@ async fn get_email(
 ) -> Result<impl IntoResponse, Error> {
     let account_key = params
         .account
-        .as_deref()
-        .unwrap_or(&state.default_account)
-        .to_string();
+        .clone()
+        .unwrap_or_else(|| state.default_account.clone());
     let session_lock = resolve_session(&state, Some(&account_key))?;
     let session = session_lock.read().await;
 

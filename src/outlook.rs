@@ -90,16 +90,17 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// Build the authorization URL for the OAuth2 PKCE flow
 pub fn auth_url(client_id: &str, code_verifier: &str, state: &str) -> String {
     let challenge = code_challenge(code_verifier);
-    format!(
-        "{AUTH_URL}?client_id={client_id}\
-         &response_type=code\
-         &redirect_uri={REDIRECT_URI}\
-         &scope={SCOPES}\
-         &code_challenge={challenge}\
-         &code_challenge_method=S256\
-         &state={state}\
-         &response_mode=query"
-    )
+    let mut url = url::Url::parse(AUTH_URL).expect("valid auth base URL");
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", REDIRECT_URI)
+        .append_pair("scope", SCOPES)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("response_mode", "query");
+    url.to_string()
 }
 
 /// Exchange authorization code for tokens
@@ -133,7 +134,7 @@ async fn exchange_code(
 async fn ensure_token(session: &OutlookSession) -> Result<(), Error> {
     let mut token = session.token.lock().await;
     if Utc::now() + chrono::Duration::seconds(60) >= token.token_expiry {
-        let resp: TokenResponse = session
+        let resp = session
             .client
             .post(TOKEN_URL)
             .form(&[
@@ -143,9 +144,14 @@ async fn ensure_token(session: &OutlookSession) -> Result<(), Error> {
                 ("scope", SCOPES),
             ])
             .send()
-            .await?
-            .json()
             .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Auth(format!("Token refresh failed: {text}")));
+        }
+
+        let resp: TokenResponse = resp.json().await?;
 
         token.access_token = resp.access_token;
         if let Some(rt) = resp.refresh_token {
