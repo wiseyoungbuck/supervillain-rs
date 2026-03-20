@@ -439,6 +439,112 @@ pub async fn respond_to_event(
     }
 }
 
+/// Fetch the current calendar event from Graph API by iCalUId.
+/// Returns a CalendarEvent with current attendee statuses, or None if not found.
+pub async fn get_calendar_event(
+    session: &OutlookSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    let token = access_token(session).await?;
+    let safe_uid = uid.replace('\'', "''");
+    let url = format!(
+        "{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id,subject,start,end,location,body,organizer,attendees,iCalUId"
+    );
+
+    let resp: serde_json::Value = session
+        .client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let event_json = match resp["value"].as_array().and_then(|arr| arr.first()) {
+        Some(ev) => ev,
+        None => return Ok(None),
+    };
+
+    Ok(parse_graph_event(uid, event_json))
+}
+
+/// Parse a Graph API event JSON object into a CalendarEvent.
+/// Separated from get_calendar_event for testability.
+fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<CalendarEvent> {
+    let attendees: Vec<crate::types::Attendee> = event_json["attendees"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let email = a["emailAddress"]["address"].as_str()?;
+                    let name = a["emailAddress"]["name"].as_str().map(String::from);
+                    let status = match a["status"]["response"].as_str().unwrap_or("none") {
+                        "accepted" => "ACCEPTED",
+                        "tentativelyAccepted" => "TENTATIVE",
+                        "declined" => "DECLINED",
+                        _ => "NEEDS-ACTION",
+                    };
+                    Some(crate::types::Attendee {
+                        email: email.to_string(),
+                        name,
+                        status: status.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let organizer_email = event_json["organizer"]["emailAddress"]["address"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let organizer_name = event_json["organizer"]["emailAddress"]["name"]
+        .as_str()
+        .map(String::from);
+
+    let summary = event_json["subject"].as_str().unwrap_or("").to_string();
+
+    // Parse start/end datetimes (Graph returns ISO 8601 without timezone, always UTC when timeZone is UTC)
+    let dtstart = event_json["start"]["dateTime"]
+        .as_str()
+        .and_then(|s| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|dt| dt.and_utc())
+        })?;
+
+    let dtend = event_json["end"]["dateTime"].as_str().and_then(|s| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(|dt| dt.and_utc())
+    });
+
+    let location = event_json["location"]["displayName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let description = event_json["body"]["content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    Some(CalendarEvent {
+        uid: uid.to_string(),
+        summary,
+        dtstart,
+        dtend,
+        location,
+        description,
+        organizer_email,
+        organizer_name,
+        attendees,
+        sequence: 0,
+        method: "REQUEST".to_string(),
+        raw_ics: String::new(),
+    })
+}
+
 /// Remove an event from the Outlook calendar by iCalUId
 pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result<bool, Error> {
     let token = access_token(session).await?;
@@ -768,5 +874,199 @@ mod tests {
         let path = dir.path().join("bad.json");
         std::fs::write(&path, "not json at all {{{").unwrap();
         assert!(load_tokens(&path, "id").is_none());
+    }
+
+    // =========================================================================
+    // parse_graph_event tests
+    // =========================================================================
+
+    fn graph_event_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "AAMkAGI2...",
+            "subject": "Team Standup",
+            "start": { "dateTime": "2026-03-20T14:00:00.0000000", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-20T14:30:00.0000000", "timeZone": "UTC" },
+            "location": { "displayName": "Room 42" },
+            "body": { "contentType": "text", "content": "Daily sync" },
+            "organizer": {
+                "emailAddress": { "address": "boss@example.com", "name": "The Boss" }
+            },
+            "attendees": [
+                {
+                    "emailAddress": { "address": "alice@example.com", "name": "Alice" },
+                    "status": { "response": "accepted" },
+                    "type": "required"
+                },
+                {
+                    "emailAddress": { "address": "bob@example.com", "name": "Bob" },
+                    "status": { "response": "tentativelyAccepted" },
+                    "type": "required"
+                },
+                {
+                    "emailAddress": { "address": "carol@example.com", "name": "Carol" },
+                    "status": { "response": "declined" },
+                    "type": "required"
+                },
+                {
+                    "emailAddress": { "address": "dave@example.com", "name": "Dave" },
+                    "status": { "response": "none" },
+                    "type": "required"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_graph_event_full() {
+        let json = graph_event_json();
+        let event = parse_graph_event("uid-123", &json).unwrap();
+        assert_eq!(event.uid, "uid-123");
+        assert_eq!(event.summary, "Team Standup");
+        assert_eq!(event.organizer_email, "boss@example.com");
+        assert_eq!(event.organizer_name.as_deref(), Some("The Boss"));
+        assert_eq!(event.location.as_deref(), Some("Room 42"));
+        assert_eq!(event.description.as_deref(), Some("Daily sync"));
+        assert!(event.dtend.is_some());
+    }
+
+    #[test]
+    fn parse_graph_event_maps_response_statuses() {
+        let json = graph_event_json();
+        let event = parse_graph_event("uid-123", &json).unwrap();
+        assert_eq!(event.attendees.len(), 4);
+        assert_eq!(event.attendees[0].email, "alice@example.com");
+        assert_eq!(event.attendees[0].status, "ACCEPTED");
+        assert_eq!(event.attendees[1].email, "bob@example.com");
+        assert_eq!(event.attendees[1].status, "TENTATIVE");
+        assert_eq!(event.attendees[2].email, "carol@example.com");
+        assert_eq!(event.attendees[2].status, "DECLINED");
+        assert_eq!(event.attendees[3].email, "dave@example.com");
+        assert_eq!(event.attendees[3].status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn parse_graph_event_preserves_attendee_names() {
+        let json = graph_event_json();
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.attendees[0].name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn parse_graph_event_no_attendees() {
+        let json = serde_json::json!({
+            "subject": "Solo focus time",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "end": { "dateTime": "2026-03-20T10:00:00.0000000" },
+            "organizer": { "emailAddress": { "address": "me@example.com" } }
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert!(event.attendees.is_empty());
+        assert_eq!(event.summary, "Solo focus time");
+    }
+
+    #[test]
+    fn parse_graph_event_missing_optional_fields() {
+        let json = serde_json::json!({
+            "subject": "Quick call",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } }
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert!(event.location.is_none());
+        assert!(event.description.is_none());
+        assert!(event.dtend.is_none());
+    }
+
+    #[test]
+    fn parse_graph_event_empty_location_treated_as_none() {
+        let json = serde_json::json!({
+            "subject": "Call",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "location": { "displayName": "" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } }
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert!(event.location.is_none());
+    }
+
+    #[test]
+    fn parse_graph_event_empty_body_treated_as_none() {
+        let json = serde_json::json!({
+            "subject": "Call",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "body": { "content": "" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } }
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert!(event.description.is_none());
+    }
+
+    #[test]
+    fn parse_graph_event_missing_start_returns_none() {
+        // No start datetime means we can't build a valid event
+        let json = serde_json::json!({
+            "subject": "Broken",
+            "organizer": { "emailAddress": { "address": "a@b.com" } }
+        });
+        assert!(parse_graph_event("uid", &json).is_none());
+    }
+
+    #[test]
+    fn parse_graph_event_attendee_missing_email_skipped() {
+        let json = serde_json::json!({
+            "subject": "Test",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } },
+            "attendees": [
+                { "emailAddress": { "name": "No Email" }, "status": { "response": "accepted" } },
+                { "emailAddress": { "address": "valid@example.com" }, "status": { "response": "accepted" } }
+            ]
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.attendees.len(), 1);
+        assert_eq!(event.attendees[0].email, "valid@example.com");
+    }
+
+    #[test]
+    fn parse_graph_event_unknown_response_maps_to_needs_action() {
+        let json = serde_json::json!({
+            "subject": "Test",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } },
+            "attendees": [{
+                "emailAddress": { "address": "x@y.com" },
+                "status": { "response": "organizer" }
+            }]
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.attendees[0].status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn parse_graph_event_missing_response_field_maps_to_needs_action() {
+        let json = serde_json::json!({
+            "subject": "Test",
+            "start": { "dateTime": "2026-03-20T09:00:00.0000000" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } },
+            "attendees": [{
+                "emailAddress": { "address": "x@y.com" },
+                "status": {}
+            }]
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.attendees[0].status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn parse_graph_event_fractional_seconds() {
+        // Graph sometimes returns varying precision
+        let json = serde_json::json!({
+            "subject": "Test",
+            "start": { "dateTime": "2026-03-20T14:30:00.123" },
+            "end": { "dateTime": "2026-03-20T15:00:00.0" },
+            "organizer": { "emailAddress": { "address": "a@b.com" } }
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.dtstart.format("%H:%M").to_string(), "14:30");
     }
 }

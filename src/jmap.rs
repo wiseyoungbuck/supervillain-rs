@@ -1177,6 +1177,32 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     Ok(Some(ics_data))
 }
 
+/// Fetch the current calendar event from CalDAV by UID.
+/// Returns a parsed CalendarEvent, or None if the event doesn't exist.
+pub async fn get_calendar_event(
+    s: &JmapSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    let caldav_url = format!(
+        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        s.username, uid
+    );
+
+    let resp = s
+        .client
+        .get(&caldav_url)
+        .header("Authorization", &s.auth_header)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let ics_data = resp.text().await?;
+    Ok(calendar::parse_ics(&ics_data))
+}
+
 pub async fn add_to_calendar(
     s: &JmapSession,
     ics_data: &str,

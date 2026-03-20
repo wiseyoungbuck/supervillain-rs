@@ -179,6 +179,18 @@ pub async fn get_calendar_data(
     }
 }
 
+/// Fetch the current calendar event from the calendar (CalDAV/Graph) by UID.
+/// Returns None if the event doesn't exist in the calendar yet.
+pub async fn get_calendar_event(
+    s: &ProviderSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::get_calendar_event(s, uid).await,
+        ProviderSession::Outlook(s) => outlook::get_calendar_event(s, uid).await,
+    }
+}
+
 // =============================================================================
 // Blob upload/download dispatch
 // =============================================================================

@@ -2427,12 +2427,26 @@ async function rsvpToEvent(status) {
     // Optimistic: update RSVP buttons immediately if we have event data
     if (event) {
         prevEvent = JSON.parse(JSON.stringify(event));
-        const accountEmail = state.currentAccount?.email?.toLowerCase();
-        if (accountEmail && event.attendees) {
-            for (const a of event.attendees) {
-                if (a.email.toLowerCase() === accountEmail) {
-                    a.status = status;
-                    break;
+        if (event.attendees) {
+            // Find the attendee using same logic as getUserRsvpStatus
+            const accountEmail = state.currentAccount?.email?.toLowerCase();
+            let matched = false;
+            if (accountEmail) {
+                for (const a of event.attendees) {
+                    if (a.email.toLowerCase() === accountEmail) {
+                        a.status = status;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched && state.currentEmail) {
+                const toEmails = [...(state.currentEmail.to || []), ...(state.currentEmail.cc || [])].map(t => t.email?.toLowerCase());
+                for (const a of event.attendees) {
+                    if (toEmails.includes(a.email.toLowerCase())) {
+                        a.status = status;
+                        break;
+                    }
                 }
             }
         }

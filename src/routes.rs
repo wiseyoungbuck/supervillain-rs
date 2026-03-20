@@ -405,6 +405,32 @@ async fn get_email(
                 }
             });
         }
+        // Merge current PARTSTAT from calendar (CalDAV/Graph) so the UI
+        // reflects the user's actual RSVP status, not the stale email ICS
+        let mut event = event;
+        match provider::get_calendar_event(&session, &event.uid).await {
+            Ok(Some(cal_event)) => {
+                for att in &mut event.attendees {
+                    if let Some(cal_att) = cal_event
+                        .attendees
+                        .iter()
+                        .find(|a| a.email.eq_ignore_ascii_case(&att.email))
+                    {
+                        att.status = cal_att.status.clone();
+                    }
+                }
+                tracing::debug!("Merged calendar PARTSTAT for event {}", event.uid);
+            }
+            Ok(None) => {
+                tracing::debug!("Event {} not in calendar yet, using email ICS", event.uid);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Calendar fetch failed for {}, falling back to email ICS: {e}",
+                    event.uid
+                );
+            }
+        }
         calendar_event = Some(event);
     }
 
@@ -675,7 +701,7 @@ async fn rsvp(
     {
         att.status = body.status.as_ics_str().to_string();
     }
-    Ok(Json(serde_json::json!(updated_event)))
+    Ok(Json(serde_json::json!({ "calendarEvent": updated_event })))
 }
 
 async fn add_to_calendar(
