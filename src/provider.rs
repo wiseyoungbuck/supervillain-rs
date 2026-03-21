@@ -22,6 +22,13 @@ impl ProviderSession {
         }
     }
 
+    pub fn provider_name(&self) -> &str {
+        match self {
+            Self::Fastmail(_) => "fastmail",
+            Self::Outlook(_) => "outlook",
+        }
+    }
+
     /// Whether this provider sends RSVP emails automatically (via Graph API)
     /// so the caller should NOT send a manual iTIP reply
     pub fn sends_rsvp_automatically(&self) -> bool {

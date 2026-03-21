@@ -232,8 +232,9 @@ async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         let session = session_lock.read().await;
         accounts.push(serde_json::json!({
             "id": name,
-            "username": session.username(),
-            "is_default": *name == state.default_account
+            "email": session.username(),
+            "provider": session.provider_name(),
+            "isDefault": *name == state.default_account
         }));
     }
     Json(serde_json::json!(accounts))
