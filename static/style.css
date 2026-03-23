@@ -1126,6 +1126,12 @@ body:not(.light-theme) .compose-quote a * {
     color: var(--bg);
 }
 
+.rsvp-status-label {
+    font-size: 11px;
+    color: var(--fg-dim);
+    margin-top: 4px;
+}
+
 /* Attachment card */
 #attachments.hidden {
     display: none;

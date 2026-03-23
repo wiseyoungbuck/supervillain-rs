@@ -70,6 +70,7 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
         sequence,
         method,
         raw_ics: data.to_string(),
+        user_rsvp_status: None,
     })
 }
 
@@ -591,6 +592,15 @@ END:VCALENDAR";
         assert!(event.attendees[0].name.is_none());
         assert_eq!(event.attendees[0].email, "dave@example.com");
         assert_eq!(event.attendees[0].status, "ACCEPTED");
+    }
+
+    #[test]
+    fn parse_user_rsvp_status_is_none() {
+        let event = parse_ics(SAMPLE_ICS).unwrap();
+        assert!(
+            event.user_rsvp_status.is_none(),
+            "parse_ics should not populate user_rsvp_status"
+        );
     }
 
     #[test]

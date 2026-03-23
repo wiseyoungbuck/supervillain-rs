@@ -376,8 +376,8 @@ async fn get_email(
     // Check for calendar event
     let mut calendar_event = None;
     if email.has_calendar
-        && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
-        && let Some(event) = calendar::parse_ics(&ics_data)
+        && let Ok(Some(ics_data)) = jmap::get_calendar_data(&session, &email_id).await
+        && let Some(mut event) = calendar::parse_ics(&ics_data)
     {
         // Auto-add invitations to calendar (non-blocking, won't overwrite existing)
         if event.method == "REQUEST" {
@@ -406,6 +406,7 @@ async fn get_email(
                 }
             });
         }
+<<<<<<< HEAD
         // Merge current PARTSTAT from calendar (CalDAV/Graph) so the UI
         // reflects the user's actual RSVP status, not the stale email ICS
         let mut event = event;
@@ -430,6 +431,14 @@ async fn get_email(
                     "Calendar fetch failed for {}, falling back to email ICS: {e}",
                     event.uid
                 );
+=======
+        // Query CalDAV for persisted RSVP status
+        if event.method == "REQUEST" {
+            let attendee_email = determine_attendee_email(email, &event, &session.username);
+            if let Some(status) = jmap::get_rsvp_status(&session, &event.uid, &attendee_email).await
+            {
+                event.user_rsvp_status = Some(status);
+>>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
             }
         }
         calendar_event = Some(event);
@@ -643,6 +652,19 @@ async fn upload_blob(
     })))
 }
 
+fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str) -> String {
+    for addr in email.to.iter().chain(email.cc.iter()) {
+        if event
+            .attendees
+            .iter()
+            .any(|a| a.email.eq_ignore_ascii_case(&addr.email))
+        {
+            return addr.email.clone();
+        }
+    }
+    fallback.to_string()
+}
+
 async fn rsvp(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
@@ -660,7 +682,7 @@ async fn rsvp(
     let event = calendar::parse_ics(&ics_data)
         .ok_or_else(|| Error::Internal("Failed to parse calendar data".into()))?;
 
-    // Determine attendee email (use account username)
+    // Determine attendee email (use account username as fallback)
     let attendee_email = {
         let emails =
             provider::get_emails(&session_guard, std::slice::from_ref(&email_id), false, None)
@@ -668,6 +690,7 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
+<<<<<<< HEAD
 
         let mut found = None;
         for addr in email.to.iter().chain(email.cc.iter()) {
@@ -681,6 +704,9 @@ async fn rsvp(
             }
         }
         found.unwrap_or_else(|| session_guard.username().to_string())
+=======
+        determine_attendee_email(email, &event, &session_guard.username)
+>>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
     };
 
     // Dispatch full RSVP flow to provider (Fastmail: iTIP email + CalDAV, Outlook: Graph API)
@@ -702,6 +728,10 @@ async fn rsvp(
     {
         att.status = body.status.as_ics_str().to_string();
     }
+<<<<<<< HEAD
+=======
+    updated_event.user_rsvp_status = Some(body.status.as_ics_str().to_string());
+>>>>>>> 63466e3 (Persist RSVP state via CalDAV and add re-RSVP guard + keyboard shortcuts)
     Ok(Json(serde_json::json!({ "calendarEvent": updated_event })))
 }
 
@@ -1800,6 +1830,221 @@ white   = '#fdf6e3'
         assert!(
             STYLE_CSS.contains("text-decoration: none"),
             "email body links should have no underline by default"
+        );
+    }
+
+    // =========================================================================
+    // determine_attendee_email tests
+    // =========================================================================
+
+    fn test_email_with_recipients(to: Vec<&str>, cc: Vec<&str>) -> Email {
+        Email {
+            id: "test-id".into(),
+            blob_id: "blob-id".into(),
+            thread_id: "thread-id".into(),
+            mailbox_ids: std::collections::HashMap::new(),
+            keywords: std::collections::HashMap::new(),
+            received_at: chrono::Utc::now(),
+            subject: "Test".into(),
+            from: vec![EmailAddress {
+                name: None,
+                email: "sender@example.com".into(),
+            }],
+            to: to
+                .into_iter()
+                .map(|e| EmailAddress {
+                    name: None,
+                    email: e.into(),
+                })
+                .collect(),
+            cc: cc
+                .into_iter()
+                .map(|e| EmailAddress {
+                    name: None,
+                    email: e.into(),
+                })
+                .collect(),
+            preview: String::new(),
+            has_attachment: false,
+            size: 0,
+            text_body: None,
+            html_body: None,
+            has_calendar: false,
+            attachments: vec![],
+        }
+    }
+
+    fn test_calendar_event(attendee_emails: Vec<&str>) -> CalendarEvent {
+        CalendarEvent {
+            uid: "uid@example.com".into(),
+            summary: "Test".into(),
+            dtstart: chrono::Utc::now(),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: "org@example.com".into(),
+            organizer_name: None,
+            attendees: attendee_emails
+                .into_iter()
+                .map(|e| Attendee {
+                    email: e.into(),
+                    name: None,
+                    status: "NEEDS-ACTION".into(),
+                })
+                .collect(),
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: None,
+        }
+    }
+
+    #[test]
+    fn determine_attendee_email_matches_to() {
+        let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "fallback@example.com"),
+            "bob@example.com"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_matches_cc() {
+        let email = test_email_with_recipients(vec![], vec!["carol@example.com"]);
+        let event = test_calendar_event(vec!["carol@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "fallback@example.com"),
+            "carol@example.com"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_prefers_to_over_cc() {
+        let email = test_email_with_recipients(vec!["bob@example.com"], vec!["carol@example.com"]);
+        let event = test_calendar_event(vec!["bob@example.com", "carol@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "fallback@example.com"),
+            "bob@example.com"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_case_insensitive() {
+        let email = test_email_with_recipients(vec!["Bob@Example.COM"], vec![]);
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "fallback@example.com"),
+            "Bob@Example.COM"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_falls_back_to_username() {
+        let email = test_email_with_recipients(vec!["unrelated@example.com"], vec![]);
+        let event = test_calendar_event(vec!["someone@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "fallback@example.com"),
+            "fallback@example.com"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_empty_recipients() {
+        let email = test_email_with_recipients(vec![], vec![]);
+        let event = test_calendar_event(vec!["someone@example.com"]);
+        assert_eq!(
+            determine_attendee_email(&email, &event, "user@fastmail.com"),
+            "user@fastmail.com"
+        );
+    }
+
+    // =========================================================================
+    // RSVP state persistence static content tests
+    // =========================================================================
+
+    #[test]
+    fn app_js_has_user_rsvp_status_preference() {
+        assert!(
+            APP_JS.contains("event.user_rsvp_status || getUserRsvpStatus(event)"),
+            "renderCalendarCard should prefer server-authoritative user_rsvp_status"
+        );
+    }
+
+    #[test]
+    fn app_js_has_same_status_guard() {
+        assert!(
+            APP_JS.contains("event?.user_rsvp_status === status"),
+            "rsvpToEvent should guard against duplicate same-status RSVPs"
+        );
+    }
+
+    #[test]
+    fn app_js_has_optimistic_user_rsvp_status() {
+        assert!(
+            APP_JS.contains("event.user_rsvp_status = status"),
+            "rsvpToEvent should optimistically set user_rsvp_status"
+        );
+    }
+
+    #[test]
+    fn app_js_has_rsvp_status_label() {
+        assert!(
+            APP_JS.contains("rsvp-status-label"),
+            "app.js should reference the RSVP status label element"
+        );
+        assert!(
+            APP_JS.contains("You responded"),
+            "app.js should show 'You responded' label text"
+        );
+    }
+
+    #[test]
+    fn app_js_has_rsvp_keyboard_shortcuts() {
+        // y for accept, n for decline
+        assert!(
+            APP_JS.contains("rsvpToEvent('ACCEPTED')"),
+            "app.js should have Accept RSVP shortcut"
+        );
+        assert!(
+            APP_JS.contains("rsvpToEvent('DECLINED')"),
+            "app.js should have Decline RSVP shortcut"
+        );
+    }
+
+    #[test]
+    fn app_js_has_rsvp_button_enter_passthrough() {
+        assert!(
+            APP_JS.contains("rsvp-btn"),
+            "app.js should check for rsvp-btn class on focused element"
+        );
+    }
+
+    #[test]
+    fn index_html_has_rsvp_status_label() {
+        assert!(
+            INDEX_HTML.contains("rsvp-status-label"),
+            "index.html should have the RSVP status label element"
+        );
+    }
+
+    #[test]
+    fn index_html_has_rsvp_keyboard_help() {
+        assert!(
+            INDEX_HTML.contains("RSVP Accept"),
+            "help overlay should document y for RSVP Accept"
+        );
+        assert!(
+            INDEX_HTML.contains("RSVP Decline"),
+            "help overlay should document n for RSVP Decline"
+        );
+    }
+
+    #[test]
+    fn style_css_has_rsvp_status_label() {
+        assert!(
+            STYLE_CSS.contains(".rsvp-status-label"),
+            "style.css should style the RSVP status label"
         );
     }
 

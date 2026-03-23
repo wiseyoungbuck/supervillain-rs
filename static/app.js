@@ -1023,6 +1023,9 @@ function handleNormalModeKey(e) {
             break;
         case 'Enter':
         case 'o':
+            if (document.activeElement?.classList.contains('rsvp-btn')) {
+                return; // Let native button click handle it
+            }
             openSelected();
             break;
         case 'Escape':
@@ -1069,6 +1072,20 @@ function handleNormalModeKey(e) {
             break;
         case 'z':
             performUndo();
+            break;
+
+        // RSVP shortcuts
+        case 'y':
+            if (state.view === 'detail' && state.currentEmail?.calendarEvent) {
+                rsvpToEvent('ACCEPTED');
+                e.preventDefault();
+            }
+            break;
+        case 'n':
+            if (state.view === 'detail' && state.currentEmail?.calendarEvent) {
+                rsvpToEvent('DECLINED');
+                e.preventDefault();
+            }
             break;
 
         // Search
@@ -2361,10 +2378,22 @@ function renderCalendarCard(event) {
     } else {
         actions.style.display = '';
         // Find current user's RSVP status and highlight active button
-        const userStatus = getUserRsvpStatus(event);
+        const userStatus = event.user_rsvp_status || getUserRsvpStatus(event);
         els.rsvpAccept.classList.toggle('active', userStatus === 'ACCEPTED');
         els.rsvpMaybe.classList.toggle('active', userStatus === 'TENTATIVE');
         els.rsvpDecline.classList.toggle('active', userStatus === 'DECLINED');
+    }
+
+    // Show "You responded" label
+    const statusLabel = document.getElementById('rsvp-status-label');
+    if (statusLabel) {
+        if (userStatus && userStatus !== 'NEEDS-ACTION') {
+            const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[userStatus];
+            statusLabel.textContent = `You responded ${label}`;
+            statusLabel.classList.remove('hidden');
+        } else {
+            statusLabel.classList.add('hidden');
+        }
     }
 }
 
@@ -2420,33 +2449,22 @@ function getStatusIcon(status) {
 async function rsvpToEvent(status) {
     if (!state.currentEmail) return;
 
-    const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     const event = state.currentEmail.calendarEvent;
+    if (event?.user_rsvp_status === status) return; // already at this status — no-op
+
+    const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     let prevEvent = null;
 
     // Optimistic: update RSVP buttons immediately if we have event data
     if (event) {
         prevEvent = JSON.parse(JSON.stringify(event));
-        if (event.attendees) {
-            // Find the attendee using same logic as getUserRsvpStatus
-            const accountEmail = state.currentAccount?.email?.toLowerCase();
-            let matched = false;
-            if (accountEmail) {
-                for (const a of event.attendees) {
-                    if (a.email.toLowerCase() === accountEmail) {
-                        a.status = status;
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if (!matched && state.currentEmail) {
-                const toEmails = [...(state.currentEmail.to || []), ...(state.currentEmail.cc || [])].map(t => t.email?.toLowerCase());
-                for (const a of event.attendees) {
-                    if (toEmails.includes(a.email.toLowerCase())) {
-                        a.status = status;
-                        break;
-                    }
+        event.user_rsvp_status = status;
+        const accountEmail = state.currentAccount?.email?.toLowerCase();
+        if (accountEmail && event.attendees) {
+            for (const a of event.attendees) {
+                if (a.email.toLowerCase() === accountEmail) {
+                    a.status = status;
+                    break;
                 }
             }
         }

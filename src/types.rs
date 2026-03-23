@@ -115,6 +115,8 @@ pub struct CalendarEvent {
     pub sequence: i32,
     pub method: String,
     pub raw_ics: String,
+    #[serde(skip_deserializing)]
+    pub user_rsvp_status: Option<String>,
 }
 
 // =============================================================================
@@ -471,6 +473,77 @@ mod tests {
         };
         let json = serde_json::to_string(&split).unwrap();
         assert!(json.contains(r#""icon":"https://example.com/icon.svg""#));
+    }
+
+    // --- CalendarEvent tests ---
+
+    #[test]
+    fn calendar_event_user_rsvp_status_serializes() {
+        let event = CalendarEvent {
+            uid: "uid@example.com".into(),
+            summary: "Test".into(),
+            dtstart: Utc::now(),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: "org@example.com".into(),
+            organizer_name: None,
+            attendees: vec![],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: Some("ACCEPTED".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["user_rsvp_status"], "ACCEPTED");
+    }
+
+    #[test]
+    fn calendar_event_user_rsvp_status_skip_deserializing() {
+        // user_rsvp_status in JSON should be ignored during deserialization
+        let json = r#"{
+            "uid": "uid@example.com",
+            "summary": "Test",
+            "dtstart": "2026-02-15T10:00:00Z",
+            "dtend": null,
+            "location": null,
+            "description": null,
+            "organizer_email": "org@example.com",
+            "organizer_name": null,
+            "attendees": [],
+            "sequence": 0,
+            "method": "REQUEST",
+            "raw_ics": "",
+            "user_rsvp_status": "ACCEPTED"
+        }"#;
+        let event: CalendarEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            event.user_rsvp_status.is_none(),
+            "user_rsvp_status should be skipped during deserialization"
+        );
+    }
+
+    #[test]
+    fn calendar_event_user_rsvp_status_none_serializes_as_null() {
+        let event = CalendarEvent {
+            uid: "uid@example.com".into(),
+            summary: "Test".into(),
+            dtstart: Utc::now(),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: "org@example.com".into(),
+            organizer_name: None,
+            attendees: vec![],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["user_rsvp_status"].is_null());
     }
 
     // --- RsvpStatus tests ---

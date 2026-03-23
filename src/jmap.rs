@@ -1265,6 +1265,47 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
     Ok(true)
 }
 
+pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -> Option<String> {
+    let caldav_url = format!(
+        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        s.username, uid
+    );
+
+    let resp = match s
+        .client
+        .get(&caldav_url)
+        .header("Authorization", &s.auth_header)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("CalDAV GET failed for {uid}: {e}");
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let ics_data = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("CalDAV GET body read failed for {uid}: {e}");
+            return None;
+        }
+    };
+
+    let event = crate::calendar::parse_ics(&ics_data)?;
+    let email_lower = attendee_email.to_lowercase();
+    event
+        .attendees
+        .iter()
+        .find(|a| a.email.to_lowercase() == email_lower)
+        .map(|a| a.status.clone())
+}
+
 /// UUID v4 generation using /dev/urandom for proper randomness.
 #[cfg(test)]
 fn uuid_v4() -> String {
