@@ -386,7 +386,7 @@ async function showEmail(emailId) {
     const listEmail = state.emails.find(e => e.id === emailId);
     if (listEmail) renderEmailDetailPartial(listEmail);
 
-    // Full body: use cache or fetch (delete+reinsert to promote in LRU)
+    // Full body: use cache or fetch (delete+reinsert to promote in FIFO-with-promotion cache)
     let full = state.emailCache[emailId];
     if (full) {
         delete state.emailCache[emailId];
@@ -411,7 +411,13 @@ async function showEmail(emailId) {
         }
     }
 
-    if (full) renderEmailDetail(full);
+    if (full) {
+        renderEmailDetail(full);
+    } else if (!listEmail) {
+        document.getElementById('email-body').innerHTML =
+            '<div style="padding:16px;color:var(--text-muted)">Email not found.</div>';
+        return;
+    }
 
     // Auto-mark-read
     if (listEmail?.isUnread) {
@@ -698,7 +704,9 @@ document.getElementById('email-list').addEventListener('click', (e) => {
 
 // Browser back button
 window.addEventListener('popstate', (e) => {
-    if (state.currentView === 'detail') {
+    if (e.state?.view === 'detail' && state.currentView !== 'detail') {
+        // Forward navigation to detail (not currently used, but safe)
+    } else if (state.currentView === 'detail') {
         showList();
     }
 });
