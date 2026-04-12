@@ -226,12 +226,24 @@ pub struct SplitsConfig {
 }
 
 // =============================================================================
+// Account error types
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountError {
+    pub account: String,
+    pub provider: String,
+    pub error: String,
+}
+
+// =============================================================================
 // App state
 // =============================================================================
 
 pub struct AppState {
     pub sessions:
         std::collections::HashMap<String, tokio::sync::RwLock<crate::provider::ProviderSession>>,
+    pub account_errors: Vec<AccountError>,
     pub default_account: String,
     pub splits_config_path: PathBuf,
 }
@@ -663,5 +675,35 @@ mod tests {
         let deserialized: Mailbox = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.total_emails, 42);
         assert_eq!(deserialized.unread_emails, 5);
+    }
+
+    #[test]
+    fn account_error_serde_roundtrip() {
+        let err = AccountError {
+            account: "fastmail".into(),
+            provider: "fastmail".into(),
+            error: "Authentication failed (401)".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let deserialized: AccountError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.account, "fastmail");
+        assert_eq!(deserialized.provider, "fastmail");
+        assert_eq!(deserialized.error, "Authentication failed (401)");
+    }
+
+    #[test]
+    fn account_error_json_has_expected_keys() {
+        let err = AccountError {
+            account: "work".into(),
+            provider: "outlook".into(),
+            error: "OAuth flow failed".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("account").is_some());
+        assert!(parsed.get("provider").is_some());
+        assert!(parsed.get("error").is_some());
+        assert_eq!(parsed["account"], "work");
+        assert_eq!(parsed["provider"], "outlook");
     }
 }

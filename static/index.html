@@ -10,6 +10,15 @@
 </head>
 <body>
     <div id="app">
+        <!-- Account error banner (shown when accounts fail to connect at startup) -->
+        <div id="account-error-banner" class="hidden">
+            <div class="error-banner-content">
+                <span class="error-banner-icon">!</span>
+                <div id="account-error-details"></div>
+                <button class="error-banner-dismiss">Dismiss</button>
+            </div>
+        </div>
+
         <!-- Status bar -->
         <div id="statusbar">
             <span id="mode-indicator">NORMAL</span>

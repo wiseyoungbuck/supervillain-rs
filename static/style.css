@@ -64,6 +64,62 @@ body {
     flex-direction: column;
 }
 
+/* Account error banner */
+#account-error-banner {
+    background: var(--bg-secondary);
+    border-bottom: 2px solid var(--danger);
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+#account-error-banner.hidden {
+    display: none;
+}
+
+.error-banner-content {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+
+.error-banner-icon {
+    background: var(--danger);
+    color: var(--bg);
+    font-weight: bold;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.error-banner-content ul {
+    margin: 4px 0 0;
+    padding-left: 16px;
+}
+
+.error-banner-content li {
+    margin: 2px 0;
+    color: var(--fg-dim);
+}
+
+.error-banner-dismiss {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: 2px 8px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.error-banner-dismiss:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
 /* Status bar */
 #statusbar {
     display: flex;

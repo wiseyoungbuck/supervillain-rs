@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use vimmail::{
-    jmap, outlook, provider, provider::ProviderSession, routes, splits, types::AppState,
+    jmap, outlook, provider,
+    provider::ProviderSession,
+    routes, splits,
+    types::{AccountError, AppState},
 };
 
 #[tokio::main]
@@ -40,51 +43,66 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let default_account = raw_config
+    let preferred_default = raw_config
         .get("default-account")
         .cloned()
         .unwrap_or_else(|| accounts.keys().next().unwrap().clone());
 
     let tokens_dir = config_dir.join("supervillain/tokens");
     let mut sessions: HashMap<String, tokio::sync::RwLock<ProviderSession>> = HashMap::new();
+    let mut account_errors: Vec<AccountError> = Vec::new();
 
     for (name, account) in &accounts {
+        if let Err(e) = validate_provider(name, &account.provider) {
+            tracing::warn!("[{name}] {}", e.error);
+            account_errors.push(e);
+            continue;
+        }
+
         match account.provider.as_str() {
             "fastmail" => {
-                let username = account
-                    .get("username")
-                    .or_else(|| std::env::var("FASTMAIL_USERNAME").ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("username not set for account [{name}]");
-                        std::process::exit(1);
-                    });
-
-                let token = account
-                    .get("api-token")
-                    .or_else(|| std::env::var("FASTMAIL_API_TOKEN").ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("api-token not set for account [{name}]");
-                        std::process::exit(1);
-                    });
+                let (username, token) = match validate_fastmail_config(name, account) {
+                    Ok(creds) => creds,
+                    Err(e) => {
+                        tracing::warn!("[{name}] {}", e.error);
+                        account_errors.push(e);
+                        continue;
+                    }
+                };
 
                 let mut session = jmap::JmapSession::new(&username, &format!("Bearer {token}"));
-                jmap::connect(&mut session)
-                    .await
-                    .expect("Failed to connect to Fastmail");
+                if let Err(e) = jmap::connect(&mut session).await {
+                    tracing::warn!("[{name}] Failed to connect: {e}");
+                    account_errors.push(AccountError {
+                        account: name.clone(),
+                        provider: "fastmail".into(),
+                        error: format!("Connection failed: {e}"),
+                    });
+                    continue;
+                }
 
-                // Cache mailboxes
-                let mailboxes = jmap::get_mailboxes(&session)
-                    .await
-                    .expect("Failed to fetch mailboxes");
-                for mb in &mailboxes {
-                    if let Some(ref role) = mb.role {
-                        session.mailbox_cache.insert(role.clone(), mb.clone());
+                match jmap::get_mailboxes(&session).await {
+                    Ok(mailboxes) => {
+                        for mb in &mailboxes {
+                            if let Some(ref role) = mb.role {
+                                session.mailbox_cache.insert(role.clone(), mb.clone());
+                            }
+                        }
+                        tracing::info!(
+                            "[{name}] Connected as {username}, {} mailboxes",
+                            mailboxes.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("[{name}] Failed to fetch mailboxes: {e}");
+                        account_errors.push(AccountError {
+                            account: name.clone(),
+                            provider: "fastmail".into(),
+                            error: format!("Failed to fetch mailboxes: {e}"),
+                        });
+                        continue;
                     }
                 }
-                tracing::info!(
-                    "[{name}] Connected as {username}, {} mailboxes",
-                    mailboxes.len()
-                );
 
                 sessions.insert(
                     name.clone(),
@@ -93,10 +111,14 @@ async fn main() {
             }
 
             "outlook" => {
-                let client_id = account.get("client-id").unwrap_or_else(|| {
-                    eprintln!("client-id not set for account [{name}]");
-                    std::process::exit(1);
-                });
+                let client_id = match validate_outlook_config(name, account) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("[{name}] {}", e.error);
+                        account_errors.push(e);
+                        continue;
+                    }
+                };
 
                 let token_path = tokens_dir.join(format!("{name}.json"));
                 let session = if let Some(s) = outlook::load_tokens(&token_path, &client_id) {
@@ -104,9 +126,18 @@ async fn main() {
                     s
                 } else {
                     tracing::info!("[{name}] No saved tokens, starting OAuth flow...");
-                    outlook::oauth_flow(&client_id, &token_path)
-                        .await
-                        .expect("Outlook OAuth flow failed")
+                    match outlook::oauth_flow(&client_id, &token_path).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("[{name}] OAuth flow failed: {e}");
+                            account_errors.push(AccountError {
+                                account: name.clone(),
+                                provider: "outlook".into(),
+                                error: format!("OAuth flow failed: {e}"),
+                            });
+                            continue;
+                        }
+                    }
                 };
 
                 sessions.insert(
@@ -115,12 +146,11 @@ async fn main() {
                 );
             }
 
-            other => {
-                eprintln!("Unknown provider '{other}' for account [{name}]");
-                std::process::exit(1);
-            }
+            _ => unreachable!(), // validate_provider already checked
         }
     }
+
+    let default_account = resolve_default_account(preferred_default, &sessions);
 
     // Auto-seed split tabs from the default account's identities
     let splits_config_path = config_dir.join("supervillain/splits.json");
@@ -140,6 +170,7 @@ async fn main() {
 
     let state = Arc::new(AppState {
         sessions,
+        account_errors,
         default_account,
         splits_config_path,
     });
@@ -251,6 +282,62 @@ struct AccountConfig {
 impl AccountConfig {
     fn get(&self, key: &str) -> Option<String> {
         self.props.get(key).cloned()
+    }
+}
+
+fn validate_provider(name: &str, provider: &str) -> Result<(), AccountError> {
+    match provider {
+        "fastmail" | "outlook" => Ok(()),
+        other => Err(AccountError {
+            account: name.into(),
+            provider: other.into(),
+            error: format!("Unknown provider '{other}'"),
+        }),
+    }
+}
+
+fn validate_fastmail_config(
+    name: &str,
+    account: &AccountConfig,
+) -> Result<(String, String), AccountError> {
+    let username = account
+        .get("username")
+        .or_else(|| std::env::var("FASTMAIL_USERNAME").ok())
+        .ok_or_else(|| AccountError {
+            account: name.into(),
+            provider: "fastmail".into(),
+            error: "Missing 'username' in config and FASTMAIL_USERNAME env var not set".into(),
+        })?;
+    let token = account
+        .get("api-token")
+        .or_else(|| std::env::var("FASTMAIL_API_TOKEN").ok())
+        .ok_or_else(|| AccountError {
+            account: name.into(),
+            provider: "fastmail".into(),
+            error: "Missing 'api-token' in config and FASTMAIL_API_TOKEN env var not set".into(),
+        })?;
+    Ok((username, token))
+}
+
+fn validate_outlook_config(name: &str, account: &AccountConfig) -> Result<String, AccountError> {
+    account.get("client-id").ok_or_else(|| AccountError {
+        account: name.into(),
+        provider: "outlook".into(),
+        error: "Missing 'client-id' in config".into(),
+    })
+}
+
+fn resolve_default_account<V>(preferred: String, sessions: &HashMap<String, V>) -> String {
+    if sessions.contains_key(&preferred) {
+        preferred
+    } else if let Some(first) = sessions.keys().next() {
+        tracing::warn!(
+            "Default account '{preferred}' failed to connect, falling back to '{first}'"
+        );
+        first.clone()
+    } else {
+        tracing::warn!("All accounts failed to connect");
+        String::new()
     }
 }
 
@@ -469,5 +556,110 @@ mod tests {
         // Sections present → flat ignored
         assert_eq!(accounts.len(), 1);
         assert!(accounts.contains_key("sectioned"));
+    }
+
+    #[test]
+    fn validate_fastmail_config_valid() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([
+                ("username".into(), "alice@fastmail.com".into()),
+                ("api-token".into(), "fmu1-xxx".into()),
+            ]),
+        };
+        let result = validate_fastmail_config("personal", &account);
+        assert!(result.is_ok());
+        let (username, token) = result.unwrap();
+        assert_eq!(username, "alice@fastmail.com");
+        assert_eq!(token, "fmu1-xxx");
+    }
+
+    #[test]
+    fn validate_fastmail_config_missing_username() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([("api-token".into(), "fmu1-xxx".into())]),
+        };
+        let result = validate_fastmail_config("personal", &account);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "personal");
+        assert_eq!(err.provider, "fastmail");
+        assert!(err.error.contains("username"));
+    }
+
+    #[test]
+    fn validate_fastmail_config_missing_token() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([("username".into(), "alice@fastmail.com".into())]),
+        };
+        let result = validate_fastmail_config("personal", &account);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "personal");
+        assert!(err.error.contains("api-token"));
+    }
+
+    #[test]
+    fn validate_outlook_config_valid() {
+        let account = AccountConfig {
+            provider: "outlook".into(),
+            props: HashMap::from([("client-id".into(), "abc-123".into())]),
+        };
+        let result = validate_outlook_config("work", &account);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "abc-123");
+    }
+
+    #[test]
+    fn validate_outlook_config_missing_client_id() {
+        let account = AccountConfig {
+            provider: "outlook".into(),
+            props: HashMap::new(),
+        };
+        let result = validate_outlook_config("work", &account);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "work");
+        assert_eq!(err.provider, "outlook");
+        assert!(err.error.contains("client-id"));
+    }
+
+    #[test]
+    fn validate_provider_known() {
+        assert!(validate_provider("test", "fastmail").is_ok());
+        assert!(validate_provider("test", "outlook").is_ok());
+    }
+
+    #[test]
+    fn validate_provider_unknown() {
+        let result = validate_provider("test", "gmail");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "test");
+        assert!(err.error.contains("gmail"));
+    }
+
+    #[test]
+    fn resolve_default_account_present() {
+        let sessions: HashMap<String, ()> = HashMap::from([("fastmail".into(), ())]);
+        let result = resolve_default_account("fastmail".into(), &sessions);
+        assert_eq!(result, "fastmail");
+    }
+
+    #[test]
+    fn resolve_default_account_missing_falls_back() {
+        let mut sessions: HashMap<String, ()> = HashMap::new();
+        sessions.insert("outlook".into(), ());
+        let result = resolve_default_account("fastmail".into(), &sessions);
+        assert_eq!(result, "outlook");
+    }
+
+    #[test]
+    fn resolve_default_account_empty_sessions() {
+        let sessions: HashMap<String, ()> = HashMap::new();
+        let result = resolve_default_account("fastmail".into(), &sessions);
+        assert_eq!(result, "");
     }
 }

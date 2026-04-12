@@ -238,7 +238,10 @@ async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             "isDefault": *name == state.default_account
         }));
     }
-    Json(serde_json::json!(accounts))
+    Json(serde_json::json!({
+        "accounts": accounts,
+        "errors": state.account_errors,
+    }))
 }
 
 async fn list_identities(

@@ -114,6 +114,8 @@ function init() {
     els.composeAttachmentsList = document.getElementById('compose-attachments-list');
     els.composeFileInput = document.getElementById('compose-file-input');
     els.starredItem = document.getElementById('starred-item');
+    els.accountErrorBanner = document.getElementById('account-error-banner');
+    els.accountErrorDetails = document.getElementById('account-error-details');
     // Event listeners
     if (els.starredItem) {
         els.starredItem.addEventListener('click', toggleStarredOnly);
@@ -242,15 +244,35 @@ async function api(method, path, body = null, signal = null) {
 
 async function loadAccounts() {
     try {
-        state.accounts = await fetch('/api/accounts').then(r => r.json());
+        const data = await fetch('/api/accounts').then(r => r.json());
+        state.accounts = data.accounts;
         renderAccounts();
 
-        // Select default account
+        if (data.errors && data.errors.length > 0) {
+            showAccountErrors(data.errors);
+        }
+
         const defaultAcc = state.accounts.find(a => a.isDefault) || state.accounts[0];
         if (defaultAcc) selectAccount(defaultAcc);
+        else if (data.errors && data.errors.length > 0) {
+            showStatus('No accounts connected', 'error');
+        }
     } catch (err) {
         showStatus('Failed to load accounts: ' + err.message, 'error');
     }
+}
+
+function showAccountErrors(errors) {
+    const count = errors.length;
+    const list = errors.map(e =>
+        `<li><strong>${e.account}</strong> (${e.provider}): ${e.error}</li>`
+    ).join('');
+    els.accountErrorDetails.innerHTML =
+        `<strong>${count} account${count > 1 ? 's' : ''} failed to connect:</strong><ul>${list}</ul>`;
+    els.accountErrorBanner.classList.remove('hidden');
+    els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
+        els.accountErrorBanner.classList.add('hidden');
+    });
 }
 
 function renderAccounts() {
