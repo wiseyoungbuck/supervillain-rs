@@ -47,27 +47,11 @@ const REDIRECT_URI: &str = "http://localhost:8400/callback";
 // Phase 1: calendar only. Phase 2 adds Mail.ReadWrite Mail.Send
 const SCOPES: &str = "Calendars.ReadWrite offline_access";
 
-// =============================================================================
-// OAuth2 PKCE (delegates to shared oauth module)
-// =============================================================================
-
 use crate::oauth;
-
-fn generate_code_verifier() -> String {
-    oauth::generate_code_verifier()
-}
-
-fn generate_state() -> String {
-    oauth::generate_state()
-}
-
-fn code_challenge(verifier: &str) -> String {
-    oauth::code_challenge(verifier)
-}
 
 /// Build the authorization URL for the OAuth2 PKCE flow
 pub fn auth_url(client_id: &str, code_verifier: &str, state: &str) -> String {
-    let challenge = code_challenge(code_verifier);
+    let challenge = oauth::code_challenge(code_verifier);
     let mut url = url::Url::parse(AUTH_URL).expect("valid auth base URL");
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
@@ -202,8 +186,8 @@ pub async fn oauth_flow(
     client_id: &str,
     token_path: &std::path::Path,
 ) -> Result<OutlookSession, Error> {
-    let code_verifier = generate_code_verifier();
-    let expected_state = generate_state();
+    let code_verifier = oauth::generate_code_verifier();
+    let expected_state = oauth::generate_state();
     let url = auth_url(client_id, &code_verifier, &expected_state);
 
     // Start a one-shot server to receive the callback

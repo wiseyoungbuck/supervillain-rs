@@ -716,7 +716,7 @@ pub async fn download_blob(
     let url = download_url
         .replace("{accountId}", account_id)
         .replace("{blobId}", blob_id)
-        .replace("{name}", filename)
+        .replace("{name}", &percent_encode_path(filename))
         .replace("{type}", "application/octet-stream");
 
     let resp = s
