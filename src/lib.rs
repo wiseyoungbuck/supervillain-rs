@@ -2,6 +2,7 @@ pub mod calendar;
 pub mod error;
 pub mod glob;
 pub mod jmap;
+pub mod oauth;
 pub mod outlook;
 pub mod provider;
 pub mod routes;

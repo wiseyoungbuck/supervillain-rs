@@ -132,60 +132,6 @@ fn parse_date_offset(s: &str) -> Option<NaiveDate> {
 }
 
 // =============================================================================
-// JMAP filter translation
-// =============================================================================
-
-pub fn to_jmap_filter(query: Option<&ParsedQuery>, mailbox_id: Option<&str>) -> serde_json::Value {
-    let mut conditions: Vec<serde_json::Value> = Vec::new();
-
-    if let Some(mb) = mailbox_id {
-        conditions.push(serde_json::json!({"inMailbox": mb}));
-    }
-
-    if let Some(q) = query {
-        for from in &q.from {
-            conditions.push(serde_json::json!({"from": from}));
-        }
-        for to in &q.to {
-            conditions.push(serde_json::json!({"to": to}));
-        }
-        for subject in &q.subject {
-            conditions.push(serde_json::json!({"subject": subject}));
-        }
-        if q.has_attachment {
-            conditions.push(serde_json::json!({"hasAttachment": true}));
-        }
-        if let Some(true) = q.is_unread {
-            conditions.push(serde_json::json!({"notKeyword": "$seen"}));
-        }
-        if let Some(false) = q.is_unread {
-            conditions.push(serde_json::json!({"hasKeyword": "$seen"}));
-        }
-        if let Some(true) = q.is_flagged {
-            conditions.push(serde_json::json!({"hasKeyword": "$flagged"}));
-        }
-        if let Some(after) = q.after {
-            conditions.push(serde_json::json!({"after": format!("{}T00:00:00Z", after)}));
-        }
-        if let Some(before) = q.before {
-            conditions.push(serde_json::json!({"before": format!("{}T00:00:00Z", before)}));
-        }
-        if !q.text.is_empty() {
-            conditions.push(serde_json::json!({"text": q.text}));
-        }
-    }
-
-    match conditions.len() {
-        0 => serde_json::json!({}),
-        1 => conditions.into_iter().next().unwrap(),
-        _ => serde_json::json!({
-            "operator": "AND",
-            "conditions": conditions
-        }),
-    }
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
@@ -326,93 +272,6 @@ mod tests {
         assert!(q.before.is_none());
     }
 
-    // --- Translate tests ---
-
-    #[test]
-    fn jmap_filter_empty() {
-        let filter = to_jmap_filter(None, None);
-        assert_eq!(filter, serde_json::json!({}));
-    }
-
-    #[test]
-    fn jmap_filter_mailbox_only() {
-        let filter = to_jmap_filter(None, Some("inbox-id"));
-        assert_eq!(filter, serde_json::json!({"inMailbox": "inbox-id"}));
-    }
-
-    #[test]
-    fn jmap_filter_from() {
-        let q = ParsedQuery {
-            from: vec!["john@example.com".into()],
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"from": "john@example.com"}));
-    }
-
-    #[test]
-    fn jmap_filter_unread() {
-        let q = ParsedQuery {
-            is_unread: Some(true),
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"notKeyword": "$seen"}));
-    }
-
-    #[test]
-    fn jmap_filter_flagged() {
-        let q = ParsedQuery {
-            is_flagged: Some(true),
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"hasKeyword": "$flagged"}));
-    }
-
-    #[test]
-    fn jmap_filter_attachment() {
-        let q = ParsedQuery {
-            has_attachment: true,
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"hasAttachment": true}));
-    }
-
-    #[test]
-    fn jmap_filter_text() {
-        let q = ParsedQuery {
-            text: "search terms".into(),
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"text": "search terms"}));
-    }
-
-    #[test]
-    fn jmap_filter_multiple_conditions_uses_and() {
-        let q = ParsedQuery {
-            from: vec!["alice@example.com".into()],
-            has_attachment: true,
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), Some("inbox-id"));
-        assert_eq!(filter["operator"], "AND");
-        let conditions = filter["conditions"].as_array().unwrap();
-        assert_eq!(conditions.len(), 3);
-    }
-
-    #[test]
-    fn jmap_filter_date_after() {
-        let q = ParsedQuery {
-            after: Some(NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(filter, serde_json::json!({"after": "2026-01-15T00:00:00Z"}));
-    }
-
     // --- Absolute date tests ---
 
     #[test]
@@ -469,18 +328,5 @@ mod tests {
     fn parse_newer_than_invalid_unit() {
         let q = parse_query("newer_than:1x");
         assert!(q.after.is_none());
-    }
-
-    #[test]
-    fn jmap_filter_date_before() {
-        let q = ParsedQuery {
-            before: Some(NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
-            ..Default::default()
-        };
-        let filter = to_jmap_filter(Some(&q), None);
-        assert_eq!(
-            filter,
-            serde_json::json!({"before": "2026-06-30T00:00:00Z"})
-        );
     }
 }

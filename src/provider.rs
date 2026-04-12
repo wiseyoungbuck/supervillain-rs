@@ -209,34 +209,7 @@ pub async fn upload_blob(
     body: &[u8],
 ) -> Result<(String, i64), Error> {
     match s {
-        ProviderSession::Fastmail(s) => {
-            let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
-            let upload_url = s.upload_url.as_ref().ok_or(Error::NotConnected)?;
-            let url = upload_url.replace("{accountId}", account_id);
-
-            let resp = s
-                .client
-                .post(&url)
-                .header("Authorization", &s.auth_header)
-                .header("Content-Type", content_type)
-                .body(reqwest::Body::from(body.to_vec()))
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(Error::Internal(format!("Upload failed ({status}): {text}")));
-            }
-
-            let result: serde_json::Value = resp.json().await?;
-            let blob_id = result["blobId"]
-                .as_str()
-                .ok_or_else(|| Error::Internal("Missing blobId in upload response".into()))?
-                .to_string();
-            let size = result["size"].as_i64().unwrap_or(0);
-            Ok((blob_id, size))
-        }
+        ProviderSession::Fastmail(s) => jmap::upload_blob(s, content_type, body).await,
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Blob upload not supported for Outlook accounts".into(),
         )),
@@ -250,37 +223,7 @@ pub async fn download_blob(
     filename: &str,
 ) -> Result<(String, Vec<u8>), Error> {
     match s {
-        ProviderSession::Fastmail(s) => {
-            let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
-            let download_url = s.download_url.as_ref().ok_or(Error::NotConnected)?;
-
-            let url = download_url
-                .replace("{accountId}", account_id)
-                .replace("{blobId}", blob_id)
-                .replace("{name}", filename)
-                .replace("{type}", "application/octet-stream");
-
-            let resp = s
-                .client
-                .get(&url)
-                .header("Authorization", &s.auth_header)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                return Err(Error::NotFound("Attachment not found".into()));
-            }
-
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/octet-stream")
-                .to_string();
-
-            let bytes = resp.bytes().await?;
-            Ok((content_type, bytes.to_vec()))
-        }
+        ProviderSession::Fastmail(s) => jmap::download_blob(s, blob_id, filename).await,
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Attachment downloads not supported for Outlook accounts".into(),
         )),

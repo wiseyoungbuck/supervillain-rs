@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vimmail::{jmap, outlook, provider::ProviderSession, routes, splits, types::AppState};
+use vimmail::{
+    jmap, outlook, provider, provider::ProviderSession, routes, splits, types::AppState,
+};
 
 #[tokio::main]
 async fn main() {
@@ -124,21 +126,15 @@ async fn main() {
     let splits_config_path = config_dir.join("supervillain/splits.json");
     if let Some(session_lock) = sessions.get(&default_account) {
         let mut session = session_lock.write().await;
-        match &mut *session {
-            ProviderSession::Fastmail(s) => match jmap::get_identities(s).await {
-                Ok(identities) => {
-                    if let Some(config) =
-                        splits::seed_from_identities(&identities, &splits_config_path)
-                    {
-                        let names: Vec<_> = config.splits.iter().map(|s| s.name.as_str()).collect();
-                        tracing::info!("Auto-created split tabs: {}", names.join(", "));
-                    }
+        match provider::get_identities(&mut session).await {
+            Ok(identities) => {
+                if let Some(config) = splits::seed_from_identities(&identities, &splits_config_path)
+                {
+                    let names: Vec<_> = config.splits.iter().map(|s| s.name.as_str()).collect();
+                    tracing::info!("Auto-created split tabs: {}", names.join(", "));
                 }
-                Err(e) => tracing::warn!("Failed to fetch identities for split seeding: {e}"),
-            },
-            ProviderSession::Outlook(_) => {
-                // Outlook doesn't support identity-based split seeding yet
             }
+            Err(e) => tracing::warn!("Failed to fetch identities for split seeding: {e}"),
         }
     }
 

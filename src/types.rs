@@ -1,19 +1,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-/// Deserialize a value that may be explicit JSON `null` into `T::default()`.
-/// `#[serde(default)]` only supplies a default when the key is absent; this
-/// also handles `"field": null` which JMAP allows for address headers, subject,
-/// preview, and size (RFC 8621 §4.1.2.3).
-fn nullable_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
-}
 
 // =============================================================================
 // Email types
@@ -91,94 +79,6 @@ pub struct Identity {
     pub id: String,
     pub email: String,
     pub name: String,
-}
-
-// =============================================================================
-// JMAP response types (deserialize-only)
-// =============================================================================
-
-/// JMAP session discovery response
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JmapSessionResponse {
-    pub api_url: Option<String>,
-    pub upload_url: Option<String>,
-    pub download_url: Option<String>,
-    #[serde(default)]
-    pub primary_accounts: HashMap<String, String>,
-}
-
-/// Recursive MIME body structure part
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BodyStructurePart {
-    #[serde(rename = "type", default)]
-    pub mime_type: String,
-    #[serde(default)]
-    pub blob_id: Option<String>,
-    #[serde(default)]
-    pub part_id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub disposition: Option<String>,
-    #[serde(default)]
-    pub cid: Option<String>,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub size: i64,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub sub_parts: Vec<BodyStructurePart>,
-}
-
-/// Body part reference (for textBody/htmlBody arrays)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BodyPartRef {
-    #[serde(default)]
-    pub part_id: String,
-}
-
-/// Body value entry from the bodyValues map
-#[derive(Debug, Clone, Deserialize)]
-pub struct BodyValue {
-    #[serde(default)]
-    pub value: String,
-}
-
-/// Raw JMAP Email/get response item. Converted to Email after body processing.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct JmapEmailRaw {
-    pub id: String,
-    pub blob_id: String,
-    pub thread_id: String,
-    #[serde(default)]
-    pub mailbox_ids: HashMap<String, bool>,
-    #[serde(default)]
-    pub keywords: HashMap<String, bool>,
-    #[serde(default)]
-    pub received_at: Option<String>,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub subject: String,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub from: Vec<EmailAddress>,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub to: Vec<EmailAddress>,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub cc: Vec<EmailAddress>,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub preview: String,
-    #[serde(default)]
-    pub has_attachment: bool,
-    #[serde(default, deserialize_with = "nullable_default")]
-    pub size: i64,
-    #[serde(default)]
-    pub text_body: Vec<BodyPartRef>,
-    #[serde(default)]
-    pub html_body: Vec<BodyPartRef>,
-    #[serde(default)]
-    pub body_values: HashMap<String, BodyValue>,
-    pub body_structure: Option<BodyStructurePart>,
 }
 
 // =============================================================================
@@ -763,81 +663,5 @@ mod tests {
         let deserialized: Mailbox = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.total_emails, 42);
         assert_eq!(deserialized.unread_emails, 5);
-    }
-
-    #[test]
-    fn body_structure_part_from_jmap() {
-        let json = serde_json::json!({
-            "type": "multipart/mixed",
-            "subParts": [
-                {
-                    "type": "text/plain",
-                    "partId": "1",
-                    "blobId": "b1",
-                    "size": 100
-                },
-                {
-                    "type": "application/pdf",
-                    "partId": "2",
-                    "blobId": "b2",
-                    "name": "report.pdf",
-                    "disposition": "attachment",
-                    "size": 5000
-                }
-            ]
-        });
-        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
-        assert_eq!(part.mime_type, "multipart/mixed");
-        assert_eq!(part.sub_parts.len(), 2);
-        assert_eq!(part.sub_parts[0].mime_type, "text/plain");
-        assert_eq!(part.sub_parts[1].name.as_deref(), Some("report.pdf"));
-        assert_eq!(part.sub_parts[1].size, 5000);
-    }
-
-    #[test]
-    fn body_structure_part_defaults_on_missing_fields() {
-        let json = serde_json::json!({});
-        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
-        assert_eq!(part.mime_type, "");
-        assert!(part.blob_id.is_none());
-        assert!(part.name.is_none());
-        assert!(part.sub_parts.is_empty());
-        assert_eq!(part.size, 0);
-    }
-
-    #[test]
-    fn jmap_email_raw_handles_explicit_null_fields() {
-        // JMAP RFC 8621 §4.1.2.3: address headers are EmailAddress[]|null,
-        // subject/preview are String|null. Explicit null must not crash serde.
-        let json = serde_json::json!({
-            "id": "e1",
-            "blobId": "b1",
-            "threadId": "t1",
-            "from": null,
-            "to": null,
-            "cc": null,
-            "subject": null,
-            "preview": null,
-            "size": null
-        });
-        let raw: JmapEmailRaw = serde_json::from_value(json).unwrap();
-        assert!(raw.from.is_empty());
-        assert!(raw.to.is_empty());
-        assert!(raw.cc.is_empty());
-        assert_eq!(raw.subject, "");
-        assert_eq!(raw.preview, "");
-        assert_eq!(raw.size, 0);
-    }
-
-    #[test]
-    fn body_structure_part_handles_null_size_and_sub_parts() {
-        let json = serde_json::json!({
-            "type": "text/plain",
-            "size": null,
-            "subParts": null
-        });
-        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
-        assert_eq!(part.size, 0);
-        assert!(part.sub_parts.is_empty());
     }
 }

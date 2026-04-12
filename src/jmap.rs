@@ -2,7 +2,108 @@ use crate::calendar;
 use crate::error::Error;
 use crate::types::ParsedQuery;
 use crate::types::*;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
+
+// =============================================================================
+// JMAP deserialization types (internal to this module)
+// =============================================================================
+
+/// Deserialize a value that may be explicit JSON `null` into `T::default()`.
+/// `#[serde(default)]` only supplies a default when the key is absent; this
+/// also handles `"field": null` which JMAP allows for address headers, subject,
+/// preview, and size (RFC 8621 §4.1.2.3).
+fn nullable_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
+/// JMAP session discovery response
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JmapSessionResponse {
+    pub api_url: Option<String>,
+    pub upload_url: Option<String>,
+    pub download_url: Option<String>,
+    #[serde(default)]
+    pub primary_accounts: HashMap<String, String>,
+}
+
+/// Recursive MIME body structure part
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyStructurePart {
+    #[serde(rename = "type", default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub blob_id: Option<String>,
+    #[serde(default)]
+    pub part_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub disposition: Option<String>,
+    #[serde(default)]
+    pub cid: Option<String>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub size: i64,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub sub_parts: Vec<BodyStructurePart>,
+}
+
+/// Body part reference (for textBody/htmlBody arrays)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyPartRef {
+    #[serde(default)]
+    pub part_id: String,
+}
+
+/// Body value entry from the bodyValues map
+#[derive(Debug, Clone, Deserialize)]
+struct BodyValue {
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Raw JMAP Email/get response item. Converted to Email after body processing.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JmapEmailRaw {
+    pub id: String,
+    pub blob_id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub mailbox_ids: HashMap<String, bool>,
+    #[serde(default)]
+    pub keywords: HashMap<String, bool>,
+    #[serde(default)]
+    pub received_at: Option<String>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub subject: String,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub from: Vec<EmailAddress>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub to: Vec<EmailAddress>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub cc: Vec<EmailAddress>,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub preview: String,
+    #[serde(default)]
+    pub has_attachment: bool,
+    #[serde(default, deserialize_with = "nullable_default")]
+    pub size: i64,
+    #[serde(default)]
+    pub text_body: Vec<BodyPartRef>,
+    #[serde(default)]
+    pub html_body: Vec<BodyPartRef>,
+    #[serde(default)]
+    pub body_values: HashMap<String, BodyValue>,
+    pub body_structure: Option<BodyStructurePart>,
+}
 
 // =============================================================================
 // JMAP Session
@@ -192,6 +293,60 @@ pub async fn get_identity_for_email(
     Ok(found)
 }
 
+// =============================================================================
+// JMAP filter translation
+// =============================================================================
+
+fn to_jmap_filter(query: Option<&ParsedQuery>, mailbox_id: Option<&str>) -> serde_json::Value {
+    let mut conditions: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(mb) = mailbox_id {
+        conditions.push(serde_json::json!({"inMailbox": mb}));
+    }
+
+    if let Some(q) = query {
+        for from in &q.from {
+            conditions.push(serde_json::json!({"from": from}));
+        }
+        for to in &q.to {
+            conditions.push(serde_json::json!({"to": to}));
+        }
+        for subject in &q.subject {
+            conditions.push(serde_json::json!({"subject": subject}));
+        }
+        if q.has_attachment {
+            conditions.push(serde_json::json!({"hasAttachment": true}));
+        }
+        if let Some(true) = q.is_unread {
+            conditions.push(serde_json::json!({"notKeyword": "$seen"}));
+        }
+        if let Some(false) = q.is_unread {
+            conditions.push(serde_json::json!({"hasKeyword": "$seen"}));
+        }
+        if let Some(true) = q.is_flagged {
+            conditions.push(serde_json::json!({"hasKeyword": "$flagged"}));
+        }
+        if let Some(after) = q.after {
+            conditions.push(serde_json::json!({"after": format!("{}T00:00:00Z", after)}));
+        }
+        if let Some(before) = q.before {
+            conditions.push(serde_json::json!({"before": format!("{}T00:00:00Z", before)}));
+        }
+        if !q.text.is_empty() {
+            conditions.push(serde_json::json!({"text": q.text}));
+        }
+    }
+
+    match conditions.len() {
+        0 => serde_json::json!({}),
+        1 => conditions.into_iter().next().unwrap(),
+        _ => serde_json::json!({
+            "operator": "AND",
+            "conditions": conditions
+        }),
+    }
+}
+
 pub async fn query_emails(
     s: &JmapSession,
     mailbox_id: Option<&str>,
@@ -201,7 +356,7 @@ pub async fn query_emails(
 ) -> Result<Vec<String>, Error> {
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
-    let filter = crate::search::to_jmap_filter(query, mailbox_id);
+    let filter = to_jmap_filter(query, mailbox_id);
 
     let resp = jmap_call(
         s,
@@ -511,6 +666,79 @@ fn collect_inline_cids(part: &BodyStructurePart, out: &mut Vec<(String, String, 
         let name = part.name.as_deref().unwrap_or("inline");
         out.push((cid.to_string(), blob_id.to_string(), name.to_string()));
     }
+}
+
+// =============================================================================
+// Blob upload/download
+// =============================================================================
+
+pub async fn upload_blob(
+    s: &JmapSession,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(String, i64), Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let upload_url = s.upload_url.as_ref().ok_or(Error::NotConnected)?;
+    let url = upload_url.replace("{accountId}", account_id);
+
+    let resp = s
+        .client
+        .post(&url)
+        .header("Authorization", &s.auth_header)
+        .header("Content-Type", content_type)
+        .body(reqwest::Body::from(body.to_vec()))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::Internal(format!("Upload failed ({status}): {text}")));
+    }
+
+    let result: serde_json::Value = resp.json().await?;
+    let blob_id = result["blobId"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("Missing blobId in upload response".into()))?
+        .to_string();
+    let size = result["size"].as_i64().unwrap_or(0);
+    Ok((blob_id, size))
+}
+
+pub async fn download_blob(
+    s: &JmapSession,
+    blob_id: &str,
+    filename: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let download_url = s.download_url.as_ref().ok_or(Error::NotConnected)?;
+
+    let url = download_url
+        .replace("{accountId}", account_id)
+        .replace("{blobId}", blob_id)
+        .replace("{name}", filename)
+        .replace("{type}", "application/octet-stream");
+
+    let resp = s
+        .client
+        .get(&url)
+        .header("Authorization", &s.auth_header)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(Error::NotFound("Attachment not found".into()));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = resp.bytes().await?;
+    Ok((content_type, bytes.to_vec()))
 }
 
 // =============================================================================
@@ -2640,5 +2868,181 @@ END:VCALENDAR";
             replace_case_insensitive(html, "cid:abc", "/img/1.png"),
             "no cids here"
         );
+    }
+
+    // --- JMAP filter translation tests (moved from search.rs) ---
+
+    #[test]
+    fn jmap_filter_empty() {
+        let filter = to_jmap_filter(None, None);
+        assert_eq!(filter, serde_json::json!({}));
+    }
+
+    #[test]
+    fn jmap_filter_mailbox_only() {
+        let filter = to_jmap_filter(None, Some("inbox-id"));
+        assert_eq!(filter, serde_json::json!({"inMailbox": "inbox-id"}));
+    }
+
+    #[test]
+    fn jmap_filter_from() {
+        let q = ParsedQuery {
+            from: vec!["john@example.com".into()],
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"from": "john@example.com"}));
+    }
+
+    #[test]
+    fn jmap_filter_unread() {
+        let q = ParsedQuery {
+            is_unread: Some(true),
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"notKeyword": "$seen"}));
+    }
+
+    #[test]
+    fn jmap_filter_flagged() {
+        let q = ParsedQuery {
+            is_flagged: Some(true),
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"hasKeyword": "$flagged"}));
+    }
+
+    #[test]
+    fn jmap_filter_attachment() {
+        let q = ParsedQuery {
+            has_attachment: true,
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"hasAttachment": true}));
+    }
+
+    #[test]
+    fn jmap_filter_text() {
+        let q = ParsedQuery {
+            text: "search terms".into(),
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"text": "search terms"}));
+    }
+
+    #[test]
+    fn jmap_filter_multiple_conditions_uses_and() {
+        let q = ParsedQuery {
+            from: vec!["alice@example.com".into()],
+            has_attachment: true,
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), Some("inbox-id"));
+        assert_eq!(filter["operator"], "AND");
+        let conditions = filter["conditions"].as_array().unwrap();
+        assert_eq!(conditions.len(), 3);
+    }
+
+    #[test]
+    fn jmap_filter_date_after() {
+        let q = ParsedQuery {
+            after: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(filter, serde_json::json!({"after": "2026-01-15T00:00:00Z"}));
+    }
+
+    #[test]
+    fn jmap_filter_date_before() {
+        let q = ParsedQuery {
+            before: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
+            ..Default::default()
+        };
+        let filter = to_jmap_filter(Some(&q), None);
+        assert_eq!(
+            filter,
+            serde_json::json!({"before": "2026-06-30T00:00:00Z"})
+        );
+    }
+
+    // --- JMAP deserialization type tests (moved from types.rs) ---
+
+    #[test]
+    fn body_structure_part_from_jmap() {
+        let json = serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                {
+                    "type": "text/plain",
+                    "partId": "1",
+                    "blobId": "b1",
+                    "size": 100
+                },
+                {
+                    "type": "application/pdf",
+                    "partId": "2",
+                    "blobId": "b2",
+                    "name": "report.pdf",
+                    "disposition": "attachment",
+                    "size": 5000
+                }
+            ]
+        });
+        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
+        assert_eq!(part.mime_type, "multipart/mixed");
+        assert_eq!(part.sub_parts.len(), 2);
+        assert_eq!(part.sub_parts[0].mime_type, "text/plain");
+        assert_eq!(part.sub_parts[1].name.as_deref(), Some("report.pdf"));
+        assert_eq!(part.sub_parts[1].size, 5000);
+    }
+
+    #[test]
+    fn body_structure_part_defaults_on_missing_fields() {
+        let json = serde_json::json!({});
+        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
+        assert_eq!(part.mime_type, "");
+        assert!(part.blob_id.is_none());
+        assert!(part.name.is_none());
+        assert!(part.sub_parts.is_empty());
+        assert_eq!(part.size, 0);
+    }
+
+    #[test]
+    fn jmap_email_raw_handles_explicit_null_fields() {
+        let json = serde_json::json!({
+            "id": "e1",
+            "blobId": "b1",
+            "threadId": "t1",
+            "from": null,
+            "to": null,
+            "cc": null,
+            "subject": null,
+            "preview": null,
+            "size": null
+        });
+        let raw: JmapEmailRaw = serde_json::from_value(json).unwrap();
+        assert!(raw.from.is_empty());
+        assert!(raw.to.is_empty());
+        assert!(raw.cc.is_empty());
+        assert_eq!(raw.subject, "");
+        assert_eq!(raw.preview, "");
+        assert_eq!(raw.size, 0);
+    }
+
+    #[test]
+    fn body_structure_part_handles_null_size_and_sub_parts() {
+        let json = serde_json::json!({
+            "type": "text/plain",
+            "size": null,
+            "subParts": null
+        });
+        let part: BodyStructurePart = serde_json::from_value(json).unwrap();
+        assert_eq!(part.size, 0);
+        assert!(part.sub_parts.is_empty());
     }
 }
