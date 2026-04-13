@@ -688,9 +688,8 @@ mod tests {
             "FASTMAIL_USERNAME" => Ok("env-user@fastmail.com".into()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let result = validate_fastmail_config("personal", &account, env);
-        assert!(result.is_ok());
-        let (username, token) = result.unwrap();
+        let (username, token) = validate_fastmail_config("personal", &account, env)
+            .expect("should succeed with env fallback for username");
         assert_eq!(username, "env-user@fastmail.com");
         assert_eq!(token, "fmu1-xxx");
     }
@@ -706,9 +705,8 @@ mod tests {
             "FASTMAIL_API_TOKEN" => Ok("fmu1-from-env".into()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let result = validate_fastmail_config("personal", &account, env);
-        assert!(result.is_ok());
-        let (username, token) = result.unwrap();
+        let (username, token) = validate_fastmail_config("personal", &account, env)
+            .expect("should succeed with env fallback for token");
         assert_eq!(username, "alice@fastmail.com");
         assert_eq!(token, "fmu1-from-env");
     }
@@ -728,9 +726,8 @@ mod tests {
             "FASTMAIL_API_TOKEN" => Ok("fmu1-env".into()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let result = validate_fastmail_config("personal", &account, env);
-        assert!(result.is_ok());
-        let (username, token) = result.unwrap();
+        let (username, token) = validate_fastmail_config("personal", &account, env)
+            .expect("config values should take precedence over env vars");
         assert_eq!(username, "config-user@fastmail.com");
         assert_eq!(token, "fmu1-config");
     }
