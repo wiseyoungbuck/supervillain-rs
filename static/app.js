@@ -126,6 +126,9 @@ function init() {
             }
         });
     }
+    els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
+        els.accountErrorBanner.classList.add('hidden');
+    });
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
@@ -265,14 +268,11 @@ async function loadAccounts() {
 function showAccountErrors(errors) {
     const count = errors.length;
     const list = errors.map(e =>
-        `<li><strong>${e.account}</strong> (${e.provider}): ${e.error}</li>`
+        `<li><strong>${escapeHtml(e.account)}</strong> (${escapeHtml(e.provider)}): ${escapeHtml(e.error)}</li>`
     ).join('');
     els.accountErrorDetails.innerHTML =
         `<strong>${count} account${count > 1 ? 's' : ''} failed to connect:</strong><ul>${list}</ul>`;
     els.accountErrorBanner.classList.remove('hidden');
-    els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
-        els.accountErrorBanner.classList.add('hidden');
-    });
 }
 
 function renderAccounts() {

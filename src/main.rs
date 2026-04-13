@@ -146,7 +146,15 @@ async fn main() {
                 );
             }
 
-            _ => unreachable!(), // validate_provider already checked
+            other => {
+                tracing::warn!("[{name}] Unknown provider '{other}'");
+                account_errors.push(AccountError {
+                    account: name.clone(),
+                    provider: other.into(),
+                    error: format!("Unknown provider '{other}'"),
+                });
+                continue;
+            }
         }
     }
 
@@ -576,6 +584,9 @@ mod tests {
 
     #[test]
     fn validate_fastmail_config_missing_username() {
+        // Remove env fallbacks so the test reliably fails on missing config
+        // SAFETY: test-only, no concurrent threads reading this var
+        unsafe { std::env::remove_var("FASTMAIL_USERNAME") };
         let account = AccountConfig {
             provider: "fastmail".into(),
             props: HashMap::from([("api-token".into(), "fmu1-xxx".into())]),
@@ -590,6 +601,9 @@ mod tests {
 
     #[test]
     fn validate_fastmail_config_missing_token() {
+        // Remove env fallback so the test reliably fails on missing config
+        // SAFETY: test-only, no concurrent threads reading this var
+        unsafe { std::env::remove_var("FASTMAIL_API_TOKEN") };
         let account = AccountConfig {
             provider: "fastmail".into(),
             props: HashMap::from([("username".into(), "alice@fastmail.com".into())]),
