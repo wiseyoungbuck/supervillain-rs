@@ -61,14 +61,15 @@ async fn main() {
 
         match account.provider.as_str() {
             "fastmail" => {
-                let (username, token) = match validate_fastmail_config(name, account) {
-                    Ok(creds) => creds,
-                    Err(e) => {
-                        tracing::warn!("[{name}] {}", e.error);
-                        account_errors.push(e);
-                        continue;
-                    }
-                };
+                let (username, token) =
+                    match validate_fastmail_config(name, account, |k| std::env::var(k)) {
+                        Ok(creds) => creds,
+                        Err(e) => {
+                            tracing::warn!("[{name}] {}", e.error);
+                            account_errors.push(e);
+                            continue;
+                        }
+                    };
 
                 let mut session = jmap::JmapSession::new(&username, &format!("Bearer {token}"));
                 if let Err(e) = jmap::connect(&mut session).await {
@@ -307,10 +308,11 @@ fn validate_provider(name: &str, provider: &str) -> Result<(), AccountError> {
 fn validate_fastmail_config(
     name: &str,
     account: &AccountConfig,
+    env_var: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(String, String), AccountError> {
     let username = account
         .get("username")
-        .or_else(|| std::env::var("FASTMAIL_USERNAME").ok())
+        .or_else(|| env_var("FASTMAIL_USERNAME").ok())
         .ok_or_else(|| AccountError {
             account: name.into(),
             provider: "fastmail".into(),
@@ -318,7 +320,7 @@ fn validate_fastmail_config(
         })?;
     let token = account
         .get("api-token")
-        .or_else(|| std::env::var("FASTMAIL_API_TOKEN").ok())
+        .or_else(|| env_var("FASTMAIL_API_TOKEN").ok())
         .ok_or_else(|| AccountError {
             account: name.into(),
             provider: "fastmail".into(),
@@ -566,6 +568,10 @@ mod tests {
         assert!(accounts.contains_key("sectioned"));
     }
 
+    fn no_env(_: &str) -> Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
+
     #[test]
     fn validate_fastmail_config_valid() {
         let account = AccountConfig {
@@ -575,7 +581,7 @@ mod tests {
                 ("api-token".into(), "fmu1-xxx".into()),
             ]),
         };
-        let result = validate_fastmail_config("personal", &account);
+        let result = validate_fastmail_config("personal", &account, no_env);
         assert!(result.is_ok());
         let (username, token) = result.unwrap();
         assert_eq!(username, "alice@fastmail.com");
@@ -584,14 +590,11 @@ mod tests {
 
     #[test]
     fn validate_fastmail_config_missing_username() {
-        // Remove env fallbacks so the test reliably fails on missing config
-        // SAFETY: test-only, no concurrent threads reading this var
-        unsafe { std::env::remove_var("FASTMAIL_USERNAME") };
         let account = AccountConfig {
             provider: "fastmail".into(),
             props: HashMap::from([("api-token".into(), "fmu1-xxx".into())]),
         };
-        let result = validate_fastmail_config("personal", &account);
+        let result = validate_fastmail_config("personal", &account, no_env);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.account, "personal");
@@ -601,14 +604,11 @@ mod tests {
 
     #[test]
     fn validate_fastmail_config_missing_token() {
-        // Remove env fallback so the test reliably fails on missing config
-        // SAFETY: test-only, no concurrent threads reading this var
-        unsafe { std::env::remove_var("FASTMAIL_API_TOKEN") };
         let account = AccountConfig {
             provider: "fastmail".into(),
             props: HashMap::from([("username".into(), "alice@fastmail.com".into())]),
         };
-        let result = validate_fastmail_config("personal", &account);
+        let result = validate_fastmail_config("personal", &account, no_env);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.account, "personal");
