@@ -2268,6 +2268,62 @@ white   = '#fdf6e3'
             "email links should underline on hover"
         );
     }
+
+    #[test]
+    fn index_html_has_account_error_banner() {
+        assert!(
+            INDEX_HTML.contains("id=\"account-error-banner\""),
+            "index.html should contain the account error banner element"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"account-error-details\""),
+            "index.html should contain the account error details element"
+        );
+        assert!(
+            INDEX_HTML.contains("error-banner-dismiss"),
+            "index.html should contain the dismiss button"
+        );
+    }
+
+    #[test]
+    fn app_js_show_account_errors_escapes_html() {
+        assert!(
+            APP_JS.contains("escapeHtml(e.account)"),
+            "showAccountErrors should escape account name"
+        );
+        assert!(
+            APP_JS.contains("escapeHtml(e.provider)"),
+            "showAccountErrors should escape provider name"
+        );
+        assert!(
+            APP_JS.contains("escapeHtml(e.error)"),
+            "showAccountErrors should escape error message"
+        );
+    }
+
+    #[test]
+    fn app_js_loads_accounts_from_envelope() {
+        assert!(
+            APP_JS.contains("data.accounts"),
+            "loadAccounts should destructure accounts from envelope"
+        );
+        assert!(
+            APP_JS.contains("data.errors"),
+            "loadAccounts should check for errors in envelope"
+        );
+    }
+
+    #[test]
+    fn style_css_has_error_banner_styles() {
+        assert!(
+            STYLE_CSS.contains("#account-error-banner"),
+            "style.css should have error banner styles"
+        );
+        assert!(
+            STYLE_CSS.contains(".error-banner-dismiss"),
+            "style.css should have dismiss button styles"
+        );
+    }
 }
 
 // External dep for theme path

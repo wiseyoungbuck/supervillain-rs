@@ -676,4 +676,62 @@ mod tests {
         let result = resolve_default_account("fastmail".into(), &sessions);
         assert_eq!(result, "");
     }
+
+    #[test]
+    fn validate_fastmail_config_env_fallback_for_username() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([("api-token".into(), "fmu1-xxx".into())]),
+        };
+        // Simulate env var providing the username
+        let env = |key: &str| match key {
+            "FASTMAIL_USERNAME" => Ok("env-user@fastmail.com".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let result = validate_fastmail_config("personal", &account, env);
+        assert!(result.is_ok());
+        let (username, token) = result.unwrap();
+        assert_eq!(username, "env-user@fastmail.com");
+        assert_eq!(token, "fmu1-xxx");
+    }
+
+    #[test]
+    fn validate_fastmail_config_env_fallback_for_token() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([("username".into(), "alice@fastmail.com".into())]),
+        };
+        // Simulate env var providing the token
+        let env = |key: &str| match key {
+            "FASTMAIL_API_TOKEN" => Ok("fmu1-from-env".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let result = validate_fastmail_config("personal", &account, env);
+        assert!(result.is_ok());
+        let (username, token) = result.unwrap();
+        assert_eq!(username, "alice@fastmail.com");
+        assert_eq!(token, "fmu1-from-env");
+    }
+
+    #[test]
+    fn validate_fastmail_config_prefers_config_over_env() {
+        let account = AccountConfig {
+            provider: "fastmail".into(),
+            props: HashMap::from([
+                ("username".into(), "config-user@fastmail.com".into()),
+                ("api-token".into(), "fmu1-config".into()),
+            ]),
+        };
+        // Env provides different values — config should win
+        let env = |key: &str| match key {
+            "FASTMAIL_USERNAME" => Ok("env-user@fastmail.com".into()),
+            "FASTMAIL_API_TOKEN" => Ok("fmu1-env".into()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let result = validate_fastmail_config("personal", &account, env);
+        assert!(result.is_ok());
+        let (username, token) = result.unwrap();
+        assert_eq!(username, "config-user@fastmail.com");
+        assert_eq!(token, "fmu1-config");
+    }
 }
