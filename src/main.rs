@@ -147,6 +147,27 @@ async fn main() {
                 );
             }
 
+            "gmail" => {
+                let _client_id = match validate_gmail_config(name, account) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!("[{name}] {}", e.error);
+                        account_errors.push(e);
+                        continue;
+                    }
+                };
+
+                tracing::warn!(
+                    "[{name}] Gmail support is planned for Phase 3 — not yet implemented"
+                );
+                account_errors.push(AccountError {
+                    account: name.clone(),
+                    provider: "gmail".into(),
+                    error: "Gmail support is planned for Phase 3 — not yet implemented".into(),
+                });
+                continue;
+            }
+
             other => {
                 tracing::warn!("[{name}] Unknown provider '{other}'");
                 account_errors.push(AccountError {
@@ -296,7 +317,7 @@ impl AccountConfig {
 
 fn validate_provider(name: &str, provider: &str) -> Result<(), AccountError> {
     match provider {
-        "fastmail" | "outlook" => Ok(()),
+        "fastmail" | "outlook" | "gmail" => Ok(()),
         other => Err(AccountError {
             account: name.into(),
             provider: other.into(),
@@ -333,6 +354,14 @@ fn validate_outlook_config(name: &str, account: &AccountConfig) -> Result<String
     account.get("client-id").ok_or_else(|| AccountError {
         account: name.into(),
         provider: "outlook".into(),
+        error: "Missing 'client-id' in config".into(),
+    })
+}
+
+fn validate_gmail_config(name: &str, account: &AccountConfig) -> Result<String, AccountError> {
+    account.get("client-id").ok_or_else(|| AccountError {
+        account: name.into(),
+        provider: "gmail".into(),
         error: "Missing 'client-id' in config".into(),
     })
 }
@@ -644,15 +673,16 @@ mod tests {
     fn validate_provider_known() {
         assert!(validate_provider("test", "fastmail").is_ok());
         assert!(validate_provider("test", "outlook").is_ok());
+        assert!(validate_provider("test", "gmail").is_ok());
     }
 
     #[test]
     fn validate_provider_unknown() {
-        let result = validate_provider("test", "gmail");
+        let result = validate_provider("test", "yahoo");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.account, "test");
-        assert!(err.error.contains("gmail"));
+        assert!(err.error.contains("yahoo"));
     }
 
     #[test]
@@ -730,5 +760,88 @@ mod tests {
             .expect("config values should take precedence over env vars");
         assert_eq!(username, "config-user@fastmail.com");
         assert_eq!(token, "fmu1-config");
+    }
+
+    #[test]
+    fn load_config_stops_at_section_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "default-account = fastmail\n\n[fastmail]\nusername = a@fm.com\napi-token = tok\n",
+        )
+        .unwrap();
+        let config = load_config(&path.to_path_buf());
+        // Only the top-level key should be captured, not keys inside sections
+        assert_eq!(config.len(), 1);
+        assert_eq!(config.get("default-account").unwrap(), "fastmail");
+        assert!(config.get("username").is_none());
+    }
+
+    #[test]
+    fn parse_accounts_default_account_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "default-account = work\n\n[personal]\nprovider = fastmail\nusername = a@fm.com\napi-token = tok\n\n[work]\nprovider = fastmail\nusername = b@fm.com\napi-token = tok2\n",
+        )
+        .unwrap();
+        let flat = load_config(&path.to_path_buf());
+        // default-account should be parsed from flat config
+        assert_eq!(flat.get("default-account").unwrap(), "work");
+        let accounts = parse_accounts(&flat, &path.to_path_buf());
+        assert_eq!(accounts.len(), 2);
+    }
+
+    #[test]
+    fn validate_provider_gmail_known() {
+        assert!(validate_provider("test", "gmail").is_ok());
+    }
+
+    #[test]
+    fn validate_gmail_config_valid() {
+        let account = AccountConfig {
+            provider: "gmail".into(),
+            props: HashMap::from([("client-id".into(), "gmail-client-123".into())]),
+        };
+        let result = validate_gmail_config("personal", &account);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "gmail-client-123");
+    }
+
+    #[test]
+    fn validate_gmail_config_missing_client_id() {
+        let account = AccountConfig {
+            provider: "gmail".into(),
+            props: HashMap::new(),
+        };
+        let result = validate_gmail_config("personal", &account);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "personal");
+        assert_eq!(err.provider, "gmail");
+        assert!(err.error.contains("client-id"));
+    }
+
+    #[test]
+    fn parse_accounts_three_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "[fastmail]\nprovider = fastmail\nusername = a@fm.com\napi-token = tok\n\n[outlook]\nprovider = outlook\nclient-id = oid\n\n[gmail]\nprovider = gmail\nclient-id = gid\n",
+        )
+        .unwrap();
+        let flat = load_config(&path.to_path_buf());
+        let accounts = parse_accounts(&flat, &path.to_path_buf());
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts.get("fastmail").unwrap().provider, "fastmail");
+        assert_eq!(accounts.get("outlook").unwrap().provider, "outlook");
+        assert_eq!(accounts.get("gmail").unwrap().provider, "gmail");
+        assert_eq!(
+            accounts.get("gmail").unwrap().get("client-id").unwrap(),
+            "gid"
+        );
     }
 }
