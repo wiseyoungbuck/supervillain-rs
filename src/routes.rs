@@ -298,6 +298,9 @@ async fn list_emails(
     let offset = params.offset.unwrap_or(0);
 
     let mut query = params.search.as_deref().map(search::parse_query);
+    // The sidebar Starred toggle takes precedence: when ?starred=true is
+    // set we always restrict to flagged mail, regardless of any is_flagged
+    // value parsed from the search string.
     if params.starred == Some(true) {
         query.get_or_insert_with(Default::default).is_flagged = Some(true);
     }

@@ -115,7 +115,15 @@ function init() {
     els.composeFileInput = document.getElementById('compose-file-input');
     els.starredItem = document.getElementById('starred-item');
     // Event listeners
-    if (els.starredItem) els.starredItem.addEventListener('click', toggleStarredOnly);
+    if (els.starredItem) {
+        els.starredItem.addEventListener('click', toggleStarredOnly);
+        els.starredItem.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                toggleStarredOnly();
+            }
+        });
+    }
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
@@ -743,15 +751,17 @@ function renderMailboxes() {
 function renderStarredItem() {
     if (!els.starredItem) return;
     els.starredItem.classList.toggle('active', state.starredOnly);
+    els.starredItem.setAttribute('aria-pressed', String(state.starredOnly));
 }
 
 function toggleStarredOnly() {
+    if (!state.currentMailbox) return;
     state.starredOnly = !state.starredOnly;
     clearSplitListCache();
     renderStarredItem();
     updateMailboxNameDisplay();
     loadEmails();
-    if (state.currentMailbox?.role === 'inbox') loadSplitCounts();
+    if (state.currentMailbox.role === 'inbox') loadSplitCounts();
 }
 
 function updateMailboxNameDisplay() {
