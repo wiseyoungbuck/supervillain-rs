@@ -124,11 +124,31 @@ t_not_a_git_repo_is_nonfatal() {
     assert_no_cargo_install "not-a-git-repo"
 }
 
+t_worktree_with_git_file() {
+    # In a git worktree, `.git` is a FILE (gitdir pointer), not a dir.
+    # The repo guard must accept either.
+    local wt="$TMP/worktree"
+    mkdir -p "$wt"
+    printf 'gitdir: /somewhere/else\n' > "$wt/.git"
+    GIT_HEAD=abc123 GIT_UPSTREAM=def456 \
+        SUPERVILLAIN_REPO_DIR="$wt" check_and_update
+    assert_cargo_install_for_repo "$wt" "worktree-git-file"
+}
+
+t_sourced_under_errexit_does_not_abort() {
+    # check-and-update.sh's last statement must leave $? == 0, otherwise
+    # callers running `set -e` will abort when they `source` it.
+    bash -c "set -e; source '$REPO/scripts/check-and-update.sh'; echo OK" \
+        | grep -q '^OK$'
+}
+
 run_test "up-to-date: skips reinstall"           t_up_to_date
 run_test "behind: triggers cargo install --path" t_behind_triggers_install
 run_test "fetch failure: no install, no crash"   t_fetch_failure_is_nonfatal
 run_test "missing repo dir: no install, no crash" t_missing_repo_is_nonfatal
 run_test "no .git in repo: no install, no crash" t_not_a_git_repo_is_nonfatal
+run_test "worktree (.git is a file): triggers install" t_worktree_with_git_file
+run_test "source under set -e: does not abort caller"  t_sourced_under_errexit_does_not_abort
 
 echo
 echo "All check_and_update tests passed."

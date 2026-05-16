@@ -20,7 +20,8 @@ _supervillain_resolve_repo_dir() {
 check_and_update() {
     local repo
     repo="$(_supervillain_resolve_repo_dir)"
-    [[ -n "$repo" && -d "$repo/.git" ]] || return 0
+    # `.git` is a directory in a normal clone, a file in a git worktree.
+    [[ -n "$repo" && -e "$repo/.git" ]] || return 0
 
     # Best-effort fetch. Offline? Skip silently — the user's already-built
     # binary is still good enough to launch.
@@ -35,7 +36,9 @@ check_and_update() {
     cargo install --path "$repo"
 }
 
-# Allow tests to source this file without side effects beyond defining
-# the function (currently there are none, but kept for symmetry with the
-# launcher's source-only convention).
-[[ "${SUPERVILLAIN_CHECK_SOURCE_ONLY:-0}" == "1" ]] && return 0
+# Symmetry hook with the launchers' source-only convention. Written as
+# an if-block (not `[[ … ]] && return 0`) so the file's final exit status
+# is 0 — otherwise sourcing under `set -e` would abort the caller.
+if [[ "${SUPERVILLAIN_CHECK_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0
+fi
