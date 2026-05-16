@@ -174,6 +174,7 @@ struct ListEmailsParams {
     split_id: Option<String>,
     search: Option<String>,
     account: Option<String>,
+    starred: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -296,7 +297,10 @@ async fn list_emails(
     let limit = params.limit.unwrap_or(150);
     let offset = params.offset.unwrap_or(0);
 
-    let query = params.search.as_deref().map(search::parse_query);
+    let mut query = params.search.as_deref().map(search::parse_query);
+    if params.starred == Some(true) {
+        query.get_or_insert_with(Default::default).is_flagged = Some(true);
+    }
     let query_ref = query.as_ref();
 
     let fetch_limit = if params.split_id.is_some() {

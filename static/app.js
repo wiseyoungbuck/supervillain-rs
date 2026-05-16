@@ -22,6 +22,7 @@ const state = {
     currentSplit: 'all',      // currently active split tab
     pendingAttachments: [],   // files being uploaded for compose
     splitCounts: {},          // email counts per split tab
+    starredOnly: false,       // sidebar "Starred" filter — restricts list to $flagged emails
 };
 
 // Simple cache: email id -> full email object with body
@@ -112,7 +113,9 @@ function init() {
     els.composeAttachments = document.getElementById('compose-attachments');
     els.composeAttachmentsList = document.getElementById('compose-attachments-list');
     els.composeFileInput = document.getElementById('compose-file-input');
+    els.starredItem = document.getElementById('starred-item');
     // Event listeners
+    els.starredItem.addEventListener('click', toggleStarredOnly);
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
@@ -378,7 +381,7 @@ function renderSplitTabs() {
 }
 
 function splitCacheKey() {
-    return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${getSearchQuery()}`;
+    return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${state.starredOnly ? 'S' : ''}:${getSearchQuery()}`;
 }
 
 function clearSplitListCache() {
@@ -441,6 +444,7 @@ function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
     if (state.currentMailbox?.role === 'inbox' && state.currentSplit && state.currentSplit !== 'all' && state.splits.length > 0) {
         url += `&split_id=${state.currentSplit}`;
     }
+    if (state.starredOnly) url += `&starred=true`;
     const search = getSearchQuery();
     if (search) url += `&search=${encodeURIComponent(search)}`;
     return url;
@@ -730,6 +734,27 @@ function renderMailboxes() {
             if (mb) selectMailbox(mb);
         });
     });
+
+    renderStarredItem();
+}
+
+function renderStarredItem() {
+    if (!els.starredItem) return;
+    els.starredItem.classList.toggle('active', state.starredOnly);
+}
+
+function toggleStarredOnly() {
+    state.starredOnly = !state.starredOnly;
+    clearSplitListCache();
+    renderStarredItem();
+    updateMailboxNameDisplay();
+    loadEmails();
+}
+
+function updateMailboxNameDisplay() {
+    if (!state.currentMailbox) return;
+    const base = state.currentMailbox.name.toUpperCase();
+    els.mailboxName.textContent = state.starredOnly ? `${base} · STARRED` : base;
 }
 
 function getRecipientBadge(email) {
@@ -879,7 +904,7 @@ function selectMailbox(mailbox) {
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
     clearSplitListCache();
-    els.mailboxName.textContent = mailbox.name.toUpperCase();
+    updateMailboxNameDisplay();
     renderMailboxes();
     renderSplitTabs();
     updateActiveFilters();

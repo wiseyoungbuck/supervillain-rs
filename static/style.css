@@ -144,6 +144,21 @@ body {
     font-weight: bold;
 }
 
+.starred-item {
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+}
+
+.starred-item .starred-icon {
+    color: var(--accent);
+}
+
+.starred-item.active .starred-icon {
+    color: inherit;
+}
+
 /* Account selector */
 #account-selector {
     padding: 8px 0;
