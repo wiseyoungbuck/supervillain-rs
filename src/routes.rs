@@ -800,6 +800,7 @@ async fn unsubscribe_and_archive(
 struct SplitCountsParams {
     mailbox_id: String,
     account: Option<String>,
+    starred: Option<bool>,
 }
 
 async fn split_counts(
@@ -819,9 +820,25 @@ async fn split_counts(
     let session_lock = resolve_session(&state, params.account.as_deref())?;
     let session = session_lock.read().await;
 
+    // When the sidebar Starred filter is active, restrict the count query to
+    // flagged emails so tab counts match the rows the user sees in the list.
+    let query = if params.starred == Some(true) {
+        Some(crate::types::ParsedQuery {
+            is_flagged: Some(true),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     let fetch_limit = 150 * SPLIT_OVERFETCH_MULTIPLIER;
-    let email_ids =
-        provider::query_emails(&session, Some(&params.mailbox_id), fetch_limit, 0, None).await?;
+    let email_ids = provider::query_emails(
+        &session,
+        Some(&params.mailbox_id),
+        fetch_limit,
+        0,
+        query.as_ref(),
+    )
+    .await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
     let mut all_emails = Vec::new();

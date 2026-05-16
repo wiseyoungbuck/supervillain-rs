@@ -115,7 +115,7 @@ function init() {
     els.composeFileInput = document.getElementById('compose-file-input');
     els.starredItem = document.getElementById('starred-item');
     // Event listeners
-    els.starredItem.addEventListener('click', toggleStarredOnly);
+    if (els.starredItem) els.starredItem.addEventListener('click', toggleStarredOnly);
     document.addEventListener('keydown', handleKeyDown);
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
@@ -301,7 +301,9 @@ async function loadSplitCounts() {
     splitCountsController = new AbortController();
     const mailboxId = state.currentMailbox.id;
     try {
-        const counts = await api('GET', `/split-counts?mailbox_id=${mailboxId}`, null, splitCountsController.signal);
+        let url = `/split-counts?mailbox_id=${mailboxId}`;
+        if (state.starredOnly) url += '&starred=true';
+        const counts = await api('GET', url, null, splitCountsController.signal);
         if (state.currentMailbox?.id !== mailboxId) return; // stale response guard
         state.splitCounts = counts;
         renderSplitTabs();
@@ -749,6 +751,7 @@ function toggleStarredOnly() {
     renderStarredItem();
     updateMailboxNameDisplay();
     loadEmails();
+    if (state.currentMailbox?.role === 'inbox') loadSplitCounts();
 }
 
 function updateMailboxNameDisplay() {
