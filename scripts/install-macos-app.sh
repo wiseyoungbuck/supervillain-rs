@@ -75,67 +75,15 @@ cat > "$CONTENTS_DIR/Info.plist" << 'PLIST'
 PLIST
 
 # Launcher script — starts the server and opens as a native webapp
-cat > "$MACOS_DIR/supervillain-launcher" << 'LAUNCHER'
-#!/usr/bin/env bash
-
-BINARY="${HOME}/.cargo/bin/supervillain"
-PORT=8000
-URL="http://127.0.0.1:${PORT}"
-LOG_FILE="${TMPDIR:-/tmp}/supervillain.log"
-
-if [[ ! -x "$BINARY" ]]; then
-    osascript -e 'display alert "Supervillain not found" message "Run: cargo install --path /path/to/supervillain-rs" as critical'
-    exit 1
-fi
-
-port_listening() {
-    /usr/sbin/lsof -i ":${PORT}" -sTCP:LISTEN &>/dev/null
-}
-
-# Open as a standalone webapp window (no browser chrome).
-# Tries Chrome first, then Edge, then falls back to default browser.
-open_webapp() {
-    local chrome="/Applications/Google Chrome.app"
-    local edge="/Applications/Microsoft Edge.app"
-    if [[ -d "$chrome" ]]; then
-        open -na "$chrome" --args --app="$URL"
-    elif [[ -d "$edge" ]]; then
-        open -na "$edge" --args --app="$URL"
-    else
-        open "$URL"
-    fi
-}
-
-# If already running, just open a webapp window
-if port_listening; then
-    open_webapp
-    exit 0
-fi
-
-# Start the server
-"$BINARY" --no-browser > "$LOG_FILE" 2>&1 &
-SERVER_PID=$!
-
-# Wait for server to be ready
-for _ in $(seq 1 30); do
-    # Check the process is still alive
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
-        osascript -e 'display alert "Supervillain crashed on startup" message "Check '"$LOG_FILE"' for details." as critical'
-        exit 1
-    fi
-    if port_listening; then
-        open_webapp
-        wait $SERVER_PID
-        exit 0
-    fi
-    sleep 0.5
-done
-
-osascript -e 'display alert "Supervillain failed to start" message "Check '"$LOG_FILE"' for details." as critical'
-kill $SERVER_PID 2>/dev/null || true
-exit 1
-LAUNCHER
+cp "${REPO_DIR}/scripts/supervillain-launcher.sh" "$MACOS_DIR/supervillain-launcher"
 chmod +x "$MACOS_DIR/supervillain-launcher"
+
+# Stamp the repo path so the launcher can find scripts/check-and-update.sh
+# and rebuild from source when upstream moves ahead.
+STAMP_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/supervillain"
+mkdir -p "$STAMP_DIR"
+printf '%s\n' "$REPO_DIR" > "$STAMP_DIR/repo"
+echo "Stamped repo path at $STAMP_DIR/repo"
 
 echo "Installed ${APP_DIR}"
 echo "You can now launch Supervillain from Spotlight or /Applications."
