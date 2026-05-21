@@ -6,7 +6,7 @@
 
 <p align="center">
   Email for people who'd rather be typing.<br>
-  Vim-native, zero-Electron, talks to Fastmail, Gmail and Outlook (calendar).
+  Vim-native, zero-Electron, talks to Fastmail, Gmail (read-only), and Outlook (calendar).
 </p>
 
 
@@ -23,7 +23,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 ## Features
 
-- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph), Gmail (planned for Phase 3)
+- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph), Gmail (read-only inbox; writes + calendar planned)
 - **Multi-account** — Switch between accounts with `1`-`9` keys
 - **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API, Google Calendar
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
@@ -84,7 +84,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
 - A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
 - Microsoft app registration (for Outlook calendar — email support planned for Phase 2), and/or:
-- Google Cloud project with OAuth credentials (Gmail — planned for Phase 3)
+- Google Cloud project with OAuth credentials (Gmail read-only inbox today; writes + Calendar in upcoming milestones)
 
 ## Quick start
 
@@ -92,7 +92,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 - **Fastmail** — Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
 - **Outlook** — Register an app in Azure AD with Calendars.ReadWrite permissions (see [Azure AD setup](#azure-ad-app-registration) below).
-- **Gmail** — Create OAuth credentials in Google Cloud Console (see [Google Cloud setup](#google-cloud-app-registration) below). *Phase 3 — not yet implemented.*
+- **Gmail** — Create OAuth credentials in Google Cloud Console (see [Google Cloud setup](#google-cloud-app-registration) below). Both `client-id` and `client-secret` are required — unlike Outlook, Google's OAuth needs a client_secret even on Desktop / PKCE flows.
 
 **2. Create the config file:**
 
@@ -122,8 +122,12 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 # [gmail]
 # provider = gmail
 # client-id = xxxx.apps.googleusercontent.com
-# # Phase 3: not yet implemented.
+# client-secret = GOCSPX-xxxxxxxxxxxx
+# # Gmail also requires client-secret (Google quirk for PKCE).
+# # Read-only inbox in Milestone A; writes + calendar coming in B–D.
 ```
+
+`chmod 600 ~/.config/supervillain/config` is recommended — the file holds API tokens and OAuth secrets.
 
 **3. Build and run:**
 
@@ -211,7 +215,8 @@ client-id = xxxx-xxxx-xxxx
 [gmail]
 provider = gmail
 client-id = xxxx.apps.googleusercontent.com
-# Phase 3: not yet implemented
+client-secret = GOCSPX-xxxxxxxxxxxx
+# Gmail needs client-secret too (Google quirk; not really secret).
 ```
 
 The sectionless format is fully backward compatible — it's treated as a single Fastmail account.
@@ -240,24 +245,33 @@ client-id = your-application-client-id
 
 ### Google Cloud App Registration
 
-> **Phase 3 — not yet implemented.** Configuration is accepted but Gmail accounts will show an error until the Gmail API client is built.
+> **Milestone A (current):** Gmail read-only inbox is implemented — OAuth sign-in, mailbox listing, message reading, search.
+> Writes (archive/trash/star/move/send) land in Milestone B–C, Google Calendar in Milestone D.
 
-To use Gmail email and Google Calendar, create OAuth credentials:
+To use Gmail with Supervillain you'll create your own OAuth client in a Google Cloud project (one-time, ~5 minutes):
 
-1. Go to [Google Cloud Console > APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials)
-2. Click **Create Credentials** > **OAuth client ID**
-3. Application type: **Desktop app** (or **Web application** with redirect URI `http://localhost:8400/callback`)
-4. After creation, copy the **Client ID** — this is your `client-id`
-5. Under **Enabled APIs**, enable: `Gmail API` and `Google Calendar API`
-6. No client secret needed — Supervillain uses PKCE (public client)
+1. Go to [Google Cloud Console > APIs & Services](https://console.cloud.google.com/apis/dashboard). Create a new project if you don't have one.
+2. Enable APIs: under **Enabled APIs & services**, enable **Gmail API** and **Google Calendar API**.
+3. Configure the OAuth consent screen: **APIs & Services > OAuth consent screen** → User type: **External** → fill in app name, your email, etc.
+4. **Add yourself as a Test User** under **Audience > Test users**. This is critical: unverified apps only work for listed test users, and refresh tokens for non-test users expire after 7 days.
+5. Create credentials: **APIs & Services > Credentials** → **Create Credentials** → **OAuth client ID** → Application type: **Web application**. Add `http://localhost:8401/callback` as an authorized redirect URI.
+6. Copy both the **Client ID** and **Client Secret**. Yes, both — Google's OAuth token endpoint requires `client_secret` even for "Desktop" / PKCE flows. It's not really secret, but the API rejects requests without it.
 
-Put the client ID in your config:
+Put both in your config:
 
 ```ini
 [gmail]
 provider = gmail
 client-id = your-client-id.apps.googleusercontent.com
+client-secret = GOCSPX-xxxxxxxxxxxx
 ```
+
+First run opens a browser for OAuth2 authorization. Tokens are saved to `~/.config/supervillain/tokens/gmail.json` (or whatever account name you used) and auto-refresh.
+
+**Troubleshooting:**
+
+- *"Refresh token expired or revoked"* — your OAuth app is in **Testing** state and you're not listed as a Test User, or you've been listed for more than 7 days. Add yourself as a Test User and re-authenticate (delete the tokens file to force OAuth).
+- *"Google did not return a refresh_token on initial consent"* — your client was created without `access_type=offline` semantics, or Google de-duplicated the consent. Revoke the app in [Google Account permissions](https://myaccount.google.com/permissions) and re-authenticate.
 
 ### Multiple identities
 
@@ -362,7 +376,7 @@ Axum HTTP Server
     │ resolve_account() → match ProviderSession
     ├── Fastmail → JMAP + CalDAV
     ├── Outlook → Microsoft Graph (Calendar only)
-    └── Gmail → Gmail API + Google Calendar (Phase 3)
+    └── Gmail → Gmail REST API (read-only; Calendar planned)
 ```
 
 ### Provider dispatch
@@ -373,10 +387,11 @@ No traits, no vtables. Each provider is a match arm on a concrete enum:
 enum ProviderSession {
     Fastmail(jmap::JmapSession),
     Outlook(outlook::OutlookSession),
+    Gmail(gmail::GmailSession),
 }
 ```
 
-Each provider module exports plain functions (`jmap::query_emails()`, `outlook::add_to_calendar()`) that take a session struct and return the same `Email`/`Mailbox`/`Identity` types. The route handler has the match statement. Gmail will add a third variant in Phase 3.
+Each provider module exports plain functions (`jmap::query_emails()`, `outlook::add_to_calendar()`, `gmail::get_mailboxes()`) that take a session struct and return the same `Email`/`Mailbox`/`Identity` types. The route handler has the match statement.
 
 ### Calendar dispatch
 
@@ -387,7 +402,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 
 - **Fastmail** — `to_jmap_filter()` (existing)
 - Outlook search planned for Phase 2
-- Gmail search planned for Phase 3
+- **Gmail** — `gmail::translate_query_to_q()` (Gmail's native `q=` syntax — essentially a superset of our DSL)
 
 ### OAuth2 flow (Outlook, Gmail)
 
@@ -395,7 +410,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 - Tokens saved to `~/.config/supervillain/tokens/{account_id}.json`
 - Auto-refresh before expiry on each API call via interior mutability
 - Same pattern as `gcloud auth login` / `gh auth login`
-- Used by Outlook (Phase 1) and Gmail (Phase 3)
+- Used by Outlook and Gmail. The callback acquisition is in `platform::desktop::acquire_oauth_callback`; iOS will substitute `ASWebAuthenticationSession`.
 
 ### Tech stack
 
@@ -405,7 +420,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 | Frontend | Vanilla JS, CSS3 (no framework, no build step) |
 | Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph API (calendar) |
 | Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook) |
-| Providers | Fastmail (email + calendar), Outlook (calendar only), Gmail (Phase 3) |
+| Providers | Fastmail (email + calendar), Outlook (calendar only), Gmail (read-only inbox; writes + calendar planned) |
 
 ## API
 
@@ -447,10 +462,13 @@ src/
   error.rs         Error enum + HTTP response mapping
   jmap.rs          JMAP client — Fastmail (connect, query, send, calendar, MIME parsing)
   outlook.rs       Microsoft Graph client (Calendar)
-  oauth.rs         OAuth2 PKCE flow (shared by Outlook and Gmail)
+  gmail.rs         Gmail REST client (read-only inbox; writes/calendar coming)
+  oauth.rs         OAuth2 PKCE primitives (shared by Outlook and Gmail)
+  platform/        OS-specific shims: TokenStore, browser, OAuth callback, log sink
+                   — desktop today, iOS module planned (Tauri-mobile)
   provider.rs      Provider dispatch — routes call provider::*, which dispatches per-provider
   routes.rs        HTTP handlers + split management
-  search.rs        Search query parser + JMAP filter translation
+  search.rs        Search query parser + per-provider filter translation
   splits.rs        Split inbox filtering + persistence
   calendar.rs      ICS parsing + RSVP generation
   glob.rs          Glob pattern matching
@@ -496,7 +514,7 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 ## Roadmap
 
 - **Outlook email** — Mail.ReadWrite + Mail.Send via Microsoft Graph (Phase 2)
-- **Gmail email + calendar** — Gmail REST API + Google Calendar API (Phase 3)
+- **Gmail writes + calendar** — `messages.modify`/`trash`/`send` + Google Calendar v3 (Phase 3 Milestones B–D, plan in repo)
 - Threading / conversation grouping
 - Drafts
 - Contact suggestions / address book

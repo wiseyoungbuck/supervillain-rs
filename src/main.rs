@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use vimmail::{
-    jmap, outlook, provider,
+    gmail, jmap, outlook, platform,
+    platform::{FsTokenStore, TokenStore},
+    provider,
     provider::ProviderSession,
     routes, splits,
     types::{AccountError, AppState},
@@ -11,15 +13,10 @@ use vimmail::{
 
 #[tokio::main]
 async fn main() {
-    let config_dir = resolve_config_dir();
+    let config_dir = platform::config_dir();
     let config_path = config_dir.join("supervillain/config");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    platform::init_tracing();
 
     let raw_config = load_config(&config_path);
     let accounts = parse_accounts(&raw_config, &config_path);
@@ -49,6 +46,7 @@ async fn main() {
         .unwrap_or_else(|| accounts.keys().next().unwrap().clone());
 
     let tokens_dir = config_dir.join("supervillain/tokens");
+    let token_store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(tokens_dir.clone()));
     let mut sessions: HashMap<String, tokio::sync::RwLock<ProviderSession>> = HashMap::new();
     let mut account_errors: Vec<AccountError> = Vec::new();
 
@@ -148,8 +146,8 @@ async fn main() {
             }
 
             "gmail" => {
-                let _client_id = match validate_gmail_config(name, account) {
-                    Ok(id) => id,
+                let (client_id, client_secret) = match validate_gmail_config(name, account) {
+                    Ok(creds) => creds,
                     Err(e) => {
                         tracing::warn!("[{name}] {}", e.error);
                         account_errors.push(e);
@@ -157,15 +155,33 @@ async fn main() {
                     }
                 };
 
-                tracing::warn!(
-                    "[{name}] Gmail support is planned for Phase 3 — not yet implemented"
+                let session = if let Some(s) =
+                    gmail::load_session(token_store.clone(), name, &client_id, &client_secret)
+                {
+                    tracing::info!("[{name}] Loaded Gmail tokens for {}", s.email);
+                    s
+                } else {
+                    tracing::info!("[{name}] No saved tokens, starting Gmail OAuth flow...");
+                    match gmail::oauth_flow(token_store.clone(), name, &client_id, &client_secret)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("[{name}] Gmail OAuth flow failed: {e}");
+                            account_errors.push(AccountError {
+                                account: name.clone(),
+                                provider: "gmail".into(),
+                                error: format!("Gmail OAuth flow failed: {e}"),
+                            });
+                            continue;
+                        }
+                    }
+                };
+
+                sessions.insert(
+                    name.clone(),
+                    tokio::sync::RwLock::new(ProviderSession::Gmail(session)),
                 );
-                account_errors.push(AccountError {
-                    account: name.clone(),
-                    provider: "gmail".into(),
-                    error: "Gmail support is planned for Phase 3 — not yet implemented".into(),
-                });
-                continue;
             }
 
             other => {
@@ -215,63 +231,10 @@ async fn main() {
     tracing::info!("Listening on {url}");
 
     if !std::env::args().any(|a| a == "--no-browser") {
-        open_browser(&url);
+        platform::open_browser(&url);
     }
 
     axum::serve(listener, app).await.unwrap();
-}
-
-fn resolve_config_dir() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .ok()
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn open_browser(url: &str) {
-    let is_omarchy = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".local/share/omarchy")
-        .is_dir();
-
-    let (cmd, args): (&str, Vec<&str>) = if is_omarchy {
-        ("omarchy-launch-webapp", vec![url])
-    } else if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-
-    match std::process::Command::new(cmd)
-        .args(&args)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            tracing::info!("Opened browser via {cmd}");
-            std::thread::spawn(move || {
-                use std::io::BufRead;
-                if let Some(stderr) = child.stderr.take() {
-                    for line in std::io::BufReader::new(stderr)
-                        .lines()
-                        .map_while(Result::ok)
-                    {
-                        if line.contains("DEPRECATED_ENDPOINT") {
-                            tracing::warn!("{line} (known Chromium issue, safe to ignore)");
-                        } else if !line.is_empty() {
-                            tracing::warn!("browser: {line}");
-                        }
-                    }
-                }
-                let _ = child.wait();
-            });
-        }
-        Err(e) => tracing::warn!("Failed to open browser via {cmd}: {e}"),
-    }
 }
 
 // =============================================================================
@@ -358,12 +321,27 @@ fn validate_outlook_config(name: &str, account: &AccountConfig) -> Result<String
     })
 }
 
-fn validate_gmail_config(name: &str, account: &AccountConfig) -> Result<String, AccountError> {
-    account.get("client-id").ok_or_else(|| AccountError {
+fn validate_gmail_config(
+    name: &str,
+    account: &AccountConfig,
+) -> Result<(String, String), AccountError> {
+    let client_id = account.get("client-id").ok_or_else(|| AccountError {
         account: name.into(),
         provider: "gmail".into(),
-        error: "Missing 'client-id' in config".into(),
-    })
+        error: "Gmail requires both client-id and client-secret in [gmail] section. \
+                Google's OAuth requires a client_secret even for Desktop apps using PKCE — \
+                see README §Gmail setup."
+            .into(),
+    })?;
+    let client_secret = account.get("client-secret").ok_or_else(|| AccountError {
+        account: name.into(),
+        provider: "gmail".into(),
+        error: "Gmail requires both client-id and client-secret in [gmail] section. \
+                Google's OAuth requires a client_secret even for Desktop apps using PKCE — \
+                see README §Gmail setup."
+            .into(),
+    })?;
+    Ok((client_id, client_secret))
 }
 
 fn resolve_default_account<V>(preferred: String, sessions: &HashMap<String, V>) -> String {
@@ -775,7 +753,7 @@ mod tests {
         // Only the top-level key should be captured, not keys inside sections
         assert_eq!(config.len(), 1);
         assert_eq!(config.get("default-account").unwrap(), "fastmail");
-        assert!(config.get("username").is_none());
+        assert!(!config.contains_key("username"));
     }
 
     #[test]
@@ -803,18 +781,23 @@ mod tests {
     fn validate_gmail_config_valid() {
         let account = AccountConfig {
             provider: "gmail".into(),
-            props: HashMap::from([("client-id".into(), "gmail-client-123".into())]),
+            props: HashMap::from([
+                ("client-id".into(), "gmail-client-123".into()),
+                ("client-secret".into(), "GOCSPX-secret".into()),
+            ]),
         };
         let result = validate_gmail_config("personal", &account);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "gmail-client-123");
+        let (client_id, client_secret) = result.unwrap();
+        assert_eq!(client_id, "gmail-client-123");
+        assert_eq!(client_secret, "GOCSPX-secret");
     }
 
     #[test]
     fn validate_gmail_config_missing_client_id() {
         let account = AccountConfig {
             provider: "gmail".into(),
-            props: HashMap::new(),
+            props: HashMap::from([("client-secret".into(), "GOCSPX-secret".into())]),
         };
         let result = validate_gmail_config("personal", &account);
         assert!(result.is_err());
@@ -822,6 +805,22 @@ mod tests {
         assert_eq!(err.account, "personal");
         assert_eq!(err.provider, "gmail");
         assert!(err.error.contains("client-id"));
+        assert!(err.error.contains("README"));
+    }
+
+    #[test]
+    fn validate_gmail_config_missing_client_secret() {
+        let account = AccountConfig {
+            provider: "gmail".into(),
+            props: HashMap::from([("client-id".into(), "gmail-client-123".into())]),
+        };
+        let result = validate_gmail_config("personal", &account);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.account, "personal");
+        assert_eq!(err.provider, "gmail");
+        assert!(err.error.contains("client-secret"));
+        assert!(err.error.contains("README"));
     }
 
     #[test]

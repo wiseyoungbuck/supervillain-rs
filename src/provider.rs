@@ -1,8 +1,9 @@
 use crate::error::Error;
+use crate::gmail::GmailSession;
 use crate::jmap::JmapSession;
 use crate::outlook::OutlookSession;
 use crate::types::*;
-use crate::{calendar, jmap, outlook};
+use crate::{calendar, gmail, jmap, outlook};
 
 // =============================================================================
 // Provider Session — concrete enum, no traits
@@ -11,6 +12,7 @@ use crate::{calendar, jmap, outlook};
 pub enum ProviderSession {
     Fastmail(JmapSession),
     Outlook(OutlookSession),
+    Gmail(GmailSession),
 }
 
 impl ProviderSession {
@@ -19,6 +21,7 @@ impl ProviderSession {
         match self {
             Self::Fastmail(s) => &s.username,
             Self::Outlook(s) => &s.email,
+            Self::Gmail(s) => &s.email,
         }
     }
 
@@ -26,13 +29,16 @@ impl ProviderSession {
         match self {
             Self::Fastmail(_) => "fastmail",
             Self::Outlook(_) => "outlook",
+            Self::Gmail(_) => "gmail",
         }
     }
 
     /// Whether this provider sends RSVP emails automatically (via Graph API)
-    /// so the caller should NOT send a manual iTIP reply
+    /// so the caller should NOT send a manual iTIP reply.
+    /// Gmail PATCHes Calendar attendees with sendUpdates=all (Milestone D),
+    /// so it counts as auto-RSVP from day one of that milestone.
     pub fn sends_rsvp_automatically(&self) -> bool {
-        matches!(self, Self::Outlook(_))
+        matches!(self, Self::Outlook(_) | Self::Gmail(_))
     }
 }
 
@@ -40,12 +46,20 @@ impl ProviderSession {
 // Dispatch functions — mechanical match arms
 // =============================================================================
 
+/// Standard error for not-yet-implemented Gmail operations (Milestones B–D).
+fn gmail_not_yet_implemented(op: &str, milestone: &str) -> Error {
+    Error::BadRequest(format!(
+        "Gmail: {op} lands in Phase 3 {milestone} (Milestone A ships read-only inbox)."
+    ))
+}
+
 pub async fn get_mailboxes(s: &ProviderSession) -> Result<Vec<Mailbox>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_mailboxes(s).await,
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(s) => gmail::get_mailboxes(s).await,
     }
 }
 
@@ -55,6 +69,7 @@ pub async fn get_identities(s: &mut ProviderSession) -> Result<Vec<Identity>, Er
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(s) => gmail::get_identities(s).await,
     }
 }
 
@@ -72,6 +87,9 @@ pub async fn query_emails(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(s) => {
+            gmail::query_emails(s, mailbox_id, limit, position, query).await
+        }
     }
 }
 
@@ -88,6 +106,11 @@ pub async fn get_emails(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(s) => {
+            // properties_override is JMAP-specific; Gmail always returns the full payload.
+            let _ = properties_override;
+            gmail::get_emails(s, ids, fetch_body).await
+        }
     }
 }
 
@@ -97,6 +120,7 @@ pub async fn mark_read(s: &ProviderSession, email_id: &str) -> Result<bool, Erro
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("mark_read", "Milestone B")),
     }
 }
 
@@ -106,6 +130,7 @@ pub async fn mark_unread(s: &ProviderSession, email_id: &str) -> Result<bool, Er
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("mark_unread", "Milestone B")),
     }
 }
 
@@ -115,6 +140,7 @@ pub async fn toggle_flag(s: &ProviderSession, email_id: &str) -> Result<bool, Er
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("toggle_flag", "Milestone B")),
     }
 }
 
@@ -124,6 +150,7 @@ pub async fn archive(s: &ProviderSession, email_id: &str) -> Result<bool, Error>
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("archive", "Milestone B")),
     }
 }
 
@@ -133,6 +160,7 @@ pub async fn trash(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("trash", "Milestone B")),
     }
 }
 
@@ -146,6 +174,9 @@ pub async fn move_to_mailbox(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => {
+            Err(gmail_not_yet_implemented("move_to_mailbox", "Milestone B"))
+        }
     }
 }
 
@@ -155,6 +186,7 @@ pub async fn archive_batch(s: &ProviderSession, email_ids: &[String]) -> Result<
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("archive_batch", "Milestone B")),
     }
 }
 
@@ -171,6 +203,7 @@ pub async fn send_email(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("send_email", "Milestone C")),
     }
 }
 
@@ -182,6 +215,10 @@ pub async fn get_calendar_data(
         ProviderSession::Fastmail(s) => jmap::get_calendar_data(s, email_id).await,
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
+        )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
+            "get_calendar_data",
+            "Milestone D",
         )),
     }
 }
@@ -195,6 +232,10 @@ pub async fn get_calendar_event(
     match s {
         ProviderSession::Fastmail(s) => jmap::get_calendar_event(s, uid).await,
         ProviderSession::Outlook(s) => outlook::get_calendar_event(s, uid).await,
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
+            "get_calendar_event",
+            "Milestone D",
+        )),
     }
 }
 
@@ -213,6 +254,7 @@ pub async fn upload_blob(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Blob upload not supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("upload_blob", "Milestone C")),
     }
 }
 
@@ -227,6 +269,7 @@ pub async fn download_blob(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Attachment downloads not supported for Outlook accounts".into(),
         )),
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("download_blob", "Milestone B")),
     }
 }
 
@@ -255,6 +298,9 @@ pub async fn add_to_calendar(
                 outlook::add_to_calendar(s, ics_data, &event).await
             }
         }
+        ProviderSession::Gmail(_) => {
+            Err(gmail_not_yet_implemented("add_to_calendar", "Milestone D"))
+        }
     }
 }
 
@@ -262,6 +308,10 @@ pub async fn remove_from_calendar(s: &ProviderSession, uid: &str) -> Result<bool
     match s {
         ProviderSession::Fastmail(s) => jmap::remove_from_calendar(s, uid).await,
         ProviderSession::Outlook(s) => outlook::remove_from_calendar(s, uid).await,
+        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
+            "remove_from_calendar",
+            "Milestone D",
+        )),
     }
 }
 
@@ -331,6 +381,9 @@ pub async fn rsvp(
                 )));
             }
         }
+        ProviderSession::Gmail(_) => {
+            return Err(gmail_not_yet_implemented("rsvp", "Milestone D"));
+        }
     }
     Ok(())
 }
@@ -342,6 +395,8 @@ pub async fn rsvp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{FsTokenStore, TokenStore, Tokens};
+    use std::sync::Arc;
 
     fn make_fastmail_session() -> ProviderSession {
         ProviderSession::Fastmail(JmapSession::new("user@fastmail.com", "Bearer token"))
@@ -361,6 +416,28 @@ mod tests {
         })
     }
 
+    fn make_gmail_session() -> ProviderSession {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(dir.path().to_path_buf()));
+        // Seed a token file so the session has something to load
+        store
+            .save(
+                "gmail",
+                &Tokens {
+                    access_token: "test".into(),
+                    refresh_token: "test".into(),
+                    token_expiry: chrono::Utc::now(),
+                    email: "user@gmail.com".into(),
+                },
+            )
+            .unwrap();
+        let session = crate::gmail::load_session(store, "gmail", "client-id", "client-secret")
+            .expect("session should load");
+        // Keep tempdir alive for the test (intentional leak; tests are short-lived)
+        std::mem::forget(dir);
+        ProviderSession::Gmail(session)
+    }
+
     #[test]
     fn username_returns_fastmail_username() {
         let s = make_fastmail_session();
@@ -374,8 +451,26 @@ mod tests {
     }
 
     #[test]
+    fn username_returns_gmail_email() {
+        let s = make_gmail_session();
+        assert_eq!(s.username(), "user@gmail.com");
+    }
+
+    #[test]
+    fn provider_name_gmail() {
+        let s = make_gmail_session();
+        assert_eq!(s.provider_name(), "gmail");
+    }
+
+    #[test]
     fn sends_rsvp_automatically_true_for_outlook() {
         let s = make_outlook_session();
+        assert!(s.sends_rsvp_automatically());
+    }
+
+    #[test]
+    fn sends_rsvp_automatically_true_for_gmail() {
+        let s = make_gmail_session();
         assert!(s.sends_rsvp_automatically());
     }
 

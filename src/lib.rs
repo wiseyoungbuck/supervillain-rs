@@ -1,9 +1,11 @@
 pub mod calendar;
 pub mod error;
 pub mod glob;
+pub mod gmail;
 pub mod jmap;
 pub mod oauth;
 pub mod outlook;
+pub mod platform;
 pub mod provider;
 pub mod routes;
 pub mod search;

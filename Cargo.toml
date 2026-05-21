@@ -9,8 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+# Explicit tokio features (not "full") so iOS builds can opt out of rt-multi-thread
+# per Tauri-mobile guidance. Add features here as the codebase needs them.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "sync", "time", "io-util", "fs"] }
+# rustls-tls (not native-tls) keeps reqwest portable to iOS (Apple Network framework
+# integration via native-tls is platform-specific; rustls is pure Rust).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

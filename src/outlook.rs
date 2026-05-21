@@ -181,7 +181,9 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
     })
 }
 
-/// One-shot OAuth2 PKCE flow: opens browser, runs local callback server, exchanges code
+/// One-shot OAuth2 PKCE flow: opens browser, runs local callback server, exchanges code.
+/// The callback acquisition is delegated to `platform::acquire_oauth_callback` so the
+/// iOS port can substitute `ASWebAuthenticationSession` without touching this code.
 pub async fn oauth_flow(
     client_id: &str,
     token_path: &std::path::Path,
@@ -190,94 +192,32 @@ pub async fn oauth_flow(
     let expected_state = oauth::generate_state();
     let url = auth_url(client_id, &code_verifier, &expected_state);
 
-    // Start a one-shot server to receive the callback
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8400")
-        .await
-        .map_err(|e| Error::Internal(format!("Failed to bind OAuth callback server: {e}")))?;
+    let callback = crate::platform::acquire_oauth_callback(&url, &expected_state, 8400).await?;
 
-    eprintln!("\nOpen this URL to authorize Outlook access:\n\n  {url}\n");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("failed to create HTTP client");
 
-    // Try to open browser
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(&url).spawn();
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-    }
+    let token_resp = exchange_code(&client, client_id, &callback.code, &code_verifier).await?;
 
-    // Wait for the callback with the authorization code
-    use axum::{Router, extract::Query, routing::get};
-    use tokio::sync::oneshot;
+    let email = fetch_user_email(&client, &token_resp.access_token).await?;
 
-    let (tx, rx) = oneshot::channel::<(String, String)>();
-    let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-    #[derive(Deserialize)]
-    struct CallbackParams {
-        code: String,
-        #[serde(default)]
-        state: String,
-    }
-
-    let tx_clone = tx.clone();
-    let callback_app = Router::new().route(
-        "/callback",
-        get(move |Query(params): Query<CallbackParams>| {
-            let tx = tx_clone.clone();
-            async move {
-                if let Some(sender) = tx.lock().await.take() {
-                    let _ = sender.send((params.code, params.state));
-                }
-                "Authorization successful! You can close this tab."
-            }
+    let session = OutlookSession {
+        client,
+        token: tokio::sync::Mutex::new(OutlookToken {
+            access_token: token_resp.access_token,
+            refresh_token: token_resp.refresh_token.unwrap_or_default(),
+            token_expiry: Utc::now() + chrono::Duration::seconds(token_resp.expires_in),
         }),
-    );
+        client_id: client_id.to_string(),
+        token_path: token_path.to_path_buf(),
+        email,
+    };
 
-    let server = axum::serve(listener, callback_app);
-
-    // Run server until we get the code
-    tokio::select! {
-        result = server => {
-            result.map_err(|e| Error::Internal(format!("OAuth callback server error: {e}")))?;
-            Err(Error::Internal("OAuth callback server exited without receiving code".into()))
-        }
-        code_and_state = rx => {
-            let (code, state) = code_and_state.map_err(|_| Error::Internal("OAuth flow cancelled".into()))?;
-
-            // Validate state parameter to prevent CSRF
-            if state != expected_state {
-                return Err(Error::Auth("OAuth state mismatch — possible CSRF attack".into()));
-            }
-
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("failed to create HTTP client");
-
-            let token_resp = exchange_code(&client, client_id, &code, &code_verifier).await?;
-
-            // Fetch user's email from Graph
-            let email = fetch_user_email(&client, &token_resp.access_token).await?;
-
-            let session = OutlookSession {
-                client,
-                token: tokio::sync::Mutex::new(OutlookToken {
-                    access_token: token_resp.access_token,
-                    refresh_token: token_resp.refresh_token.unwrap_or_default(),
-                    token_expiry: Utc::now() + chrono::Duration::seconds(token_resp.expires_in),
-                }),
-                client_id: client_id.to_string(),
-                token_path: token_path.to_path_buf(),
-                email,
-            };
-
-            save_tokens(&session)?;
-            tracing::info!("Outlook OAuth completed for {}", session.email);
-            Ok(session)
-        }
-    }
+    save_tokens(&session)?;
+    tracing::info!("Outlook OAuth completed for {}", session.email);
+    Ok(session)
 }
 
 /// Fetch the authenticated user's email from Microsoft Graph
