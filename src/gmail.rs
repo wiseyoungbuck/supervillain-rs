@@ -23,6 +23,10 @@ use serde::Deserialize;
 use crate::error::Error;
 use crate::oauth;
 use crate::platform::{self, TokenStore, Tokens};
+use crate::provider_utils::{
+    MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP, encode_path_segment,
+    mime_type_from_filename, should_clear_tokens_on_refresh_failure,
+};
 use crate::types::{CalendarEvent, Email, EmailAddress, Identity, Mailbox, ParsedQuery};
 
 // =============================================================================
@@ -78,15 +82,9 @@ pub struct GmailSession {
     pub parent_message_id_cache: tokio::sync::Mutex<Vec<(String, String)>>,
 }
 
-const UPLOAD_CACHE_CAP: usize = 32;
+// UPLOAD_CACHE_CAP, MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES → see
+// crate::provider_utils (single tuning point shared with Outlook).
 const PARENT_MID_CACHE_CAP: usize = 16;
-/// Per-attachment upper bound. Gmail's `messages.send` rejects RFC822 over
-/// ~25 MiB; any single blob above that can't land regardless. Bounded here
-/// so we fail fast at upload time instead of constructing a doomed RFC822.
-const MAX_BLOB_BYTES: usize = 25 * 1024 * 1024;
-/// Aggregate per-session cap. Pins RAM at 50 MiB worst-case (32 small blobs
-/// can fit; two ~25 MiB blobs would trip this). Same fail-fast rationale.
-const MAX_UPLOAD_CACHE_BYTES: usize = 50 * 1024 * 1024;
 
 /// What's needed to fetch a given page from Gmail's cursor-paginated
 /// `messages.list`. The three states are deliberately distinguishable so the
@@ -573,19 +571,8 @@ pub async fn clear_stored_tokens(session: &GmailSession) {
     }
 }
 
-/// Decide whether a refresh-token failure should evict the stored tokens.
-/// Pure — testable without HTTP.
-///
-/// Returns true only on 4xx + body containing `"invalid_grant"`. Other
-/// failures (5xx, network, malformed request, generic 401 without
-/// invalid_grant) preserve the tokens, because clearing on transient
-/// trouble would force a re-OAuth dance on every Google blip.
-pub(crate) fn should_clear_tokens_on_refresh_failure(
-    status: reqwest::StatusCode,
-    body: &str,
-) -> bool {
-    status.is_client_error() && body.contains("invalid_grant")
-}
+// should_clear_tokens_on_refresh_failure → see crate::provider_utils
+// (identical predicate for Gmail and Outlook).
 
 // =============================================================================
 // Identities (sendAs)
@@ -1213,37 +1200,7 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::Internal(format!("base64url decode failed: {e}")))
 }
 
-/// Percent-encode a string for safe interpolation as a single URL path
-/// segment. Encodes everything that isn't RFC 3986 unreserved
-/// (`A-Za-z0-9-._~`). Gmail's actual ID space is a subset of unreserved, so
-/// this is a no-op for real IDs; it's defense-in-depth against future
-/// untrusted-input flows.
-pub(crate) fn encode_path_segment(s: &str) -> String {
-    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-    // RFC 3986 path segment: pchar = unreserved / pct-encoded / sub-delims / ":" / "@"
-    // We're stricter — only allow unreserved.
-    const PATH_SEG: &AsciiSet = &CONTROLS
-        .add(b' ')
-        .add(b'"')
-        .add(b'<')
-        .add(b'>')
-        .add(b'`')
-        .add(b'#')
-        .add(b'?')
-        .add(b'{')
-        .add(b'}')
-        .add(b'/')
-        .add(b'%')
-        .add(b'&')
-        .add(b'=')
-        .add(b'+')
-        .add(b':')
-        .add(b'@')
-        .add(b';')
-        .add(b',')
-        .add(b'$');
-    utf8_percent_encode(s, PATH_SEG).to_string()
-}
+// encode_path_segment → see crate::provider_utils.
 
 /// Map a Gmail HTTP error response to the right `Error` variant so frontends
 /// can distinguish "your input/state is stale" (4xx — refresh the list) from
@@ -1502,47 +1459,7 @@ struct AttachmentBody {
     data: Option<String>,
 }
 
-/// Best-effort MIME guess from filename extension. Gmail's
-/// `messages.attachments.get` returns only `{size, data}` with no
-/// content-type, and we don't want to spend an extra `messages.get` RTT just
-/// to look it up — the user's UI already knows the type from `get_emails`.
-/// Falls back to `application/octet-stream` for unknown extensions, which the
-/// browser will treat as a download (with the path's filename).
-pub(crate) fn mime_type_from_filename(filename: &str) -> &'static str {
-    let lower = filename.to_ascii_lowercase();
-    let ext = match lower.rsplit_once('.') {
-        Some((_, ext)) => ext,
-        None => return "application/octet-stream",
-    };
-    match ext {
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "heic" => "image/heic",
-        "txt" | "log" | "md" => "text/plain",
-        "html" | "htm" => "text/html",
-        "csv" => "text/csv",
-        "ics" => "text/calendar",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "zip" => "application/zip",
-        "gz" | "tgz" => "application/gzip",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ppt" => "application/vnd.ms-powerpoint",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        _ => "application/octet-stream",
-    }
-}
+// mime_type_from_filename → see crate::provider_utils.
 
 pub async fn download_blob(
     session: &GmailSession,
@@ -3407,90 +3324,7 @@ mod tests {
         assert_eq!(body["removeLabelIds"], serde_json::json!(["INBOX"]));
     }
 
-    // ---- Milestone B: mime_type_from_filename ----
-
-    #[test]
-    fn mime_pdf() {
-        assert_eq!(mime_type_from_filename("report.pdf"), "application/pdf");
-    }
-
-    #[test]
-    fn mime_case_insensitive_extension() {
-        assert_eq!(mime_type_from_filename("PHOTO.JPG"), "image/jpeg");
-        assert_eq!(mime_type_from_filename("Doc.PDF"), "application/pdf");
-    }
-
-    #[test]
-    fn mime_jpeg_both_extensions() {
-        assert_eq!(mime_type_from_filename("a.jpg"), "image/jpeg");
-        assert_eq!(mime_type_from_filename("b.jpeg"), "image/jpeg");
-    }
-
-    #[test]
-    fn mime_calendar() {
-        assert_eq!(mime_type_from_filename("invite.ics"), "text/calendar");
-    }
-
-    #[test]
-    fn mime_office_docx() {
-        assert_eq!(
-            mime_type_from_filename("contract.docx"),
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        );
-    }
-
-    #[test]
-    fn mime_unknown_extension_falls_back_to_octet_stream() {
-        assert_eq!(
-            mime_type_from_filename("mystery.xyzfoo"),
-            "application/octet-stream"
-        );
-    }
-
-    #[test]
-    fn mime_no_extension_falls_back_to_octet_stream() {
-        assert_eq!(
-            mime_type_from_filename("README"),
-            "application/octet-stream"
-        );
-    }
-
-    #[test]
-    fn mime_dot_at_start_treated_as_extension() {
-        // Hidden file with no extension — `rsplit_once('.')` returns
-        // `("", "bashrc")`, which is "unknown", so octet-stream.
-        assert_eq!(
-            mime_type_from_filename(".bashrc"),
-            "application/octet-stream"
-        );
-    }
-
-    #[test]
-    fn mime_double_extension_uses_last() {
-        // tar.gz → ext is "gz" → application/gzip
-        assert_eq!(mime_type_from_filename("backup.tar.gz"), "application/gzip");
-    }
-
-    // Lock high-traffic entries that bit-rot silently (roborev 174 #7).
-    #[test]
-    fn mime_common_image_and_av_extensions() {
-        assert_eq!(mime_type_from_filename("a.svg"), "image/svg+xml");
-        assert_eq!(mime_type_from_filename("a.webp"), "image/webp");
-        assert_eq!(mime_type_from_filename("a.heic"), "image/heic");
-        assert_eq!(mime_type_from_filename("a.mp4"), "video/mp4");
-        assert_eq!(mime_type_from_filename("a.mov"), "video/quicktime");
-        assert_eq!(mime_type_from_filename("a.mp3"), "audio/mpeg");
-        assert_eq!(mime_type_from_filename("a.wav"), "audio/wav");
-    }
-
-    #[test]
-    fn mime_common_text_and_data_extensions() {
-        assert_eq!(mime_type_from_filename("a.csv"), "text/csv");
-        assert_eq!(mime_type_from_filename("a.xml"), "application/xml");
-        assert_eq!(mime_type_from_filename("a.zip"), "application/zip");
-        assert_eq!(mime_type_from_filename("a.tgz"), "application/gzip");
-        assert_eq!(mime_type_from_filename("a.json"), "application/json");
-    }
+    // mime_type_from_filename tests → crate::provider_utils::tests
 
     // ---- move_plan (roborev 174 finding #1 + #7) ----
 
@@ -3724,50 +3558,9 @@ mod tests {
     }
 
     // ---- Milestone E: 401-on-revoke token clearing ----
-
-    #[test]
-    fn should_clear_tokens_on_invalid_grant() {
-        // invalid_grant is the canonical "your refresh token is gone" signal
-        // from Google — happens when a Testing-mode app's test-user grant
-        // ages past 7 days, or the user explicitly revokes the app.
-        let s = reqwest::StatusCode::BAD_REQUEST;
-        let body =
-            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
-        assert!(should_clear_tokens_on_refresh_failure(s, body));
-    }
-
-    #[test]
-    fn should_clear_tokens_on_invalid_grant_401() {
-        // Some Google paths return 401 instead of 400 for the same case.
-        let s = reqwest::StatusCode::UNAUTHORIZED;
-        let body = r#"{"error":"invalid_grant"}"#;
-        assert!(should_clear_tokens_on_refresh_failure(s, body));
-    }
-
-    #[test]
-    fn should_not_clear_on_transient_5xx() {
-        // 5xx means Google had a hiccup; the token may still be valid.
-        // Clearing here would force a re-OAuth on a transient outage.
-        let s = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
-        let body = "google internal error";
-        assert!(!should_clear_tokens_on_refresh_failure(s, body));
-    }
-
-    #[test]
-    fn should_not_clear_on_4xx_without_invalid_grant() {
-        // 400 for some other reason (malformed request, etc.) shouldn't
-        // wipe credentials — the token might still work for read calls.
-        let s = reqwest::StatusCode::BAD_REQUEST;
-        let body = r#"{"error":"invalid_request"}"#;
-        assert!(!should_clear_tokens_on_refresh_failure(s, body));
-    }
-
-    #[test]
-    fn should_not_clear_on_empty_body() {
-        // Without a body to disambiguate, default to preserving credentials.
-        let s = reqwest::StatusCode::BAD_REQUEST;
-        assert!(!should_clear_tokens_on_refresh_failure(s, ""));
-    }
+    // should_clear_tokens_on_refresh_failure tests → crate::provider_utils::tests.
+    // Below: integration test for the Gmail-specific clear_stored_tokens helper
+    // (drops session token store entry — still lives on the session struct).
 
     #[tokio::test]
     async fn clear_stored_tokens_removes_from_store() {
@@ -3985,34 +3778,7 @@ mod tests {
         assert!(looks_like_message_id("  <foo@bar>  "));
     }
 
-    // ---- Roborev 176 #2: encode_path_segment ----
-
-    #[test]
-    fn encode_path_segment_passes_alphanumeric_through() {
-        assert_eq!(encode_path_segment("190abc-DEF_xyz"), "190abc-DEF_xyz");
-    }
-
-    #[test]
-    fn encode_path_segment_encodes_slash() {
-        // The bug class: `/` would corrupt the URL path.
-        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
-    }
-
-    #[test]
-    fn encode_path_segment_encodes_query_and_fragment_chars() {
-        assert_eq!(encode_path_segment("a?b"), "a%3Fb");
-        assert_eq!(encode_path_segment("a#b"), "a%23b");
-        assert_eq!(encode_path_segment("a&b"), "a%26b");
-    }
-
-    #[test]
-    fn encode_path_segment_encodes_path_traversal_separators() {
-        let encoded = encode_path_segment("../etc/passwd");
-        // The `/` chars must be encoded so this can't break out of the
-        // intended path segment.
-        assert!(!encoded.contains('/'));
-        assert!(encoded.contains("%2F"));
-    }
+    // encode_path_segment tests → crate::provider_utils::tests
 
     // ---- Roborev 176 #4: upload size caps ----
 

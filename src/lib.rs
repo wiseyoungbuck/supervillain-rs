@@ -7,6 +7,7 @@ pub mod oauth;
 pub mod outlook;
 pub mod platform;
 pub mod provider;
+pub mod provider_utils;
 pub mod routes;
 pub mod search;
 pub mod splits;
