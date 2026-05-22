@@ -205,11 +205,20 @@ async fn ensure_token(session: &GmailSession) -> Result<(), Error> {
             response_body = %text,
             "Gmail token refresh failed"
         );
-        if text.contains("invalid_grant") {
+        // Irrecoverable: tokens are gone on Google's side. Evict ours so the
+        // next process launch goes through the full OAuth flow instead of
+        // hammering /token with a refresh that will never succeed.
+        if should_clear_tokens_on_refresh_failure(status, &text) {
+            // Release the mutex before clear_stored_tokens (it acquires its
+            // own lock — different mutex, but the principle holds).
+            drop(token);
+            clear_stored_tokens(session).await;
             return Err(Error::Auth(format!(
-                "Gmail refresh token expired or revoked. If your OAuth app is in 'Testing' \
-                 state in Google Cloud Console, you must be listed as a Test User; otherwise \
-                 tokens expire after 7 days. See README §Gmail setup. ({status}): {text}"
+                "Gmail refresh token expired or revoked. Stored tokens cleared; \
+                 restart supervillain to re-authenticate. If your OAuth app is in \
+                 'Testing' state in Google Cloud Console, you must be listed as a \
+                 Test User; otherwise tokens expire after 7 days. \
+                 See README §Gmail setup. ({status}): {text}"
             )));
         }
         return Err(Error::Auth(format!(
@@ -547,6 +556,35 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
 pub async fn invalidate_label_cache(session: &GmailSession) {
     let mut cache = session.label_cache.lock().await;
     *cache = None;
+}
+
+/// Delete the stored OAuth tokens for this session's account. Called when
+/// `ensure_token` detects an irrecoverable refresh failure (typically
+/// `invalid_grant` from a revoked or 7-day-expired test-user token), so the
+/// next launch falls through to a fresh `oauth_flow` instead of looping on
+/// a doomed refresh.
+pub async fn clear_stored_tokens(session: &GmailSession) {
+    if let Err(e) = session.token_store.delete(&session.account_id) {
+        tracing::warn!(
+            account_id = %session.account_id,
+            error = %e,
+            "Failed to delete stored Gmail tokens after refresh failure"
+        );
+    }
+}
+
+/// Decide whether a refresh-token failure should evict the stored tokens.
+/// Pure — testable without HTTP.
+///
+/// Returns true only on 4xx + body containing `"invalid_grant"`. Other
+/// failures (5xx, network, malformed request, generic 401 without
+/// invalid_grant) preserve the tokens, because clearing on transient
+/// trouble would force a re-OAuth dance on every Google blip.
+pub(crate) fn should_clear_tokens_on_refresh_failure(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    status.is_client_error() && body.contains("invalid_grant")
 }
 
 // =============================================================================
@@ -3638,6 +3676,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    // ---- Milestone E: 401-on-revoke token clearing ----
+
+    #[test]
+    fn should_clear_tokens_on_invalid_grant() {
+        // invalid_grant is the canonical "your refresh token is gone" signal
+        // from Google — happens when a Testing-mode app's test-user grant
+        // ages past 7 days, or the user explicitly revokes the app.
+        let s = reqwest::StatusCode::BAD_REQUEST;
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        assert!(should_clear_tokens_on_refresh_failure(s, body));
+    }
+
+    #[test]
+    fn should_clear_tokens_on_invalid_grant_401() {
+        // Some Google paths return 401 instead of 400 for the same case.
+        let s = reqwest::StatusCode::UNAUTHORIZED;
+        let body = r#"{"error":"invalid_grant"}"#;
+        assert!(should_clear_tokens_on_refresh_failure(s, body));
+    }
+
+    #[test]
+    fn should_not_clear_on_transient_5xx() {
+        // 5xx means Google had a hiccup; the token may still be valid.
+        // Clearing here would force a re-OAuth on a transient outage.
+        let s = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let body = "google internal error";
+        assert!(!should_clear_tokens_on_refresh_failure(s, body));
+    }
+
+    #[test]
+    fn should_not_clear_on_4xx_without_invalid_grant() {
+        // 400 for some other reason (malformed request, etc.) shouldn't
+        // wipe credentials — the token might still work for read calls.
+        let s = reqwest::StatusCode::BAD_REQUEST;
+        let body = r#"{"error":"invalid_request"}"#;
+        assert!(!should_clear_tokens_on_refresh_failure(s, body));
+    }
+
+    #[test]
+    fn should_not_clear_on_empty_body() {
+        // Without a body to disambiguate, default to preserving credentials.
+        let s = reqwest::StatusCode::BAD_REQUEST;
+        assert!(!should_clear_tokens_on_refresh_failure(s, ""));
+    }
+
+    #[tokio::test]
+    async fn clear_stored_tokens_removes_from_store() {
+        // RED before clear_stored_tokens existed: the call below didn't compile.
+        let session = test_session();
+        // Sanity: the test_session helper seeds tokens, so they're present.
+        assert!(
+            session.token_store.load(&session.account_id).is_some(),
+            "precondition: test_session seeds a stored token"
+        );
+
+        clear_stored_tokens(&session).await;
+
+        assert!(
+            session.token_store.load(&session.account_id).is_none(),
+            "stored tokens should be deleted after clear_stored_tokens"
+        );
     }
 
     // ---- Milestone C: extract_message_id ----
