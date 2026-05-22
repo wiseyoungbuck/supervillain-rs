@@ -67,7 +67,20 @@ pub struct GmailSession {
     /// re-issuing the page-0 request (which would otherwise happen if a plain
     /// `None` were used both as "no token needed" and "no more results").
     pub page_cache: tokio::sync::Mutex<HashMap<String, Vec<PageStart>>>,
+    /// Synthetic blob cache for compose-time uploads. Gmail has no
+    /// standalone blob store, so uploads are buffered here and inlined into
+    /// the RFC822 at `send_email` time. Capped at `UPLOAD_CACHE_CAP` per
+    /// session; entries are consumed on resolve so memory drops promptly.
+    pub upload_cache: tokio::sync::Mutex<HashMap<uuid::Uuid, (String, Vec<u8>)>>,
+    /// LRU-ish cache of (gmail_msg_id → real RFC822 Message-ID header value).
+    /// Populated lazily when sending a reply — the frontend passes Gmail's
+    /// message ID as `in_reply_to`, but RFC822 needs the actual `<…@…>`
+    /// header value. Capped at `PARENT_MID_CACHE_CAP`; oldest entries evicted.
+    pub parent_message_id_cache: tokio::sync::Mutex<Vec<(String, String)>>,
 }
+
+const UPLOAD_CACHE_CAP: usize = 32;
+const PARENT_MID_CACHE_CAP: usize = 16;
 
 /// What's needed to fetch a given page from Gmail's cursor-paginated
 /// `messages.list`. The three states are deliberately distinguishable so the
@@ -280,6 +293,8 @@ pub fn load_session(
         account_id: account_id.to_string(),
         label_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
+        upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+        parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -329,6 +344,8 @@ pub async fn oauth_flow(
         account_id: account_id.to_string(),
         label_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
+        upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+        parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
     };
 
     let token = session.token.lock().await;
@@ -1489,6 +1506,349 @@ pub async fn download_blob(
 }
 
 // =============================================================================
+// upload_blob — synthetic blob cache (compose-time uploads)
+// =============================================================================
+
+/// Stash uploaded bytes in the session's synthetic-blob cache and return a
+/// `BlobRef::Synthetic(uuid)` to embed in the EmailSubmission. Cap-enforced
+/// (`UPLOAD_CACHE_CAP`) so a misbehaving client can't grow memory unbounded.
+///
+/// Gmail has no standalone blob store — the bytes have to be inlined into the
+/// RFC822 at send time. We resolve+consume on `send_email`, so the typical
+/// upload→send lifetime is short.
+pub async fn upload_blob(
+    session: &GmailSession,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(String, i64), Error> {
+    let mut cache = session.upload_cache.lock().await;
+    if cache.len() >= UPLOAD_CACHE_CAP {
+        return Err(Error::BadRequest(format!(
+            "Gmail upload cache full ({UPLOAD_CACHE_CAP} entries). \
+             Cancel or send pending drafts before attaching more files."
+        )));
+    }
+    let id = uuid::Uuid::new_v4();
+    cache.insert(id, (content_type.to_string(), body.to_vec()));
+    let blob_ref = crate::types::BlobRef::Synthetic(id);
+    Ok((blob_ref.to_string(), body.len() as i64))
+}
+
+/// Resolve a `BlobRef` to its bytes. Pure-async helper used by `send_email`
+/// when inlining attachments into the RFC822.
+///
+/// - `Synthetic` → look up in `upload_cache` and **consume** (removed on
+///   resolve). A second resolve of the same UUID will fail.
+/// - `GmailAttachment` → delegate to `download_blob` to re-fetch from Gmail.
+///   This is the "reply with original attachment" path — the EmailSubmission
+///   carries the original message's `{msg_id}:{att_id}` blob_id, we re-fetch
+///   the bytes server-side rather than round-tripping through the client.
+async fn resolve_blob_to_bytes(
+    session: &GmailSession,
+    blob_id: &str,
+    filename: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let blob_ref = crate::types::BlobRef::parse(blob_id)?;
+    match blob_ref {
+        crate::types::BlobRef::Synthetic(id) => {
+            let mut cache = session.upload_cache.lock().await;
+            cache.remove(&id).ok_or_else(|| {
+                Error::BadRequest(format!(
+                    "Gmail synthetic blob {id} not found (already consumed or session restarted)"
+                ))
+            })
+        }
+        crate::types::BlobRef::GmailAttachment { .. } => {
+            // download_blob re-parses the blob_id internally; cheap.
+            download_blob(session, blob_id, filename).await
+        }
+    }
+}
+
+// =============================================================================
+// lookup_parent_message_id — for In-Reply-To resolution
+// =============================================================================
+
+/// The frontend passes Gmail's message ID as `EmailSubmission.in_reply_to`,
+/// but RFC822's `In-Reply-To` header takes the parent's RFC822 `Message-ID`
+/// header value (`<…@…>`). This helper fetches the parent and extracts it.
+///
+/// LRU-ish cache on the session (capped at `PARENT_MID_CACHE_CAP`); a
+/// burst of replies in the same thread doesn't re-fetch. Pure linear scan
+/// over a small vec — no point in a real LRU at this size.
+async fn lookup_parent_message_id(
+    session: &GmailSession,
+    gmail_msg_id: &str,
+) -> Result<Option<String>, Error> {
+    {
+        let cache = session.parent_message_id_cache.lock().await;
+        if let Some((_, mid)) = cache.iter().find(|(k, _)| k == gmail_msg_id) {
+            return Ok(Some(mid.clone()));
+        }
+    }
+
+    let token = access_token(session).await?;
+    let url =
+        format!("{GMAIL_BASE}/messages/{gmail_msg_id}?format=metadata&metadataHeaders=Message-ID");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        // Don't fail the whole send for a missing parent — just skip threading.
+        tracing::warn!(
+            gmail_msg_id = %gmail_msg_id,
+            http_status = %status,
+            response_body = %text,
+            "Gmail parent-message lookup failed; sending without In-Reply-To"
+        );
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct MetadataResp {
+        #[serde(default)]
+        payload: MetadataPayload,
+    }
+    #[derive(Default, Deserialize)]
+    struct MetadataPayload {
+        #[serde(default)]
+        headers: Vec<GmailHeader>,
+    }
+
+    let parsed: MetadataResp = resp.json().await?;
+    let mid = parsed
+        .payload
+        .headers
+        .into_iter()
+        .find(|h| h.name.eq_ignore_ascii_case("Message-ID"))
+        .map(|h| extract_message_id(&h.value))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref mid) = mid {
+        let mut cache = session.parent_message_id_cache.lock().await;
+        if cache.len() >= PARENT_MID_CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push((gmail_msg_id.to_string(), mid.clone()));
+    }
+    Ok(mid)
+}
+
+/// Strip a `Message-ID:` header value down to its canonical `<…@…>` form.
+/// Gmail returns the raw header value, which may include trailing comments
+/// or whitespace. We keep the angle brackets — they're the canonical form
+/// stored elsewhere (cache, downstream comparisons).
+pub(crate) fn extract_message_id(header_value: &str) -> String {
+    let trimmed = header_value.trim();
+    if let Some(start) = trimmed.find('<')
+        && let Some(end) = trimmed[start..].find('>')
+    {
+        return trimmed[start..start + end + 1].to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Strip surrounding `<>` brackets from a Message-ID-shaped string. Used at
+/// the point of handing values to mail-builder, which always re-wraps in
+/// `<…>` and would otherwise produce `<<…>>` for already-bracketed input.
+pub(crate) fn strip_message_id_brackets(s: &str) -> &str {
+    let t = s.trim();
+    t.strip_prefix('<')
+        .unwrap_or(t)
+        .strip_suffix('>')
+        .unwrap_or(t.strip_prefix('<').unwrap_or(t))
+}
+
+// =============================================================================
+// send_email — RFC822 construction + messages.send
+// =============================================================================
+
+#[derive(Deserialize)]
+struct SendResponse {
+    id: String,
+}
+
+/// Pick the identity matching `from_addr` (or the override). Falls back to
+/// the first identity if there's no match — same behavior as JMAP.
+async fn pick_identity_display_name(
+    session: &GmailSession,
+    from_addr: &str,
+    identity_id_override: Option<&str>,
+) -> Option<String> {
+    let identities = get_identities(session).await.ok()?;
+    let chosen = if let Some(id) = identity_id_override {
+        identities.iter().find(|i| i.id == id)
+    } else {
+        identities
+            .iter()
+            .find(|i| i.email.eq_ignore_ascii_case(from_addr))
+    };
+    chosen
+        .or_else(|| identities.first())
+        .map(|i| i.name.clone())
+        .filter(|n| !n.is_empty())
+}
+
+/// Construct an RFC822 message ready for Gmail's `messages.send`. Async only
+/// because attachment resolution (`download_blob` for original attachments)
+/// needs an HTTP call. Returns the raw bytes.
+async fn build_rfc822(
+    session: &GmailSession,
+    sub: &crate::types::EmailSubmission,
+    from_addr: &str,
+    from_display_name: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&[String]>,
+) -> Result<Vec<u8>, Error> {
+    use mail_builder::MessageBuilder;
+    use mail_builder::headers::address::Address;
+    use mail_builder::mime::BodyPart;
+
+    let from_addr_owned = from_addr.to_string();
+    let mut builder = MessageBuilder::new();
+
+    // From with display name
+    let from_addr_cow: std::borrow::Cow<'_, str> = from_addr_owned.clone().into();
+    builder = match from_display_name {
+        Some(name) => builder.from(Address::new_address(
+            Some(std::borrow::Cow::Owned(name.to_string())),
+            from_addr_cow,
+        )),
+        None => builder.from(from_addr_owned.clone()),
+    };
+
+    // Recipients
+    if !sub.to.is_empty() {
+        let to_list: Vec<Address<'_>> = sub
+            .to
+            .iter()
+            .map(|e| Address::new_address(None::<std::borrow::Cow<'_, str>>, e.clone()))
+            .collect();
+        builder = builder.to(Address::new_list(to_list));
+    }
+    if !sub.cc.is_empty() {
+        let cc_list: Vec<Address<'_>> = sub
+            .cc
+            .iter()
+            .map(|e| Address::new_address(None::<std::borrow::Cow<'_, str>>, e.clone()))
+            .collect();
+        builder = builder.cc(Address::new_list(cc_list));
+    }
+    if let Some(bcc) = &sub.bcc
+        && !bcc.is_empty()
+    {
+        let bcc_list: Vec<Address<'_>> = bcc
+            .iter()
+            .map(|e| Address::new_address(None::<std::borrow::Cow<'_, str>>, e.clone()))
+            .collect();
+        builder = builder.bcc(Address::new_list(bcc_list));
+    }
+
+    builder = builder.subject(sub.subject.clone());
+
+    // Threading headers — only if caller resolved them. mail-builder's
+    // `MessageId` always wraps values in `<…>`, so strip any incoming
+    // brackets to avoid `<<foo@bar>>` in the wire format.
+    if let Some(mid) = in_reply_to {
+        builder = builder.in_reply_to(strip_message_id_brackets(mid).to_string());
+    }
+    if let Some(refs) = references
+        && !refs.is_empty()
+    {
+        let stripped: Vec<String> = refs
+            .iter()
+            .map(|r| strip_message_id_brackets(r).to_string())
+            .collect();
+        builder = builder.references(stripped);
+    }
+
+    builder = builder.text_body(sub.text_body.clone());
+    if let Some(html) = &sub.html_body {
+        builder = builder.html_body(html.clone());
+    }
+
+    for att in &sub.attachments {
+        let (resolved_mime, bytes) =
+            resolve_blob_to_bytes(session, &att.blob_id, &att.name).await?;
+        // Prefer the EmailSubmission's mime_type (from the original Email
+        // metadata), fall back to whatever resolve returned (extension guess).
+        let mime = if !att.mime_type.is_empty() {
+            att.mime_type.clone()
+        } else {
+            resolved_mime
+        };
+        builder = builder.attachment(mime, att.name.clone(), BodyPart::Binary(bytes.into()));
+    }
+
+    let mut out = Vec::with_capacity(4096);
+    builder
+        .write_to(&mut out)
+        .map_err(|e| Error::Internal(format!("RFC822 build failed: {e}")))?;
+    Ok(out)
+}
+
+pub async fn send_email(
+    session: &mut GmailSession,
+    sub: &crate::types::EmailSubmission,
+    from_addr: &str,
+    identity_id_override: Option<&str>,
+) -> Result<Option<String>, Error> {
+    let display_name = pick_identity_display_name(session, from_addr, identity_id_override).await;
+
+    // Resolve in_reply_to. If the frontend already passed a `<…@…>` form,
+    // use it verbatim; otherwise treat it as a Gmail msg ID and look up.
+    let (resolved_in_reply_to, resolved_references) = match sub.in_reply_to.as_deref() {
+        None => (None, sub.references.clone()),
+        Some(s) if s.starts_with('<') && s.contains('@') => {
+            (Some(s.to_string()), sub.references.clone())
+        }
+        Some(gmail_id) => {
+            let mid = lookup_parent_message_id(session, gmail_id).await?;
+            // Auto-populate References if caller didn't, since we have the
+            // parent's Message-ID and that's what threading clients expect.
+            let refs = match (&sub.references, &mid) {
+                (Some(r), _) => Some(r.clone()),
+                (None, Some(m)) => Some(vec![m.clone()]),
+                (None, None) => None,
+            };
+            (mid, refs)
+        }
+    };
+
+    let rfc822 = build_rfc822(
+        session,
+        sub,
+        from_addr,
+        display_name.as_deref(),
+        resolved_in_reply_to.as_deref(),
+        resolved_references.as_deref(),
+    )
+    .await?;
+
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&rfc822);
+
+    let token = access_token(session).await?;
+    let url = format!("{GMAIL_BASE}/messages/send");
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "raw": raw }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error("messages.send", status, &text));
+    }
+    let parsed: SendResponse = resp.json().await?;
+    invalidate_label_cache(session).await;
+    Ok(Some(parsed.id))
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -2599,5 +2959,240 @@ mod tests {
             Error::BadRequest(msg) => assert!(msg.contains("synthetic")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    // ---- Milestone C: upload cache lifecycle ----
+
+    fn test_session() -> GmailSession {
+        use crate::platform::{FsTokenStore, TokenStore, Tokens};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(dir.path().to_path_buf()));
+        store
+            .save(
+                "gmail",
+                &Tokens {
+                    access_token: "tok".into(),
+                    refresh_token: "rtok".into(),
+                    token_expiry: Utc::now() + chrono::Duration::hours(1),
+                    email: "u@g.com".into(),
+                },
+            )
+            .unwrap();
+        let session =
+            load_session(store, "gmail", "client-id", "client-secret").expect("session loads");
+        std::mem::forget(dir);
+        session
+    }
+
+    #[tokio::test]
+    async fn upload_blob_roundtrips_through_blob_ref() {
+        let session = test_session();
+        let (blob_id, size) = upload_blob(&session, "image/png", b"PNG-bytes")
+            .await
+            .unwrap();
+        assert_eq!(size, 9);
+        assert!(blob_id.starts_with("synth:"));
+        // Must parse back to Synthetic
+        let parsed = crate::types::BlobRef::parse(&blob_id).unwrap();
+        assert!(matches!(parsed, crate::types::BlobRef::Synthetic(_)));
+    }
+
+    #[tokio::test]
+    async fn upload_blob_cap_rejects_after_32_entries() {
+        let session = test_session();
+        for i in 0..UPLOAD_CACHE_CAP {
+            upload_blob(&session, "application/octet-stream", &[i as u8])
+                .await
+                .unwrap_or_else(|e| panic!("upload {i} should succeed: {e:?}"));
+        }
+        let err = upload_blob(&session, "application/octet-stream", &[99])
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("full")),
+            other => panic!("expected BadRequest for cap, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_synthetic_consumes_entry() {
+        let session = test_session();
+        let (blob_id, _) = upload_blob(&session, "text/plain", b"hello").await.unwrap();
+        let (mime, bytes) = resolve_blob_to_bytes(&session, &blob_id, "ignored")
+            .await
+            .unwrap();
+        assert_eq!(mime, "text/plain");
+        assert_eq!(bytes, b"hello");
+        // Second resolve must fail — entry was consumed.
+        let err = resolve_blob_to_bytes(&session, &blob_id, "ignored")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    // ---- Milestone C: extract_message_id ----
+
+    #[test]
+    fn extract_message_id_bracketed() {
+        assert_eq!(extract_message_id("<abc@example.com>"), "<abc@example.com>");
+    }
+
+    #[test]
+    fn extract_message_id_with_whitespace_and_comment() {
+        // RFC822 headers may include CFWS; extractor pulls just <…>.
+        assert_eq!(
+            extract_message_id("  <abc@example.com> (comment)"),
+            "<abc@example.com>"
+        );
+    }
+
+    #[test]
+    fn extract_message_id_unbracketed_passes_through() {
+        // If a server returns the bare form (uncommon but legal), pass it
+        // through trimmed — downstream comparisons will still work-ish.
+        assert_eq!(extract_message_id("  abc@example.com  "), "abc@example.com");
+    }
+
+    #[test]
+    fn extract_message_id_empty() {
+        assert_eq!(extract_message_id(""), "");
+        assert_eq!(extract_message_id("   "), "");
+    }
+
+    // ---- Milestone C: build_rfc822 fixtures ----
+    //
+    // build_rfc822 is async because it resolves attachments; the test runner
+    // uses #[tokio::test] but the network paths are exercised only via
+    // synthetic blobs (no real HTTP).
+
+    fn email_sub_text_only(subject: &str, body: &str) -> crate::types::EmailSubmission {
+        crate::types::EmailSubmission {
+            to: vec!["recipient@example.com".into()],
+            cc: vec![],
+            bcc: None,
+            subject: subject.into(),
+            text_body: body.into(),
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_text_only_has_required_headers() {
+        let session = test_session();
+        let sub = email_sub_text_only("Hello", "Body");
+        let raw = build_rfc822(
+            &session,
+            &sub,
+            "from@example.com",
+            Some("Alice"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("From: "));
+        assert!(s.contains("from@example.com"));
+        assert!(s.contains("Alice"));
+        assert!(s.contains("To: "));
+        assert!(s.contains("recipient@example.com"));
+        assert!(s.contains("Subject: Hello"));
+        assert!(s.contains("MIME-Version: 1.0"));
+        assert!(s.contains("Message-ID: "));
+        assert!(s.contains("Date: "));
+        assert!(s.contains("Body"));
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_text_and_html_uses_alternative() {
+        let session = test_session();
+        let mut sub = email_sub_text_only("Mixed", "plain body");
+        sub.html_body = Some("<p>html body</p>".into());
+        let raw = build_rfc822(&session, &sub, "from@example.com", None, None, None)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("multipart/alternative"));
+        assert!(s.contains("text/plain"));
+        assert!(s.contains("text/html"));
+        assert!(s.contains("plain body"));
+        assert!(s.contains("html body") || s.contains("<p>html body</p>"));
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_reply_includes_in_reply_to_and_references() {
+        let session = test_session();
+        let sub = email_sub_text_only("Re: thing", "ack");
+        let raw = build_rfc822(
+            &session,
+            &sub,
+            "me@example.com",
+            None,
+            Some("<parent@example.com>"),
+            Some(&["<parent@example.com>".to_string()]),
+        )
+        .await
+        .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("In-Reply-To: <parent@example.com>"));
+        assert!(s.contains("References: <parent@example.com>"));
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_bcc_included_in_headers() {
+        let session = test_session();
+        let mut sub = email_sub_text_only("Hi", "body");
+        sub.bcc = Some(vec!["secret@example.com".into()]);
+        let raw = build_rfc822(&session, &sub, "from@example.com", None, None, None)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("Bcc:"));
+        assert!(s.contains("secret@example.com"));
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_with_attachment_becomes_multipart_mixed() {
+        let session = test_session();
+        let (blob_id, _) = upload_blob(&session, "application/pdf", b"%PDF-fake")
+            .await
+            .unwrap();
+        let mut sub = email_sub_text_only("Report", "see attached");
+        sub.attachments = vec![crate::types::Attachment {
+            blob_id,
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 9,
+        }];
+        let raw = build_rfc822(&session, &sub, "from@example.com", None, None, None)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("multipart/mixed"));
+        assert!(s.contains("application/pdf"));
+        assert!(s.contains("report.pdf"));
+        // Content-Disposition: attachment for the second part
+        assert!(s.to_ascii_lowercase().contains("attachment"));
+    }
+
+    #[tokio::test]
+    async fn build_rfc822_multiple_recipients() {
+        let session = test_session();
+        let mut sub = email_sub_text_only("Hi", "all");
+        sub.to = vec!["a@example.com".into(), "b@example.com".into()];
+        sub.cc = vec!["c@example.com".into()];
+        let raw = build_rfc822(&session, &sub, "from@example.com", None, None, None)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.contains("a@example.com"));
+        assert!(s.contains("b@example.com"));
+        assert!(s.contains("c@example.com"));
+        assert!(s.contains("Cc:"));
     }
 }

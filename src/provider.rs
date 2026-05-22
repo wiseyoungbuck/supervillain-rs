@@ -12,7 +12,11 @@ use crate::{calendar, gmail, jmap, outlook};
 pub enum ProviderSession {
     Fastmail(JmapSession),
     Outlook(OutlookSession),
-    Gmail(GmailSession),
+    /// Boxed because GmailSession is larger than the other variants
+    /// (label_cache + page_cache + upload_cache + parent_message_id_cache).
+    /// Without the box, every ProviderSession instance pays the size cost
+    /// even for Fastmail/Outlook accounts.
+    Gmail(Box<GmailSession>),
 }
 
 impl ProviderSession {
@@ -201,7 +205,9 @@ pub async fn send_email(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("send_email", "Milestone C")),
+        ProviderSession::Gmail(s) => {
+            gmail::send_email(s, sub, from_addr, identity_id_override).await
+        }
     }
 }
 
@@ -252,7 +258,7 @@ pub async fn upload_blob(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Blob upload not supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("upload_blob", "Milestone C")),
+        ProviderSession::Gmail(s) => gmail::upload_blob(s, content_type, body).await,
     }
 }
 
@@ -433,7 +439,7 @@ mod tests {
             .expect("session should load");
         // Keep tempdir alive for the test (intentional leak; tests are short-lived)
         std::mem::forget(dir);
-        ProviderSession::Gmail(session)
+        ProviderSession::Gmail(Box::new(session))
     }
 
     #[test]

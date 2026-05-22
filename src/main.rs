@@ -180,7 +180,7 @@ async fn main() {
 
                 sessions.insert(
                     name.clone(),
-                    tokio::sync::RwLock::new(ProviderSession::Gmail(session)),
+                    tokio::sync::RwLock::new(ProviderSession::Gmail(Box::new(session))),
                 );
             }
 
