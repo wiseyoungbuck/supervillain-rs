@@ -1513,6 +1513,7 @@ dependencies = [
  "base64",
  "chrono",
  "mail-builder",
+ "percent-encoding",
  "rand",
  "regex",
  "reqwest",

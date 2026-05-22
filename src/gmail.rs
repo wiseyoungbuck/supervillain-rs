@@ -81,6 +81,13 @@ pub struct GmailSession {
 
 const UPLOAD_CACHE_CAP: usize = 32;
 const PARENT_MID_CACHE_CAP: usize = 16;
+/// Per-attachment upper bound. Gmail's `messages.send` rejects RFC822 over
+/// ~25 MiB; any single blob above that can't land regardless. Bounded here
+/// so we fail fast at upload time instead of constructing a doomed RFC822.
+const MAX_BLOB_BYTES: usize = 25 * 1024 * 1024;
+/// Aggregate per-session cap. Pins RAM at 50 MiB worst-case (32 small blobs
+/// can fit; two ~25 MiB blobs would trip this). Same fail-fast rationale.
+const MAX_UPLOAD_CACHE_BYTES: usize = 50 * 1024 * 1024;
 
 /// What's needed to fetch a given page from Gmail's cursor-paginated
 /// `messages.list`. The three states are deliberately distinguishable so the
@@ -1169,6 +1176,38 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::Internal(format!("base64url decode failed: {e}")))
 }
 
+/// Percent-encode a string for safe interpolation as a single URL path
+/// segment. Encodes everything that isn't RFC 3986 unreserved
+/// (`A-Za-z0-9-._~`). Gmail's actual ID space is a subset of unreserved, so
+/// this is a no-op for real IDs; it's defense-in-depth against future
+/// untrusted-input flows.
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    // RFC 3986 path segment: pchar = unreserved / pct-encoded / sub-delims / ":" / "@"
+    // We're stricter — only allow unreserved.
+    const PATH_SEG: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'`')
+        .add(b'#')
+        .add(b'?')
+        .add(b'{')
+        .add(b'}')
+        .add(b'/')
+        .add(b'%')
+        .add(b'&')
+        .add(b'=')
+        .add(b'+')
+        .add(b':')
+        .add(b'@')
+        .add(b';')
+        .add(b',')
+        .add(b'$');
+    utf8_percent_encode(s, PATH_SEG).to_string()
+}
+
 /// Map a Gmail HTTP error response to the right `Error` variant so frontends
 /// can distinguish "your input/state is stale" (4xx — refresh the list) from
 /// "Gmail is down" (5xx — retry later). Pure — unit-tested.
@@ -1511,21 +1550,42 @@ pub async fn download_blob(
 
 /// Stash uploaded bytes in the session's synthetic-blob cache and return a
 /// `BlobRef::Synthetic(uuid)` to embed in the EmailSubmission. Cap-enforced
-/// (`UPLOAD_CACHE_CAP`) so a misbehaving client can't grow memory unbounded.
+/// on three axes so a misbehaving client can't pin memory:
+///   - count (`UPLOAD_CACHE_CAP`)
+///   - per-blob size (`MAX_BLOB_BYTES`)
+///   - aggregate session size (`MAX_UPLOAD_CACHE_BYTES`)
 ///
 /// Gmail has no standalone blob store — the bytes have to be inlined into the
-/// RFC822 at send time. We resolve+consume on `send_email`, so the typical
+/// RFC822 at send time. We consume on `send_email` success, so the typical
 /// upload→send lifetime is short.
 pub async fn upload_blob(
     session: &GmailSession,
     content_type: &str,
     body: &[u8],
 ) -> Result<(String, i64), Error> {
+    if body.len() > MAX_BLOB_BYTES {
+        return Err(Error::BadRequest(format!(
+            "Gmail attachment too large: {} bytes (limit: {} MiB). \
+             Gmail's send endpoint rejects RFC822 above ~25 MiB regardless.",
+            body.len(),
+            MAX_BLOB_BYTES / 1024 / 1024
+        )));
+    }
     let mut cache = session.upload_cache.lock().await;
     if cache.len() >= UPLOAD_CACHE_CAP {
         return Err(Error::BadRequest(format!(
             "Gmail upload cache full ({UPLOAD_CACHE_CAP} entries). \
              Cancel or send pending drafts before attaching more files."
+        )));
+    }
+    let current_total: usize = cache.values().map(|(_, b)| b.len()).sum();
+    if current_total + body.len() > MAX_UPLOAD_CACHE_BYTES {
+        return Err(Error::BadRequest(format!(
+            "Gmail upload cache aggregate size would exceed {} MiB \
+             (current: {} MiB, this upload: {} MiB).",
+            MAX_UPLOAD_CACHE_BYTES / 1024 / 1024,
+            current_total / 1024 / 1024,
+            body.len() / 1024 / 1024
         )));
     }
     let id = uuid::Uuid::new_v4();
@@ -1534,16 +1594,17 @@ pub async fn upload_blob(
     Ok((blob_ref.to_string(), body.len() as i64))
 }
 
-/// Resolve a `BlobRef` to its bytes. Pure-async helper used by `send_email`
-/// when inlining attachments into the RFC822.
+/// Read a `BlobRef`'s bytes without mutating the cache. Used by `build_rfc822`
+/// at compose time — we don't want partial-failure during build to leave the
+/// session with half its synthetic blobs gone, so consumption is deferred
+/// until after `messages/send` returns 2xx (see `drain_consumed_synthetic_blobs`).
 ///
-/// - `Synthetic` → look up in `upload_cache` and **consume** (removed on
-///   resolve). A second resolve of the same UUID will fail.
+/// - `Synthetic` → look up in `upload_cache`, return a *clone* of the bytes.
 /// - `GmailAttachment` → delegate to `download_blob` to re-fetch from Gmail.
-///   This is the "reply with original attachment" path — the EmailSubmission
-///   carries the original message's `{msg_id}:{att_id}` blob_id, we re-fetch
-///   the bytes server-side rather than round-tripping through the client.
-async fn resolve_blob_to_bytes(
+///   The "reply with original attachment" path: the EmailSubmission carries
+///   the original message's `{msg_id}:{att_id}` blob_id, we re-fetch the
+///   bytes server-side rather than round-tripping through the client.
+async fn peek_blob_bytes(
     session: &GmailSession,
     blob_id: &str,
     filename: &str,
@@ -1551,16 +1612,32 @@ async fn resolve_blob_to_bytes(
     let blob_ref = crate::types::BlobRef::parse(blob_id)?;
     match blob_ref {
         crate::types::BlobRef::Synthetic(id) => {
-            let mut cache = session.upload_cache.lock().await;
-            cache.remove(&id).ok_or_else(|| {
+            let cache = session.upload_cache.lock().await;
+            cache.get(&id).cloned().ok_or_else(|| {
                 Error::BadRequest(format!(
                     "Gmail synthetic blob {id} not found (already consumed or session restarted)"
                 ))
             })
         }
         crate::types::BlobRef::GmailAttachment { .. } => {
-            // download_blob re-parses the blob_id internally; cheap.
             download_blob(session, blob_id, filename).await
+        }
+    }
+}
+
+/// Drop synthetic-blob entries from `upload_cache` after the EmailSubmission
+/// referencing them has been successfully sent. Idempotent — non-synthetic
+/// blob_ids and missing entries are silently skipped. Called from
+/// `send_email` only on a 2xx response from `messages/send`.
+async fn drain_consumed_synthetic_blobs(
+    session: &GmailSession,
+    attachments: &[crate::types::Attachment],
+) {
+    let mut cache = session.upload_cache.lock().await;
+    for att in attachments {
+        if let Ok(crate::types::BlobRef::Synthetic(id)) = crate::types::BlobRef::parse(&att.blob_id)
+        {
+            cache.remove(&id);
         }
     }
 }
@@ -1588,8 +1665,13 @@ async fn lookup_parent_message_id(
     }
 
     let token = access_token(session).await?;
+    // Defense-in-depth: percent-encode the message ID as a path segment
+    // even though Gmail IDs are URL-safe base64-ish. `gmail_msg_id` flows
+    // from frontend-provided `EmailSubmission.in_reply_to`; if a future
+    // change widens that input's trust boundary, the URL won't corrupt.
+    let encoded_id = encode_path_segment(gmail_msg_id);
     let url =
-        format!("{GMAIL_BASE}/messages/{gmail_msg_id}?format=metadata&metadataHeaders=Message-ID");
+        format!("{GMAIL_BASE}/messages/{encoded_id}?format=metadata&metadataHeaders=Message-ID");
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -1653,11 +1735,18 @@ pub(crate) fn extract_message_id(header_value: &str) -> String {
 /// the point of handing values to mail-builder, which always re-wraps in
 /// `<…>` and would otherwise produce `<<…>>` for already-bracketed input.
 pub(crate) fn strip_message_id_brackets(s: &str) -> &str {
+    let trimmed = s.trim();
+    let no_lt = trimmed.strip_prefix('<').unwrap_or(trimmed);
+    no_lt.strip_suffix('>').unwrap_or(no_lt)
+}
+
+/// Heuristic: does `s` look like an RFC 5322 `Message-ID` (`<local@domain>`)
+/// rather than a Gmail message ID? Used by `send_email` to decide whether
+/// to pass `in_reply_to` through verbatim or look up the parent's
+/// `Message-ID` header. Conservative — requires both leading `<` and a `@`.
+pub(crate) fn looks_like_message_id(s: &str) -> bool {
     let t = s.trim();
-    t.strip_prefix('<')
-        .unwrap_or(t)
-        .strip_suffix('>')
-        .unwrap_or(t.strip_prefix('<').unwrap_or(t))
+    t.starts_with('<') && t.contains('@')
 }
 
 // =============================================================================
@@ -1669,25 +1758,38 @@ struct SendResponse {
     id: String,
 }
 
-/// Pick the identity matching `from_addr` (or the override). Falls back to
-/// the first identity if there's no match — same behavior as JMAP.
+/// Pick the identity matching `from_addr` (or the explicit override).
+/// Resolution rules:
+///   - explicit `identity_id_override` set → must match an existing identity;
+///     otherwise log + return None (no display name on the From line is less
+///     wrong than attaching some *other* identity's name to `from_addr`).
+///   - no override → match by email; fall back to the first identity if no
+///     match (acceptable since the user's primary intent is the From address,
+///     and we're just attaching the best-effort display name).
 async fn pick_identity_display_name(
     session: &GmailSession,
     from_addr: &str,
     identity_id_override: Option<&str>,
 ) -> Option<String> {
     let identities = get_identities(session).await.ok()?;
-    let chosen = if let Some(id) = identity_id_override {
-        identities.iter().find(|i| i.id == id)
-    } else {
-        identities
+    let chosen = match identity_id_override {
+        Some(id) => {
+            let matched = identities.iter().find(|i| i.id == id);
+            if matched.is_none() {
+                tracing::warn!(
+                    identity_id_override = %id,
+                    "Gmail send: identity_id_override does not match any sendAs identity; \
+                     sending without display name to avoid mislabeling From"
+                );
+            }
+            matched
+        }
+        None => identities
             .iter()
             .find(|i| i.email.eq_ignore_ascii_case(from_addr))
+            .or_else(|| identities.first()),
     };
-    chosen
-        .or_else(|| identities.first())
-        .map(|i| i.name.clone())
-        .filter(|n| !n.is_empty())
+    chosen.map(|i| i.name.clone()).filter(|n| !n.is_empty())
 }
 
 /// Construct an RFC822 message ready for Gmail's `messages.send`. Async only
@@ -1769,8 +1871,7 @@ async fn build_rfc822(
     }
 
     for att in &sub.attachments {
-        let (resolved_mime, bytes) =
-            resolve_blob_to_bytes(session, &att.blob_id, &att.name).await?;
+        let (resolved_mime, bytes) = peek_blob_bytes(session, &att.blob_id, &att.name).await?;
         // Prefer the EmailSubmission's mime_type (from the original Email
         // metadata), fall back to whatever resolve returned (extension guess).
         let mime = if !att.mime_type.is_empty() {
@@ -1800,9 +1901,7 @@ pub async fn send_email(
     // use it verbatim; otherwise treat it as a Gmail msg ID and look up.
     let (resolved_in_reply_to, resolved_references) = match sub.in_reply_to.as_deref() {
         None => (None, sub.references.clone()),
-        Some(s) if s.starts_with('<') && s.contains('@') => {
-            (Some(s.to_string()), sub.references.clone())
-        }
+        Some(s) if looks_like_message_id(s) => (Some(s.to_string()), sub.references.clone()),
         Some(gmail_id) => {
             let mid = lookup_parent_message_id(session, gmail_id).await?;
             // Auto-populate References if caller didn't, since we have the
@@ -1844,7 +1943,16 @@ pub async fn send_email(
         return Err(classify_gmail_error("messages.send", status, &text));
     }
     let parsed: SendResponse = resp.json().await?;
+    // Consume the synthetic-blob entries now that we know the bytes made
+    // it onto the wire. Order matters: if the send fails (4xx/5xx earlier),
+    // the cache is preserved so the user can retry without re-uploading.
+    drain_consumed_synthetic_blobs(session, &sub.attachments).await;
+    // A successful send adds a message to the SENT label and changes
+    // counts. Invalidate label_cache for the count; clear page_cache so a
+    // subsequent scroll of Sent doesn't show stale cursors that miss the
+    // new message.
     invalidate_label_cache(session).await;
+    session.page_cache.lock().await.clear();
     Ok(Some(parsed.id))
 }
 
@@ -3016,16 +3124,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_synthetic_consumes_entry() {
+    async fn peek_blob_bytes_does_not_consume_synthetic() {
+        // Two successive peeks must both succeed — peek is read-only on the
+        // cache so partial-failure during build_rfc822 can be retried
+        // without losing already-uploaded blobs (roborev 176 #1).
         let session = test_session();
         let (blob_id, _) = upload_blob(&session, "text/plain", b"hello").await.unwrap();
-        let (mime, bytes) = resolve_blob_to_bytes(&session, &blob_id, "ignored")
+        let (mime, bytes) = peek_blob_bytes(&session, &blob_id, "ignored")
             .await
             .unwrap();
         assert_eq!(mime, "text/plain");
         assert_eq!(bytes, b"hello");
-        // Second resolve must fail — entry was consumed.
-        let err = resolve_blob_to_bytes(&session, &blob_id, "ignored")
+        // Second peek must succeed too.
+        let (mime2, bytes2) = peek_blob_bytes(&session, &blob_id, "ignored")
+            .await
+            .unwrap();
+        assert_eq!(mime2, "text/plain");
+        assert_eq!(bytes2, b"hello");
+    }
+
+    #[tokio::test]
+    async fn drain_consumed_synthetic_blobs_removes_only_synthetic_entries() {
+        let session = test_session();
+        let (synth_id, _) = upload_blob(&session, "text/plain", b"X").await.unwrap();
+        // Mix synthetic + gmail-shaped blob_ids in the attachment list.
+        let atts = vec![
+            crate::types::Attachment {
+                blob_id: synth_id.clone(),
+                name: "a.txt".into(),
+                mime_type: "text/plain".into(),
+                size: 1,
+            },
+            crate::types::Attachment {
+                blob_id: "msg-abc:att-xyz".into(),
+                name: "b.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 0,
+            },
+        ];
+        drain_consumed_synthetic_blobs(&session, &atts).await;
+        // Synthetic gone; non-synthetic was never in cache, idempotent.
+        let err = peek_blob_bytes(&session, &synth_id, "ignored")
             .await
             .unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)));
@@ -3194,5 +3333,102 @@ mod tests {
         assert!(s.contains("b@example.com"));
         assert!(s.contains("c@example.com"));
         assert!(s.contains("Cc:"));
+    }
+
+    // ---- Roborev 176 #8: looks_like_message_id heuristic ----
+
+    #[test]
+    fn looks_like_message_id_canonical_form() {
+        assert!(looks_like_message_id("<abc@example.com>"));
+    }
+
+    #[test]
+    fn looks_like_message_id_unbracketed_rejected() {
+        // Bare `local@domain` could be a Gmail ID containing `@` (rare but
+        // possible-ish if encoded). Heuristic requires the leading `<`.
+        assert!(!looks_like_message_id("abc@example.com"));
+    }
+
+    #[test]
+    fn looks_like_message_id_gmail_id_rejected() {
+        // Gmail message IDs are URL-safe base64-ish, no `<` or `@`.
+        assert!(!looks_like_message_id("190abc-DEF_xyz"));
+    }
+
+    #[test]
+    fn looks_like_message_id_empty_rejected() {
+        assert!(!looks_like_message_id(""));
+        assert!(!looks_like_message_id("   "));
+    }
+
+    #[test]
+    fn looks_like_message_id_handles_leading_whitespace() {
+        // Defensive: header values may be padded; the heuristic should
+        // ignore surrounding whitespace.
+        assert!(looks_like_message_id("  <foo@bar>  "));
+    }
+
+    // ---- Roborev 176 #2: encode_path_segment ----
+
+    #[test]
+    fn encode_path_segment_passes_alphanumeric_through() {
+        assert_eq!(encode_path_segment("190abc-DEF_xyz"), "190abc-DEF_xyz");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_slash() {
+        // The bug class: `/` would corrupt the URL path.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_query_and_fragment_chars() {
+        assert_eq!(encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(encode_path_segment("a#b"), "a%23b");
+        assert_eq!(encode_path_segment("a&b"), "a%26b");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_path_traversal_separators() {
+        let encoded = encode_path_segment("../etc/passwd");
+        // The `/` chars must be encoded so this can't break out of the
+        // intended path segment.
+        assert!(!encoded.contains('/'));
+        assert!(encoded.contains("%2F"));
+    }
+
+    // ---- Roborev 176 #4: upload size caps ----
+
+    #[tokio::test]
+    async fn upload_blob_rejects_oversized_per_blob() {
+        let session = test_session();
+        let big = vec![0u8; MAX_BLOB_BYTES + 1];
+        let err = upload_blob(&session, "application/octet-stream", &big)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("too large")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_blob_rejects_aggregate_overflow() {
+        let session = test_session();
+        // Three near-max blobs: first two fit (50 MiB total), third overflows.
+        let chunk = vec![0u8; 20 * 1024 * 1024];
+        upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap();
+        upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap();
+        let err = upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("aggregate")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }
