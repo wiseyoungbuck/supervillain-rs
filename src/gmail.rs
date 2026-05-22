@@ -61,9 +61,26 @@ pub struct GmailSession {
     pub token_store: Arc<dyn TokenStore>,
     pub account_id: String,
     pub label_cache: tokio::sync::Mutex<Option<LabelCacheEntry>>,
-    /// Per-(mailbox+query) cursor cache: index N holds the pageToken needed to
-    /// fetch page N (index 0 is always None). Updated as pages are walked.
-    pub page_cache: tokio::sync::Mutex<HashMap<String, Vec<Option<String>>>>,
+    /// Per-(mailbox+query) cursor cache: index N is the `PageStart` for fetching
+    /// page N. Index 0 is always `First`; an `End` entry means "no such page,
+    /// past the end of results" so a re-fetch can short-circuit without
+    /// re-issuing the page-0 request (which would otherwise happen if a plain
+    /// `None` were used both as "no token needed" and "no more results").
+    pub page_cache: tokio::sync::Mutex<HashMap<String, Vec<PageStart>>>,
+}
+
+/// What's needed to fetch a given page from Gmail's cursor-paginated
+/// `messages.list`. The three states are deliberately distinguishable so the
+/// pagination cache can't confuse "no token needed (page 0)" with
+/// "no more results past this index".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageStart {
+    /// Page 0: fetch with no `pageToken` parameter.
+    First,
+    /// Page N>0: fetch with this `pageToken`.
+    With(String),
+    /// No such page: a previous response returned `nextPageToken: None`.
+    End,
 }
 
 pub struct GmailToken {
@@ -379,6 +396,14 @@ fn should_include_label(name: &str, label_type: &str) -> bool {
     matches!(name, "INBOX" | "SENT" | "DRAFT" | "SPAM" | "TRASH")
 }
 
+/// Mirror of `should_include_label` operating on label IDs only (used at email
+/// parse time, where we have IDs but not the label `type` field). Gmail's
+/// system labels use ALL-CAPS IDs that match their names; user labels are
+/// `Label_N` so they always pass.
+pub(crate) fn is_displayable_label_id(id: &str) -> bool {
+    !matches!(id, "STARRED" | "IMPORTANT" | "UNREAD" | "CHAT") && !id.starts_with("CATEGORY_")
+}
+
 /// Build Mailbox structs from a flat list of detailed labels, populating
 /// `parent_id` for nested `Parent/Child` user labels.
 fn build_mailboxes(labels: Vec<LabelDetail>) -> Vec<Mailbox> {
@@ -557,7 +582,7 @@ pub async fn get_identities(session: &GmailSession) -> Result<Vec<Identity>, Err
 /// `:`, or `"` get quoted with `"…"`; inner `"` are escaped as `\"`.
 /// Dates use slashes (`YYYY/MM/DD`) — Gmail rejects ISO dashes. Gmail
 /// interprets dates in the account's timezone; Fastmail uses UTC.
-pub fn translate_query_to_q(query: &ParsedQuery, mailbox_id: Option<&str>) -> String {
+pub fn translate_query_to_q(query: &ParsedQuery) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     for v in &query.from {
@@ -579,7 +604,7 @@ pub fn translate_query_to_q(query: &ParsedQuery, mailbox_id: Option<&str>) -> St
     }
     match query.is_flagged {
         Some(true) => parts.push("is:starred".into()),
-        Some(false) => {}
+        Some(false) => parts.push("-is:starred".into()),
         None => {}
     }
     if let Some(after) = query.after {
@@ -591,14 +616,8 @@ pub fn translate_query_to_q(query: &ParsedQuery, mailbox_id: Option<&str>) -> St
     if !query.text.is_empty() {
         parts.push(query.text.clone());
     }
-    if let Some(id) = mailbox_id
-        && !id.is_empty()
-    {
-        // Gmail's q= accepts `label:` by name, but the route handler passes a
-        // label *id*. We pass labelIds as a separate query param in
-        // query_emails(); keep q= clean here.
-        let _ = id;
-    }
+    // Mailbox scoping is applied via the `labelIds=` URL parameter in
+    // `fetch_messages_page`, not via `q=`, so this function takes no mailbox arg.
 
     parts.join(" ")
 }
@@ -668,10 +687,39 @@ async fn fetch_messages_page(
     Ok(resp.json().await?)
 }
 
+/// Translate a Gmail `nextPageToken` to the cache's `PageStart` for the *next*
+/// index. `None` from the API means "no more pages" (End sentinel); `Some(t)`
+/// means "use this token". Pure function — extracted for unit testing.
+fn next_page_start_from(api_next_token: Option<String>) -> PageStart {
+    match api_next_token {
+        Some(t) => PageStart::With(t),
+        None => PageStart::End,
+    }
+}
+
+/// Record the result of fetching page `page_idx` into the cache, growing the
+/// vector if needed. Pure function — no I/O, no awaits. Returns the slot
+/// written to so tests can assert. Invariant after this call:
+/// `cache[page_idx + 1] == next_page_start_from(api_next_token)`.
+fn record_page_fetched(
+    cache: &mut Vec<PageStart>,
+    page_idx: usize,
+    api_next_token: Option<String>,
+) {
+    let next_idx = page_idx + 1;
+    let next_start = next_page_start_from(api_next_token);
+    if next_idx >= cache.len() {
+        cache.resize(next_idx + 1, PageStart::End);
+    }
+    cache[next_idx] = next_start;
+}
+
 /// Query email IDs. Translates cursor pagination to the route handler's
-/// offset model. The cache stores the pageToken needed to fetch page N for
+/// offset model. The cache stores the `PageStart` for fetching page N for
 /// each (mailbox+query) key; first request seeds it, subsequent forward
 /// requests follow it, jump-backs re-walk from 0 (bounded by MAX_REWALK_PAGES).
+/// `PageStart::End` entries are respected — we never re-issue a page-0 fetch
+/// just because a later page returned no more results.
 pub async fn query_emails(
     session: &GmailSession,
     mailbox_id: Option<&str>,
@@ -679,9 +727,7 @@ pub async fn query_emails(
     position: usize,
     query: Option<&ParsedQuery>,
 ) -> Result<Vec<String>, Error> {
-    let q = query
-        .map(|q| translate_query_to_q(q, mailbox_id))
-        .unwrap_or_default();
+    let q = query.map(translate_query_to_q).unwrap_or_default();
     let token = access_token(session).await?;
     let key = page_cache_key(mailbox_id, &q);
 
@@ -704,55 +750,59 @@ pub async fn query_emails(
     }
 
     // Snapshot the cache, extend it as we walk.
-    let mut tokens_by_page: Vec<Option<String>> = {
+    let mut cache: Vec<PageStart> = {
         let cache = session.page_cache.lock().await;
-        cache.get(&key).cloned().unwrap_or_else(|| vec![None])
+        cache
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| vec![PageStart::First])
     };
 
     let mut ids: Vec<String> = Vec::with_capacity(limit);
     let mut consumed_in_first_page = 0usize;
+    let mut hit_end = false;
 
-    for page_idx in 0..=end_page.saturating_sub(1) {
+    for page_idx in 0..end_page {
         // Extend cache forward by walking from the last known page if needed.
-        if page_idx >= tokens_by_page.len() {
-            // We need pageToken for page_idx but only have up to len-1.
-            // Walk forward, fetching pages we don't care about just to get
-            // the token. Bounded by MAX_REWALK_PAGES via end_page check above.
-            while tokens_by_page.len() <= page_idx {
-                let prev_token = tokens_by_page.last().and_then(|t| t.clone());
-                if tokens_by_page.len() > 1 && prev_token.is_none() {
-                    // Previous page had no nextPageToken — we've reached the end.
+        while page_idx >= cache.len() {
+            let walk_idx = cache.len() - 1;
+            let start = &cache[walk_idx];
+            let page_token = match start {
+                PageStart::First => None,
+                PageStart::With(t) => Some(t.as_str()),
+                PageStart::End => {
+                    // Past end of results — no more pages exist.
+                    hit_end = true;
                     break;
                 }
-                let resp =
-                    fetch_messages_page(session, &token, mailbox_id, &q, prev_token.as_deref())
-                        .await?;
-                tokens_by_page.push(resp.next_page_token);
-            }
-            if page_idx >= tokens_by_page.len() {
-                // Ran out of results entirely.
-                break;
-            }
+            };
+            let resp = fetch_messages_page(session, &token, mailbox_id, &q, page_token).await?;
+            record_page_fetched(&mut cache, walk_idx, resp.next_page_token);
+        }
+        if hit_end {
+            break;
         }
 
-        // Only fetch pages we actually need to extract IDs from.
+        // Skip pages we don't need IDs from (already cached their next-token).
         if page_idx < start_page {
             continue;
         }
 
-        let page_token = tokens_by_page[page_idx].clone();
-        let resp =
-            fetch_messages_page(session, &token, mailbox_id, &q, page_token.as_deref()).await?;
+        let page_token = match &cache[page_idx] {
+            PageStart::First => None,
+            PageStart::With(t) => Some(t.clone()),
+            PageStart::End => {
+                // Reached end-of-results at or before our requested slice.
+                break;
+            }
+        };
+        let MessagesListResp {
+            messages,
+            next_page_token,
+        } = fetch_messages_page(session, &token, mailbox_id, &q, page_token.as_deref()).await?;
+        record_page_fetched(&mut cache, page_idx, next_page_token);
 
-        // Cache the next-page token so future calls can follow.
-        let next_idx = page_idx + 1;
-        if next_idx >= tokens_by_page.len() {
-            tokens_by_page.push(resp.next_page_token.clone());
-        } else {
-            tokens_by_page[next_idx] = resp.next_page_token.clone();
-        }
-
-        for msg in resp.messages {
+        for msg in messages {
             if page_idx == start_page && consumed_in_first_page < skip_in_first {
                 consumed_in_first_page += 1;
                 continue;
@@ -765,19 +815,14 @@ pub async fn query_emails(
         if ids.len() >= limit {
             break;
         }
-        if tokens_by_page
-            .get(next_idx)
-            .and_then(|t| t.as_ref())
-            .is_none()
-        {
-            // No next page available; we're done.
+        if matches!(cache.get(page_idx + 1), Some(PageStart::End)) {
             break;
         }
     }
 
     // Write back cache snapshot.
-    let mut cache = session.page_cache.lock().await;
-    cache.insert(key, tokens_by_page);
+    let mut cache_lock = session.page_cache.lock().await;
+    cache_lock.insert(key, cache);
 
     Ok(ids)
 }
@@ -894,8 +939,17 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
     if msg.label_ids.iter().any(|l| l == "STARRED") {
         keywords.insert("$flagged".to_string(), true);
     }
-    let mailbox_ids: HashMap<String, bool> =
-        msg.label_ids.iter().map(|l| (l.clone(), true)).collect();
+    // Filter out system labels that are keyword-equivalents (STARRED, UNREAD)
+    // or sidebar-noise (IMPORTANT, CHAT, CATEGORY_*) — those are deliberately
+    // excluded from get_mailboxes(), so they shouldn't appear in mailbox_ids
+    // either. Without this filter a frontend doing email.mailbox_ids → sidebar
+    // lookup would surface pseudo-mailboxes that don't actually exist.
+    let mailbox_ids: HashMap<String, bool> = msg
+        .label_ids
+        .iter()
+        .filter(|l| is_displayable_label_id(l))
+        .map(|l| (l.clone(), true))
+        .collect();
 
     let mut subject = String::new();
     let mut from: Vec<EmailAddress> = Vec::new();
@@ -1262,14 +1316,14 @@ mod tests {
     #[test]
     fn q_translator_empty() {
         let q = ParsedQuery::default();
-        assert_eq!(translate_query_to_q(&q, None), "");
+        assert_eq!(translate_query_to_q(&q), "");
     }
 
     #[test]
     fn q_translator_single_from() {
         let mut q = ParsedQuery::default();
         q.from.push("alice@example.com".into());
-        assert_eq!(translate_query_to_q(&q, None), "from:alice@example.com");
+        assert_eq!(translate_query_to_q(&q), "from:alice@example.com");
     }
 
     #[test]
@@ -1277,35 +1331,35 @@ mod tests {
         let mut q = ParsedQuery::default();
         q.from.push("a@x.com".into());
         q.from.push("b@y.com".into());
-        assert_eq!(translate_query_to_q(&q, None), "from:a@x.com from:b@y.com");
+        assert_eq!(translate_query_to_q(&q), "from:a@x.com from:b@y.com");
     }
 
     #[test]
     fn q_translator_quotes_whitespace_value() {
         let mut q = ParsedQuery::default();
         q.from.push("Alice Smith".into());
-        assert_eq!(translate_query_to_q(&q, None), r#"from:"Alice Smith""#);
+        assert_eq!(translate_query_to_q(&q), r#"from:"Alice Smith""#);
     }
 
     #[test]
     fn q_translator_quotes_subject_with_colon() {
         let mut q = ParsedQuery::default();
         q.subject.push("Re: foo".into());
-        assert_eq!(translate_query_to_q(&q, None), r#"subject:"Re: foo""#);
+        assert_eq!(translate_query_to_q(&q), r#"subject:"Re: foo""#);
     }
 
     #[test]
     fn q_translator_escapes_inner_quote() {
         let mut q = ParsedQuery::default();
         q.subject.push(r#"a"b"#.into());
-        assert_eq!(translate_query_to_q(&q, None), r#"subject:"a\"b""#);
+        assert_eq!(translate_query_to_q(&q), r#"subject:"a\"b""#);
     }
 
     #[test]
     fn q_translator_email_with_plus_unquoted() {
         let mut q = ParsedQuery::default();
         q.from.push("bob+test@x.com".into());
-        assert_eq!(translate_query_to_q(&q, None), "from:bob+test@x.com");
+        assert_eq!(translate_query_to_q(&q), "from:bob+test@x.com");
     }
 
     #[test]
@@ -1314,7 +1368,7 @@ mod tests {
             is_unread: Some(true),
             ..Default::default()
         };
-        assert_eq!(translate_query_to_q(&q, None), "is:unread");
+        assert_eq!(translate_query_to_q(&q), "is:unread");
     }
 
     #[test]
@@ -1323,7 +1377,7 @@ mod tests {
             has_attachment: true,
             ..Default::default()
         };
-        assert_eq!(translate_query_to_q(&q, None), "has:attachment");
+        assert_eq!(translate_query_to_q(&q), "has:attachment");
     }
 
     #[test]
@@ -1333,7 +1387,7 @@ mod tests {
             after: Some(NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()),
             ..Default::default()
         };
-        let s = translate_query_to_q(&q, None);
+        let s = translate_query_to_q(&q);
         assert!(s.contains("before:2026/01/15"));
         assert!(s.contains("after:2025/12/01"));
         assert!(!s.contains('-'));
@@ -1345,7 +1399,7 @@ mod tests {
             text: "quarterly review".into(),
             ..Default::default()
         };
-        assert_eq!(translate_query_to_q(&q, None), "quarterly review");
+        assert_eq!(translate_query_to_q(&q), "quarterly review");
     }
 
     #[test]
@@ -1355,7 +1409,7 @@ mod tests {
         q.is_unread = Some(true);
         q.has_attachment = true;
         q.text = "report".into();
-        let s = translate_query_to_q(&q, None);
+        let s = translate_query_to_q(&q);
         assert_eq!(s, "from:alice@x.com has:attachment is:unread report");
     }
 
@@ -1720,5 +1774,253 @@ mod tests {
         };
         let email = parse_message_to_email(msg, false);
         assert_eq!(email.received_at.timestamp_millis(), 1700000000000);
+    }
+
+    // ---- mailbox_ids pseudo-label filtering (roborev 173 finding #6) ----
+
+    fn make_msg_with_labels(labels: Vec<&str>) -> GmailMessage {
+        GmailMessage {
+            id: "m".into(),
+            thread_id: "t".into(),
+            label_ids: labels.iter().map(|s| s.to_string()).collect(),
+            snippet: "".into(),
+            internal_date: "1700000000000".into(),
+            size_estimate: 0,
+            payload: GmailPayload {
+                mime_type: "text/plain".into(),
+                filename: String::new(),
+                headers: vec![],
+                body: None,
+                parts: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mailbox_ids_excludes_starred_pseudo_label() {
+        let email = parse_message_to_email(make_msg_with_labels(vec!["INBOX", "STARRED"]), false);
+        assert!(email.mailbox_ids.contains_key("INBOX"));
+        assert!(!email.mailbox_ids.contains_key("STARRED"));
+        // But the keyword still flips $flagged:
+        assert!(email.is_flagged());
+    }
+
+    #[test]
+    fn mailbox_ids_excludes_unread_pseudo_label() {
+        let email = parse_message_to_email(make_msg_with_labels(vec!["INBOX", "UNREAD"]), false);
+        assert!(email.mailbox_ids.contains_key("INBOX"));
+        assert!(!email.mailbox_ids.contains_key("UNREAD"));
+        assert!(email.is_unread());
+    }
+
+    #[test]
+    fn mailbox_ids_excludes_important_and_chat() {
+        let email = parse_message_to_email(
+            make_msg_with_labels(vec!["INBOX", "IMPORTANT", "CHAT"]),
+            false,
+        );
+        assert!(email.mailbox_ids.contains_key("INBOX"));
+        assert!(!email.mailbox_ids.contains_key("IMPORTANT"));
+        assert!(!email.mailbox_ids.contains_key("CHAT"));
+    }
+
+    #[test]
+    fn mailbox_ids_excludes_category_labels() {
+        let email = parse_message_to_email(
+            make_msg_with_labels(vec!["INBOX", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL"]),
+            false,
+        );
+        assert!(!email.mailbox_ids.contains_key("CATEGORY_PERSONAL"));
+        assert!(!email.mailbox_ids.contains_key("CATEGORY_SOCIAL"));
+    }
+
+    #[test]
+    fn mailbox_ids_includes_user_labels() {
+        let email = parse_message_to_email(make_msg_with_labels(vec!["INBOX", "Label_5"]), false);
+        assert!(email.mailbox_ids.contains_key("Label_5"));
+    }
+
+    #[test]
+    fn is_displayable_label_id_predicate() {
+        assert!(is_displayable_label_id("INBOX"));
+        assert!(is_displayable_label_id("SENT"));
+        assert!(is_displayable_label_id("Label_5"));
+        assert!(!is_displayable_label_id("STARRED"));
+        assert!(!is_displayable_label_id("IMPORTANT"));
+        assert!(!is_displayable_label_id("UNREAD"));
+        assert!(!is_displayable_label_id("CHAT"));
+        assert!(!is_displayable_label_id("CATEGORY_PERSONAL"));
+        assert!(!is_displayable_label_id("CATEGORY_UPDATES"));
+    }
+
+    // ---- pagination cache PageStart logic (roborev 173 finding #1) ----
+
+    #[test]
+    fn next_page_start_some_token_yields_with() {
+        assert_eq!(
+            next_page_start_from(Some("tok1".into())),
+            PageStart::With("tok1".into())
+        );
+    }
+
+    #[test]
+    fn next_page_start_none_yields_end() {
+        assert_eq!(next_page_start_from(None), PageStart::End);
+    }
+
+    #[test]
+    fn record_page_fetched_seeds_next_slot_with_token() {
+        let mut cache = vec![PageStart::First];
+        record_page_fetched(&mut cache, 0, Some("t1".into()));
+        assert_eq!(cache, vec![PageStart::First, PageStart::With("t1".into())]);
+    }
+
+    #[test]
+    fn record_page_fetched_none_yields_end_sentinel_not_first() {
+        // The bug the End sentinel prevents: a `None` next-token must not
+        // round-trip to "fetch page 0 again". After recording end-of-results,
+        // the next slot is `End`, not the implicit "no token" state.
+        let mut cache = vec![PageStart::First, PageStart::With("t1".into())];
+        record_page_fetched(&mut cache, 1, None);
+        assert_eq!(
+            cache,
+            vec![
+                PageStart::First,
+                PageStart::With("t1".into()),
+                PageStart::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn record_page_fetched_grows_cache_with_end_padding() {
+        // If page_idx is past the end of cache (shouldn't happen in normal
+        // flow but defensive), the in-between slots are End.
+        let mut cache = vec![PageStart::First];
+        record_page_fetched(&mut cache, 3, Some("t4".into()));
+        assert_eq!(
+            cache,
+            vec![
+                PageStart::First,
+                PageStart::End,
+                PageStart::End,
+                PageStart::End,
+                PageStart::With("t4".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_page_fetched_overwrites_existing_slot() {
+        let mut cache = vec![
+            PageStart::First,
+            PageStart::With("t1-old".into()),
+            PageStart::End,
+        ];
+        record_page_fetched(&mut cache, 0, Some("t1-new".into()));
+        assert_eq!(cache[1], PageStart::With("t1-new".into()));
+    }
+
+    // ---- nested multipart/related → multipart/alternative (roborev 173 #9) ----
+
+    fn b64u(s: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn parse_message_nested_related_alternative_extracts_both_bodies() {
+        // Common Gmail shape for HTML email with embedded images:
+        //   multipart/related
+        //     ├── multipart/alternative
+        //     │     ├── text/plain
+        //     │     └── text/html
+        //     └── image/png (inline, cid-referenced)
+        let msg = GmailMessage {
+            id: "msg-nested".into(),
+            thread_id: "t".into(),
+            label_ids: vec!["INBOX".into()],
+            snippet: "".into(),
+            internal_date: "1700000000000".into(),
+            size_estimate: 0,
+            payload: GmailPayload {
+                mime_type: "multipart/related".into(),
+                filename: String::new(),
+                headers: vec![header("Subject", "Newsletter")],
+                body: None,
+                parts: Some(vec![
+                    GmailPayload {
+                        mime_type: "multipart/alternative".into(),
+                        filename: String::new(),
+                        headers: vec![],
+                        body: None,
+                        parts: Some(vec![
+                            GmailPayload {
+                                mime_type: "text/plain".into(),
+                                filename: String::new(),
+                                headers: vec![],
+                                body: Some(GmailBody {
+                                    size: 11,
+                                    data: Some(b64u("plain text")),
+                                    attachment_id: None,
+                                }),
+                                parts: None,
+                            },
+                            GmailPayload {
+                                mime_type: "text/html".into(),
+                                filename: String::new(),
+                                headers: vec![],
+                                body: Some(GmailBody {
+                                    size: 30,
+                                    data: Some(b64u("<p>html <img src=\"cid:x\"></p>")),
+                                    attachment_id: None,
+                                }),
+                                parts: None,
+                            },
+                        ]),
+                    },
+                    GmailPayload {
+                        mime_type: "image/png".into(),
+                        filename: "embedded.png".into(),
+                        headers: vec![header(
+                            "Content-Disposition",
+                            "inline; filename=embedded.png",
+                        )],
+                        body: Some(GmailBody {
+                            size: 100,
+                            data: None,
+                            attachment_id: Some("att_inline".into()),
+                        }),
+                        parts: None,
+                    },
+                ]),
+            },
+        };
+        let email = parse_message_to_email(msg, true);
+        assert_eq!(email.text_body.as_deref(), Some("plain text"));
+        assert!(email.html_body.as_deref().unwrap().contains("<p>html"));
+        // The inline image should NOT appear as an attachment because it's
+        // inside multipart/related with disposition=inline.
+        assert!(!email.has_attachment);
+        assert!(email.attachments.is_empty());
+    }
+
+    // ---- address parser known limitation (roborev 173 #8) ----
+
+    /// Documents the known failure mode of `parse_address_list`: commas
+    /// inside quoted display names split into bogus addresses. A proper RFC
+    /// 5322 parser would handle this. Test pins the current behavior so a
+    /// future fix has something to flip.
+    #[test]
+    fn parse_address_quoted_comma_is_currently_mis_parsed() {
+        let addrs = parse_address_list(r#""Smith, John" <jsmith@example.com>"#);
+        // Current behavior: splits on the comma, producing two malformed
+        // entries. When this test starts failing, the parser was fixed —
+        // update the assertion.
+        assert_eq!(
+            addrs.len(),
+            2,
+            "if this now returns 1, the parser was fixed — update the test"
+        );
     }
 }

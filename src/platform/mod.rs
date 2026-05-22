@@ -34,6 +34,7 @@ pub trait TokenStore: Send + Sync {
 
 /// Result of an OAuth2 authorization callback. State validation happens inside
 /// `acquire_oauth_callback`; callers only see the authorization code.
+#[derive(Debug)]
 pub struct OauthCallback {
     pub code: String,
 }
