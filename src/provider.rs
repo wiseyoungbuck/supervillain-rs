@@ -296,7 +296,11 @@ pub async fn add_to_calendar(
                 gmail::add_to_calendar(s, ics_data, &event).await
             } else {
                 // Explicit add — remove then re-add to handle updates.
-                let _ = gmail::remove_from_calendar(s, uid).await;
+                // Propagate remove errors: if the delete failed (5xx, network)
+                // the event still exists and the follow-up add hits the
+                // existence check and short-circuits to Ok(true), leaving the
+                // user thinking the update landed while the content is stale.
+                gmail::remove_from_calendar(s, uid).await?;
                 gmail::add_to_calendar(s, ics_data, &event).await
             }
         }
@@ -379,9 +383,16 @@ pub async fn rsvp(
         }
         ProviderSession::Gmail(s) => {
             // Ensure the event exists before we try to PATCH its attendees.
-            let event_parsed = calendar::parse_ics(ics_data)
-                .ok_or_else(|| Error::Internal("Failed to parse ICS for Gmail RSVP".into()))?;
-            let _ = gmail::add_to_calendar(s, ics_data, &event_parsed).await;
+            // `add_to_calendar` is idempotent (Ok(true) when already present);
+            // we log-and-continue on failure so the more diagnostic upstream
+            // error isn't lost behind the generic "event missing" message
+            // respond_to_event would otherwise produce.
+            if let Err(e) = gmail::add_to_calendar(s, ics_data, event).await {
+                tracing::warn!(
+                    uid = %event.uid,
+                    "Gmail RSVP pre-add failed (continuing to PATCH in case event already exists): {e}"
+                );
+            }
 
             // Google's PATCH attendees + sendUpdates=all sends the
             // organizer email automatically — no separate iTIP needed.

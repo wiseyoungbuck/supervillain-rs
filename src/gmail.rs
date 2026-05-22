@@ -2015,6 +2015,10 @@ async fn find_event_id_by_ical_uid(
     uid: &str,
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
+    // `encode_path_segment` is intentionally a superset of both path- and
+    // query-component encoding (it also escapes `&`, `=`, `+`, `#`, `?`), so
+    // it's safe to reuse for query string values. If that set is ever
+    // narrowed, audit these query-string callers.
     let encoded = encode_path_segment(uid);
     let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
@@ -2074,10 +2078,13 @@ pub(crate) fn calendar_event_to_google_json(event: &CalendarEvent) -> serde_json
         body["description"] = serde_json::json!(desc);
     }
     if !event.organizer_email.is_empty() {
-        body["organizer"] = serde_json::json!({
-            "email": event.organizer_email,
-            "displayName": event.organizer_name.clone().unwrap_or_default(),
-        });
+        let mut organizer = serde_json::json!({ "email": event.organizer_email });
+        if let Some(name) = &event.organizer_name
+            && !name.is_empty()
+        {
+            organizer["displayName"] = serde_json::json!(name);
+        }
+        body["organizer"] = organizer;
     }
     if !event.attendees.is_empty() {
         let attendees: Vec<serde_json::Value> = event
@@ -2239,6 +2246,8 @@ pub async fn get_calendar_event(
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
     let token = access_token(session).await?;
+    // See `find_event_id_by_ical_uid`: `encode_path_segment`'s escape set is a
+    // superset of query-component requirements, so reusing it here is safe.
     let encoded = encode_path_segment(uid);
     let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
@@ -2378,8 +2387,25 @@ pub async fn respond_to_event(
         .cloned()
         .unwrap_or_default();
     let google_status = ics_status_to_google(status.as_ics_str());
-    let updated = mutate_attendee_status(&mut attendees, attendee_email, google_status);
-    if !updated {
+
+    // Idempotency: if the attendee's responseStatus already matches, skip the
+    // PATCH. `sendUpdates=all` would otherwise send a duplicate organizer
+    // notification every time the user clicks "Accept" on an already-accepted
+    // invite. `attendee_present` is true iff the email appears in the array.
+    let mut attendee_present = false;
+    let mut already_matches = false;
+    for entry in &attendees {
+        if let Some(email) = entry["email"].as_str()
+            && email.eq_ignore_ascii_case(attendee_email)
+        {
+            attendee_present = true;
+            if entry["responseStatus"].as_str() == Some(google_status) {
+                already_matches = true;
+            }
+            break;
+        }
+    }
+    if !attendee_present {
         tracing::warn!(
             uid = %uid,
             attendee_email = %attendee_email,
@@ -2387,6 +2413,19 @@ pub async fn respond_to_event(
         );
         return Ok(false);
     }
+    if already_matches {
+        tracing::debug!(
+            uid = %uid,
+            "RSVP status already {google_status}; skipping PATCH to avoid duplicate notification"
+        );
+        return Ok(true);
+    }
+
+    let updated = mutate_attendee_status(&mut attendees, attendee_email, google_status);
+    debug_assert!(
+        updated,
+        "attendee was present in pre-check but lost in mutate"
+    );
 
     let patch_body = serde_json::json!({ "attendees": attendees });
     let patch_url = format!("{event_url}?sendUpdates=all");
@@ -2445,19 +2484,25 @@ pub async fn get_calendar_data(
 /// Walk the payload tree until a `text/calendar` part with inline data is
 /// found, then return its decoded UTF-8 string. Pure — testable with
 /// hand-rolled GmailPayload fixtures.
+///
+/// Iterative DFS rather than recursion so a pathological or malicious
+/// payload can't blow the stack. Pre-order traversal preserves the original
+/// "outer parts first, then nested" order.
 pub(crate) fn find_calendar_ics(part: &GmailPayload) -> Option<String> {
-    if part.mime_type.eq_ignore_ascii_case("text/calendar")
-        && let Some(body) = &part.body
-        && let Some(data) = &body.data
-        && let Ok(bytes) = base64url_decode(data)
-        && let Ok(s) = String::from_utf8(bytes)
-    {
-        return Some(s);
-    }
-    if let Some(parts) = &part.parts {
-        for child in parts {
-            if let Some(found) = find_calendar_ics(child) {
-                return Some(found);
+    let mut stack: Vec<&GmailPayload> = vec![part];
+    while let Some(node) = stack.pop() {
+        if node.mime_type.eq_ignore_ascii_case("text/calendar")
+            && let Some(body) = &node.body
+            && let Some(data) = &body.data
+            && let Ok(bytes) = base64url_decode(data)
+            && let Ok(s) = String::from_utf8(bytes)
+        {
+            return Some(s);
+        }
+        if let Some(parts) = &node.parts {
+            // Push in reverse so pop() yields siblings in original order.
+            for child in parts.iter().rev() {
+                stack.push(child);
             }
         }
     }
@@ -4119,6 +4164,24 @@ mod tests {
     }
 
     #[test]
+    fn google_json_omits_organizer_display_name_when_absent() {
+        let mut ev = sample_event();
+        ev.organizer_name = None;
+        let j = calendar_event_to_google_json(&ev);
+        assert_eq!(j["organizer"]["email"], "lead@example.com");
+        // Matches the per-attendee pattern: omit displayName instead of "".
+        assert!(j["organizer"].get("displayName").is_none());
+    }
+
+    #[test]
+    fn google_json_omits_organizer_display_name_when_empty_string() {
+        let mut ev = sample_event();
+        ev.organizer_name = Some(String::new());
+        let j = calendar_event_to_google_json(&ev);
+        assert!(j["organizer"].get("displayName").is_none());
+    }
+
+    #[test]
     fn google_json_defaults_end_to_one_hour_when_missing() {
         let mut ev = sample_event();
         ev.dtend = None;
@@ -4365,5 +4428,45 @@ mod tests {
         let mut part = calendar_part("BEGIN:VCALENDAR\r\nEND:VCALENDAR");
         part.mime_type = "Text/Calendar".into();
         assert!(find_calendar_ics(&part).is_some());
+    }
+
+    #[test]
+    fn find_calendar_ics_handles_deep_nesting_without_stack_overflow() {
+        // Build a payload deeply enough that a per-frame recursion would be
+        // visibly costly on a small test-thread stack. The iterative DFS
+        // walker handles it as one allocation rather than 256 frames.
+        // (Kept moderate so the structural Drop at end-of-test doesn't
+        // itself recurse off the cliff — Drop is recursive even though
+        // traversal isn't.)
+        let mut current = calendar_part("BEGIN:VCALENDAR\r\nUID:deep\r\nEND:VCALENDAR");
+        for _ in 0..256 {
+            current = GmailPayload {
+                mime_type: "multipart/mixed".into(),
+                filename: String::new(),
+                headers: vec![],
+                body: None,
+                parts: Some(vec![current]),
+            };
+        }
+        let ics = find_calendar_ics(&current).unwrap();
+        assert!(ics.contains("UID:deep"));
+    }
+
+    #[test]
+    fn find_calendar_ics_pre_order_returns_first_when_siblings_match() {
+        // Two text/calendar siblings: returns the first. Matches the
+        // recursive version's behavior so callers don't observe a regression.
+        let payload = GmailPayload {
+            mime_type: "multipart/mixed".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: None,
+            parts: Some(vec![
+                calendar_part("BEGIN:VCALENDAR\r\nUID:first\r\nEND:VCALENDAR"),
+                calendar_part("BEGIN:VCALENDAR\r\nUID:second\r\nEND:VCALENDAR"),
+            ]),
+        };
+        let ics = find_calendar_ics(&payload).unwrap();
+        assert!(ics.contains("UID:first"));
     }
 }
