@@ -23,7 +23,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 ## Features
 
-- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph), Gmail (read + label/star/archive/trash/move + attachment download; compose + calendar planned)
+- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph), Gmail (full email + Google Calendar)
 - **Multi-account** — Switch between accounts with `1`-`9` keys
 - **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API, Google Calendar
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
@@ -84,7 +84,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
 - A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
 - Microsoft app registration (for Outlook calendar — email support planned for Phase 2), and/or:
-- Google Cloud project with OAuth credentials (Gmail read + write + send today; Calendar in upcoming milestone)
+- Google Cloud project with OAuth credentials (full Gmail + Google Calendar today)
 
 ## Quick start
 
@@ -124,7 +124,7 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 # client-id = xxxx.apps.googleusercontent.com
 # client-secret = GOCSPX-xxxxxxxxxxxx
 # # Gmail also requires client-secret (Google quirk for PKCE).
-# # Read + label/star/archive/trash/move/send in Milestones A-C; calendar in D.
+# # Full Gmail support: read/write/send/calendar (Phase 3 complete).
 ```
 
 `chmod 600 ~/.config/supervillain/config` is recommended — the file holds API tokens and OAuth secrets.
@@ -245,9 +245,9 @@ client-id = your-application-client-id
 
 ### Google Cloud App Registration
 
-> **Milestones A + B + C (current):** OAuth sign-in, mailbox listing, message reading, search,
-> mark read/unread, star, archive, trash, move, batch-archive, attachment download,
-> compose + reply + send with attachments. Google Calendar lands in Milestone D.
+> **Milestones A + B + C + D (Phase 3 complete):** OAuth sign-in, mailbox listing, message reading,
+> search, mark read/unread, star, archive, trash, move, batch-archive, attachment download,
+> compose + reply + send with attachments, Google Calendar add/remove, RSVP via Calendar PATCH.
 
 To use Gmail with Supervillain you'll create your own OAuth client in a Google Cloud project (one-time, ~5 minutes):
 
@@ -377,7 +377,7 @@ Axum HTTP Server
     │ resolve_account() → match ProviderSession
     ├── Fastmail → JMAP + CalDAV
     ├── Outlook → Microsoft Graph (Calendar only)
-    └── Gmail → Gmail REST API (read + write + send; Calendar planned)
+    └── Gmail → Gmail REST API + Google Calendar v3
 ```
 
 ### Provider dispatch
@@ -421,7 +421,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 | Frontend | Vanilla JS, CSS3 (no framework, no build step) |
 | Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph API (calendar) |
 | Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook) |
-| Providers | Fastmail (email + calendar), Outlook (calendar only), Gmail (read + write + send; calendar planned) |
+| Providers | Fastmail (email + calendar), Outlook (calendar only), Gmail (email + calendar) |
 
 ## API
 
@@ -463,7 +463,7 @@ src/
   error.rs         Error enum + HTTP response mapping
   jmap.rs          JMAP client — Fastmail (connect, query, send, calendar, MIME parsing)
   outlook.rs       Microsoft Graph client (Calendar)
-  gmail.rs         Gmail REST client (read + write + send via mail-builder; calendar coming)
+  gmail.rs         Gmail REST client + Google Calendar v3 (full email + RSVP)
   oauth.rs         OAuth2 PKCE primitives (shared by Outlook and Gmail)
   platform/        OS-specific shims: TokenStore, browser, OAuth callback, log sink
                    — desktop today, iOS module planned (Tauri-mobile)
@@ -515,7 +515,7 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 ## Roadmap
 
 - **Outlook email** — Mail.ReadWrite + Mail.Send via Microsoft Graph (Phase 2)
-- **Gmail compose + calendar** — `messages.send` (RFC822 via mail-builder) + Google Calendar v3 (Phase 3 Milestones C–D, plan in repo)
+- **iOS app via Tauri-mobile** — `src/platform/ios.rs` (KeychainTokenStore, ASWebAuthenticationSession, os_log sink)
 - Threading / conversation grouping
 - Drafts
 - Contact suggestions / address book

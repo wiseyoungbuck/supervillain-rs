@@ -50,13 +50,6 @@ impl ProviderSession {
 // Dispatch functions — mechanical match arms
 // =============================================================================
 
-/// Standard error for not-yet-implemented Gmail operations (Milestones B–D).
-fn gmail_not_yet_implemented(op: &str, milestone: &str) -> Error {
-    Error::BadRequest(format!(
-        "Gmail: {op} lands in Phase 3 {milestone} (Milestone A ships read-only inbox)."
-    ))
-}
-
 pub async fn get_mailboxes(s: &ProviderSession) -> Result<Vec<Mailbox>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_mailboxes(s).await,
@@ -220,10 +213,7 @@ pub async fn get_calendar_data(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
-            "get_calendar_data",
-            "Milestone D",
-        )),
+        ProviderSession::Gmail(s) => gmail::get_calendar_data(s, email_id).await,
     }
 }
 
@@ -236,10 +226,7 @@ pub async fn get_calendar_event(
     match s {
         ProviderSession::Fastmail(s) => jmap::get_calendar_event(s, uid).await,
         ProviderSession::Outlook(s) => outlook::get_calendar_event(s, uid).await,
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
-            "get_calendar_event",
-            "Milestone D",
-        )),
+        ProviderSession::Gmail(s) => gmail::get_calendar_event(s, uid).await,
     }
 }
 
@@ -302,8 +289,16 @@ pub async fn add_to_calendar(
                 outlook::add_to_calendar(s, ics_data, &event).await
             }
         }
-        ProviderSession::Gmail(_) => {
-            Err(gmail_not_yet_implemented("add_to_calendar", "Milestone D"))
+        ProviderSession::Gmail(s) => {
+            let event = calendar::parse_ics(ics_data)
+                .ok_or_else(|| Error::Internal("Failed to parse ICS for Gmail calendar".into()))?;
+            if only_if_new {
+                gmail::add_to_calendar(s, ics_data, &event).await
+            } else {
+                // Explicit add — remove then re-add to handle updates.
+                let _ = gmail::remove_from_calendar(s, uid).await;
+                gmail::add_to_calendar(s, ics_data, &event).await
+            }
         }
     }
 }
@@ -312,10 +307,7 @@ pub async fn remove_from_calendar(s: &ProviderSession, uid: &str) -> Result<bool
     match s {
         ProviderSession::Fastmail(s) => jmap::remove_from_calendar(s, uid).await,
         ProviderSession::Outlook(s) => outlook::remove_from_calendar(s, uid).await,
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented(
-            "remove_from_calendar",
-            "Milestone D",
-        )),
+        ProviderSession::Gmail(s) => gmail::remove_from_calendar(s, uid).await,
     }
 }
 
@@ -385,8 +377,20 @@ pub async fn rsvp(
                 )));
             }
         }
-        ProviderSession::Gmail(_) => {
-            return Err(gmail_not_yet_implemented("rsvp", "Milestone D"));
+        ProviderSession::Gmail(s) => {
+            // Ensure the event exists before we try to PATCH its attendees.
+            let event_parsed = calendar::parse_ics(ics_data)
+                .ok_or_else(|| Error::Internal("Failed to parse ICS for Gmail RSVP".into()))?;
+            let _ = gmail::add_to_calendar(s, ics_data, &event_parsed).await;
+
+            // Google's PATCH attendees + sendUpdates=all sends the
+            // organizer email automatically — no separate iTIP needed.
+            if !gmail::respond_to_event(s, &event.uid, attendee_email, status).await? {
+                return Err(Error::Internal(format!(
+                    "Gmail RSVP failed for event {} (event missing or attendee {} not in invitees)",
+                    event.uid, attendee_email
+                )));
+            }
         }
     }
     Ok(())

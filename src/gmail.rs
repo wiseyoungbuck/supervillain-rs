@@ -1,11 +1,9 @@
-// Gmail provider.
+// Gmail provider — Phase 3 complete: OAuth (A), mutations (B), send (C),
+// Google Calendar + RSVP (D).
 //
 // Mirrors src/outlook.rs in shape: session struct, OAuth2 PKCE flow via the
 // shared platform abstraction, then a flat set of async functions that
 // `src/provider.rs` dispatches into via its enum match arms.
-//
-// Phase 3 Milestone A scope: OAuth + read-only inbox. Mutations land in
-// Milestone B; send/compose in C; calendar in D.
 //
 // Google OAuth notes (the landmines this code routes around):
 //   - PKCE clients still need `client_secret` (Google quirk; not really secret).
@@ -25,7 +23,7 @@ use serde::Deserialize;
 use crate::error::Error;
 use crate::oauth;
 use crate::platform::{self, TokenStore, Tokens};
-use crate::types::{Email, EmailAddress, Identity, Mailbox, ParsedQuery};
+use crate::types::{CalendarEvent, Email, EmailAddress, Identity, Mailbox, ParsedQuery};
 
 // =============================================================================
 // Endpoints + constants
@@ -34,6 +32,7 @@ use crate::types::{Email, EmailAddress, Identity, Mailbox, ParsedQuery};
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars/primary";
 const REDIRECT_URI: &str = "http://localhost:8401/callback";
 const CALLBACK_PORT: u16 = 8401;
 
@@ -1957,6 +1956,477 @@ pub async fn send_email(
 }
 
 // =============================================================================
+// Google Calendar v3 — events.list/import, delete, RSVP via attendees PATCH
+// =============================================================================
+//
+// Quirks worth remembering:
+//   - events.import (not events.insert) is what preserves iCalUID across
+//     accounts — required for cross-account dedup of the same invite.
+//   - PATCHing attendees is read-modify-write: the request body must include
+//     the FULL current attendees array, mutated in place. Sending only the
+//     changed entry silently wipes the others. (Documented but easy to miss.)
+//   - sendUpdates=all triggers the organizer-notification email, replacing
+//     the iTIP reply path JMAP uses. That's why sends_rsvp_automatically()
+//     returns true for Gmail.
+
+/// Find a calendar event's Google ID by its iCalUID. Used as the GET-then-X
+/// preamble for `add_to_calendar` (existence check), `remove_from_calendar`
+/// (id-to-delete), and `respond_to_event` (id-to-patch).
+async fn find_event_id_by_ical_uid(
+    session: &GmailSession,
+    uid: &str,
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let encoded = encode_path_segment(uid);
+    let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            "calendar.events.list?iCalUID",
+            status,
+            &text,
+        ));
+    }
+    #[derive(Deserialize)]
+    struct ListResp {
+        #[serde(default)]
+        items: Vec<EventStub>,
+    }
+    #[derive(Deserialize)]
+    struct EventStub {
+        id: String,
+    }
+    let parsed: ListResp = resp.json().await?;
+    Ok(parsed.items.into_iter().next().map(|e| e.id))
+}
+
+/// Convert our canonical `CalendarEvent` into Google Calendar's `Event`
+/// resource JSON. Pure — testable without HTTP.
+///
+/// - `iCalUID` is preserved so `events.import` deduplicates across accounts.
+/// - Times always go out as UTC (we store UTC internally).
+/// - End time defaults to start+1h if missing (matches Outlook's path).
+pub(crate) fn calendar_event_to_google_json(event: &CalendarEvent) -> serde_json::Value {
+    let dtend = event
+        .dtend
+        .unwrap_or_else(|| event.dtstart + chrono::Duration::hours(1));
+    let mut body = serde_json::json!({
+        "iCalUID": event.uid,
+        "summary": event.summary,
+        "start": {
+            "dateTime": event.dtstart.to_rfc3339(),
+            "timeZone": "UTC",
+        },
+        "end": {
+            "dateTime": dtend.to_rfc3339(),
+            "timeZone": "UTC",
+        },
+    });
+
+    if let Some(loc) = &event.location
+        && !loc.is_empty()
+    {
+        body["location"] = serde_json::json!(loc);
+    }
+    if let Some(desc) = &event.description
+        && !desc.is_empty()
+    {
+        body["description"] = serde_json::json!(desc);
+    }
+    if !event.organizer_email.is_empty() {
+        body["organizer"] = serde_json::json!({
+            "email": event.organizer_email,
+            "displayName": event.organizer_name.clone().unwrap_or_default(),
+        });
+    }
+    if !event.attendees.is_empty() {
+        let attendees: Vec<serde_json::Value> = event
+            .attendees
+            .iter()
+            .map(|a| {
+                let mut entry = serde_json::json!({
+                    "email": a.email,
+                    "responseStatus": ics_status_to_google(&a.status),
+                });
+                if let Some(name) = &a.name
+                    && !name.is_empty()
+                {
+                    entry["displayName"] = serde_json::json!(name);
+                }
+                entry
+            })
+            .collect();
+        body["attendees"] = serde_json::json!(attendees);
+    }
+
+    body
+}
+
+/// Convert a Google Calendar `Event` JSON resource back into our canonical
+/// `CalendarEvent`. Pure — extracted for fixture-based tests.
+pub(crate) fn parse_google_event(
+    uid: &str,
+    event_json: &serde_json::Value,
+) -> Option<CalendarEvent> {
+    let summary = event_json["summary"].as_str().unwrap_or("").to_string();
+
+    let dtstart = parse_google_datetime(&event_json["start"])?;
+    let dtend = parse_google_datetime(&event_json["end"]);
+
+    let location = event_json["location"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let description = event_json["description"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let organizer_email = event_json["organizer"]["email"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let organizer_name = event_json["organizer"]["displayName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let attendees: Vec<crate::types::Attendee> = event_json["attendees"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    let email = a["email"].as_str()?;
+                    let name = a["displayName"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    let status =
+                        google_status_to_ics(a["responseStatus"].as_str().unwrap_or("needsAction"));
+                    Some(crate::types::Attendee {
+                        email: email.to_string(),
+                        name,
+                        status: status.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(CalendarEvent {
+        uid: uid.to_string(),
+        summary,
+        dtstart,
+        dtend,
+        location,
+        description,
+        organizer_email,
+        organizer_name,
+        attendees,
+        sequence: 0,
+        method: "REQUEST".to_string(),
+        raw_ics: String::new(),
+        user_rsvp_status: None,
+    })
+}
+
+/// Parse a Google Calendar datetime block (`{dateTime, timeZone}` or
+/// `{date}` for all-day events). RFC3339 with offset; we normalize to UTC.
+fn parse_google_datetime(block: &serde_json::Value) -> Option<DateTime<Utc>> {
+    if let Some(dt) = block["dateTime"].as_str() {
+        return chrono::DateTime::parse_from_rfc3339(dt)
+            .ok()
+            .map(|d| d.with_timezone(&Utc));
+    }
+    if let Some(d) = block["date"].as_str() {
+        // All-day events have no time — anchor at UTC midnight so the
+        // downstream invariant (CalendarEvent.dtstart is DateTime<Utc>) holds.
+        return chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .ok()
+            .and_then(|nd| nd.and_hms_opt(0, 0, 0))
+            .map(|ndt| ndt.and_utc());
+    }
+    None
+}
+
+/// Map our iTIP-style attendee status strings to Google's enum values.
+pub(crate) fn ics_status_to_google(ics_status: &str) -> &'static str {
+    match ics_status {
+        "ACCEPTED" => "accepted",
+        "TENTATIVE" => "tentative",
+        "DECLINED" => "declined",
+        _ => "needsAction",
+    }
+}
+
+/// Map Google's `responseStatus` enum back to our iTIP-style string.
+pub(crate) fn google_status_to_ics(google_status: &str) -> &'static str {
+    match google_status {
+        "accepted" => "ACCEPTED",
+        "tentative" => "TENTATIVE",
+        "declined" => "DECLINED",
+        _ => "NEEDS-ACTION",
+    }
+}
+
+/// Mutate a Google attendees array: set the matching attendee's
+/// `responseStatus`, leave others untouched. Pure — extracted so the
+/// "PATCH must include full array" Google quirk is covered by unit tests
+/// without HTTP mocking. If the email isn't present, the array is returned
+/// unchanged and `false` is returned so the caller can surface "not invited".
+pub(crate) fn mutate_attendee_status(
+    attendees: &mut [serde_json::Value],
+    attendee_email: &str,
+    google_status: &str,
+) -> bool {
+    let mut found = false;
+    for entry in attendees.iter_mut() {
+        if let Some(email) = entry["email"].as_str()
+            && email.eq_ignore_ascii_case(attendee_email)
+        {
+            entry["responseStatus"] = serde_json::json!(google_status);
+            found = true;
+        }
+    }
+    found
+}
+
+/// Look up a calendar event by its iCalUID. Returns the parsed event with
+/// up-to-date attendee statuses, or `None` if not in the calendar.
+pub async fn get_calendar_event(
+    session: &GmailSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    let token = access_token(session).await?;
+    let encoded = encode_path_segment(uid);
+    let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            "calendar.events.list?iCalUID",
+            status,
+            &text,
+        ));
+    }
+    let parsed: serde_json::Value = resp.json().await?;
+    let first = parsed["items"].as_array().and_then(|arr| arr.first());
+    Ok(first.and_then(|ev| parse_google_event(uid, ev)))
+}
+
+/// Add a parsed CalendarEvent to the user's primary Google Calendar via
+/// `events.import` (preserves iCalUID for cross-account dedup). If the
+/// event already exists by iCalUID, this is a no-op returning `Ok(true)`.
+pub async fn add_to_calendar(
+    session: &GmailSession,
+    _ics_data: &str,
+    event: &CalendarEvent,
+) -> Result<bool, Error> {
+    if find_event_id_by_ical_uid(session, &event.uid)
+        .await?
+        .is_some()
+    {
+        tracing::debug!("Event {} already in Google Calendar", event.uid);
+        return Ok(true);
+    }
+    let token = access_token(session).await?;
+    let body = calendar_event_to_google_json(event);
+    let url = format!("{CALENDAR_BASE}/events/import");
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        tracing::info!("Added event {} to Google Calendar", event.uid);
+        Ok(true)
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!("calendar.events.import failed ({status}): {text}");
+        Err(classify_gmail_error(
+            "calendar.events.import",
+            status,
+            &text,
+        ))
+    }
+}
+
+/// Remove an event from the user's calendar by iCalUID. Tolerant of "not
+/// found" (returns `Ok(true)`) so retries are idempotent.
+pub async fn remove_from_calendar(session: &GmailSession, uid: &str) -> Result<bool, Error> {
+    let event_id = match find_event_id_by_ical_uid(session, uid).await? {
+        Some(id) => id,
+        None => {
+            tracing::debug!("Event {uid} not in Google Calendar, nothing to remove");
+            return Ok(true);
+        }
+    };
+    let token = access_token(session).await?;
+    let encoded_id = encode_path_segment(&event_id);
+    let url = format!("{CALENDAR_BASE}/events/{encoded_id}");
+    let resp = session
+        .client
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        tracing::info!("Removed event {uid} from Google Calendar");
+        Ok(true)
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        tracing::warn!("calendar.events.delete failed ({status}): {text}");
+        Err(classify_gmail_error(
+            "calendar.events.delete",
+            status,
+            &text,
+        ))
+    }
+}
+
+/// RSVP to an event by GET-mutate-PATCHing the attendees array. Triggers
+/// the organizer-notification email via `sendUpdates=all`.
+///
+/// `attendee_email` is who's responding (typically `session.email`). If the
+/// event doesn't exist or the email isn't in its attendees list, returns
+/// `Ok(false)` so the caller can surface a "not invited" message.
+pub async fn respond_to_event(
+    session: &GmailSession,
+    uid: &str,
+    attendee_email: &str,
+    status: &crate::types::RsvpStatus,
+) -> Result<bool, Error> {
+    let event_id = match find_event_id_by_ical_uid(session, uid).await? {
+        Some(id) => id,
+        None => {
+            tracing::warn!("Cannot RSVP: event {uid} not found in Google Calendar");
+            return Ok(false);
+        }
+    };
+    let token = access_token(session).await?;
+    let encoded_id = encode_path_segment(&event_id);
+    let event_url = format!("{CALENDAR_BASE}/events/{encoded_id}");
+
+    // GET the current event so we have the full attendees array (Google's
+    // PATCH semantics require the full array; partial PATCH silently wipes).
+    let get_resp = session
+        .client
+        .get(&event_url)
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    let get_status = get_resp.status();
+    if !get_status.is_success() {
+        let text = get_resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            "calendar.events.get",
+            get_status,
+            &text,
+        ));
+    }
+    let event_json: serde_json::Value = get_resp.json().await?;
+
+    // Ensure attendees is an array we can mutate.
+    let mut attendees = event_json["attendees"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let google_status = ics_status_to_google(status.as_ics_str());
+    let updated = mutate_attendee_status(&mut attendees, attendee_email, google_status);
+    if !updated {
+        tracing::warn!(
+            uid = %uid,
+            attendee_email = %attendee_email,
+            "RSVP target email not in event attendees; not patching"
+        );
+        return Ok(false);
+    }
+
+    let patch_body = serde_json::json!({ "attendees": attendees });
+    let patch_url = format!("{event_url}?sendUpdates=all");
+    let patch_resp = session
+        .client
+        .patch(&patch_url)
+        .bearer_auth(&token)
+        .json(&patch_body)
+        .send()
+        .await?;
+    let patch_status = patch_resp.status();
+    if patch_status.is_success() {
+        tracing::info!(
+            "RSVP {} for event {uid} via Google Calendar PATCH",
+            status.as_ics_str()
+        );
+        Ok(true)
+    } else {
+        let text = patch_resp.text().await.unwrap_or_default();
+        Err(classify_gmail_error(
+            "calendar.events.patch",
+            patch_status,
+            &text,
+        ))
+    }
+}
+
+// =============================================================================
+// get_calendar_data — extract text/calendar part from a message
+// =============================================================================
+
+/// Extract the raw ICS bytes from a Gmail message's `text/calendar` part, if
+/// any. Walks the same payload tree as `walk_payload` but pulls the body
+/// data instead of just setting `has_calendar = true`.
+pub async fn get_calendar_data(
+    session: &GmailSession,
+    email_id: &str,
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let encoded_id = encode_path_segment(email_id);
+    let url = format!("{GMAIL_BASE}/messages/{encoded_id}?format=full");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            &format!("messages.get(full) {email_id}"),
+            status,
+            &text,
+        ));
+    }
+    let msg: GmailMessage = resp.json().await?;
+    Ok(find_calendar_ics(&msg.payload))
+}
+
+/// Walk the payload tree until a `text/calendar` part with inline data is
+/// found, then return its decoded UTF-8 string. Pure — testable with
+/// hand-rolled GmailPayload fixtures.
+pub(crate) fn find_calendar_ics(part: &GmailPayload) -> Option<String> {
+    if part.mime_type.eq_ignore_ascii_case("text/calendar")
+        && let Some(body) = &part.body
+        && let Some(data) = &body.data
+        && let Ok(bytes) = base64url_decode(data)
+        && let Ok(s) = String::from_utf8(bytes)
+    {
+        return Some(s);
+    }
+    if let Some(parts) = &part.parts {
+        for child in parts {
+            if let Some(found) = find_calendar_ics(child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -3430,5 +3900,368 @@ mod tests {
             Error::BadRequest(msg) => assert!(msg.contains("aggregate")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // Milestone D: Google Calendar
+    //
+    // Tests below cover the pure helpers added for Calendar (parse/build/
+    // mutate/walk). The HTTP-bound functions (get_calendar_event,
+    // add_to_calendar, remove_from_calendar, respond_to_event,
+    // get_calendar_data) don't have unit tests — the codebase doesn't have
+    // an HTTP-mocking dep established (see roborev 176 #3 / 175 #3 dialog).
+    // The pure helpers are the part most likely to bit-rot silently.
+    // =========================================================================
+
+    fn sample_event() -> CalendarEvent {
+        CalendarEvent {
+            uid: "uid-1@example.com".into(),
+            summary: "Sync".into(),
+            dtstart: chrono::DateTime::parse_from_rfc3339("2026-03-20T14:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            dtend: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-03-20T14:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            location: Some("Room 1".into()),
+            description: Some("Daily standup".into()),
+            organizer_email: "lead@example.com".into(),
+            organizer_name: Some("Lead".into()),
+            attendees: vec![
+                crate::types::Attendee {
+                    email: "alice@example.com".into(),
+                    name: Some("Alice".into()),
+                    status: "ACCEPTED".into(),
+                },
+                crate::types::Attendee {
+                    email: "bob@example.com".into(),
+                    name: None,
+                    status: "NEEDS-ACTION".into(),
+                },
+            ],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: None,
+        }
+    }
+
+    // ---- ics_status_to_google / google_status_to_ics ----
+
+    #[test]
+    fn ics_to_google_status_mapping() {
+        assert_eq!(ics_status_to_google("ACCEPTED"), "accepted");
+        assert_eq!(ics_status_to_google("TENTATIVE"), "tentative");
+        assert_eq!(ics_status_to_google("DECLINED"), "declined");
+        assert_eq!(ics_status_to_google("NEEDS-ACTION"), "needsAction");
+        // Unknown defaults to needsAction (safest — don't accidentally accept).
+        assert_eq!(ics_status_to_google("BOGUS"), "needsAction");
+    }
+
+    #[test]
+    fn google_to_ics_status_mapping() {
+        assert_eq!(google_status_to_ics("accepted"), "ACCEPTED");
+        assert_eq!(google_status_to_ics("tentative"), "TENTATIVE");
+        assert_eq!(google_status_to_ics("declined"), "DECLINED");
+        assert_eq!(google_status_to_ics("needsAction"), "NEEDS-ACTION");
+        assert_eq!(google_status_to_ics("anything-else"), "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn status_mapping_round_trips_for_known_values() {
+        for ics in &["ACCEPTED", "TENTATIVE", "DECLINED", "NEEDS-ACTION"] {
+            let google = ics_status_to_google(ics);
+            let back = google_status_to_ics(google);
+            assert_eq!(back, *ics, "round trip failed for {ics}");
+        }
+    }
+
+    // ---- calendar_event_to_google_json ----
+
+    #[test]
+    fn google_json_has_required_fields() {
+        let j = calendar_event_to_google_json(&sample_event());
+        assert_eq!(j["iCalUID"], "uid-1@example.com");
+        assert_eq!(j["summary"], "Sync");
+        assert_eq!(j["start"]["timeZone"], "UTC");
+        assert_eq!(j["end"]["timeZone"], "UTC");
+        // RFC3339 with Z suffix (UTC) — Google accepts this form.
+        assert!(
+            j["start"]["dateTime"].as_str().unwrap().ends_with("+00:00")
+                || j["start"]["dateTime"].as_str().unwrap().ends_with("Z")
+        );
+    }
+
+    #[test]
+    fn google_json_includes_location_when_set() {
+        let j = calendar_event_to_google_json(&sample_event());
+        assert_eq!(j["location"], "Room 1");
+    }
+
+    #[test]
+    fn google_json_omits_empty_location() {
+        let mut ev = sample_event();
+        ev.location = None;
+        let j = calendar_event_to_google_json(&ev);
+        assert!(j.get("location").is_none());
+    }
+
+    #[test]
+    fn google_json_omits_empty_description() {
+        let mut ev = sample_event();
+        ev.description = None;
+        let j = calendar_event_to_google_json(&ev);
+        assert!(j.get("description").is_none());
+    }
+
+    #[test]
+    fn google_json_defaults_end_to_one_hour_when_missing() {
+        let mut ev = sample_event();
+        ev.dtend = None;
+        let j = calendar_event_to_google_json(&ev);
+        // start = 14:00, default end = 15:00
+        let end = j["end"]["dateTime"].as_str().unwrap();
+        assert!(end.contains("15:00:00"));
+    }
+
+    #[test]
+    fn google_json_attendee_status_translated() {
+        let j = calendar_event_to_google_json(&sample_event());
+        let attendees = j["attendees"].as_array().unwrap();
+        assert_eq!(attendees[0]["email"], "alice@example.com");
+        assert_eq!(attendees[0]["responseStatus"], "accepted");
+        assert_eq!(attendees[0]["displayName"], "Alice");
+        assert_eq!(attendees[1]["email"], "bob@example.com");
+        assert_eq!(attendees[1]["responseStatus"], "needsAction");
+        // No displayName when none was set
+        assert!(attendees[1].get("displayName").is_none());
+    }
+
+    #[test]
+    fn google_json_omits_attendees_when_empty() {
+        let mut ev = sample_event();
+        ev.attendees = vec![];
+        let j = calendar_event_to_google_json(&ev);
+        assert!(j.get("attendees").is_none());
+    }
+
+    // ---- parse_google_event ----
+
+    fn google_event_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "google-id-abc",
+            "iCalUID": "uid-1@example.com",
+            "summary": "Sync",
+            "description": "Daily standup",
+            "location": "Room 1",
+            "start": { "dateTime": "2026-03-20T14:00:00Z", "timeZone": "UTC" },
+            "end": { "dateTime": "2026-03-20T14:30:00Z", "timeZone": "UTC" },
+            "organizer": { "email": "lead@example.com", "displayName": "Lead" },
+            "attendees": [
+                { "email": "alice@example.com", "displayName": "Alice", "responseStatus": "accepted" },
+                { "email": "bob@example.com", "responseStatus": "tentative" },
+                { "email": "carol@example.com", "responseStatus": "declined" },
+                { "email": "dave@example.com", "responseStatus": "needsAction" }
+            ]
+        })
+    }
+
+    #[test]
+    fn parse_google_event_full() {
+        let parsed = parse_google_event("uid-1@example.com", &google_event_json()).unwrap();
+        assert_eq!(parsed.uid, "uid-1@example.com");
+        assert_eq!(parsed.summary, "Sync");
+        assert_eq!(parsed.location.as_deref(), Some("Room 1"));
+        assert_eq!(parsed.description.as_deref(), Some("Daily standup"));
+        assert_eq!(parsed.organizer_email, "lead@example.com");
+        assert_eq!(parsed.organizer_name.as_deref(), Some("Lead"));
+        assert!(parsed.dtend.is_some());
+    }
+
+    #[test]
+    fn parse_google_event_maps_all_attendee_statuses() {
+        let parsed = parse_google_event("uid-x", &google_event_json()).unwrap();
+        assert_eq!(parsed.attendees[0].status, "ACCEPTED");
+        assert_eq!(parsed.attendees[1].status, "TENTATIVE");
+        assert_eq!(parsed.attendees[2].status, "DECLINED");
+        assert_eq!(parsed.attendees[3].status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn parse_google_event_handles_all_day_date() {
+        // All-day events use {date} instead of {dateTime}.
+        let json = serde_json::json!({
+            "summary": "Holiday",
+            "start": { "date": "2026-12-25" },
+            "end": { "date": "2026-12-26" }
+        });
+        let parsed = parse_google_event("uid-holiday", &json).unwrap();
+        assert_eq!(parsed.dtstart.format("%Y-%m-%d").to_string(), "2026-12-25");
+        assert_eq!(
+            parsed.dtend.unwrap().format("%Y-%m-%d").to_string(),
+            "2026-12-26"
+        );
+    }
+
+    #[test]
+    fn parse_google_event_missing_start_returns_none() {
+        let json = serde_json::json!({ "summary": "no-start" });
+        assert!(parse_google_event("uid", &json).is_none());
+    }
+
+    #[test]
+    fn parse_google_event_empty_optional_fields_treated_as_none() {
+        let json = serde_json::json!({
+            "summary": "Call",
+            "start": { "dateTime": "2026-03-20T09:00:00Z" },
+            "location": "",
+            "description": "",
+            "organizer": { "email": "a@b.com", "displayName": "" }
+        });
+        let parsed = parse_google_event("uid", &json).unwrap();
+        assert!(parsed.location.is_none());
+        assert!(parsed.description.is_none());
+        assert!(parsed.organizer_name.is_none());
+    }
+
+    #[test]
+    fn parse_google_event_attendee_missing_email_skipped() {
+        let json = serde_json::json!({
+            "summary": "Test",
+            "start": { "dateTime": "2026-03-20T09:00:00Z" },
+            "attendees": [
+                { "displayName": "No Email", "responseStatus": "accepted" },
+                { "email": "valid@example.com", "responseStatus": "accepted" }
+            ]
+        });
+        let parsed = parse_google_event("uid", &json).unwrap();
+        assert_eq!(parsed.attendees.len(), 1);
+        assert_eq!(parsed.attendees[0].email, "valid@example.com");
+    }
+
+    // ---- mutate_attendee_status ----
+
+    fn make_attendees() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({ "email": "alice@example.com", "responseStatus": "needsAction" }),
+            serde_json::json!({ "email": "bob@example.com", "responseStatus": "needsAction" }),
+        ]
+    }
+
+    #[test]
+    fn mutate_attendee_status_updates_match() {
+        let mut atts = make_attendees();
+        let found = mutate_attendee_status(&mut atts, "alice@example.com", "accepted");
+        assert!(found);
+        assert_eq!(atts[0]["responseStatus"], "accepted");
+        // Bob untouched — this is the Google-PATCH quirk: full-array submit
+        // must preserve all other attendees.
+        assert_eq!(atts[1]["responseStatus"], "needsAction");
+    }
+
+    #[test]
+    fn mutate_attendee_status_case_insensitive_match() {
+        let mut atts = make_attendees();
+        let found = mutate_attendee_status(&mut atts, "ALICE@EXAMPLE.COM", "tentative");
+        assert!(found);
+        assert_eq!(atts[0]["responseStatus"], "tentative");
+    }
+
+    #[test]
+    fn mutate_attendee_status_returns_false_when_email_absent() {
+        let mut atts = make_attendees();
+        let found = mutate_attendee_status(&mut atts, "stranger@example.com", "accepted");
+        assert!(!found);
+        // Nothing changed
+        assert_eq!(atts[0]["responseStatus"], "needsAction");
+        assert_eq!(atts[1]["responseStatus"], "needsAction");
+    }
+
+    #[test]
+    fn mutate_attendee_status_preserves_other_fields() {
+        let mut atts = vec![serde_json::json!({
+            "email": "alice@example.com",
+            "displayName": "Alice",
+            "optional": true,
+            "responseStatus": "needsAction"
+        })];
+        mutate_attendee_status(&mut atts, "alice@example.com", "declined");
+        assert_eq!(atts[0]["responseStatus"], "declined");
+        assert_eq!(atts[0]["displayName"], "Alice");
+        assert_eq!(atts[0]["optional"], true);
+    }
+
+    // ---- find_calendar_ics ----
+
+    fn calendar_part(ics: &str) -> GmailPayload {
+        GmailPayload {
+            mime_type: "text/calendar".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: Some(GmailBody {
+                size: ics.len() as i64,
+                data: Some(b64u(ics)),
+                attachment_id: None,
+            }),
+            parts: None,
+        }
+    }
+
+    #[test]
+    fn find_calendar_ics_at_root() {
+        let payload = calendar_part("BEGIN:VCALENDAR\r\nEND:VCALENDAR");
+        let ics = find_calendar_ics(&payload).unwrap();
+        assert!(ics.starts_with("BEGIN:VCALENDAR"));
+    }
+
+    #[test]
+    fn find_calendar_ics_nested_in_multipart() {
+        let payload = GmailPayload {
+            mime_type: "multipart/mixed".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: None,
+            parts: Some(vec![
+                GmailPayload {
+                    mime_type: "text/plain".into(),
+                    filename: String::new(),
+                    headers: vec![],
+                    body: Some(GmailBody {
+                        size: 5,
+                        data: Some(b64u("hello")),
+                        attachment_id: None,
+                    }),
+                    parts: None,
+                },
+                calendar_part("BEGIN:VCALENDAR\r\nUID:abc\r\nEND:VCALENDAR"),
+            ]),
+        };
+        let ics = find_calendar_ics(&payload).unwrap();
+        assert!(ics.contains("UID:abc"));
+    }
+
+    #[test]
+    fn find_calendar_ics_returns_none_when_absent() {
+        let payload = GmailPayload {
+            mime_type: "text/plain".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: Some(GmailBody {
+                size: 5,
+                data: Some(b64u("hello")),
+                attachment_id: None,
+            }),
+            parts: None,
+        };
+        assert!(find_calendar_ics(&payload).is_none());
+    }
+
+    #[test]
+    fn find_calendar_ics_case_insensitive_mime() {
+        let mut part = calendar_part("BEGIN:VCALENDAR\r\nEND:VCALENDAR");
+        part.mime_type = "Text/Calendar".into();
+        assert!(find_calendar_ics(&part).is_some());
     }
 }
