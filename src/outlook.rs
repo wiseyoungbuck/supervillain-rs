@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+// The upload cache constants and `should_clear_tokens_on_refresh_failure`
+// from provider_utils will be wired in Milestones B (download) and C
+// (upload/send). Import on demand at that time; importing them now and
+// dead-coding them tripped clippy::unused-imports and roborev 179 #7.
 use crate::error::Error;
-use crate::provider_utils::{
-    MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP,
-    should_clear_tokens_on_refresh_failure,
-};
 use crate::types::{CalendarEvent, Mailbox};
 
 // =============================================================================
@@ -52,16 +52,12 @@ pub struct OutlookPageCursor {
 /// Folder cache TTL (same as Gmail's label cache).
 pub const FOLDER_CACHE_TTL: Duration = Duration::from_secs(60);
 
-// Touch the imports so they don't warn before being used in later TDD steps.
-// (Will be wired into upload_blob + ensure_token in Milestones C and A
-// respectively; keeping the import here groups all provider_utils uses.)
-#[allow(dead_code)]
-fn _touch_provider_utils_imports() {
-    let _ = UPLOAD_CACHE_CAP;
-    let _ = MAX_BLOB_BYTES;
-    let _ = MAX_UPLOAD_CACHE_BYTES;
-    let _ = should_clear_tokens_on_refresh_failure;
-}
+/// Cap on the page_cache to bound memory if a long-running session
+/// accumulates many unique (folder, filter, search) queries. When the
+/// cache reaches this size, the next insert evicts an arbitrary entry —
+/// re-issuing the query just costs one Graph round-trip.
+/// Roborev 179 #3.
+pub const MAX_PAGE_CACHE_ENTRIES: usize = 32;
 
 pub struct OutlookToken {
     pub access_token: String,
@@ -303,8 +299,13 @@ async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Resul
 /// Idempotent: missing file is a no-op (the 401-on-revoke path can race
 /// with manual user cleanup).
 pub async fn clear_stored_tokens(session: &OutlookSession) {
-    if session.token_path.exists()
-        && let Err(e) = std::fs::remove_file(&session.token_path)
+    // Roborev 179 #8: use tokio::fs::remove_file so the async signature is
+    // honest — the function is awaited from inside ensure_token's hot path
+    // and a blocking remove_file would briefly stall the runtime.
+    if tokio::fs::try_exists(&session.token_path)
+        .await
+        .unwrap_or(false)
+        && let Err(e) = tokio::fs::remove_file(&session.token_path).await
     {
         tracing::warn!(
             token_path = %session.token_path.display(),
@@ -377,8 +378,15 @@ pub(crate) fn translate_query_to_odata(q: &crate::types::ParsedQuery) -> OdataQu
     }
 
     // Subject and free text both flow into $search. Subject gets KQL prefix.
+    // Roborev 179 #6: multi-word subject values must be wrapped in KQL
+    // quotes — otherwise `subject:meeting tomorrow` parses as
+    // `subject:meeting AND tomorrow`.
     for sub in &q.subject {
-        search_parts.push(format!("subject:{sub}"));
+        if sub.contains(char::is_whitespace) {
+            search_parts.push(format!("subject:\"{}\"", escape_search_string(sub)));
+        } else {
+            search_parts.push(format!("subject:{sub}"));
+        }
     }
     if !q.text.is_empty() {
         search_parts.push(q.text.clone());
@@ -538,16 +546,37 @@ fn parse_graph_body(body_json: &serde_json::Value) -> (Option<String>, Option<St
 /// Parse `attachments[]` from an `$expand=attachments` response. Each
 /// fileAttachment becomes one `Attachment`; the blob_id uses the
 /// `outlook:{msg}:{att}` prefix so download_blob routes correctly.
+///
+/// Roborev 179 #10 defense: msg_id and att_id must NOT contain `:` —
+/// otherwise the formatted `outlook:msg:att` string would round-trip to
+/// the wrong split when `BlobRef::parse` rebuilds it. Real Graph IDs are
+/// long base64 (no colons), but we don't trust Graph blindly.
 fn parse_graph_attachments(
     msg_id: &str,
     arr_json: &serde_json::Value,
 ) -> Vec<crate::types::Attachment> {
+    if msg_id.contains(':') {
+        tracing::warn!(
+            msg_id = %msg_id,
+            "Outlook message ID contains ':' — refusing to construct \
+             BlobRefs (would round-trip incorrectly)"
+        );
+        return Vec::new();
+    }
     arr_json
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|att| {
                     let att_id = att["id"].as_str()?;
+                    if att_id.contains(':') {
+                        tracing::warn!(
+                            att_id = %att_id,
+                            "Outlook attachment ID contains ':' — skipping \
+                             (would corrupt BlobRef round-trip)"
+                        );
+                        return None;
+                    }
                     let name = att["name"].as_str().unwrap_or("").to_string();
                     let mime_type = att["contentType"]
                         .as_str()
@@ -645,7 +674,11 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
     }
 
     let token = access_token(session).await?;
-    let url = format!("{GRAPH_BASE}/me/mailFolders?$top=100");
+    // Roborev 179 #4: $top=100 silently truncates for users with many
+    // folders. 999 is Graph's documented per-page max — covers practical
+    // cases without following @odata.nextLink (which we'd need if users
+    // legitimately exceed 999).
+    let url = format!("{GRAPH_BASE}/me/mailFolders?$top=999");
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
     let status = resp.status();
     if !status.is_success() {
@@ -658,14 +691,11 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
         .value
         .into_iter()
         .map(|f| {
-            // Graph exposes wellKnownName for system folders; fall back
-            // to the ID, which is also the well-known string for the
-            // built-in folders ("inbox", "sentitems", etc.).
-            let role = f
-                .well_known_name
-                .as_deref()
-                .and_then(outlook_folder_role)
-                .or_else(|| outlook_folder_role(&f.id));
+            // Graph exposes wellKnownName for system folders; user folders
+            // get `None` here. Roborev 179 #9: dropped the `id` fallback —
+            // Graph returns opaque base64 IDs in `id`, never the well-known
+            // strings, so the fallback could never fire.
+            let role = f.well_known_name.as_deref().and_then(outlook_folder_role);
             Mailbox {
                 id: f.id,
                 name: f.display_name,
@@ -690,6 +720,15 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
 pub async fn invalidate_folder_cache(session: &OutlookSession) {
     let mut cache = session.folder_cache.lock().await;
     *cache = None;
+}
+
+/// Invalidate the page cursor cache. Roborev 179 #3: mutations should
+/// clear this alongside the folder cache — otherwise a cached
+/// `@odata.nextLink` happily skips deleted/moved messages on subsequent
+/// scrolls. Milestone B wires this into mark_read/archive/trash/move.
+pub async fn invalidate_page_cache(session: &OutlookSession) {
+    let mut cache = session.page_cache.lock().await;
+    cache.clear();
 }
 
 /// Fetch user identities. Outlook is simpler than Gmail's sendAs — Graph
@@ -783,8 +822,16 @@ pub async fn query_emails(
 
     let ids: Vec<String> = parsed.value.into_iter().map(|m| m.id).collect();
 
-    // Update cache cursor for next-page following.
+    // Update cache cursor for next-page following. Cap enforcement
+    // (roborev 179 #3): evict an arbitrary entry if we'd exceed the cap.
+    // Re-issuing the evicted query is just one Graph round-trip — cheap.
     let mut cache = session.page_cache.lock().await;
+    if cache.len() >= MAX_PAGE_CACHE_ENTRIES
+        && !cache.contains_key(&cache_key)
+        && let Some(victim_key) = cache.keys().next().cloned()
+    {
+        cache.remove(&victim_key);
+    }
     cache.insert(
         cache_key,
         OutlookPageCursor {
@@ -825,13 +872,35 @@ fn build_outlook_query_url(
         if let Some(s) = &odata.search {
             q.append_pair("$search", s);
         }
-        q.append_pair("$orderby", "receivedDateTime desc");
+        // Roborev 179 #1: Graph rejects $orderby combined with $search
+        // ($search results are relevance-ranked). Skipping $orderby when
+        // $search is set is the load-bearing fix; results then come back
+        // in Graph's default order (relevance for $search, server-default
+        // otherwise — usually receivedDateTime desc).
+        //
+        // Roborev 179 #2 policy: when both $filter and $search are set,
+        // we emit both. Graph's docs say this is supported on
+        // /me/messages with restrictions; if a tenant rejects the
+        // combination, the user-visible error from classify_outlook_error
+        // makes it visible. Switching to client-side filtering is the
+        // documented fallback; defer until reports come in.
+        if odata.search.is_none() {
+            q.append_pair("$orderby", "receivedDateTime desc");
+        }
     }
     url.to_string()
 }
 
 /// Fetch full message data for each ID in parallel. Uses `$expand=attachments`
 /// so attachment metadata comes back in the same response.
+/// Cap on concurrent in-flight Graph requests from a single `get_emails`
+/// call. Graph throttles aggressively (HTTP 429 with `Retry-After`);
+/// fanning out 200 requests at once is a recipe for a 429 storm.
+/// 5 is conservative — matches what Gmail's get_emails effectively
+/// achieves via tokio's natural connection-pool serialization.
+/// Roborev 179 #5.
+const GET_EMAILS_MAX_CONCURRENCY: usize = 5;
+
 pub async fn get_emails(
     session: &OutlookSession,
     ids: &[String],
@@ -841,12 +910,19 @@ pub async fn get_emails(
         return Ok(Vec::new());
     }
     let token = access_token(session).await?;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
         let client = session.client.clone();
         let token = token.clone();
         let id = id.clone();
+        let sem = sem.clone();
         join_set.spawn(async move {
+            // Acquire holds the permit for the duration of the request.
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| Error::Internal(format!("get_emails semaphore: {e}")))?;
             let encoded = crate::provider_utils::encode_path_segment(&id);
             let url = format!("{GRAPH_BASE}/me/messages/{encoded}?$expand=attachments");
             let resp = client.get(&url).bearer_auth(&token).send().await?;
@@ -1896,6 +1972,36 @@ mod tests {
     }
 
     #[test]
+    fn odata_translator_subject_with_spaces_wraps_value_in_kql_quotes() {
+        // Roborev 179 #6: KQL parses `subject:meeting tomorrow` as
+        // `subject:meeting AND tomorrow`. Multi-word subject values must
+        // be wrapped in KQL quotes: subject:"meeting tomorrow".
+        let q = ParsedQuery {
+            subject: vec!["meeting tomorrow".into()],
+            ..Default::default()
+        };
+        let r = translate_query_to_odata(&q);
+        let s = r.search.unwrap();
+        // The outer $search wrap escapes the inner KQL quotes.
+        // Inside the outer "…", we want subject:\"meeting tomorrow\".
+        assert!(s.contains(r#"subject:\"meeting tomorrow\""#), "got {s}");
+    }
+
+    #[test]
+    fn odata_translator_subject_single_word_no_quoting() {
+        // Single-word subject doesn't need quoting — keep the simpler shape.
+        let q = ParsedQuery {
+            subject: vec!["urgent".into()],
+            ..Default::default()
+        };
+        let r = translate_query_to_odata(&q);
+        let s = r.search.unwrap();
+        assert!(s.contains("subject:urgent"));
+        // No backslash-quote sequence around "urgent" since it's unquoted.
+        assert!(!s.contains(r#"subject:\"urgent\""#));
+    }
+
+    #[test]
     fn odata_translator_free_text_routes_to_search() {
         let q = ParsedQuery {
             text: "quarterly review".into(),
@@ -2138,5 +2244,201 @@ mod tests {
         // UI's split-by-folder views work.
         let m = parse_graph_message(&graph_message_minimal(), true);
         assert!(m.mailbox_ids.contains_key("inbox"));
+    }
+
+    // ---- Roborev 179 #10: parse_graph_attachments validates IDs ----
+    //
+    // If Graph ever returns an `id` containing `:`, the serialized blob_id
+    // (`outlook:msg:att`) would round-trip into the wrong msg/att split.
+    // Defensive: skip such attachments at construction with a warn.
+
+    #[test]
+    fn parse_graph_attachments_skips_msg_id_with_colon() {
+        // Construct with a msg_id that itself contains ':' — must be
+        // filtered out so the blob_id doesn't deserialize to garbage.
+        let attachments_json = serde_json::json!([
+            {
+                "id": "valid-att-1",
+                "name": "ok.pdf",
+                "contentType": "application/pdf",
+                "size": 100
+            }
+        ]);
+        let parsed = parse_graph_attachments("bad:msg:id", &attachments_json);
+        // The bad msg_id means we can't safely construct any blob_id —
+        // expect empty (defensive skip).
+        assert!(parsed.is_empty(), "got {parsed:?}");
+    }
+
+    #[test]
+    fn parse_graph_attachments_skips_att_id_with_colon() {
+        let attachments_json = serde_json::json!([
+            {
+                "id": "evil:att:id",
+                "name": "weird.bin",
+                "contentType": "application/octet-stream",
+                "size": 1
+            },
+            {
+                "id": "good-att-id",
+                "name": "ok.bin",
+                "contentType": "application/octet-stream",
+                "size": 1
+            }
+        ]);
+        let parsed = parse_graph_attachments("safe-msg-id", &attachments_json);
+        // Only the well-formed one survives.
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "ok.bin");
+    }
+
+    #[test]
+    fn parse_graph_attachments_accepts_normal_graph_ids() {
+        // Real Graph IDs are long base64; they don't contain ':'. Sanity
+        // that the validation doesn't reject the common case.
+        let attachments_json = serde_json::json!([
+            {
+                "id": "AAMkADA1ZTI5MDdkLTczODItNDhmZi1iMzM2LTUyMjdiMzNkNTM0OQBGAAAAAAA=",
+                "name": "report.pdf",
+                "contentType": "application/pdf",
+                "size": 12345
+            }
+        ]);
+        let parsed = parse_graph_attachments("msg-abc", &attachments_json);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].blob_id.starts_with("outlook:msg-abc:"));
+    }
+
+    // ---- Roborev 179 #1 + #11: build_outlook_query_url $orderby/$search ----
+
+    #[test]
+    fn url_builder_includes_orderby_when_no_search() {
+        let odata = OdataQuery {
+            filter: Some("isRead eq false".into()),
+            search: None,
+        };
+        let url = build_outlook_query_url(None, &odata, 25, 0);
+        assert!(
+            url.contains("%24orderby=receivedDateTime+desc")
+                || url.contains("%24orderby=receivedDateTime%20desc"),
+            "expected $orderby in URL when no $search: {url}"
+        );
+    }
+
+    #[test]
+    fn url_builder_omits_orderby_when_search_present() {
+        // Roborev 179 #1: Graph rejects $orderby combined with $search
+        // (search results are relevance-ranked). Sending both yields HTTP
+        // 400 on every search query. Skip $orderby when $search is set.
+        let odata = OdataQuery {
+            filter: None,
+            search: Some(r#""newsletter""#.into()),
+        };
+        let url = build_outlook_query_url(None, &odata, 25, 0);
+        assert!(
+            !url.contains("orderby"),
+            "expected NO $orderby when $search present: {url}"
+        );
+    }
+
+    #[test]
+    fn url_builder_omits_orderby_when_filter_and_search_both_present() {
+        let odata = OdataQuery {
+            filter: Some("isRead eq false".into()),
+            search: Some(r#""urgent""#.into()),
+        };
+        let url = build_outlook_query_url(None, &odata, 25, 0);
+        assert!(!url.contains("orderby"));
+        assert!(url.contains("%24filter=") || url.contains("$filter="));
+        assert!(url.contains("%24search=") || url.contains("$search="));
+    }
+
+    #[test]
+    fn url_builder_uses_folder_path_when_id_given() {
+        let url = build_outlook_query_url(Some("inbox"), &OdataQuery::default(), 25, 0);
+        assert!(url.contains("/me/mailFolders/inbox/messages"));
+    }
+
+    #[test]
+    fn url_builder_uses_me_messages_when_folder_none() {
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0);
+        assert!(url.contains("/me/messages"));
+        assert!(!url.contains("mailFolders"));
+    }
+
+    #[test]
+    fn url_builder_includes_top_and_skip() {
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 50, 100);
+        assert!(url.contains("%24top=50") || url.contains("$top=50"));
+        assert!(url.contains("%24skip=100") || url.contains("$skip=100"));
+    }
+
+    #[test]
+    fn url_builder_omits_skip_when_position_zero() {
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0);
+        assert!(!url.contains("skip="));
+    }
+
+    // ---- Roborev 179 #11: classify_outlook_error tests ----
+
+    #[test]
+    fn classify_outlook_4xx_returns_bad_request() {
+        let err = classify_outlook_error(
+            "messages.list",
+            reqwest::StatusCode::BAD_REQUEST,
+            "bad query",
+        );
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_outlook_401_returns_bad_request() {
+        let err = classify_outlook_error("me.get", reqwest::StatusCode::UNAUTHORIZED, "bad token");
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_outlook_404_returns_bad_request() {
+        let err =
+            classify_outlook_error("messages.get xyz", reqwest::StatusCode::NOT_FOUND, "gone");
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_outlook_5xx_returns_internal() {
+        let err = classify_outlook_error(
+            "messages.list",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "down",
+        );
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn classify_outlook_429_returns_bad_request() {
+        // Graph's throttling — 4xx, surfaces to caller. Future work could
+        // expose Retry-After but it's still BadRequest-shaped today.
+        let err = classify_outlook_error(
+            "messages.list",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "throttled",
+        );
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_outlook_includes_operation_and_status_in_message() {
+        let err = classify_outlook_error(
+            "messages.send",
+            reqwest::StatusCode::BAD_REQUEST,
+            "missing field",
+        );
+        let msg = match err {
+            Error::BadRequest(m) => m,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        assert!(msg.contains("messages.send"));
+        assert!(msg.contains("400"));
+        assert!(msg.contains("missing field"));
     }
 }
