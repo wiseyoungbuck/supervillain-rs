@@ -111,6 +111,7 @@ pub struct Attachment {
 pub enum BlobRef {
     Synthetic(uuid::Uuid),
     GmailAttachment { msg_id: String, att_id: String },
+    OutlookAttachment { msg_id: String, att_id: String },
 }
 
 impl BlobRef {
@@ -120,25 +121,41 @@ impl BlobRef {
     }
 
     /// Parse from the wire format used in URLs / Attachment.blob_id strings.
-    /// Accepts `synth:{uuid}` or `{msg_id}:{att_id}`.
     ///
-    /// Components are validated against URL-safe characters (`[A-Za-z0-9_-]`
-    /// plus base64url's `=` padding) so a malformed `blob_id` like
-    /// `"../../../../foo:bar"` can't be reflected into a provider HTTP URL
-    /// even if it reaches `download_blob` from an untrusted source.
+    /// Accepts:
+    /// - `synth:{uuid}` → `Synthetic`
+    /// - `outlook:{msg_id}:{att_id}` → `OutlookAttachment`
+    /// - `{msg_id}:{att_id}` → `GmailAttachment` (no prefix; legacy)
+    ///
+    /// URL-safety is enforced per variant: Gmail IDs are URL-safe base64
+    /// (`[A-Za-z0-9_=-]`); Outlook/Graph IDs add `+/` because Graph uses
+    /// standard base64. Both reject path-traversal sequences like `..`.
     pub fn parse(s: &str) -> Result<Self, crate::error::Error> {
-        // Note: the `synth:` prefix would collide with any Gmail message ID
-        // starting with the literal bytes `synth:`. Gmail's actual ID space
-        // is URL-safe-base64-ish (hex-leaning), so collision is astronomically
-        // unlikely; if it ever happens, the user-visible failure is a clean
-        // `BadRequest("invalid synthetic blob UUID")` rather than fetching
-        // the wrong attachment. Acceptable; flag here for future maintainers.
+        // synth:{uuid} — vanishingly unlikely to collide with provider IDs
         if let Some(rest) = s.strip_prefix("synth:") {
             let uuid = uuid::Uuid::parse_str(rest).map_err(|e| {
                 crate::error::Error::BadRequest(format!("invalid synthetic blob UUID: {e}"))
             })?;
             return Ok(Self::Synthetic(uuid));
         }
+        // outlook:{msg}:{att} — explicit prefix so Outlook IDs (with possibly
+        // base64 `+`, `/`) don't get rejected by Gmail's stricter URL-safety.
+        if let Some(rest) = s.strip_prefix("outlook:") {
+            return match rest.split_once(':') {
+                Some((msg_id, att_id)) if !msg_id.is_empty() && !att_id.is_empty() => {
+                    ensure_outlook_url_safe(msg_id, "msg_id")?;
+                    ensure_outlook_url_safe(att_id, "att_id")?;
+                    Ok(Self::OutlookAttachment {
+                        msg_id: msg_id.to_string(),
+                        att_id: att_id.to_string(),
+                    })
+                }
+                _ => Err(crate::error::Error::BadRequest(format!(
+                    "outlook blob_id '{s}' is malformed (expected 'outlook:msg_id:att_id')"
+                ))),
+            };
+        }
+        // Bare {msg}:{att} → Gmail (back-compat with the original format).
         match s.split_once(':') {
             Some((msg_id, att_id)) if !msg_id.is_empty() && !att_id.is_empty() => {
                 ensure_url_safe(msg_id, "msg_id")?;
@@ -149,18 +166,14 @@ impl BlobRef {
                 })
             }
             _ => Err(crate::error::Error::BadRequest(format!(
-                "blob_id '{s}' is not a valid BlobRef (expected 'synth:UUID' or 'msg_id:att_id')"
+                "blob_id '{s}' is not a valid BlobRef (expected 'synth:UUID', 'outlook:msg_id:att_id', or 'msg_id:att_id')"
             ))),
         }
     }
 }
 
-/// Restrict to URL-path-safe characters: ASCII alphanumerics plus `_`, `-`,
-/// and base64url's `=` padding. Gmail message and attachment IDs are within
-/// this set; rejecting `/`, `?`, `#`, `..`, etc. prevents a malicious or
-/// malformed blob_id from steering the eventual HTTP request to a different
-/// API path. Defense-in-depth — `walk_payload` never produces bad input
-/// today, but routes that forward client-provided blob_ids might.
+/// Gmail's URL-safe character set: alphanumerics plus `_`, `-`, and
+/// base64url padding `=`. Strict enough to reject path traversal.
 fn ensure_url_safe(s: &str, label: &str) -> Result<(), crate::error::Error> {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=')
@@ -173,11 +186,33 @@ fn ensure_url_safe(s: &str, label: &str) -> Result<(), crate::error::Error> {
     }
 }
 
+/// Outlook/Graph IDs use standard base64 (not URL-safe), so they may
+/// contain `+` and `/`. Still rejects path traversal (`..`, `%`, etc.).
+fn ensure_outlook_url_safe(s: &str, label: &str) -> Result<(), crate::error::Error> {
+    if s.contains("..") {
+        return Err(crate::error::Error::BadRequest(format!(
+            "BlobRef {label} contains path-traversal sequence"
+        )));
+    }
+    if s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=' || c == '+' || c == '/'
+    }) {
+        Ok(())
+    } else {
+        Err(crate::error::Error::BadRequest(format!(
+            "BlobRef {label} contains characters outside [A-Za-z0-9_=+/-]"
+        )))
+    }
+}
+
 impl std::fmt::Display for BlobRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Synthetic(u) => write!(f, "synth:{u}"),
             Self::GmailAttachment { msg_id, att_id } => write!(f, "{msg_id}:{att_id}"),
+            Self::OutlookAttachment { msg_id, att_id } => {
+                write!(f, "outlook:{msg_id}:{att_id}")
+            }
         }
     }
 }
@@ -875,5 +910,56 @@ mod tests {
         // Gmail IDs use URL-safe base64-ish strings; these must work.
         let r = BlobRef::parse("190abc-DEF_123=:ANGjdJ_xyz0-Q").unwrap();
         assert!(matches!(r, BlobRef::GmailAttachment { .. }));
+    }
+
+    // ---- BlobRef::OutlookAttachment (Phase 4 Milestone A) ----
+
+    #[test]
+    fn blob_ref_outlook_attachment_roundtrip() {
+        let r = BlobRef::OutlookAttachment {
+            msg_id: "AQMkADA1ZTI5".into(),
+            att_id: "AAMkADA1ZTI5XYZ".into(),
+        };
+        let s = r.to_string();
+        assert_eq!(s, "outlook:AQMkADA1ZTI5:AAMkADA1ZTI5XYZ");
+        let parsed = BlobRef::parse(&s).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn blob_ref_outlook_prefix_disambiguates_from_gmail() {
+        // Same shape after the prefix as Gmail's `{msg}:{att}`, but the
+        // outlook: prefix routes to the OutlookAttachment variant.
+        let r = BlobRef::parse("outlook:msg-1:att-1").unwrap();
+        assert!(matches!(r, BlobRef::OutlookAttachment { .. }));
+    }
+
+    #[test]
+    fn blob_ref_outlook_accepts_graph_id_chars() {
+        // Graph IDs can include `+`, `/`, `=` (full base64). They must
+        // round-trip through parse without tripping URL-safety checks.
+        let r = BlobRef::parse("outlook:abc+def/ghi=:xyz+123/456=").unwrap();
+        match r {
+            BlobRef::OutlookAttachment { msg_id, att_id } => {
+                assert_eq!(msg_id, "abc+def/ghi=");
+                assert_eq!(att_id, "xyz+123/456=");
+            }
+            other => panic!("expected OutlookAttachment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blob_ref_outlook_parse_rejects_empty_components() {
+        assert!(BlobRef::parse("outlook::att").is_err());
+        assert!(BlobRef::parse("outlook:msg:").is_err());
+        assert!(BlobRef::parse("outlook:").is_err());
+    }
+
+    #[test]
+    fn blob_ref_outlook_parse_rejects_path_traversal() {
+        // Defense-in-depth: even with the broader Graph alphabet, path
+        // traversal sequences must not survive parse.
+        assert!(BlobRef::parse("outlook:../escape:att").is_err());
+        assert!(BlobRef::parse("outlook:msg:..%2Fescape").is_err());
     }
 }

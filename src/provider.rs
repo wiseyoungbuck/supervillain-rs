@@ -53,9 +53,7 @@ impl ProviderSession {
 pub async fn get_mailboxes(s: &ProviderSession) -> Result<Vec<Mailbox>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_mailboxes(s).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::get_mailboxes(s).await,
         ProviderSession::Gmail(s) => gmail::get_mailboxes(s).await,
     }
 }
@@ -63,9 +61,7 @@ pub async fn get_mailboxes(s: &ProviderSession) -> Result<Vec<Mailbox>, Error> {
 pub async fn get_identities(s: &mut ProviderSession) -> Result<Vec<Identity>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_identities(s).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::get_identities(s).await,
         ProviderSession::Gmail(s) => gmail::get_identities(s).await,
     }
 }
@@ -81,9 +77,9 @@ pub async fn query_emails(
         ProviderSession::Fastmail(s) => {
             jmap::query_emails(s, mailbox_id, limit, position, query).await
         }
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => {
+            outlook::query_emails(s, mailbox_id, limit, position, query).await
+        }
         ProviderSession::Gmail(s) => {
             gmail::query_emails(s, mailbox_id, limit, position, query).await
         }
@@ -100,9 +96,12 @@ pub async fn get_emails(
         ProviderSession::Fastmail(s) => {
             jmap::get_emails(s, ids, fetch_body, properties_override).await
         }
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => {
+            // properties_override is JMAP-specific; Graph returns the full
+            // message resource with $expand=attachments.
+            let _ = properties_override;
+            outlook::get_emails(s, ids, fetch_body).await
+        }
         ProviderSession::Gmail(s) => {
             // properties_override is JMAP-specific; Gmail always returns the full payload.
             let _ = properties_override;
@@ -210,9 +209,7 @@ pub async fn get_calendar_data(
 ) -> Result<Option<String>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_calendar_data(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::get_calendar_data(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::get_calendar_data(s, email_id).await,
     }
 }
@@ -432,6 +429,8 @@ mod tests {
             client_id: "test".into(),
             token_path: std::path::PathBuf::from("/tmp/test"),
             email: "user@outlook.com".into(),
+            folder_cache: tokio::sync::Mutex::new(None),
+            page_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

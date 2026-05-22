@@ -1476,6 +1476,11 @@ pub async fn download_blob(
                     .into(),
             ));
         }
+        crate::types::BlobRef::OutlookAttachment { .. } => {
+            return Err(Error::BadRequest(
+                "outlook blob_id passed to gmail::download_blob — wrong provider".into(),
+            ));
+        }
     };
 
     let token = access_token(session).await?;
@@ -1576,6 +1581,9 @@ async fn peek_blob_bytes(
         crate::types::BlobRef::GmailAttachment { .. } => {
             download_blob(session, blob_id, filename).await
         }
+        crate::types::BlobRef::OutlookAttachment { .. } => Err(Error::BadRequest(
+            "outlook blob_id passed to gmail::peek_blob_bytes — wrong provider".into(),
+        )),
     }
 }
 
