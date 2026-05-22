@@ -251,9 +251,7 @@ async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Resul
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(Error::Internal(format!(
-            "Gmail getProfile failed ({status}): {text}"
-        )));
+        return Err(classify_gmail_error("getProfile", status, &text));
     }
     let profile: GmailProfile = resp.json().await?;
     Ok(profile.email_address)
@@ -462,9 +460,7 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Internal(format!(
-                "Gmail labels.list failed ({status}): {text}"
-            )));
+            return Err(classify_gmail_error("labels.list", status, &text));
         }
         resp.json().await?
     };
@@ -488,9 +484,11 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(Error::Internal(format!(
-                    "Gmail labels.get {id} failed ({status}): {text}"
-                )));
+                return Err(classify_gmail_error(
+                    &format!("labels.get {id}"),
+                    status,
+                    &text,
+                ));
             }
             let detail: LabelDetail = resp.json().await?;
             Ok::<_, Error>(detail)
@@ -557,9 +555,7 @@ pub async fn get_identities(session: &GmailSession) -> Result<Vec<Identity>, Err
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(Error::Internal(format!(
-            "Gmail sendAs.list failed ({status}): {text}"
-        )));
+        return Err(classify_gmail_error("sendAs.list", status, &text));
     }
     let parsed: SendAsResp = resp.json().await?;
     Ok(parsed
@@ -680,9 +676,7 @@ async fn fetch_messages_page(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(Error::Internal(format!(
-            "Gmail messages.list failed ({status}): {text}"
-        )));
+        return Err(classify_gmail_error("messages.list", status, &text));
     }
     Ok(resp.json().await?)
 }
@@ -900,9 +894,11 @@ pub async fn get_emails(
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(Error::Internal(format!(
-                    "Gmail messages.get {id} failed ({status}): {text}"
-                )));
+                return Err(classify_gmail_error(
+                    &format!("messages.get {id}"),
+                    status,
+                    &text,
+                ));
             }
             let msg: GmailMessage = resp.json().await?;
             Ok::<_, Error>((idx, parse_message_to_email(msg, fetch_body)))
@@ -1135,8 +1131,12 @@ fn walk_payload(
 
     if is_attachment && let Some(att_id) = part.body.as_ref().and_then(|b| b.attachment_id.clone())
     {
+        let blob_ref = crate::types::BlobRef::GmailAttachment {
+            msg_id: msg_id.to_string(),
+            att_id,
+        };
         attachments.push(crate::types::Attachment {
-            blob_id: format!("{msg_id}:{att_id}"),
+            blob_id: blob_ref.to_string(),
             name: filename.unwrap_or("").to_string(),
             mime_type: part.mime_type.clone(),
             size: part.body.as_ref().map(|b| b.size).unwrap_or(0),
@@ -1150,6 +1150,342 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, Error> {
         .decode(s)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
         .map_err(|e| Error::Internal(format!("base64url decode failed: {e}")))
+}
+
+/// Map a Gmail HTTP error response to the right `Error` variant so frontends
+/// can distinguish "your input/state is stale" (4xx — refresh the list) from
+/// "Gmail is down" (5xx — retry later). Pure — unit-tested.
+pub(crate) fn classify_gmail_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Error {
+    let msg = format!("Gmail {operation} failed ({status}): {body}");
+    if status.is_client_error() {
+        Error::BadRequest(msg)
+    } else {
+        Error::Internal(msg)
+    }
+}
+
+// =============================================================================
+// Mutations — messages.modify, messages.trash, messages.batchModify
+// =============================================================================
+
+/// Body for `messages.modify` and `messages.batchModify`. Extracted as a pure
+/// fn so the JSON shape is testable without an HTTP mock.
+fn modify_body(add: &[&str], remove: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "addLabelIds": add,
+        "removeLabelIds": remove,
+    })
+}
+
+/// Body for `messages.batchModify`. Same shape as `modify_body` plus the `ids`
+/// array of message IDs to mutate.
+fn batch_modify_body(ids: &[String], add: &[&str], remove: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "ids": ids,
+        "addLabelIds": add,
+        "removeLabelIds": remove,
+    })
+}
+
+async fn modify_labels(
+    session: &GmailSession,
+    msg_id: &str,
+    add: &[&str],
+    remove: &[&str],
+) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    let url = format!("{GMAIL_BASE}/messages/{msg_id}/modify");
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&modify_body(add, remove))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            &format!("messages.modify {msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    invalidate_label_cache(session).await;
+    Ok(true)
+}
+
+pub async fn mark_read(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    modify_labels(session, msg_id, &[], &["UNREAD"]).await
+}
+
+pub async fn mark_unread(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    modify_labels(session, msg_id, &["UNREAD"], &[]).await
+}
+
+pub async fn archive(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    modify_labels(session, msg_id, &[], &["INBOX"]).await
+}
+
+/// Move semantics for Gmail (best-effort — Gmail's flat label model has no
+/// folder analog):
+///
+/// - `INBOX` target: add `INBOX`, remove nothing (filing back from archive).
+/// - `TRASH` target: routed to `trash()` (uses the dedicated `/trash`
+///   endpoint which actually trashes; plain `messages.modify` would only add
+///   the label without invoking trash semantics).
+/// - `SPAM`, `DRAFT`, `SENT`: rejected with `BadRequest` — these system
+///   labels need dedicated API endpoints, not `messages.modify`.
+/// - User labels: add target, remove `INBOX` (matches "file out of inbox
+///   into folder" expectation).
+///
+/// Cross-user-label moves (e.g. `Work` → `Personal`) remain additive — Gmail
+/// has no way to know the source label without the caller telling us. If
+/// that becomes a real complaint, extend the signature with `from_mailbox_id`.
+pub async fn move_to_mailbox(
+    session: &GmailSession,
+    msg_id: &str,
+    mailbox_id: &str,
+) -> Result<bool, Error> {
+    match move_plan(mailbox_id) {
+        MovePlan::Trash => trash(session, msg_id).await,
+        MovePlan::Reject(reason) => Err(Error::BadRequest(reason.into())),
+        MovePlan::Labels { add, remove } => {
+            let add_refs: Vec<&str> = add.iter().map(String::as_str).collect();
+            let remove_refs: Vec<&str> = remove.iter().map(String::as_str).collect();
+            modify_labels(session, msg_id, &add_refs, &remove_refs).await
+        }
+    }
+}
+
+/// What `move_to_mailbox` should do for a given target. Pure — extracted for
+/// unit testing the INBOX special case + rejection list without HTTP.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MovePlan {
+    /// Reject with a `BadRequest`. Static text — these are all fixed strings.
+    Reject(&'static str),
+    /// Route to the dedicated `trash()` endpoint.
+    Trash,
+    /// Use `messages.modify` with these add/remove sets.
+    Labels {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+}
+
+pub(crate) fn move_plan(mailbox_id: &str) -> MovePlan {
+    match mailbox_id {
+        "TRASH" => MovePlan::Trash,
+        "SPAM" => MovePlan::Reject(
+            "Gmail: move to SPAM is not supported via messages.modify — \
+             use 'Report as spam' (dedicated endpoint not yet wired).",
+        ),
+        "DRAFT" => MovePlan::Reject(
+            "Gmail: cannot move a message into Drafts (drafts are created via \
+             draft.create, not label changes).",
+        ),
+        "SENT" => MovePlan::Reject(
+            "Gmail: cannot move a message into Sent (the Sent label is set \
+             automatically when you send a message).",
+        ),
+        // INBOX target = "restore to inbox" — also strip TRASH/SPAM so the
+        // message actually moves back. Without removing TRASH, Gmail's
+        // 30-day purge timer keeps ticking and the message vanishes despite
+        // the INBOX label being present.
+        "INBOX" => MovePlan::Labels {
+            add: vec!["INBOX".into()],
+            remove: vec!["TRASH".into(), "SPAM".into()],
+        },
+        other => MovePlan::Labels {
+            add: vec![other.into()],
+            remove: vec!["INBOX".into()],
+        },
+    }
+}
+
+/// Toggle the `STARRED` label. Requires a metadata fetch first to know which
+/// direction to flip (Gmail has no native toggle endpoint). Two API calls per
+/// invocation — acceptable for a user-driven action.
+///
+/// Known limitation: TOCTOU between the read and the modify. Two concurrent
+/// toggles (rapid clicks, or another Gmail client mid-flight) both see the
+/// pre-toggle state and apply the same direction — net result is one toggle
+/// where the user expected two. Gmail exposes no conditional-update primitive
+/// here, so a real fix would need frontend debouncing or a server-side
+/// per-msg-id lock. Don't parallelize this without addressing the race.
+pub async fn toggle_flag(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    let starred = message_has_label(session, msg_id, "STARRED").await?;
+    if starred {
+        modify_labels(session, msg_id, &[], &["STARRED"]).await
+    } else {
+        modify_labels(session, msg_id, &["STARRED"], &[]).await
+    }
+}
+
+#[derive(Deserialize)]
+struct LabelsOnlyResp {
+    #[serde(default, rename = "labelIds")]
+    label_ids: Vec<String>,
+}
+
+async fn message_has_label(
+    session: &GmailSession,
+    msg_id: &str,
+    label_id: &str,
+) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    // format=metadata returns labelIds without the payload bytes (cheaper).
+    let url = format!("{GMAIL_BASE}/messages/{msg_id}?format=metadata");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            &format!("messages.get(metadata) {msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    let parsed: LabelsOnlyResp = resp.json().await?;
+    Ok(parsed.label_ids.iter().any(|l| l == label_id))
+}
+
+pub async fn trash(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    let url = format!("{GMAIL_BASE}/messages/{msg_id}/trash");
+    let resp = session.client.post(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            &format!("messages.trash {msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    invalidate_label_cache(session).await;
+    Ok(true)
+}
+
+/// Archive a batch of messages in one API call. Returns the count of IDs
+/// *submitted*, not necessarily archived — Gmail's `batchModify` returns 204
+/// with no body, so per-ID success isn't observable. If any single ID in the
+/// batch is invalid, Gmail rejects the whole batch with a 4xx and this fn
+/// returns `BadRequest`; callers shouldn't claim "N archived" from the
+/// returned count without acknowledging this contract.
+pub async fn archive_batch(session: &GmailSession, msg_ids: &[String]) -> Result<usize, Error> {
+    if msg_ids.is_empty() {
+        return Ok(0);
+    }
+    let token = access_token(session).await?;
+    let url = format!("{GMAIL_BASE}/messages/batchModify");
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&batch_modify_body(msg_ids, &[], &["INBOX"]))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error("messages.batchModify", status, &text));
+    }
+    invalidate_label_cache(session).await;
+    Ok(msg_ids.len())
+}
+
+// =============================================================================
+// download_blob — messages.attachments.get
+// =============================================================================
+
+#[derive(Deserialize)]
+struct AttachmentBody {
+    #[serde(default)]
+    data: Option<String>,
+}
+
+/// Best-effort MIME guess from filename extension. Gmail's
+/// `messages.attachments.get` returns only `{size, data}` with no
+/// content-type, and we don't want to spend an extra `messages.get` RTT just
+/// to look it up — the user's UI already knows the type from `get_emails`.
+/// Falls back to `application/octet-stream` for unknown extensions, which the
+/// browser will treat as a download (with the path's filename).
+pub(crate) fn mime_type_from_filename(filename: &str) -> &'static str {
+    let lower = filename.to_ascii_lowercase();
+    let ext = match lower.rsplit_once('.') {
+        Some((_, ext)) => ext,
+        None => return "application/octet-stream",
+    };
+    match ext {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "heic" => "image/heic",
+        "txt" | "log" | "md" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "ics" => "text/calendar",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+pub async fn download_blob(
+    session: &GmailSession,
+    blob_id: &str,
+    filename: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let blob_ref = crate::types::BlobRef::parse(blob_id)?;
+    let (msg_id, att_id) = match blob_ref {
+        crate::types::BlobRef::GmailAttachment { msg_id, att_id } => (msg_id, att_id),
+        crate::types::BlobRef::Synthetic(_) => {
+            return Err(Error::BadRequest(
+                "synthetic blob_id passed to gmail::download_blob — \
+                 compose uploads aren't downloadable until they're sent"
+                    .into(),
+            ));
+        }
+    };
+
+    let token = access_token(session).await?;
+    let url = format!("{GMAIL_BASE}/messages/{msg_id}/attachments/{att_id}");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error(
+            "messages.attachments.get",
+            status,
+            &text,
+        ));
+    }
+    let body: AttachmentBody = resp.json().await?;
+    let data = body
+        .data
+        .ok_or_else(|| Error::Internal("Gmail attachment response had no data field".into()))?;
+    let bytes = base64url_decode(&data)?;
+    Ok((mime_type_from_filename(filename).to_string(), bytes))
 }
 
 // =============================================================================
@@ -2022,5 +2358,246 @@ mod tests {
             2,
             "if this now returns 1, the parser was fixed — update the test"
         );
+    }
+
+    // ---- Milestone B: mutation body builders ----
+
+    #[test]
+    fn modify_body_includes_both_label_arrays() {
+        let body = modify_body(&["STARRED"], &["UNREAD"]);
+        assert_eq!(body["addLabelIds"], serde_json::json!(["STARRED"]));
+        assert_eq!(body["removeLabelIds"], serde_json::json!(["UNREAD"]));
+    }
+
+    #[test]
+    fn modify_body_with_empty_add_or_remove_keeps_empty_array() {
+        // Gmail accepts empty arrays; serializing as `[]` (not omitting the
+        // key) keeps the request shape predictable.
+        let body = modify_body(&[], &["INBOX"]);
+        assert_eq!(body["addLabelIds"], serde_json::json!([]));
+        assert_eq!(body["removeLabelIds"], serde_json::json!(["INBOX"]));
+    }
+
+    #[test]
+    fn batch_modify_body_includes_ids() {
+        let ids = vec!["msg1".to_string(), "msg2".to_string()];
+        let body = batch_modify_body(&ids, &[], &["INBOX"]);
+        assert_eq!(body["ids"], serde_json::json!(["msg1", "msg2"]));
+        assert_eq!(body["removeLabelIds"], serde_json::json!(["INBOX"]));
+    }
+
+    // ---- Milestone B: mime_type_from_filename ----
+
+    #[test]
+    fn mime_pdf() {
+        assert_eq!(mime_type_from_filename("report.pdf"), "application/pdf");
+    }
+
+    #[test]
+    fn mime_case_insensitive_extension() {
+        assert_eq!(mime_type_from_filename("PHOTO.JPG"), "image/jpeg");
+        assert_eq!(mime_type_from_filename("Doc.PDF"), "application/pdf");
+    }
+
+    #[test]
+    fn mime_jpeg_both_extensions() {
+        assert_eq!(mime_type_from_filename("a.jpg"), "image/jpeg");
+        assert_eq!(mime_type_from_filename("b.jpeg"), "image/jpeg");
+    }
+
+    #[test]
+    fn mime_calendar() {
+        assert_eq!(mime_type_from_filename("invite.ics"), "text/calendar");
+    }
+
+    #[test]
+    fn mime_office_docx() {
+        assert_eq!(
+            mime_type_from_filename("contract.docx"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        );
+    }
+
+    #[test]
+    fn mime_unknown_extension_falls_back_to_octet_stream() {
+        assert_eq!(
+            mime_type_from_filename("mystery.xyzfoo"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn mime_no_extension_falls_back_to_octet_stream() {
+        assert_eq!(
+            mime_type_from_filename("README"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn mime_dot_at_start_treated_as_extension() {
+        // Hidden file with no extension — `rsplit_once('.')` returns
+        // `("", "bashrc")`, which is "unknown", so octet-stream.
+        assert_eq!(
+            mime_type_from_filename(".bashrc"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn mime_double_extension_uses_last() {
+        // tar.gz → ext is "gz" → application/gzip
+        assert_eq!(mime_type_from_filename("backup.tar.gz"), "application/gzip");
+    }
+
+    // Lock high-traffic entries that bit-rot silently (roborev 174 #7).
+    #[test]
+    fn mime_common_image_and_av_extensions() {
+        assert_eq!(mime_type_from_filename("a.svg"), "image/svg+xml");
+        assert_eq!(mime_type_from_filename("a.webp"), "image/webp");
+        assert_eq!(mime_type_from_filename("a.heic"), "image/heic");
+        assert_eq!(mime_type_from_filename("a.mp4"), "video/mp4");
+        assert_eq!(mime_type_from_filename("a.mov"), "video/quicktime");
+        assert_eq!(mime_type_from_filename("a.mp3"), "audio/mpeg");
+        assert_eq!(mime_type_from_filename("a.wav"), "audio/wav");
+    }
+
+    #[test]
+    fn mime_common_text_and_data_extensions() {
+        assert_eq!(mime_type_from_filename("a.csv"), "text/csv");
+        assert_eq!(mime_type_from_filename("a.xml"), "application/xml");
+        assert_eq!(mime_type_from_filename("a.zip"), "application/zip");
+        assert_eq!(mime_type_from_filename("a.tgz"), "application/gzip");
+        assert_eq!(mime_type_from_filename("a.json"), "application/json");
+    }
+
+    // ---- move_plan (roborev 174 finding #1 + #7) ----
+
+    #[test]
+    fn move_plan_inbox_restores_by_removing_trash_and_spam() {
+        // "Move to INBOX" must strip TRASH/SPAM, otherwise a message moved
+        // back from Trash stays subject to the 30-day purge timer despite
+        // having INBOX applied. Regression guard for roborev 175 #4.
+        assert_eq!(
+            move_plan("INBOX"),
+            MovePlan::Labels {
+                add: vec!["INBOX".into()],
+                remove: vec!["TRASH".into(), "SPAM".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_user_label_adds_target_removes_inbox() {
+        assert_eq!(
+            move_plan("Label_42"),
+            MovePlan::Labels {
+                add: vec!["Label_42".into()],
+                remove: vec!["INBOX".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_trash_routes_to_trash_endpoint() {
+        assert_eq!(move_plan("TRASH"), MovePlan::Trash);
+    }
+
+    #[test]
+    fn move_plan_rejects_spam() {
+        match move_plan("SPAM") {
+            MovePlan::Reject(msg) => assert!(msg.contains("SPAM")),
+            other => panic!("expected Reject for SPAM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_plan_rejects_draft_and_sent() {
+        assert!(matches!(move_plan("DRAFT"), MovePlan::Reject(_)));
+        assert!(matches!(move_plan("SENT"), MovePlan::Reject(_)));
+    }
+
+    // ---- classify_gmail_error (roborev 174 finding #5 + #7) ----
+
+    #[test]
+    fn classify_4xx_returns_bad_request() {
+        let err = classify_gmail_error("messages.modify abc", reqwest::StatusCode::NOT_FOUND, "{}");
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_401_returns_bad_request() {
+        let err = classify_gmail_error("foo", reqwest::StatusCode::UNAUTHORIZED, "bad token");
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_403_returns_bad_request() {
+        let err = classify_gmail_error("foo", reqwest::StatusCode::FORBIDDEN, "no scope");
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[test]
+    fn classify_5xx_returns_internal() {
+        let err = classify_gmail_error(
+            "messages.modify abc",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "down",
+        );
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn classify_503_returns_internal() {
+        let err = classify_gmail_error("foo", reqwest::StatusCode::SERVICE_UNAVAILABLE, "");
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn classify_includes_operation_status_and_body() {
+        let err = classify_gmail_error(
+            "messages.batchModify",
+            reqwest::StatusCode::BAD_REQUEST,
+            "Invalid ID",
+        );
+        let msg = match err {
+            Error::BadRequest(m) => m,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        assert!(msg.contains("messages.batchModify"));
+        assert!(msg.contains("400"));
+        assert!(msg.contains("Invalid ID"));
+    }
+
+    // ---- Milestone B: download_blob synthetic-blob rejection ----
+    // Synthetic blobs can't be downloaded — they're upload bytes. Until the
+    // compose flow lands in Milestone C, this path should reject cleanly.
+
+    #[tokio::test]
+    async fn download_blob_rejects_synthetic_blob_ref() {
+        use crate::platform::{FsTokenStore, TokenStore, Tokens};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(dir.path().to_path_buf()));
+        store
+            .save(
+                "gmail",
+                &Tokens {
+                    access_token: "tok".into(),
+                    refresh_token: "rtok".into(),
+                    token_expiry: Utc::now() + chrono::Duration::hours(1),
+                    email: "u@g.com".into(),
+                },
+            )
+            .unwrap();
+        let session =
+            load_session(store, "gmail", "client-id", "client-secret").expect("session loads");
+        let synth = crate::types::BlobRef::new_synthetic().to_string();
+        let err = download_blob(&session, &synth, "x.txt").await.unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("synthetic")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 }

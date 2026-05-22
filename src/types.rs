@@ -93,6 +93,95 @@ pub struct Attachment {
     pub size: i64,
 }
 
+/// Typed reference to attachment bytes, decoupled from the on-wire string
+/// representation each provider uses.
+///
+/// - `Synthetic` is the compose-flow upload blob: the frontend POSTs bytes to
+///   `/api/upload`, gets back a synthetic ID, references it in the draft.
+///   Resolved at `send_email` time. Display format: `synth:{uuid}`.
+/// - `GmailAttachment` references a Gmail message attachment via the pair
+///   `{message_id}:{attachment_id}` — what Gmail's `messages.attachments.get`
+///   needs.
+///
+/// Add provider variants here as they're built (e.g. `OutlookAttachment` for
+/// Microsoft Graph). Keeping this typed (instead of a `String` with implicit
+/// shape) means provider code can't accidentally feed an upload UUID into the
+/// download path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobRef {
+    Synthetic(uuid::Uuid),
+    GmailAttachment { msg_id: String, att_id: String },
+}
+
+impl BlobRef {
+    /// Generate a fresh synthetic blob reference for a compose-time upload.
+    pub fn new_synthetic() -> Self {
+        Self::Synthetic(uuid::Uuid::new_v4())
+    }
+
+    /// Parse from the wire format used in URLs / Attachment.blob_id strings.
+    /// Accepts `synth:{uuid}` or `{msg_id}:{att_id}`.
+    ///
+    /// Components are validated against URL-safe characters (`[A-Za-z0-9_-]`
+    /// plus base64url's `=` padding) so a malformed `blob_id` like
+    /// `"../../../../foo:bar"` can't be reflected into a provider HTTP URL
+    /// even if it reaches `download_blob` from an untrusted source.
+    pub fn parse(s: &str) -> Result<Self, crate::error::Error> {
+        // Note: the `synth:` prefix would collide with any Gmail message ID
+        // starting with the literal bytes `synth:`. Gmail's actual ID space
+        // is URL-safe-base64-ish (hex-leaning), so collision is astronomically
+        // unlikely; if it ever happens, the user-visible failure is a clean
+        // `BadRequest("invalid synthetic blob UUID")` rather than fetching
+        // the wrong attachment. Acceptable; flag here for future maintainers.
+        if let Some(rest) = s.strip_prefix("synth:") {
+            let uuid = uuid::Uuid::parse_str(rest).map_err(|e| {
+                crate::error::Error::BadRequest(format!("invalid synthetic blob UUID: {e}"))
+            })?;
+            return Ok(Self::Synthetic(uuid));
+        }
+        match s.split_once(':') {
+            Some((msg_id, att_id)) if !msg_id.is_empty() && !att_id.is_empty() => {
+                ensure_url_safe(msg_id, "msg_id")?;
+                ensure_url_safe(att_id, "att_id")?;
+                Ok(Self::GmailAttachment {
+                    msg_id: msg_id.to_string(),
+                    att_id: att_id.to_string(),
+                })
+            }
+            _ => Err(crate::error::Error::BadRequest(format!(
+                "blob_id '{s}' is not a valid BlobRef (expected 'synth:UUID' or 'msg_id:att_id')"
+            ))),
+        }
+    }
+}
+
+/// Restrict to URL-path-safe characters: ASCII alphanumerics plus `_`, `-`,
+/// and base64url's `=` padding. Gmail message and attachment IDs are within
+/// this set; rejecting `/`, `?`, `#`, `..`, etc. prevents a malicious or
+/// malformed blob_id from steering the eventual HTTP request to a different
+/// API path. Defense-in-depth — `walk_payload` never produces bad input
+/// today, but routes that forward client-provided blob_ids might.
+fn ensure_url_safe(s: &str, label: &str) -> Result<(), crate::error::Error> {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=')
+    {
+        Ok(())
+    } else {
+        Err(crate::error::Error::BadRequest(format!(
+            "BlobRef {label} contains characters outside [A-Za-z0-9_=-]"
+        )))
+    }
+}
+
+impl std::fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Synthetic(u) => write!(f, "synth:{u}"),
+            Self::GmailAttachment { msg_id, att_id } => write!(f, "{msg_id}:{att_id}"),
+        }
+    }
+}
+
 // =============================================================================
 // Calendar types
 // =============================================================================
@@ -705,5 +794,86 @@ mod tests {
         assert!(parsed.get("error").is_some());
         assert_eq!(parsed["account"], "work");
         assert_eq!(parsed["provider"], "outlook");
+    }
+
+    // ---- BlobRef ----
+
+    #[test]
+    fn blob_ref_synthetic_roundtrip() {
+        let r = BlobRef::new_synthetic();
+        let s = r.to_string();
+        assert!(s.starts_with("synth:"));
+        let parsed = BlobRef::parse(&s).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn blob_ref_gmail_roundtrip() {
+        let r = BlobRef::GmailAttachment {
+            msg_id: "1900abc".into(),
+            att_id: "ANGjdJ_xyz".into(),
+        };
+        let s = r.to_string();
+        assert_eq!(s, "1900abc:ANGjdJ_xyz");
+        let parsed = BlobRef::parse(&s).unwrap();
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_empty() {
+        assert!(BlobRef::parse("").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_no_separator() {
+        assert!(BlobRef::parse("just-a-string").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_empty_components() {
+        assert!(BlobRef::parse(":att-id").is_err());
+        assert!(BlobRef::parse("msg-id:").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_bad_synth_uuid() {
+        assert!(BlobRef::parse("synth:not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn blob_ref_synth_prefix_takes_precedence() {
+        // A synth: prefix is always Synthetic, even if the rest also contains ':'
+        let r = BlobRef::new_synthetic();
+        let parsed = BlobRef::parse(&r.to_string()).unwrap();
+        assert!(matches!(parsed, BlobRef::Synthetic(_)));
+    }
+
+    // ---- BlobRef::parse URL-safety hardening (roborev 174 finding #3) ----
+
+    #[test]
+    fn blob_ref_parse_rejects_path_traversal() {
+        assert!(BlobRef::parse("../../etc/passwd:foo").is_err());
+        assert!(BlobRef::parse("msgid:..%2Fbadpath").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_slash() {
+        assert!(BlobRef::parse("msg/id:att").is_err());
+        assert!(BlobRef::parse("msg:att/extra").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_rejects_url_special_chars() {
+        assert!(BlobRef::parse("msg?id:att").is_err());
+        assert!(BlobRef::parse("msg#id:att").is_err());
+        assert!(BlobRef::parse("msg id:att").is_err()); // space
+        assert!(BlobRef::parse("msg&id:att").is_err());
+    }
+
+    #[test]
+    fn blob_ref_parse_accepts_base64url_components() {
+        // Gmail IDs use URL-safe base64-ish strings; these must work.
+        let r = BlobRef::parse("190abc-DEF_123=:ANGjdJ_xyz0-Q").unwrap();
+        assert!(matches!(r, BlobRef::GmailAttachment { .. }));
     }
 }

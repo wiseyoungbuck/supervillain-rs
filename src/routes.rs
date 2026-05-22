@@ -505,6 +505,11 @@ async fn download_attachment(
     let (content_type, bytes) = provider::download_blob(&session, &blob_id, &filename).await?;
 
     let safe_filename = sanitize_filename_for_header(&filename);
+    // X-Content-Type-Options: nosniff prevents browsers from sniffing past the
+    // declared Content-Type. Combined with Content-Disposition: attachment,
+    // this neutralizes the sender-controlled-filename-→-mime-type attack
+    // surface (a sender mailing `pwned.html` doesn't get HTML rendered from
+    // our origin if the user clicks "open" rather than "save").
     Ok((
         StatusCode::OK,
         [
@@ -513,6 +518,7 @@ async fn download_attachment(
                 "content-disposition",
                 format!("attachment; filename=\"{}\"", safe_filename),
             ),
+            ("x-content-type-options", "nosniff".to_string()),
         ],
         bytes,
     ))

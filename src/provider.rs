@@ -120,7 +120,7 @@ pub async fn mark_read(s: &ProviderSession, email_id: &str) -> Result<bool, Erro
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("mark_read", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::mark_read(s, email_id).await,
     }
 }
 
@@ -130,7 +130,7 @@ pub async fn mark_unread(s: &ProviderSession, email_id: &str) -> Result<bool, Er
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("mark_unread", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::mark_unread(s, email_id).await,
     }
 }
 
@@ -140,7 +140,7 @@ pub async fn toggle_flag(s: &ProviderSession, email_id: &str) -> Result<bool, Er
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("toggle_flag", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::toggle_flag(s, email_id).await,
     }
 }
 
@@ -150,7 +150,7 @@ pub async fn archive(s: &ProviderSession, email_id: &str) -> Result<bool, Error>
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("archive", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::archive(s, email_id).await,
     }
 }
 
@@ -160,7 +160,7 @@ pub async fn trash(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("trash", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::trash(s, email_id).await,
     }
 }
 
@@ -174,9 +174,7 @@ pub async fn move_to_mailbox(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => {
-            Err(gmail_not_yet_implemented("move_to_mailbox", "Milestone B"))
-        }
+        ProviderSession::Gmail(s) => gmail::move_to_mailbox(s, email_id, mailbox_id).await,
     }
 }
 
@@ -186,7 +184,7 @@ pub async fn archive_batch(s: &ProviderSession, email_ids: &[String]) -> Result<
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Email operations not yet supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("archive_batch", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::archive_batch(s, email_ids).await,
     }
 }
 
@@ -269,7 +267,7 @@ pub async fn download_blob(
         ProviderSession::Outlook(_) => Err(Error::BadRequest(
             "Attachment downloads not supported for Outlook accounts".into(),
         )),
-        ProviderSession::Gmail(_) => Err(gmail_not_yet_implemented("download_blob", "Milestone B")),
+        ProviderSession::Gmail(s) => gmail::download_blob(s, blob_id, filename).await,
     }
 }
 

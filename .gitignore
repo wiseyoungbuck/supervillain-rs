@@ -2,3 +2,6 @@
 
 # Large source artwork (regenerate icons via ImageMagick)
 static/Gemini_Generated_Image_*.png
+
+# Editor / CLI metadata (machine-specific, do not commit)
+.antigravitycli/
