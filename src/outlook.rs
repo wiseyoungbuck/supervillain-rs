@@ -5,11 +5,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// The upload cache constants and `should_clear_tokens_on_refresh_failure`
-// from provider_utils will be wired in Milestones B (download) and C
-// (upload/send). Import on demand at that time; importing them now and
-// dead-coding them tripped clippy::unused-imports and roborev 179 #7.
 use crate::error::Error;
+use crate::provider_utils::{MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP};
 use crate::types::{CalendarEvent, Mailbox};
 
 // =============================================================================
@@ -30,6 +27,12 @@ pub struct OutlookSession {
     /// not opaque page tokens like Gmail. Forward iteration follows the
     /// link verbatim; jump-back re-issues with `$skip`.
     pub page_cache: tokio::sync::Mutex<HashMap<String, OutlookPageCursor>>,
+    /// Compose-time blob upload cache. Synthetic blob_ids returned to the
+    /// frontend by `upload_blob` map to (mime, bytes) pairs here; resolved
+    /// by `peek_blob_bytes` during send and dropped after a successful
+    /// send via `drain_consumed_synthetic_blobs`. Same shape as Gmail's
+    /// upload_cache — cap discipline shared via provider_utils constants.
+    pub upload_cache: tokio::sync::Mutex<HashMap<uuid::Uuid, (String, Vec<u8>)>>,
 }
 
 /// A snapshot of the folder list, anchored at a fetch time for TTL math.
@@ -226,6 +229,7 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
         email: stored.email,
         folder_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
+        upload_cache: tokio::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -263,6 +267,7 @@ pub async fn oauth_flow(
         email,
         folder_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
+        upload_cache: tokio::sync::Mutex::new(HashMap::new()),
     };
 
     save_tokens(&session)?;
@@ -1513,6 +1518,467 @@ pub async fn download_blob(
 }
 
 // =============================================================================
+// Phase 4 Milestone C — send + compose
+// =============================================================================
+
+use crate::types::EmailSubmission;
+
+/// Which Graph API path to use to send `sub`. Top-5 greats finding:
+/// no-attachment replies hit `/reply` in one call; attachment-bearing
+/// replies need the 3-call createReply → PATCH → send dance because
+/// `/reply` doesn't accept attachments in the body.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendPath {
+    /// `POST /me/sendMail` — handles new mail with or without attachments.
+    NewMail,
+    /// `POST /me/messages/{parent}/reply` — single-call, Graph handles
+    /// threading server-side, no draft state.
+    ReplyNoAttachments,
+    /// `POST /me/messages/{parent}/createReply` → `PATCH /me/messages/{draft}`
+    /// → `POST /me/messages/{draft}/send`. Three RTTs because attachments
+    /// must be inlined via PATCH on the draft.
+    ReplyWithAttachments,
+}
+
+/// Pure dispatch on (in_reply_to, attachments). Treats `None` and empty
+/// `attachments` identically (defensive against frontend habits).
+pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
+    match (&sub.in_reply_to, sub.attachments.is_empty()) {
+        (None, _) => SendPath::NewMail,
+        (Some(_), true) => SendPath::ReplyNoAttachments,
+        (Some(_), false) => SendPath::ReplyWithAttachments,
+    }
+}
+
+/// Build the Graph `Message` JSON resource for sendMail / draft PATCH.
+///
+/// `resolved_attachments` is the already-resolved `(name, mime, bytes)`
+/// triples produced by `peek_blob_bytes` over the EmailSubmission's
+/// attachment list — split out so this builder stays pure (no async, no
+/// session state).
+///
+/// Body: HTML if present, else text. Graph picks contentType from the
+/// `body.contentType` field, not a header.
+///
+/// Attachments inline as `fileAttachment` entries with base64-encoded
+/// `contentBytes` (Graph has no standalone blob store — bytes must be
+/// in the message body itself).
+pub(crate) fn build_graph_message(
+    sub: &EmailSubmission,
+    resolved_attachments: &[(String, String, Vec<u8>)],
+) -> serde_json::Value {
+    fn recipients(addrs: &[String]) -> serde_json::Value {
+        let arr: Vec<serde_json::Value> = addrs
+            .iter()
+            .map(|a| serde_json::json!({ "emailAddress": { "address": a } }))
+            .collect();
+        serde_json::json!(arr)
+    }
+
+    // Pick HTML when both are present — the user composed HTML and the
+    // text_body is the plain-text fallback we'd send separately on JMAP.
+    // Graph's single body field forces us to pick one; pick the richer.
+    let (content_type, content) = match &sub.html_body {
+        Some(html) => ("html", html.clone()),
+        None => ("text", sub.text_body.clone()),
+    };
+
+    let mut msg = serde_json::json!({
+        "subject": sub.subject,
+        "body": { "contentType": content_type, "content": content },
+        "toRecipients": recipients(&sub.to),
+    });
+
+    if !sub.cc.is_empty() {
+        msg["ccRecipients"] = recipients(&sub.cc);
+    }
+    if let Some(bcc) = &sub.bcc
+        && !bcc.is_empty()
+    {
+        msg["bccRecipients"] = recipients(bcc);
+    }
+
+    if !resolved_attachments.is_empty() {
+        use base64::Engine;
+        let atts: Vec<serde_json::Value> = resolved_attachments
+            .iter()
+            .map(|(name, mime, bytes)| {
+                serde_json::json!({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": name,
+                    "contentType": mime,
+                    "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+            })
+            .collect();
+        msg["attachments"] = serde_json::json!(atts);
+    }
+
+    msg
+}
+
+/// Stash compose-time bytes in the session's synthetic-blob cache; return
+/// the `BlobRef::Synthetic(uuid).to_string()` for the frontend to embed in
+/// the EmailSubmission. Cap-enforced (count + per-blob + aggregate) so a
+/// misbehaving client can't grow memory unbounded. Mirror of Gmail's
+/// upload_blob.
+pub async fn upload_blob(
+    session: &OutlookSession,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(String, i64), Error> {
+    if body.len() > MAX_BLOB_BYTES {
+        return Err(Error::BadRequest(format!(
+            "Outlook attachment too large: {} bytes (limit: {} MiB). \
+             Larger uploads need Graph's upload-session flow (not yet wired).",
+            body.len(),
+            MAX_BLOB_BYTES / 1024 / 1024
+        )));
+    }
+    let mut cache = session.upload_cache.lock().await;
+    if cache.len() >= UPLOAD_CACHE_CAP {
+        return Err(Error::BadRequest(format!(
+            "Outlook upload cache full ({UPLOAD_CACHE_CAP} entries). \
+             Cancel or send pending drafts before attaching more files."
+        )));
+    }
+    let current_total: usize = cache.values().map(|(_, b)| b.len()).sum();
+    if current_total + body.len() > MAX_UPLOAD_CACHE_BYTES {
+        return Err(Error::BadRequest(format!(
+            "Outlook upload cache aggregate size would exceed {} MiB \
+             (current: {} MiB, this upload: {} MiB).",
+            MAX_UPLOAD_CACHE_BYTES / 1024 / 1024,
+            current_total / 1024 / 1024,
+            body.len() / 1024 / 1024
+        )));
+    }
+    let id = uuid::Uuid::new_v4();
+    cache.insert(id, (content_type.to_string(), body.to_vec()));
+    let blob_ref = crate::types::BlobRef::Synthetic(id);
+    Ok((blob_ref.to_string(), body.len() as i64))
+}
+
+/// Read a blob's bytes for inclusion in a send body without mutating the
+/// cache. Synthetic blobs are cloned from upload_cache; OutlookAttachment
+/// blobs are re-fetched via download_blob (for the "reply with original
+/// attachment" path); Gmail/wrong-prefix blobs are rejected.
+///
+/// Cache draining happens after a successful send via
+/// `drain_consumed_synthetic_blobs` so partial-build failures don't lose
+/// already-uploaded bytes (the same correctness property that motivated
+/// Gmail's roborev 176 #1 fix).
+async fn peek_blob_bytes(
+    session: &OutlookSession,
+    blob_id: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let blob_ref = crate::types::BlobRef::parse(blob_id)?;
+    match blob_ref {
+        crate::types::BlobRef::Synthetic(id) => {
+            let cache = session.upload_cache.lock().await;
+            cache.get(&id).cloned().ok_or_else(|| {
+                Error::BadRequest(format!(
+                    "Outlook synthetic blob {id} not found (already consumed or session restarted)"
+                ))
+            })
+        }
+        crate::types::BlobRef::OutlookAttachment { .. } => {
+            // Re-fetch the original attachment bytes (reply-with-original
+            // path). download_blob re-parses the blob_id internally.
+            download_blob(session, blob_id, "").await
+        }
+        crate::types::BlobRef::GmailAttachment { .. } => Err(Error::BadRequest(
+            "gmail blob_id passed to outlook::peek_blob_bytes — wrong provider".into(),
+        )),
+    }
+}
+
+/// Drop synthetic-blob entries from `upload_cache` after a successful
+/// send. Idempotent; non-synthetic and missing entries are silently
+/// skipped. Mirrors Gmail's drain semantics.
+async fn drain_consumed_synthetic_blobs(
+    session: &OutlookSession,
+    attachments: &[crate::types::Attachment],
+) {
+    let mut cache = session.upload_cache.lock().await;
+    for att in attachments {
+        if let Ok(crate::types::BlobRef::Synthetic(id)) = crate::types::BlobRef::parse(&att.blob_id)
+        {
+            cache.remove(&id);
+        }
+    }
+}
+
+/// Resolve every attachment in the EmailSubmission to its (name, mime,
+/// bytes) triple via `peek_blob_bytes`. Failure on any attachment aborts
+/// the whole send — the upload cache stays intact so the user can retry.
+async fn resolve_all_attachments(
+    session: &OutlookSession,
+    attachments: &[crate::types::Attachment],
+) -> Result<Vec<(String, String, Vec<u8>)>, Error> {
+    let mut out = Vec::with_capacity(attachments.len());
+    for att in attachments {
+        let (mime, bytes) = peek_blob_bytes(session, &att.blob_id).await?;
+        // Prefer the attachment's declared mime_type; fall back to what
+        // peek returned. Matches Gmail's discipline.
+        let final_mime = if att.mime_type.is_empty() {
+            mime
+        } else {
+            att.mime_type.clone()
+        };
+        out.push((att.name.clone(), final_mime, bytes));
+    }
+    Ok(out)
+}
+
+/// Send via the chosen Graph path. Top-5 greats finding: branch on
+/// `pick_send_path` so no-attachment replies take 1 RTT, with-attachment
+/// replies eat the 3-RTT createReply → PATCH → send dance. Orphan-draft
+/// cleanup on the 3-call path so a mid-flight failure doesn't strand a
+/// draft in the user's Drafts folder.
+///
+/// On success: drain consumed synthetic blobs (cache no longer needs the
+/// bytes) and invalidate folder_cache + page_cache (the sent message
+/// lands in `sentitems` and would otherwise show stale cursors).
+pub async fn send_email(
+    session: &OutlookSession,
+    sub: &EmailSubmission,
+) -> Result<Option<String>, Error> {
+    // Resolve attachments BEFORE deciding the send path — even the
+    // ReplyNoAttachments branch needs the (empty) resolve to validate
+    // the upload cache state. (Resolves to Ok(vec![]) cheaply.)
+    let resolved = resolve_all_attachments(session, &sub.attachments).await?;
+    let path = pick_send_path(sub);
+    let new_id = match path {
+        SendPath::NewMail => send_new_mail(session, sub, &resolved).await?,
+        SendPath::ReplyNoAttachments => {
+            let parent = sub
+                .in_reply_to
+                .as_deref()
+                .expect("ReplyNoAttachments implies in_reply_to is Some");
+            send_reply_text_only(session, sub, parent).await?
+        }
+        SendPath::ReplyWithAttachments => {
+            let parent = sub
+                .in_reply_to
+                .as_deref()
+                .expect("ReplyWithAttachments implies in_reply_to is Some");
+            send_reply_with_attachments(session, sub, parent, &resolved).await?
+        }
+    };
+    drain_consumed_synthetic_blobs(session, &sub.attachments).await;
+    invalidate_caches_after_mutation(session).await;
+    Ok(new_id)
+}
+
+/// `POST /me/sendMail` with the full Graph Message inline. Used for new
+/// mail (no `in_reply_to`) regardless of attachments — sendMail accepts
+/// attachments inline. Returns `Ok(None)` because sendMail returns 202
+/// Accepted with no body and no message ID; Graph doesn't tell us the
+/// stored Sent-folder message ID (a known Graph limitation).
+async fn send_new_mail(
+    session: &OutlookSession,
+    sub: &EmailSubmission,
+    resolved: &[(String, String, Vec<u8>)],
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let message = build_graph_message(sub, resolved);
+    // saveToSentItems defaults to true on the Graph side but spec it
+    // explicitly so the wire shape doesn't depend on tenant defaults.
+    let body = serde_json::json!({
+        "message": message,
+        "saveToSentItems": true,
+    });
+    let resp = session
+        .client
+        .post(format!("{GRAPH_BASE}/me/sendMail"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error("sendMail", status, &text));
+    }
+    Ok(None)
+}
+
+/// `POST /me/messages/{parent}/reply` — single call, Graph threads it
+/// server-side via the parent message ID, no draft state. Body is just
+/// `{ "comment": "..." }` — additional headers/recipients are inherited
+/// from the parent (which is the Outlook UX users expect for "Reply").
+///
+/// Limitation: this path can't add Cc/Bcc beyond what's on the parent.
+/// If the EmailSubmission carries new Cc/Bcc, fall back to the 3-call
+/// createReply path so the PATCH can set those fields.
+async fn send_reply_text_only(
+    session: &OutlookSession,
+    sub: &EmailSubmission,
+    parent_msg_id: &str,
+) -> Result<Option<String>, Error> {
+    // If the user added recipients beyond the parent's set, we need the
+    // 3-call path to actually attach them. Detect and bail upward (the
+    // caller hasn't routed here in that case if pick_send_path is honest,
+    // but defend anyway).
+    if !sub.cc.is_empty() || sub.bcc.as_ref().is_some_and(|v| !v.is_empty()) {
+        return send_reply_with_attachments(session, sub, parent_msg_id, &[]).await;
+    }
+    let token = access_token(session).await?;
+    let encoded = crate::provider_utils::encode_path_segment(parent_msg_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{encoded}/reply");
+    let comment = if let Some(html) = &sub.html_body {
+        html.clone()
+    } else {
+        sub.text_body.clone()
+    };
+    let body = serde_json::json!({ "comment": comment });
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("reply {parent_msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    Ok(None)
+}
+
+/// Three-call dance for replies that need attachments (or new Cc/Bcc):
+/// `POST .../createReply` → returns draft → `PATCH draft` with body +
+/// attachments + recipients → `POST draft/send`.
+///
+/// Orphan-draft cleanup: if PATCH or send fails after createReply
+/// succeeded, attempt `DELETE draft` so we don't leave a confusing draft
+/// in the user's Drafts folder. If cleanup itself fails, the user-facing
+/// error mentions the draft.
+async fn send_reply_with_attachments(
+    session: &OutlookSession,
+    sub: &EmailSubmission,
+    parent_msg_id: &str,
+    resolved: &[(String, String, Vec<u8>)],
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let encoded_parent = crate::provider_utils::encode_path_segment(parent_msg_id);
+
+    // 1. createReply → draft.id
+    let create_url = format!("{GRAPH_BASE}/me/messages/{encoded_parent}/createReply");
+    let resp = session
+        .client
+        .post(&create_url)
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("createReply {parent_msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    let draft: serde_json::Value = resp.json().await?;
+    let draft_id = draft["id"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("createReply response missing draft id".into()))?
+        .to_string();
+
+    // 2. PATCH draft with full body + attachments + recipients. We use
+    //    build_graph_message and then trim the wrapper so we PATCH the
+    //    Message resource directly (not wrapped in {message: ...}).
+    match patch_and_send_draft(session, &token, &draft_id, sub, resolved).await {
+        Ok(()) => Ok(Some(draft_id)),
+        Err(e) => {
+            // Orphan-draft cleanup. Best-effort; surface the original
+            // error either way.
+            let cleanup_result = delete_draft(session, &token, &draft_id).await;
+            match cleanup_result {
+                Ok(()) => Err(e),
+                Err(cleanup_err) => Err(Error::Internal(format!(
+                    "send failed ({e}); orphan draft cleanup also failed \
+                     ({cleanup_err}); draft remains in Drafts folder as {draft_id}"
+                ))),
+            }
+        }
+    }
+}
+
+async fn patch_and_send_draft(
+    session: &OutlookSession,
+    token: &str,
+    draft_id: &str,
+    sub: &EmailSubmission,
+    resolved: &[(String, String, Vec<u8>)],
+) -> Result<(), Error> {
+    let encoded_draft = crate::provider_utils::encode_path_segment(draft_id);
+    let patch_body = build_graph_message(sub, resolved);
+    let patch_url = format!("{GRAPH_BASE}/me/messages/{encoded_draft}");
+    let resp = session
+        .client
+        .patch(&patch_url)
+        .bearer_auth(token)
+        .json(&patch_body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("draft.patch {draft_id}"),
+            status,
+            &text,
+        ));
+    }
+    let send_url = format!("{GRAPH_BASE}/me/messages/{encoded_draft}/send");
+    let resp = session
+        .client
+        .post(&send_url)
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("draft.send {draft_id}"),
+            status,
+            &text,
+        ));
+    }
+    Ok(())
+}
+
+async fn delete_draft(session: &OutlookSession, token: &str, draft_id: &str) -> Result<(), Error> {
+    let encoded = crate::provider_utils::encode_path_segment(draft_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{encoded}");
+    let resp = session
+        .client
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(classify_outlook_error(
+            &format!("draft.delete {draft_id}"),
+            status,
+            &text,
+        ))
+    }
+}
+
+// =============================================================================
 // Microsoft Graph Calendar Operations
 // =============================================================================
 
@@ -1962,6 +2428,7 @@ mod tests {
             email: "user@example.com".into(),
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         };
 
         save_tokens(&session).unwrap();
@@ -2263,6 +2730,7 @@ mod tests {
             email: "u@x.com".into(),
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -3213,5 +3681,300 @@ mod tests {
         assert!(role_rejects_move(Some("archive")).is_none());
         assert!(role_rejects_move(Some("trash")).is_none());
         assert!(role_rejects_move(None).is_none());
+    }
+
+    // =========================================================================
+    // Phase 4 Milestone C — send + compose
+    // =========================================================================
+
+    // ---- pick_send_path ----
+    //
+    // Top-5 greats finding: branch on attachments to save 2 RTTs in the
+    // no-attachment reply case. Graph's POST /me/messages/{id}/reply is
+    // a single call that handles threading; createReply → PATCH → send
+    // is only needed when attachments must be inlined via PATCH.
+
+    fn empty_sub() -> EmailSubmission {
+        EmailSubmission {
+            to: vec!["alice@example.com".into()],
+            cc: vec![],
+            subject: "S".into(),
+            text_body: "B".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: None,
+        }
+    }
+
+    fn fake_attachment() -> crate::types::Attachment {
+        crate::types::Attachment {
+            blob_id: "synth:00000000-0000-0000-0000-000000000001".into(),
+            name: "a.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn pick_send_path_no_reply_no_attachments_is_new_mail() {
+        let sub = empty_sub();
+        assert_eq!(pick_send_path(&sub), SendPath::NewMail);
+    }
+
+    #[test]
+    fn pick_send_path_no_reply_with_attachments_is_new_mail() {
+        let mut sub = empty_sub();
+        sub.attachments = vec![fake_attachment()];
+        // No `in_reply_to` → still NewMail; attachments are inlined in
+        // the sendMail body, no draft needed.
+        assert_eq!(pick_send_path(&sub), SendPath::NewMail);
+    }
+
+    #[test]
+    fn pick_send_path_reply_no_attachments_is_one_call_reply() {
+        let mut sub = empty_sub();
+        sub.in_reply_to = Some("parent-msg-id".into());
+        // Graph's /reply takes a comment + threads server-side. 1 RTT.
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyNoAttachments);
+    }
+
+    #[test]
+    fn pick_send_path_reply_with_attachments_is_three_call_create_reply() {
+        let mut sub = empty_sub();
+        sub.in_reply_to = Some("parent-msg-id".into());
+        sub.attachments = vec![fake_attachment()];
+        // Attachments can't be inlined in /reply; need createReply →
+        // PATCH attachments → send (3 RTTs + orphan-draft cleanup risk).
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyWithAttachments);
+    }
+
+    #[test]
+    fn pick_send_path_reply_with_empty_attachments_vec_is_one_call_reply() {
+        // Empty vec must be treated the same as None — defensive against
+        // frontend always sending [] regardless of attachments actually
+        // attached.
+        let mut sub = empty_sub();
+        sub.in_reply_to = Some("parent-msg-id".into());
+        sub.attachments = vec![];
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyNoAttachments);
+    }
+
+    // ---- build_graph_message ----
+    //
+    // Pure: constructs the Graph Message JSON resource used by the
+    // sendMail / draft PATCH paths. Attachments are inlined as
+    // fileAttachment items with base64 contentBytes — Graph has no
+    // standalone blob store, so the bytes must be in the message body.
+
+    #[test]
+    fn graph_message_text_only_has_required_fields() {
+        let sub = empty_sub();
+        let msg = build_graph_message(&sub, &[]);
+        assert_eq!(msg["subject"], "S");
+        assert_eq!(msg["body"]["contentType"], "text");
+        assert_eq!(msg["body"]["content"], "B");
+        let to_arr = msg["toRecipients"].as_array().unwrap();
+        assert_eq!(to_arr.len(), 1);
+        assert_eq!(to_arr[0]["emailAddress"]["address"], "alice@example.com");
+    }
+
+    #[test]
+    fn graph_message_html_body_uses_html_contenttype() {
+        let mut sub = empty_sub();
+        sub.html_body = Some("<p>hi</p>".into());
+        let msg = build_graph_message(&sub, &[]);
+        // HTML body wins when present (matches the body the user composed).
+        assert_eq!(msg["body"]["contentType"], "html");
+        assert_eq!(msg["body"]["content"], "<p>hi</p>");
+    }
+
+    #[test]
+    fn graph_message_includes_cc_recipients() {
+        let mut sub = empty_sub();
+        sub.cc = vec!["bob@example.com".into()];
+        let msg = build_graph_message(&sub, &[]);
+        let cc_arr = msg["ccRecipients"].as_array().unwrap();
+        assert_eq!(cc_arr.len(), 1);
+        assert_eq!(cc_arr[0]["emailAddress"]["address"], "bob@example.com");
+    }
+
+    #[test]
+    fn graph_message_includes_bcc_recipients_when_set() {
+        let mut sub = empty_sub();
+        sub.bcc = Some(vec!["carol@example.com".into()]);
+        let msg = build_graph_message(&sub, &[]);
+        let bcc_arr = msg["bccRecipients"].as_array().unwrap();
+        assert_eq!(bcc_arr.len(), 1);
+        assert_eq!(bcc_arr[0]["emailAddress"]["address"], "carol@example.com");
+    }
+
+    #[test]
+    fn graph_message_omits_bcc_when_none() {
+        let sub = empty_sub();
+        let msg = build_graph_message(&sub, &[]);
+        // Graph treats absence and `[]` differently for bcc — absent is
+        // cleaner. Don't add an empty bccRecipients key.
+        assert!(msg.get("bccRecipients").is_none());
+    }
+
+    #[test]
+    fn graph_message_inlines_attachments_as_file_attachment() {
+        // Resolved blobs (after peek_blob_bytes) come in as a Vec<(name,
+        // mime, bytes)>. Builder turns them into Graph fileAttachment
+        // entries with base64 contentBytes.
+        let sub = empty_sub();
+        let resolved = vec![(
+            "report.pdf".to_string(),
+            "application/pdf".to_string(),
+            b"%PDF-fake".to_vec(),
+        )];
+        let msg = build_graph_message(&sub, &resolved);
+        let atts = msg["attachments"].as_array().unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["@odata.type"], "#microsoft.graph.fileAttachment");
+        assert_eq!(atts[0]["name"], "report.pdf");
+        assert_eq!(atts[0]["contentType"], "application/pdf");
+        // contentBytes is standard base64 of "%PDF-fake"
+        use base64::Engine;
+        let expected = base64::engine::general_purpose::STANDARD.encode(b"%PDF-fake");
+        assert_eq!(atts[0]["contentBytes"], expected);
+    }
+
+    #[test]
+    fn graph_message_omits_attachments_when_resolved_empty() {
+        let sub = empty_sub();
+        let msg = build_graph_message(&sub, &[]);
+        assert!(msg.get("attachments").is_none());
+    }
+
+    #[test]
+    fn graph_message_multiple_to_recipients() {
+        let mut sub = empty_sub();
+        sub.to = vec!["a@x.com".into(), "b@y.com".into(), "c@z.com".into()];
+        let msg = build_graph_message(&sub, &[]);
+        let to_arr = msg["toRecipients"].as_array().unwrap();
+        assert_eq!(to_arr.len(), 3);
+    }
+
+    // ---- upload_blob + peek_blob_bytes + drain_consumed_synthetic_blobs ----
+    //
+    // Mirror the Gmail tests since the contract is the same:
+    // cap-enforced on count + per-blob size + aggregate size,
+    // peek is non-consuming, drain only removes Synthetic entries.
+
+    fn make_outlook_test_session() -> OutlookSession {
+        OutlookSession {
+            client: reqwest::Client::new(),
+            token: tokio::sync::Mutex::new(OutlookToken {
+                access_token: "tok".into(),
+                refresh_token: "rtok".into(),
+                token_expiry: Utc::now() + chrono::Duration::hours(1),
+            }),
+            client_id: "test-client".into(),
+            token_path: std::path::PathBuf::from("/tmp/test-outlook-session"),
+            email: "u@example.com".into(),
+            folder_cache: tokio::sync::Mutex::new(None),
+            page_cache: tokio::sync::Mutex::new(HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_blob_rejects_oversized_per_blob() {
+        let session = make_outlook_test_session();
+        let big = vec![0u8; MAX_BLOB_BYTES + 1];
+        let err = upload_blob(&session, "application/octet-stream", &big)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("too large")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_blob_rejects_after_count_cap() {
+        let session = make_outlook_test_session();
+        for i in 0..UPLOAD_CACHE_CAP {
+            upload_blob(&session, "text/plain", &[i as u8])
+                .await
+                .unwrap_or_else(|e| panic!("upload {i} should succeed: {e:?}"));
+        }
+        let err = upload_blob(&session, "text/plain", &[99])
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("full")),
+            other => panic!("expected BadRequest cap, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_blob_rejects_aggregate_overflow() {
+        let session = make_outlook_test_session();
+        let chunk = vec![0u8; 20 * 1024 * 1024];
+        upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap();
+        upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap();
+        // Two 20 MiB blobs = 40 MiB; third would push past 50 MiB cap.
+        let err = upload_blob(&session, "application/octet-stream", &chunk)
+            .await
+            .unwrap_err();
+        match err {
+            Error::BadRequest(msg) => assert!(msg.contains("aggregate")),
+            other => panic!("expected BadRequest aggregate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn peek_blob_bytes_does_not_consume_synthetic() {
+        let session = make_outlook_test_session();
+        let (blob_id, _) = upload_blob(&session, "text/plain", b"hello").await.unwrap();
+        let (mime, bytes) = peek_blob_bytes(&session, &blob_id).await.unwrap();
+        assert_eq!(mime, "text/plain");
+        assert_eq!(bytes, b"hello");
+        // Second peek still works — cache wasn't consumed.
+        let (mime2, bytes2) = peek_blob_bytes(&session, &blob_id).await.unwrap();
+        assert_eq!(mime2, "text/plain");
+        assert_eq!(bytes2, b"hello");
+    }
+
+    #[tokio::test]
+    async fn drain_consumed_synthetic_blobs_removes_only_synthetic_entries() {
+        let session = make_outlook_test_session();
+        let (synth_id, _) = upload_blob(&session, "text/plain", b"X").await.unwrap();
+        let atts = vec![
+            crate::types::Attachment {
+                blob_id: synth_id.clone(),
+                name: "a.txt".into(),
+                mime_type: "text/plain".into(),
+                size: 1,
+            },
+            // Non-synthetic (OutlookAttachment) → drain should ignore.
+            crate::types::Attachment {
+                blob_id: "outlook:msg-x:att-y".into(),
+                name: "b.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size: 0,
+            },
+        ];
+        drain_consumed_synthetic_blobs(&session, &atts).await;
+        let err = peek_blob_bytes(&session, &synth_id).await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn peek_blob_bytes_rejects_gmail_blob_ref() {
+        // Cross-provider blob_id must be rejected explicitly so the
+        // synthetic-blob path can't accidentally fetch a Gmail attachment.
+        let session = make_outlook_test_session();
+        let err = peek_blob_bytes(&session, "msg-1:att-1").await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
     }
 }

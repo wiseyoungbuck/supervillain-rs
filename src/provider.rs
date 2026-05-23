@@ -180,9 +180,13 @@ pub async fn send_email(
         ProviderSession::Fastmail(s) => {
             jmap::send_email(s, sub, from_addr, identity_id_override).await
         }
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => {
+            // Outlook has a single identity from /me — from_addr and
+            // identity_id_override are informational only (Graph picks
+            // the From from the authenticated user).
+            let _ = (from_addr, identity_id_override);
+            outlook::send_email(s, sub).await
+        }
         ProviderSession::Gmail(s) => {
             gmail::send_email(s, sub, from_addr, identity_id_override).await
         }
@@ -225,9 +229,7 @@ pub async fn upload_blob(
 ) -> Result<(String, i64), Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::upload_blob(s, content_type, body).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Blob upload not supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::upload_blob(s, content_type, body).await,
         ProviderSession::Gmail(s) => gmail::upload_blob(s, content_type, body).await,
     }
 }
@@ -415,6 +417,7 @@ mod tests {
             email: "user@outlook.com".into(),
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
