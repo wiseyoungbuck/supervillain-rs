@@ -678,6 +678,95 @@ pub(crate) fn move_body(destination_folder_id: &str) -> serde_json::Value {
     serde_json::json!({ "destinationId": destination_folder_id })
 }
 
+/// Outcome of parsing a Graph `/$batch` response. Roborev 180 #4 + #5:
+/// `succeeded` is the count of 2xx per-item responses; `errors` is the
+/// aggregated list of per-item failures (caller can join into one
+/// message rather than truncate to the first); `any_404` flags whether
+/// any per-item failure was a 404 (used by archive_batch to surface the
+/// "create Archive folder" actionable message).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BatchResult {
+    pub succeeded: usize,
+    pub errors: Vec<String>,
+    pub any_404: bool,
+}
+
+/// Parse a Graph `/$batch` response JSON. Returns `Err(_)` for protocol
+/// violations (missing `responses` array, count mismatch — roborev 180
+/// #4), and `Ok(BatchResult)` otherwise (including partial failures —
+/// the caller decides how to react). Pure; unit-tested.
+pub(crate) fn parse_batch_response(
+    body: &serde_json::Value,
+    expected_count: usize,
+) -> Result<BatchResult, String> {
+    let arr = body["responses"].as_array().ok_or_else(|| {
+        "Graph /$batch response missing `responses` array (malformed)".to_string()
+    })?;
+    if arr.len() != expected_count {
+        return Err(format!(
+            "Graph /$batch responses count mismatch: expected {expected_count}, got {}",
+            arr.len()
+        ));
+    }
+    let mut succeeded = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let mut any_404 = false;
+    for r in arr {
+        let status = r["status"].as_u64().unwrap_or(0);
+        if (200..300).contains(&status) {
+            succeeded += 1;
+        } else {
+            if status == 404 {
+                any_404 = true;
+            }
+            let item_id = r["id"].as_str().unwrap_or("?");
+            let msg = r["body"]["error"]["message"]
+                .as_str()
+                .unwrap_or("(no error message)");
+            errors.push(format!("item {item_id}: {status} {msg}"));
+        }
+    }
+    Ok(BatchResult {
+        succeeded,
+        errors,
+        any_404,
+    })
+}
+
+/// Should this `Mailbox.role` reject `/move` calls? Roborev 180 #6:
+/// drafts/sent/junk need dedicated endpoints (createReply, send,
+/// markAsJunk respectively). Matches the literal-string branches in
+/// `move_plan_outlook` so opaque folder IDs are caught equivalently.
+pub(crate) fn role_rejects_move(role: Option<&str>) -> Option<&'static str> {
+    match role {
+        Some("drafts") => Some(
+            "Outlook: cannot move messages into Drafts. Drafts are created \
+             via send/reply endpoints, not /me/messages/{id}/move.",
+        ),
+        Some("sent") => Some(
+            "Outlook: cannot move messages into Sent. The Sent folder is \
+             populated automatically when you send a message.",
+        ),
+        Some("junk") => Some(
+            "Outlook: 'Mark as junk' must use the markAsJunk action so the \
+             junk filter learns — plain /move skips that signal.",
+        ),
+        _ => None,
+    }
+}
+
+/// Friendly user-facing message for the "Archive folder missing" 404.
+/// Shared between archive() (single-message 404) and archive_batch()
+/// (per-item 404 in /$batch response). Roborev 180 #2.
+pub(crate) fn archive_404_message() -> Error {
+    Error::BadRequest(
+        "This Outlook account has no Archive folder. Create one in \
+         Outlook web (Settings → Mail → Layout → Archive folder), \
+         then retry."
+            .into(),
+    )
+}
+
 /// Split message IDs into batches of at most 20 — Graph's `/$batch`
 /// per-request cap. Empty input → empty output (no degenerate empty
 /// chunks). Pure; tests assert boundary cases (1, exactly 20, 21, 50).
@@ -1173,6 +1262,10 @@ pub async fn toggle_flag(session: &OutlookSession, msg_id: &str) -> Result<bool,
         ));
     }
     let parsed: serde_json::Value = resp.json().await?;
+    // Roborev 180 #7: messages that have never been flagged may return
+    // `{}` or omit the `flag` key entirely from $select=flag. Treat
+    // missing == not-flagged so toggling defaults to flagging (the
+    // user's likely intent — they clicked the star icon).
     let currently_flagged = parsed["flag"]["flagStatus"].as_str() == Some("flagged");
     patch_message(
         session,
@@ -1207,15 +1300,13 @@ async fn move_message(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        // Special-case 404 for the Archive folder so the user sees an
-        // actionable message instead of "Outlook archive failed (404):".
+        // Roborev 180 #8: the destination-string match is intentional —
+        // archive() is the only call path that uses the literal "archive"
+        // well-known name. move_to_mailbox with an opaque Archive-folder
+        // ID would route through the role check earlier; we never get
+        // here for that path with a non-archive 404.
         if status == reqwest::StatusCode::NOT_FOUND && destination == "archive" {
-            return Err(Error::BadRequest(
-                "This Outlook account has no Archive folder. Create one in \
-                 Outlook web (Settings → Mail → Layout → Archive folder), \
-                 then retry."
-                    .into(),
-            ));
+            return Err(archive_404_message());
         }
         return Err(classify_outlook_error(
             &format!("{op} {msg_id} -> {destination}"),
@@ -1240,18 +1331,41 @@ pub async fn move_to_mailbox(
     msg_id: &str,
     mailbox_id: &str,
 ) -> Result<bool, Error> {
-    match move_plan_outlook(mailbox_id) {
-        MovePlanOutlook::Reject(reason) => Err(Error::BadRequest(reason.into())),
-        MovePlanOutlook::Move { destination } => {
-            move_message(session, msg_id, &destination, "move").await
-        }
+    // First check: literal well-known-name match (drafts/sentitems/junkemail).
+    // Catches the common case where the frontend passes "drafts" directly.
+    let destination = match move_plan_outlook(mailbox_id) {
+        MovePlanOutlook::Reject(reason) => return Err(Error::BadRequest(reason.into())),
+        MovePlanOutlook::Move { destination } => destination,
+    };
+    // Second check (roborev 180 #6): the frontend might pass an opaque
+    // Graph folder ID for a system folder rather than the well-known
+    // name. Resolve via folder_cache and apply the same rejection rules
+    // by role. Graceful: if folder lookup fails, fall through to attempt
+    // the move and let Graph return a real error.
+    if let Ok(folders) = get_mailboxes(session).await
+        && let Some(folder) = folders.iter().find(|f| f.id == mailbox_id)
+        && let Some(reason) = role_rejects_move(folder.role.as_deref())
+    {
+        return Err(Error::BadRequest(reason.into()));
     }
+    move_message(session, msg_id, &destination, "move").await
 }
 
 /// Archive a batch of messages via Graph's `/$batch` endpoint, chunked at
-/// the documented 20-per-batch cap. Returns the count of messages
-/// *submitted in successful batches*; per-batch failure aborts the rest
-/// to keep the contract simple (matching Gmail's archive_batch shape).
+/// the documented 20-per-batch cap.
+///
+/// Contract (roborev 180 #3): all-or-nothing per call. On any chunk
+/// failure (chunk-level HTTP error, missing/malformed `responses` array,
+/// or any per-item non-2xx) returns `Err` describing the failure. Cache
+/// invalidation has been applied for chunks that completed before the
+/// failure, so the caller's next read sees fresh state for the partial
+/// move. The returned `usize` on success is the total count submitted
+/// across all chunks (== msg_ids.len()).
+///
+/// If any per-item 404 fires when the destination is the Archive folder
+/// (typically on accounts without one set up), returns the actionable
+/// "create Archive folder" message that single-message `archive()`
+/// produces — roborev 180 #2.
 pub async fn archive_batch(session: &OutlookSession, msg_ids: &[String]) -> Result<usize, Error> {
     if msg_ids.is_empty() {
         return Ok(0);
@@ -1271,26 +1385,49 @@ pub async fn archive_batch(session: &OutlookSession, msg_ids: &[String]) -> Resu
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            // Roborev 180 #1: invalidate caches for chunks that did
+            // complete before this failure so the caller's next read
+            // doesn't see stale counts.
+            invalidate_caches_after_mutation(session).await;
             return Err(classify_outlook_error("$batch.archive", status, &text));
         }
-        // Per-item failures inside a batch are reported in the response
-        // `responses[].status`, but Graph's overall HTTP status is still
-        // 200. Bail on individual non-2xx so the caller sees the failure
-        // rather than over-counting `succeeded`.
+        // Per-item failures live in `responses[].status`; Graph's
+        // overall HTTP status is still 200. parse_batch_response
+        // (pure, tested) extracts the outcomes — roborev 180 #4 + #5.
         let parsed: serde_json::Value = resp.json().await?;
-        if let Some(arr) = parsed["responses"].as_array() {
-            for r in arr {
-                let item_status = r["status"].as_u64().unwrap_or(0);
-                if !(200..300).contains(&item_status) {
-                    return Err(Error::BadRequest(format!(
-                        "Outlook $batch archive partial failure: {r}"
-                    )));
-                }
+        let outcome = parse_batch_response(&parsed, chunk.len()).map_err(|e| {
+            // Roborev 180 #1: invalidate before bailing.
+            // (Async closure restriction: can't await here, so do it
+            // by hand after match below.)
+            Error::Internal(format!("Outlook $batch archive: {e}"))
+        });
+        // Hoist the invalidate-before-bail because async closures can't
+        // .await inside map_err.
+        let outcome = match outcome {
+            Err(e) => {
+                invalidate_caches_after_mutation(session).await;
+                return Err(e);
             }
+            Ok(o) => o,
+        };
+        if !outcome.errors.is_empty() {
+            invalidate_caches_after_mutation(session).await;
+            // Archive-folder-missing wins: actionable user message.
+            if outcome.any_404 {
+                return Err(archive_404_message());
+            }
+            return Err(Error::BadRequest(format!(
+                "Outlook $batch archive: {} of {} failed: {}",
+                outcome.errors.len(),
+                chunk.len(),
+                outcome.errors.join(" | ")
+            )));
         }
-        succeeded += chunk.len();
+        succeeded += outcome.succeeded;
+        // Roborev 180 #1: per-chunk invalidation so a subsequent failure
+        // can't leave earlier chunks' state stale.
+        invalidate_caches_after_mutation(session).await;
     }
-    invalidate_caches_after_mutation(session).await;
     Ok(succeeded)
 }
 
@@ -1323,6 +1460,12 @@ fn build_batch_archive_body(msg_ids: &[&str]) -> serde_json::Value {
 /// `/$value` endpoint returns raw bytes with `Content-Type` set from the
 /// attachment's stored contentType — more accurate than guessing from
 /// the filename extension (which Gmail has to do).
+///
+/// The `_filename` parameter is intentionally ignored here — Graph
+/// returns the truth in the `Content-Type` response header, so we don't
+/// need to extension-guess. The param is part of the provider dispatch
+/// signature (Gmail uses it; symmetric trait shape).
+/// Roborev 180 #10.
 pub async fn download_blob(
     session: &OutlookSession,
     blob_id: &str,
@@ -2947,5 +3090,128 @@ mod tests {
         assert_eq!(chunks[0].len(), 20);
         assert_eq!(chunks[1].len(), 20);
         assert_eq!(chunks[2].len(), 10);
+    }
+
+    // ---- Roborev 180 #4 + #5: parse_batch_response ----
+    //
+    // Graph's /$batch returns 200 with a `responses[]` array of per-item
+    // results. This parser extracts the per-item outcomes so the caller
+    // can distinguish "all-succeeded" from "partial-failure" and aggregate
+    // ALL failures (not just the first).
+
+    #[test]
+    fn parse_batch_response_all_succeed() {
+        let body = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 200 },
+                { "id": "2", "status": 200 },
+                { "id": "3", "status": 200 }
+            ]
+        });
+        let r = parse_batch_response(&body, 3).unwrap();
+        assert_eq!(r.succeeded, 3);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn parse_batch_response_204_no_content_counts_as_success() {
+        // Graph's /move returns 204 in the per-item response.
+        let body = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 204 }
+            ]
+        });
+        let r = parse_batch_response(&body, 1).unwrap();
+        assert_eq!(r.succeeded, 1);
+    }
+
+    #[test]
+    fn parse_batch_response_partial_failure_collects_all_errors() {
+        // Roborev 180 #5: if items 1, 3, and 5 all fail in the same batch,
+        // the user should see all of them, not just item 1's.
+        let body = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 404, "body": { "error": { "message": "gone-1" } } },
+                { "id": "2", "status": 200 },
+                { "id": "3", "status": 403, "body": { "error": { "message": "denied-3" } } },
+                { "id": "4", "status": 200 },
+                { "id": "5", "status": 500, "body": { "error": { "message": "boom-5" } } }
+            ]
+        });
+        let r = parse_batch_response(&body, 5).unwrap();
+        assert_eq!(r.succeeded, 2);
+        assert_eq!(r.errors.len(), 3);
+        // Each failure surfaces its status and message.
+        let joined = r.errors.join(" | ");
+        assert!(joined.contains("404") && joined.contains("gone-1"));
+        assert!(joined.contains("403") && joined.contains("denied-3"));
+        assert!(joined.contains("500") && joined.contains("boom-5"));
+    }
+
+    #[test]
+    fn parse_batch_response_missing_responses_array_is_error() {
+        // Roborev 180 #4: if Graph returns 200 with no `responses` key
+        // (malformed / future API change / gateway interception), don't
+        // silently over-count succeeded — fail loudly.
+        let body = serde_json::json!({ "value": [] });
+        let err = parse_batch_response(&body, 3).unwrap_err();
+        assert!(err.contains("responses"));
+    }
+
+    #[test]
+    fn parse_batch_response_count_mismatch_is_error() {
+        // Submitted 3 but Graph responded with 2 — protocol violation.
+        let body = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 200 },
+                { "id": "2", "status": 200 }
+            ]
+        });
+        let err = parse_batch_response(&body, 3).unwrap_err();
+        assert!(err.contains("expected 3") || err.contains("count"));
+    }
+
+    #[test]
+    fn parse_batch_response_404_is_archive_friendly_flag() {
+        // Roborev 180 #2: when the per-item failure is 404, the caller
+        // (archive_batch) needs to substitute the actionable "create
+        // Archive folder" message.
+        let body = serde_json::json!({
+            "responses": [
+                { "id": "1", "status": 404, "body": { "error": { "message": "archive missing" } } }
+            ]
+        });
+        let r = parse_batch_response(&body, 1).unwrap();
+        assert!(
+            r.any_404,
+            "should flag 404 for the archive friendly-message path"
+        );
+    }
+
+    // ---- Roborev 180 #6: role_rejects_move ----
+
+    #[test]
+    fn role_rejects_drafts() {
+        assert!(role_rejects_move(Some("drafts")).is_some());
+    }
+
+    #[test]
+    fn role_rejects_sent() {
+        // Note: Mailbox.role for sent is "sent" (not "sentitems" — that's
+        // the Graph well-known name; outlook_folder_role normalizes it).
+        assert!(role_rejects_move(Some("sent")).is_some());
+    }
+
+    #[test]
+    fn role_rejects_junk() {
+        assert!(role_rejects_move(Some("junk")).is_some());
+    }
+
+    #[test]
+    fn role_does_not_reject_inbox_archive_trash_user() {
+        assert!(role_rejects_move(Some("inbox")).is_none());
+        assert!(role_rejects_move(Some("archive")).is_none());
+        assert!(role_rejects_move(Some("trash")).is_none());
+        assert!(role_rejects_move(None).is_none());
     }
 }
