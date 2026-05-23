@@ -79,6 +79,57 @@ portability (rustls-tls; explicit tokio features).
   `provider::send_email` to Outlook (previously discarded). README + this
   TODO updated to reflect full Outlook parity with Gmail/Fastmail.
 
+## Completed in Phase 5 (in-app account management + timezone-aware invites)
+
+- **In-app account management** — New `src/accounts.rs`: typed `AccountConfig`
+  enum (Fastmail / Outlook / Gmail), pure INI parse/serialize, `atomic_write_config`
+  (tmpfile → fsync → rename → parent-dir fsync, per-call `AtomicU64` seq counter
+  so concurrent same-PID writers can't clobber, mode 0600), path-traversal-safe
+  `validate_section_name` (rejects `/`, `\`, `.`, `..`, leading dot, NUL,
+  control chars, brackets, `=`, `#`, newlines; enforced at parse time too so
+  hand-edited configs can't smuggle traversal names). Routes:
+  `POST /api/accounts/{id}` (upsert; new Fastmail connects sync OUTSIDE the
+  registry lock; OAuth providers return `authStatus: pending`),
+  `DELETE /api/accounts/{id}` (removes session + token file, promotes
+  alphabetically-first remaining account to default), `PUT /api/accounts/{id}/default`,
+  `POST /api/accounts/{id}/authorize` (long-poll, single-flight via
+  `AuthorizingGuard` RAII so panics can't leak the slot). `AppState.accounts`
+  is now `RwLock<AccountRegistry>` with an in-memory `account_configs` cache
+  so handlers never re-read disk under the write lock. First run with no
+  config no longer `exit(1)`s — it surfaces a `setup` sentinel error and the
+  frontend auto-routes to the settings view. Frontend: `#settings-view`
+  (master/detail in `static/index.html`), `g s` chord + `:settings` command,
+  settings-mode keybindings (`a` add, `d` delete + confirm, `Shift+D` set
+  default, `Ctrl+Enter` save, `Esc` back), `api()` allowlist regex so settings
+  routes don't get auto-tagged with `?account=`. `clientId` echoed on the GET
+  response so editing OAuth accounts doesn't make the user retype it; secrets
+  never echoed.
+- **Timezone-aware calendar invites** — New `src/timezone.rs`: `TimezoneConfig`
+  persisted to `~/.config/supervillain/timezone.json` via `atomic_write_bytes`,
+  IANA validation via `chrono-tz`, system-TZ detection via `iana-time-zone`,
+  primary + additional display zones. Routes: `GET/PUT /api/timezone`,
+  `POST /api/timezone/accept-system`, `POST /api/timezone/dismiss-change`
+  (`seen_system` TOCTOU check → 409 if system TZ moved between banner display
+  and click), `GET /api/timezone/zones`. `AppState.timezone_write_lock`
+  serializes load→mutate→save so concurrent updates can't lose writes.
+  `calendar.rs` gained `generate_invite` (iTIP REQUEST with `DTSTART;TZID=...`,
+  synthesized VTIMEZONE including `X-LIC-LOCATION` per libical/RFC 7808 so
+  strict parsers caching VTIMEZONE by TZID can map back to IANA) and
+  `generate_rsvp_with_tz` (REPLY in user's primary TZ instead of UTC-Z).
+  `chrono-tz::Tz::from_str` resolves `TZID` first in the parser (fixes
+  documented single-offset-per-TZID DST limitation); VTIMEZONE-offset fallback
+  retained for non-IANA labels. ICS-injection hardening: `escape_param_value`
+  strips CR/LF/control/`:`/`"` and DQUOTE-wraps when `,`/`;`/space present;
+  `sanitize_address` strips CR/LF/control/`,`/`;`/`"` so CRLF injection in
+  attendee names or organizer addresses can't produce a second property
+  line. `POST /api/calendar/invite` rejects `dtend <= dtstart` and threads
+  attachments through to the outbound mail (compose toggle "Attach calendar
+  invite" in the frontend). `provider::rsvp` doc-comment now explicitly
+  documents that `reply_tz` is Fastmail-only (Outlook/Gmail use Graph/Calendar
+  PATCH which renders in the recipient's TZ).
+- **Roborev 186 + 188 hardening** — applied throughout the above: see commits
+  `d00dd60` and `ab7765d`.
+
 ## Not yet implemented
 
 - Threading/conversation grouping (`thread_id` is populated on `Email` but unused in the list view)

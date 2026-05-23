@@ -25,13 +25,14 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 - **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (full email + calendar via Microsoft Graph), Gmail (full email + Google Calendar)
 - **Multi-account** — Switch between accounts with `1`-`9` keys
+- **In-app account management** — Add, edit, delete, and re-authorize accounts from the UI (`g s` or `Ctrl+K → settings`); no editing the config file or restarting the server. First run lands directly in the settings screen.
 - **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API, Google Calendar
+- **Timezone-aware calendar invites** — View, RSVP, and compose new invites with proper RFC 5545 VTIMEZONE/TZID. Multi-timezone display on every event card (great for travel); a banner catches when your OS timezone changes and lets you accept or keep the previous setting. Configurable per-user via Settings; persisted at `~/.config/supervillain/timezone.json`
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
 - **Split inbox** — Filterable tabs by sender, recipient, subject, or calendar invites. Auto-generated from your identities on first run
 - **Gmail-style search** — `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `before:`, `newer_than:`, and more
 - **Command palette** — `Ctrl+K` for quick actions
 - **Multiple identities** — All your addresses in one inbox. Replies auto-select the matching From address
-- **Calendar invites** — View ICS details and RSVP directly from email
 - **Attachments** — Download inline or as files
 - **Undo** — `z` to reverse archive, trash, and read-state changes
 - **PWA support** — Installable on mobile with offline-capable service worker
@@ -79,6 +80,20 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 | `Ctrl+Enter` | Send |
 | `Esc` | Cancel |
 
+### Account settings
+
+| Key | Action |
+|-----|--------|
+| `g s` | Open settings (from any view) |
+| `Ctrl+K` → `settings` | Open settings via command palette |
+| `j` / `k` | Navigate account list |
+| `Enter` | Edit selected account |
+| `a` | Add a new account |
+| `d` | Delete (then confirm) |
+| `Shift+D` | Set selected account as default |
+| `Ctrl+Enter` | Save |
+| `Esc` | Back to inbox |
+
 ## Requirements
 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
@@ -94,37 +109,36 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 - **Outlook** — Register an app in Azure AD with `Mail.ReadWrite`, `Mail.Send`, and `Calendars.ReadWrite` permissions (see [Azure AD setup](#azure-ad-app-registration) below).
 - **Gmail** — Create OAuth credentials in Google Cloud Console (see [Google Cloud setup](#google-cloud-app-registration) below). Both `client-id` and `client-secret` are required — unlike Outlook, Google's OAuth needs a client_secret even on Desktop / PKCE flows.
 
-**2. Create the config file:**
+**2. Configure your first account — two options:**
+
+- **Option A (recommended):** Skip this step. Run `supervillain` and add accounts from the in-app settings screen (`g s`). First run lands directly in settings; the server writes `~/.config/supervillain/config` for you with mode `0600`.
+- **Option B:** Hand-edit `~/.config/supervillain/config` before first run:
 
 ```sh
 mkdir -p ~/.config/supervillain
 ```
 
 ```ini
-# ~/.config/supervillain/config
+# ~/.config/supervillain/config — managed by the in-app settings UI.
+# Hand-edited comments are not preserved on UI save.
 
-# Single Fastmail account (simplest config)
+default-account = fastmail
+
+[fastmail]
+provider = fastmail
 username = you@fastmail.com
 api-token = fmu1-xxxxxxxxxxxxxxxx
 
-# Or: multiple accounts with [sections]
-# [fastmail]
-# provider = fastmail
-# username = you@fastmail.com
-# api-token = fmu1-xxxxxxxxxxxxxxxx
-#
-# [outlook]
-# provider = outlook
-# username = you@company.com
-# client-id = xxxx-xxxx-xxxx
-# # Full Outlook support: read/write/send/calendar (Phase 4 complete).
-#
-# [gmail]
-# provider = gmail
-# client-id = xxxx.apps.googleusercontent.com
-# client-secret = GOCSPX-xxxxxxxxxxxx
-# # Gmail also requires client-secret (Google quirk for PKCE).
-# # Full Gmail support: read/write/send/calendar (Phase 3 complete).
+[outlook]
+provider = outlook
+client-id = xxxx-xxxx-xxxx
+# OAuth completes on first [Authorize] click in settings.
+
+[gmail]
+provider = gmail
+client-id = xxxx.apps.googleusercontent.com
+client-secret = GOCSPX-xxxxxxxxxxxx
+# Gmail also requires client-secret (Google quirk for PKCE).
 ```
 
 `chmod 600 ~/.config/supervillain/config` is recommended — the file holds API tokens and OAuth secrets.
@@ -140,7 +154,7 @@ supervillain
 
 This installs the `supervillain` binary to `~/.cargo/bin/` (on your PATH) and opens `http://127.0.0.1:8000` in your browser.
 
-For Outlook accounts, first run opens a browser for OAuth2 authorization. Tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry.
+If no accounts are configured, the UI opens straight into the settings screen — add an account there (`a` to add, `Ctrl+Enter` to save). For OAuth providers, click `[Authorize]` in the settings form to complete the flow in a browser; tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry. To remove an account, select it in settings and press `d` then confirm.
 
 ## Installation
 
@@ -188,19 +202,13 @@ cargo install --path .
 
 `~/.config/supervillain/config` (or `$XDG_CONFIG_HOME/supervillain/config`)
 
-Two formats supported:
+The settings UI (`g s`) is the supported way to manage this file at runtime. Hand-editing still works — comments and key order are not preserved when the UI saves, so prefer editing fields through the UI for anything secret-bearing.
 
-**Simple format** — single Fastmail account, `key = value` pairs. Lines starting with `#` are comments.
-
-```ini
-# Fastmail credentials
-username = you@fastmail.com
-api-token = fmu1-xxxxxxxxxxxxxxxx
-```
-
-**Multi-account format** — INI-style `[sections]`, each with a `provider` field.
+INI-style `[sections]`, each with a `provider` field. The optional `default-account = <name>` top-level key selects which account is active on startup.
 
 ```ini
+default-account = fastmail
+
 [fastmail]
 provider = fastmail
 username = you@fastmail.com
@@ -208,18 +216,18 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 
 [outlook]
 provider = outlook
-username = you@company.com
 client-id = xxxx-xxxx-xxxx
-# Phase 1: calendar only
+email = you@company.com   # populated automatically after [Authorize]
 
 [gmail]
 provider = gmail
 client-id = xxxx.apps.googleusercontent.com
 client-secret = GOCSPX-xxxxxxxxxxxx
 # Gmail needs client-secret too (Google quirk; not really secret).
+email = you@gmail.com
 ```
 
-The sectionless format is fully backward compatible — it's treated as a single Fastmail account.
+Account names (the `[section]` value) become the filename stem for token storage and are validated against path-traversal: no `/`, `\`, `.`, `..`, leading dot, brackets, `=`, `#`, control characters, or newlines (`validate_section_name`). Sections that violate these rules are skipped at startup with a warning.
 
 ### Azure AD App Registration
 
@@ -283,6 +291,16 @@ If you have multiple addresses in Fastmail (e.g. you@company.com, you@gmail.com,
 - **Splits** — On first run, auto-creates one tab per domain from your identities.
 
 No multi-account configuration needed.
+
+### Timezones (calendar invites)
+
+Calendar invites are timezone-aware. Configure in the in-app Settings panel (under TIMEZONES); persisted at `~/.config/supervillain/timezone.json`.
+
+- **System mode (default)** — primary timezone tracks your OS, detected via the `iana-time-zone` crate. When the OS timezone changes (e.g. you travel and your laptop picks up the new region), a banner appears at the top of the app: *Update to system* / *Keep current* / *Recheck*. The dismiss action sends back the value you saw so the server refuses to dismiss a change that already moved on (409 Conflict).
+- **Manual mode** — pin a specific IANA timezone (e.g. `America/Los_Angeles`) as primary regardless of what the OS reports.
+- **Additional display timezones** — add any number of extra IANA zones. Every received event card and every outgoing invite shows times in *all* configured zones, primary first. Useful when you're travelling between zones and want to see both wall-clock times at a glance.
+
+Outgoing invites and RSVPs are generated with `DTSTART;TZID=<primary>` and a synthesized VTIMEZONE block (rather than UTC-Z), so organizers see your time in your locale. The TZID parser uses `chrono-tz` for correct DST resolution at the event's instant — old single-offset VTIMEZONE parsing remains as a fallback for non-IANA TZIDs (e.g. Outlook's "Pacific Standard Time").
 
 ### Splits (inbox tabs)
 
@@ -396,8 +414,15 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 
 ### Calendar dispatch
 
-- **Fastmail** — CalDAV PUT/DELETE (existing)
+- **Fastmail** — CalDAV PUT/DELETE
 - **Outlook** — Microsoft Graph (`POST /me/events`, lookup by `iCalUId` filter)
+- **Gmail** — Google Calendar v3 (`events.import` preserves `iCalUID`; RSVP via attendees PATCH with `sendUpdates=all`)
+
+### Timezone + invite generation
+
+- Incoming ICS parsing tries `chrono_tz::Tz::from_str(TZID)` first (correct DST resolution at the event's instant); falls back to legacy VTIMEZONE-offset parsing for non-IANA labels (e.g. Outlook's "Pacific Standard Time").
+- Outgoing invites (`POST /api/calendar/invite`) and RSVPs use `calendar::generate_invite` / `calendar::generate_rsvp_with_tz` to emit `DTSTART;TZID=<primary>` plus a synthesized VTIMEZONE block scoped to the event instant. All text/atom fields run through `escape_text` (`\r`/`\n`/`,`/`;`/`\\`) and `sanitize_token` / `sanitize_address` to keep attacker-controlled summaries or organizer names from injecting iCal properties on round-trip.
+- Display: `formatEventTimeMultiTz` in `static/app.js` renders one row per configured display TZ using `Intl.DateTimeFormat` with `timeZone` + `timeZoneName: 'short'`. Primary first, additionals dimmed.
 
 ### Search dispatch
 
@@ -417,19 +442,23 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 
 | Layer | Technology |
 |-------|------------|
-| Backend | Rust, Axum 0.8, Tokio, reqwest |
-| Frontend | Vanilla JS, CSS3 (no framework, no build step) |
-| Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph API (calendar) |
-| Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook) |
-| Providers | Fastmail (email + calendar), Outlook (calendar only), Gmail (email + calendar) |
+| Backend | Rust, Axum 0.8, Tokio, reqwest, chrono + chrono-tz, iana-time-zone |
+| Frontend | Vanilla JS, CSS3 (no framework, no build step), `Intl.DateTimeFormat` for TZ-aware rendering |
+| Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph (Outlook), Gmail REST + Google Calendar v3, iCalendar / iTIP ([RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) / [5546](https://www.rfc-editor.org/rfc/rfc5546)) |
+| Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook, Gmail) |
+| Providers | Fastmail, Outlook, Gmail — full email + calendar parity across all three |
 
 ## API
 
-All endpoints live under `/api/`. The frontend communicates exclusively through these. Multi-account endpoints accept `?account={id}`.
+All endpoints live under `/api/`. The frontend communicates exclusively through these. Account-scoped endpoints (`/emails/*`, `/mailboxes`, `/identities`, `/splits`, `/upload`, `/split-counts`) accept `?account={id}`; settings endpoints (`/accounts/*`, `/theme`, `/timezone/*`, `/calendar/invite`) are global.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/accounts` | List connected accounts |
+| GET | `/api/accounts` | List connected accounts (with `authStatus`, `clientId` for OAuth) |
+| POST | `/api/accounts/{id}` | Upsert. New id → create; existing id → update fields (empty secret values preserve the existing secret). Fastmail connects synchronously; OAuth providers return 201 + `authStatus: "pending"`. |
+| DELETE | `/api/accounts/{id}` | Remove account + delete its token file + rewrite config. Promotes the alphabetically-first remaining account to default if the deleted one was default. |
+| PUT | `/api/accounts/{id}/default` | Set the default account. Idempotent. |
+| POST | `/api/accounts/{id}/authorize` | Long-poll OAuth (single-flight, RAII slot release). Returns 200 + populated `email` on success, 502 on failure, 409 if another flow is in progress. |
 | GET | `/api/identities` | List sender identities |
 | GET | `/api/mailboxes` | List mailboxes |
 | GET | `/api/emails?mailbox_id=&limit=&offset=&split_id=&search=` | List emails |
@@ -450,6 +479,12 @@ All endpoints live under `/api/`. The frontend communicates exclusively through 
 | PUT | `/api/splits/{id}` | Update split |
 | DELETE | `/api/splits/{id}` | Delete split |
 | GET | `/api/split-counts` | Get unread counts per split |
+| GET | `/api/timezone` | Get resolved timezone settings (primary + display list + system + change-detection) |
+| PUT | `/api/timezone` | Update timezone settings (system vs manual primary, additional display zones) |
+| POST | `/api/timezone/accept-system` | Acknowledge the current OS timezone as the new baseline |
+| POST | `/api/timezone/dismiss-change` | Dismiss the change banner; body `{ "seen_system": "<IANA>" }` returns 409 on mismatch |
+| GET | `/api/timezone/zones` | List of known IANA timezone names (for the picker datalist) |
+| POST | `/api/calendar/invite` | Send a new calendar invite (iTIP REQUEST with TZID-qualified DTSTART/DTEND) |
 | GET | `/api/theme` | Get theme configuration |
 | POST | `/api/upload` | Upload attachment for compose |
 
@@ -457,27 +492,36 @@ All endpoints live under `/api/`. The frontend communicates exclusively through 
 
 ```
 src/
-  main.rs          Entry point, config parsing, server startup
+  main.rs          Entry point, server startup, non-blocking session load (empty registry → first-run UI)
   lib.rs           Module declarations
-  types.rs         Data types (Email, Mailbox, Identity, Attachment, etc.)
-  error.rs         Error enum + HTTP response mapping
+  types.rs         Data types + AppState + AccountRegistry (in-memory mirror of on-disk config)
+  error.rs         Error enum (Auth/Network/BadRequest/Conflict/NotFound/Internal) + HTTP response mapping
+  accounts.rs      In-app account management: typed AccountConfig enum, INI parse/serialize,
+                   atomic_write_config (fsync file → rename → fsync parent dir, per-call seq counter),
+                   path-traversal-safe section-name validator, ICS-safe escapers used by calendar.rs,
+                   AuthorizingGuard (RAII single-flight OAuth slot), HTTP handlers for
+                   POST/DELETE/PUT-default/POST-authorize on /api/accounts/{id}
+  timezone.rs      TimezoneConfig (~/.config/supervillain/timezone.json), atomic_write_bytes,
+                   IANA validation via chrono-tz, system-TZ detection via iana-time-zone
   jmap.rs          JMAP client — Fastmail (connect, query, send, calendar, MIME parsing)
-  outlook.rs       Microsoft Graph client (Calendar)
+  outlook.rs       Microsoft Graph client — full Outlook email + calendar
   gmail.rs         Gmail REST client + Google Calendar v3 (full email + RSVP)
   oauth.rs         OAuth2 PKCE primitives (shared by Outlook and Gmail)
   platform/        OS-specific shims: TokenStore, browser, OAuth callback, log sink
                    — desktop today, iOS module planned (Tauri-mobile)
-  provider.rs      Provider dispatch — routes call provider::*, which dispatches per-provider
-  routes.rs        HTTP handlers + split management
+  provider.rs      Provider dispatch — routes call provider::*, which dispatches per-provider.
+                   `rsvp()` doc-comment specifies which arms use `reply_tz` (Fastmail) and which don't.
+  routes.rs        HTTP handlers: emails, splits, timezone, calendar invite, theme
   search.rs        Search query parser + per-provider filter translation
   splits.rs        Split inbox filtering + persistence
-  calendar.rs      ICS parsing + RSVP generation
+  calendar.rs      ICS parsing + RSVP generation + invite generation: TZID-qualified DTSTART,
+                   synthesized VTIMEZONE with X-LIC-LOCATION, ICS-injection-safe param/address escaping
   glob.rs          Glob pattern matching
   theme.rs         Theme configuration
   validate.rs      Validation macro
 static/
-  index.html       Frontend shell
-  app.js           All frontend logic (vanilla JS)
+  index.html       Frontend shell + settings view + help overlay
+  app.js           All frontend logic (vanilla JS): inbox, compose, settings, authorize long-poll
   style.css        Terminal-style dark theme
   icon-*.png       Favicon + PWA icons
 scripts/
@@ -514,10 +558,11 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 
 ## Roadmap
 
-- **Outlook email** — Mail.ReadWrite + Mail.Send via Microsoft Graph (Phase 2)
 - **iOS app via Tauri-mobile** — `src/platform/ios.rs` (KeychainTokenStore, ASWebAuthenticationSession, os_log sink)
 - Threading / conversation grouping
 - Drafts
 - Contact suggestions / address book
 - Email signatures
 - Offline mode
+
+See [TODO.md](TODO.md) for the per-phase change log (Phase 3 Gmail, Phase 4 Outlook, Phase 5 in-app account management + timezone-aware invites).
