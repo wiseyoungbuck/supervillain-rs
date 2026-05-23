@@ -6,7 +6,7 @@
 
 <p align="center">
   Email for people who'd rather be typing.<br>
-  Vim-native, zero-Electron, talks to Fastmail, Gmail, and Outlook (calendar).
+  Vim-native, zero-Electron, talks to Fastmail, Gmail, and Outlook.
 </p>
 
 
@@ -19,11 +19,11 @@
 
 ---
 
-Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook calendar. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
+Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook, Gmail REST + Google Calendar. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
 
 ## Features
 
-- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (calendar via Microsoft Graph), Gmail (full email + Google Calendar)
+- **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (full email + calendar via Microsoft Graph), Gmail (full email + Google Calendar)
 - **Multi-account** — Switch between accounts with `1`-`9` keys
 - **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API, Google Calendar
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
@@ -83,7 +83,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 
 - [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
 - A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
-- Microsoft app registration (for Outlook calendar — email support planned for Phase 2), and/or:
+- Microsoft app registration (for Outlook email + calendar via Microsoft Graph), and/or:
 - Google Cloud project with OAuth credentials (full Gmail + Google Calendar today)
 
 ## Quick start
@@ -91,7 +91,7 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 **1. Create credentials for your provider:**
 
 - **Fastmail** — Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
-- **Outlook** — Register an app in Azure AD with Calendars.ReadWrite permissions (see [Azure AD setup](#azure-ad-app-registration) below).
+- **Outlook** — Register an app in Azure AD with `Mail.ReadWrite`, `Mail.Send`, and `Calendars.ReadWrite` permissions (see [Azure AD setup](#azure-ad-app-registration) below).
 - **Gmail** — Create OAuth credentials in Google Cloud Console (see [Google Cloud setup](#google-cloud-app-registration) below). Both `client-id` and `client-secret` are required — unlike Outlook, Google's OAuth needs a client_secret even on Desktop / PKCE flows.
 
 **2. Create the config file:**
@@ -117,7 +117,7 @@ api-token = fmu1-xxxxxxxxxxxxxxxx
 # provider = outlook
 # username = you@company.com
 # client-id = xxxx-xxxx-xxxx
-# # Phase 1: calendar only. Email support coming in Phase 2.
+# # Full Outlook support: read/write/send/calendar (Phase 4 complete).
 #
 # [gmail]
 # provider = gmail
@@ -223,7 +223,7 @@ The sectionless format is fully backward compatible — it's treated as a single
 
 ### Azure AD App Registration
 
-To use Outlook calendar sync, register an app in Azure AD:
+To use Outlook (email + calendar), register an app in Azure AD:
 
 1. Go to [Azure Portal > App registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
 2. Click **New registration**
@@ -231,7 +231,7 @@ To use Outlook calendar sync, register an app in Azure AD:
 4. Supported account types: "Accounts in any organizational directory and personal Microsoft accounts"
 5. Redirect URI: **Web** → `http://localhost:8400/callback`
 6. After creation, copy the **Application (client) ID** — this is your `client-id`
-7. Under **API permissions**, add: `Calendars.ReadWrite` (delegated)
+7. Under **API permissions**, add (all delegated): `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`
 8. No client secret needed — Supervillain uses PKCE (public client)
 
 Put the client ID in your config:
@@ -376,7 +376,7 @@ Browser (localhost:8000)
 Axum HTTP Server
     │ resolve_account() → match ProviderSession
     ├── Fastmail → JMAP + CalDAV
-    ├── Outlook → Microsoft Graph (Calendar only)
+    ├── Outlook → Microsoft Graph (Mail + Calendar)
     └── Gmail → Gmail REST API + Google Calendar v3
 ```
 
@@ -402,7 +402,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 ### Search dispatch
 
 - **Fastmail** — `to_jmap_filter()` (existing)
-- Outlook search planned for Phase 2
+- **Outlook** — `outlook::translate_query_to_odata()` (Microsoft Graph splits free-text into `$search` and structured terms into `$filter`)
 - **Gmail** — `gmail::translate_query_to_q()` (Gmail's native `q=` syntax — essentially a superset of our DSL)
 
 ### OAuth2 flow (Outlook, Gmail)

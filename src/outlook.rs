@@ -1521,7 +1521,7 @@ pub async fn download_blob(
 // Phase 4 Milestone C — send + compose
 // =============================================================================
 
-use crate::types::EmailSubmission;
+use crate::types::{EmailSubmission, Identity};
 
 /// Which Graph API path to use to send `sub`. Top-5 greats finding plus
 /// roborev 181 #1 refinement:
@@ -1554,6 +1554,53 @@ pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
     }
 }
 
+/// Pick the display name to set on Graph's `from.emailAddress.name`.
+///
+/// Pure — caller fetches identities once and passes them in. Returns the
+/// display name to attach to From, or `None` to leave it unset (Graph
+/// then renders the authenticated user's default).
+///
+/// Discipline (Milestone D.1, mirrors `gmail::pick_identity_display_name`
+/// line 1744): if `identity_id_override` is `Some(id)` but doesn't match
+/// any known identity, return `None` and emit a `tracing::warn!` —
+/// refuses to silently fall back to a different identity, because
+/// attaching the wrong name to the From line is a worse failure than
+/// having no name at all.
+///
+/// Outlook's identity list is single-element today (just `/me`), so the
+/// no-override / no-match path also returns `None`: with only one
+/// identity, a non-matching `from_addr` means the caller is trying to
+/// send-as something they don't own. Attaching the primary identity's
+/// name would mislabel From. (Gmail can afford a first-identity fallback
+/// because its sendAs list often has the user's many real addresses; we
+/// don't have that luxury yet.) If alias enumeration ever lands, this
+/// helper's signature already takes a slice and the fallback policy can
+/// be revisited without changing call sites.
+fn pick_outlook_display_name(
+    identities: &[Identity],
+    from_addr: &str,
+    identity_id_override: Option<&str>,
+) -> Option<String> {
+    let chosen = match identity_id_override {
+        Some(id) => {
+            let matched = identities.iter().find(|i| i.id == id);
+            if matched.is_none() {
+                tracing::warn!(
+                    identity_id_override = %id,
+                    "Outlook send: identity_id_override does not match any \
+                     identity; sending without display name to avoid \
+                     mislabeling From"
+                );
+            }
+            matched
+        }
+        None => identities
+            .iter()
+            .find(|i| i.email.eq_ignore_ascii_case(from_addr)),
+    };
+    chosen.map(|i| i.name.clone()).filter(|n| !n.is_empty())
+}
+
 /// Build a Graph `Message` resource with an optional `from` field.
 /// Used for shared-mailbox / send-as scenarios where the caller wants to
 /// pick the From address (roborev 181 #5). For personal mailboxes pass
@@ -1569,10 +1616,11 @@ pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
 /// Attachments inline as `fileAttachment` entries with base64-encoded
 /// `contentBytes` (Graph has no standalone blob store — bytes must be
 /// in the message body itself).
-pub(crate) fn build_graph_message_with_from(
+pub(crate) fn build_graph_message_with_from_identity(
     sub: &EmailSubmission,
     resolved_attachments: &[(String, String, Vec<u8>)],
     from_addr: Option<&str>,
+    from_name: Option<&str>,
 ) -> serde_json::Value {
     fn recipients(addrs: &[String]) -> serde_json::Value {
         let arr: Vec<serde_json::Value> = addrs
@@ -1605,11 +1653,19 @@ pub(crate) fn build_graph_message_with_from(
         msg["bccRecipients"] = recipients(bcc);
     }
     // Roborev 181 #5: send-as / shared-mailbox support. Only set if the
-    // caller explicitly asked for a non-default sender.
+    // caller explicitly asked for a non-default sender. Milestone D.1:
+    // also thread the picker-resolved display name onto
+    // `from.emailAddress.name` when present.
     if let Some(addr) = from_addr
         && !addr.is_empty()
     {
-        msg["from"] = serde_json::json!({ "emailAddress": { "address": addr } });
+        let mut email_addr = serde_json::json!({ "address": addr });
+        if let Some(name) = from_name
+            && !name.is_empty()
+        {
+            email_addr["name"] = serde_json::Value::String(name.to_string());
+        }
+        msg["from"] = serde_json::json!({ "emailAddress": email_addr });
     }
 
     if !resolved_attachments.is_empty() {
@@ -1817,6 +1873,7 @@ pub async fn send_email(
     session: &OutlookSession,
     sub: &EmailSubmission,
     from_addr: Option<&str>,
+    identity_id_override: Option<&str>,
 ) -> Result<Option<String>, Error> {
     // Resolve attachments BEFORE deciding the send path — even the
     // ReplyOneShot branch validates the upload cache state (resolves to
@@ -1835,8 +1892,20 @@ pub async fn send_email(
             )
         })
     };
+    // Milestone D.1: resolve display name once. Only NewMail accepts a
+    // `from` field on the Graph Message — the reply paths inherit
+    // recipients (and From) from the parent message Graph-side, so the
+    // picker output is irrelevant there.
+    let from_name = if matches!(path, SendPath::NewMail) && from_addr.is_some() {
+        let identities = get_identities(session).await.unwrap_or_default();
+        pick_outlook_display_name(&identities, from_addr.unwrap_or(""), identity_id_override)
+    } else {
+        None
+    };
     let new_id = match path {
-        SendPath::NewMail => send_new_mail(session, sub, &resolved, from_addr).await?,
+        SendPath::NewMail => {
+            send_new_mail(session, sub, &resolved, from_addr, from_name.as_deref()).await?
+        }
         SendPath::ReplyOneShot => send_reply_one_shot(session, sub, parent()?).await?,
         SendPath::ReplyWithAttachments => {
             send_reply_with_attachments(session, sub, parent()?, &resolved).await?
@@ -1857,9 +1926,10 @@ async fn send_new_mail(
     sub: &EmailSubmission,
     resolved: &[(String, String, Vec<u8>)],
     from_addr: Option<&str>,
+    from_name: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
-    let message = build_graph_message_with_from(sub, resolved, from_addr);
+    let message = build_graph_message_with_from_identity(sub, resolved, from_addr, from_name);
     // saveToSentItems defaults to true on the Graph side but spec it
     // explicitly so the wire shape doesn't depend on tenant defaults.
     let body = serde_json::json!({
@@ -3906,7 +3976,7 @@ mod tests {
     #[test]
     fn graph_message_text_only_has_required_fields() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         assert_eq!(msg["subject"], "S");
         assert_eq!(msg["body"]["contentType"], "text");
         assert_eq!(msg["body"]["content"], "B");
@@ -3919,7 +3989,7 @@ mod tests {
     fn graph_message_html_body_uses_html_contenttype() {
         let mut sub = empty_sub();
         sub.html_body = Some("<p>hi</p>".into());
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         // HTML body wins when present (matches the body the user composed).
         assert_eq!(msg["body"]["contentType"], "html");
         assert_eq!(msg["body"]["content"], "<p>hi</p>");
@@ -3929,7 +3999,7 @@ mod tests {
     fn graph_message_includes_cc_recipients() {
         let mut sub = empty_sub();
         sub.cc = vec!["bob@example.com".into()];
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         let cc_arr = msg["ccRecipients"].as_array().unwrap();
         assert_eq!(cc_arr.len(), 1);
         assert_eq!(cc_arr[0]["emailAddress"]["address"], "bob@example.com");
@@ -3939,7 +4009,7 @@ mod tests {
     fn graph_message_includes_bcc_recipients_when_set() {
         let mut sub = empty_sub();
         sub.bcc = Some(vec!["carol@example.com".into()]);
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         let bcc_arr = msg["bccRecipients"].as_array().unwrap();
         assert_eq!(bcc_arr.len(), 1);
         assert_eq!(bcc_arr[0]["emailAddress"]["address"], "carol@example.com");
@@ -3948,7 +4018,7 @@ mod tests {
     #[test]
     fn graph_message_omits_bcc_when_none() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         // Graph treats absence and `[]` differently for bcc — absent is
         // cleaner. Don't add an empty bccRecipients key.
         assert!(msg.get("bccRecipients").is_none());
@@ -3965,7 +4035,7 @@ mod tests {
             "application/pdf".to_string(),
             b"%PDF-fake".to_vec(),
         )];
-        let msg = build_graph_message_with_from(&sub, &resolved, None);
+        let msg = build_graph_message_with_from_identity(&sub, &resolved, None, None);
         let atts = msg["attachments"].as_array().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["@odata.type"], "#microsoft.graph.fileAttachment");
@@ -3980,7 +4050,7 @@ mod tests {
     #[test]
     fn graph_message_omits_attachments_when_resolved_empty() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         assert!(msg.get("attachments").is_none());
     }
 
@@ -3988,7 +4058,7 @@ mod tests {
     fn graph_message_multiple_to_recipients() {
         let mut sub = empty_sub();
         sub.to = vec!["a@x.com".into(), "b@y.com".into(), "c@z.com".into()];
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         let to_arr = msg["toRecipients"].as_array().unwrap();
         assert_eq!(to_arr.len(), 3);
     }
@@ -4074,14 +4144,14 @@ mod tests {
     #[test]
     fn graph_message_includes_from_when_provided() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], Some("shared@org.com"));
+        let msg = build_graph_message_with_from_identity(&sub, &[], Some("shared@org.com"), None);
         assert_eq!(msg["from"]["emailAddress"]["address"], "shared@org.com");
     }
 
     #[test]
     fn graph_message_omits_from_when_none() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], None);
+        let msg = build_graph_message_with_from_identity(&sub, &[], None, None);
         assert!(
             msg.get("from").is_none(),
             "no 'from' field when caller didn't provide one — Graph picks default"
@@ -4091,8 +4161,125 @@ mod tests {
     #[test]
     fn graph_message_omits_from_when_empty_string() {
         let sub = empty_sub();
-        let msg = build_graph_message_with_from(&sub, &[], Some(""));
+        let msg = build_graph_message_with_from_identity(&sub, &[], Some(""), None);
         assert!(msg.get("from").is_none());
+    }
+
+    // ---- Milestone D.1: from.emailAddress.name on Graph message ----
+    //
+    // The picker resolves a display name; the builder must thread it
+    // onto Graph's typed Message resource as
+    // `from.emailAddress.name`. Without this, the picker's output is
+    // discarded and the recipient sees a name-less From line for
+    // shared-mailbox sends.
+
+    #[test]
+    fn graph_message_includes_from_name_when_provided() {
+        let sub = empty_sub();
+        let msg = build_graph_message_with_from_identity(
+            &sub,
+            &[],
+            Some("shared@org.com"),
+            Some("Shared Inbox"),
+        );
+        assert_eq!(msg["from"]["emailAddress"]["address"], "shared@org.com");
+        assert_eq!(msg["from"]["emailAddress"]["name"], "Shared Inbox");
+    }
+
+    #[test]
+    fn graph_message_omits_from_name_when_none() {
+        let sub = empty_sub();
+        let msg = build_graph_message_with_from_identity(&sub, &[], Some("shared@org.com"), None);
+        assert_eq!(msg["from"]["emailAddress"]["address"], "shared@org.com");
+        // No "name" key when caller didn't resolve one — Graph picks
+        // the default rendering rather than rendering an empty name.
+        assert!(
+            msg["from"]["emailAddress"].get("name").is_none(),
+            "no 'name' on from when picker returned None: {msg}"
+        );
+    }
+
+    // ---- Milestone D.1: pick_outlook_display_name ----
+    //
+    // Pure picker that mirrors Gmail's pick_identity_display_name discipline:
+    // when identity_id_override is supplied but does not match, refuse to
+    // fall back to a different identity (don't mislabel From). Outlook's
+    // identity list is single-element today (just /me), but the helper
+    // takes a slice so the contract survives if alias enumeration lands.
+
+    fn id(id_: &str, email: &str, name: &str) -> crate::types::Identity {
+        crate::types::Identity {
+            id: id_.into(),
+            email: email.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn picker_returns_none_for_empty_identities() {
+        assert_eq!(pick_outlook_display_name(&[], "u@example.com", None), None);
+    }
+
+    #[test]
+    fn picker_uses_identity_name_when_from_addr_matches() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "u@example.com", None),
+            Some("Ursula Example".into())
+        );
+    }
+
+    #[test]
+    fn picker_returns_none_when_from_addr_does_not_match_and_no_override() {
+        // Stricter than Gmail: Outlook has exactly one identity (the
+        // user's primary) so a non-matching from_addr means the user
+        // is trying to send-as something they don't own — attaching the
+        // primary identity's name would be mislabeling, not a best
+        // effort. Refuse the fallback.
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "other@example.com", None),
+            None
+        );
+    }
+
+    #[test]
+    fn picker_returns_none_when_identity_has_empty_name() {
+        let ids = vec![id("id-1", "u@example.com", "")];
+        assert_eq!(pick_outlook_display_name(&ids, "u@example.com", None), None);
+    }
+
+    #[test]
+    fn picker_returns_name_when_override_matches_identity_id() {
+        let ids = vec![
+            id("id-1", "u@example.com", "Ursula Example"),
+            id("id-2", "alias@example.com", "Ursula Alias"),
+        ];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "alias@example.com", Some("id-2")),
+            Some("Ursula Alias".into())
+        );
+    }
+
+    #[test]
+    fn picker_returns_none_when_override_id_unknown() {
+        // Key discipline test: override supplied but invalid → return None
+        // and do NOT fall back to another identity (Gmail line 1744 parity).
+        // Caller emits a tracing::warn so the operator notices.
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "u@example.com", Some("does-not-exist")),
+            None
+        );
+    }
+
+    #[test]
+    fn picker_match_is_case_insensitive_on_from_addr() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "U@EXAMPLE.COM", None),
+            Some("Ursula Example".into())
+        );
     }
 
     // ---- Roborev 181 #3: format_send_failure_with_cleanup ----
