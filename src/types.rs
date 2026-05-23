@@ -364,12 +364,52 @@ pub struct AccountError {
 // App state
 // =============================================================================
 
-pub struct AppState {
-    pub sessions:
-        std::collections::HashMap<String, tokio::sync::RwLock<crate::provider::ProviderSession>>,
-    pub account_errors: Vec<AccountError>,
+/// Per-session lock; wrapped in `Arc` so handlers can clone it out of the
+/// registry under the outer read lock and then do JMAP/Graph I/O without
+/// holding any global lock.
+pub type SessionLock = std::sync::Arc<tokio::sync::RwLock<crate::provider::ProviderSession>>;
+
+/// In-memory mirror of the configured accounts, mutable at runtime so the
+/// UI can add/remove/set-default without restarting the server.
+///
+/// `account_configs` caches the parsed disk config so route handlers never
+/// re-read the file under the write lock (Carmack: "set_default does disk
+/// I/O while holding the registry write lock"). All mutations update both
+/// `account_configs` and `sessions` under the lock; the snapshot is then
+/// written to disk *after* the lock is released.
+pub struct AccountRegistry {
+    pub sessions: std::collections::HashMap<String, SessionLock>,
+    pub account_configs: std::collections::BTreeMap<String, crate::accounts::AccountConfig>,
     pub default_account: String,
+}
+
+impl AccountRegistry {
+    /// Snapshot the registry's account configs into a `ConfigFile` suitable
+    /// for `atomic_write_config`. Cheap — clones the BTreeMap entries.
+    pub fn snapshot(&self) -> crate::accounts::ConfigFile {
+        crate::accounts::ConfigFile {
+            default_account: if self.default_account.is_empty() {
+                None
+            } else {
+                Some(self.default_account.clone())
+            },
+            accounts: self.account_configs.clone(),
+        }
+    }
+}
+
+pub struct AppState {
+    /// Outer write lock is held only across `HashMap::insert`/`remove`/
+    /// `default_account` swaps — microseconds. Sessions are built outside
+    /// this lock; see `accounts::router` handlers for the pattern.
+    pub accounts: tokio::sync::RwLock<AccountRegistry>,
+    pub account_errors: tokio::sync::RwLock<Vec<AccountError>>,
     pub splits_config_path: PathBuf,
+    pub timezone_config_path: PathBuf,
+    pub config_path: PathBuf,
+    pub tokens_dir: PathBuf,
+    pub token_store: std::sync::Arc<dyn crate::platform::TokenStore>,
+    pub authorizing: crate::accounts::AuthorizingSlot,
 }
 
 // =============================================================================

@@ -19,6 +19,17 @@
             </div>
         </div>
 
+        <!-- Timezone-change banner (system TZ differs from last-known) -->
+        <div id="tz-change-banner" class="hidden">
+            <div class="tz-banner-content">
+                <span class="tz-banner-icon">&#x1F30D;</span>
+                <span id="tz-change-text">System timezone changed.</span>
+                <button id="tz-accept-system" type="button">Update to system</button>
+                <button id="tz-keep-current" type="button">Keep current</button>
+                <button id="tz-recheck" type="button">Recheck</button>
+            </div>
+        </div>
+
         <!-- Status bar -->
         <div id="statusbar">
             <span id="mode-indicator">NORMAL</span>
@@ -79,6 +90,118 @@
                 <div id="email-body"></div>
             </div>
 
+            <!-- Settings view: account management -->
+            <div id="settings-view" class="view">
+                <div class="settings-header">
+                    <span class="settings-title">ACCOUNTS</span>
+                    <span class="settings-hint">:settings &mdash; <kbd>a</kbd> add &middot; <kbd>d</kbd> delete &middot; <kbd>D</kbd> default &middot; <kbd>Esc</kbd> back</span>
+                </div>
+                <div class="settings-body">
+                    <div class="account-pane">
+                        <div id="account-pane-list"></div>
+                        <div class="account-row add-row" data-action="add">
+                            <span class="account-row-key">a</span>
+                            <span class="account-row-email">+ Add account</span>
+                        </div>
+                    </div>
+                    <div class="account-detail">
+                        <div id="account-empty" class="account-empty"></div>
+                        <form id="account-form" class="account-form hidden" autocomplete="off">
+                            <div class="modal-field">
+                                <label>Provider:</label>
+                                <select id="acct-provider">
+                                    <option value="fastmail">Fastmail (JMAP)</option>
+                                    <option value="outlook">Outlook (OAuth)</option>
+                                    <option value="gmail">Gmail (OAuth)</option>
+                                </select>
+                            </div>
+                            <div class="modal-field">
+                                <label>Name:</label>
+                                <input type="text" id="acct-name" autocomplete="off" placeholder="work, personal, ...">
+                            </div>
+                            <div class="modal-field" data-provider="fastmail">
+                                <label>Username:</label>
+                                <input type="email" id="acct-username" autocomplete="off" placeholder="you@fastmail.com">
+                            </div>
+                            <div class="modal-field" data-provider="outlook,gmail">
+                                <label>Email:</label>
+                                <input type="email" id="acct-email" readonly placeholder="(populated after authorize)">
+                            </div>
+                            <div class="modal-field" data-provider="fastmail">
+                                <label>API Token:</label>
+                                <div class="secret-input">
+                                    <input type="password" id="acct-api-token" autocomplete="new-password" placeholder="fmu1-...">
+                                    <button type="button" class="reveal-btn" data-target="acct-api-token">reveal</button>
+                                </div>
+                            </div>
+                            <div class="modal-field" data-provider="outlook,gmail">
+                                <label>Client ID:</label>
+                                <input type="text" id="acct-client-id" autocomplete="off">
+                            </div>
+                            <div class="modal-field" data-provider="gmail">
+                                <label>Client Secret:</label>
+                                <div class="secret-input">
+                                    <input type="password" id="acct-client-secret" autocomplete="new-password">
+                                    <button type="button" class="reveal-btn" data-target="acct-client-secret">reveal</button>
+                                </div>
+                            </div>
+                            <div class="modal-field" data-provider="outlook,gmail">
+                                <label>Status:</label>
+                                <span id="acct-auth-pill" class="auth-status-pill idle">IDLE</span>
+                                <button type="button" id="acct-authorize-btn">Authorize</button>
+                            </div>
+                            <div class="modal-field" data-when-editing>
+                                <label>Default:</label>
+                                <span id="acct-default-marker">no</span>
+                                <button type="button" id="acct-set-default">Set as default (D)</button>
+                            </div>
+                            <div class="modal-hint">Tab between fields &middot; Ctrl+Enter to save &middot; Esc to cancel</div>
+                            <div class="modal-buttons account-actions">
+                                <button type="submit" id="acct-save">Save (Ctrl+Enter)</button>
+                                <button type="button" id="acct-delete" class="danger" data-when-editing>Delete (d)</button>
+                            </div>
+                            <div id="acct-confirm-delete" class="confirm-delete hidden">
+                                Delete this account and its cached tokens?
+                                <button type="button" data-confirm="yes">yes</button>
+                                <button type="button" data-confirm="no">no</button>
+                            </div>
+                            <div id="acct-form-error" class="form-error hidden"></div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Timezone settings -->
+                <div id="timezone-settings" class="timezone-settings">
+                    <div class="settings-section-header">TIMEZONES</div>
+                    <div class="tz-row">
+                        <label>
+                            <input type="radio" name="tz-mode" id="tz-mode-system" value="system" checked>
+                            Use system timezone (<span id="tz-detected">detecting&hellip;</span>)
+                        </label>
+                    </div>
+                    <div class="tz-row">
+                        <label>
+                            <input type="radio" name="tz-mode" id="tz-mode-manual" value="manual">
+                            Set primary manually
+                        </label>
+                        <input type="text" id="tz-manual-primary" list="tz-iana-list"
+                               placeholder="e.g. America/Los_Angeles" disabled>
+                    </div>
+                    <div class="tz-row">
+                        <label>Additional timezones (shown on every event):</label>
+                        <div id="tz-additional-chips" class="tz-chips"></div>
+                        <input type="text" id="tz-additional-input" list="tz-iana-list"
+                               placeholder="add a timezone&hellip;">
+                        <button type="button" id="tz-additional-add">Add</button>
+                    </div>
+                    <div class="tz-row">
+                        <button type="button" id="tz-save">Save</button>
+                        <span id="tz-save-status" class="tz-save-status hidden"></span>
+                    </div>
+                    <datalist id="tz-iana-list"></datalist>
+                </div>
+            </div>
+
             <!-- Compose view -->
             <div id="compose-view" class="view">
                 <div class="compose-field">
@@ -105,6 +228,34 @@
                 </div>
                 <input type="file" id="compose-file-input" multiple style="display:none">
                 <div id="compose-quote" class="compose-quote hidden"></div>
+                <div class="compose-invite-toggle">
+                    <label>
+                        <input type="checkbox" id="compose-invite-enabled">
+                        Attach calendar invite
+                    </label>
+                </div>
+                <div id="compose-invite-fields" class="compose-invite-fields hidden">
+                    <div class="compose-field">
+                        <label>Event title:</label>
+                        <input type="text" id="invite-summary" autocomplete="off">
+                    </div>
+                    <div class="compose-field">
+                        <label>Location:</label>
+                        <input type="text" id="invite-location" autocomplete="off" placeholder="optional">
+                    </div>
+                    <div class="compose-field">
+                        <label>Start:</label>
+                        <input type="datetime-local" id="invite-start">
+                    </div>
+                    <div class="compose-field">
+                        <label>End:</label>
+                        <input type="datetime-local" id="invite-end">
+                    </div>
+                    <div class="compose-field">
+                        <label>Timezone:</label>
+                        <input type="text" id="invite-tz" list="tz-iana-list" autocomplete="off">
+                    </div>
+                </div>
                 <div class="compose-hint">Cmd/Ctrl+Enter to send | Escape to cancel | a to attach</div>
             </div>
         </div>
@@ -156,8 +307,16 @@
                     <div class="shortcut"><kbd>Ctrl+k</kbd> Command palette</div>
                     <div class="shortcut"><kbd>Ctrl+1-9</kbd> Jump to split tab</div>
                     <div class="shortcut"><kbd>1-9</kbd> Switch account</div>
+                    <div class="shortcut"><kbd>g s</kbd> Open account settings</div>
                     <div class="shortcut"><kbd>?</kbd> This help</div>
                     <div class="shortcut"><kbd>R</kbd> Refresh</div>
+                </div>
+                <div class="help-section">
+                    <h3>Settings (account management)</h3>
+                    <div class="shortcut"><kbd>a</kbd> Add account</div>
+                    <div class="shortcut"><kbd>d</kbd> Delete (then confirm)</div>
+                    <div class="shortcut"><kbd>Shift+D</kbd> Set default</div>
+                    <div class="shortcut"><kbd>Ctrl+Enter</kbd> Save</div>
                 </div>
                 <div class="help-close">Press any key to close</div>
             </div>

@@ -2,8 +2,8 @@
 // Direct, readable code. No framework, no build step.
 
 const state = {
-    mode: 'normal',           // normal, insert, command, search
-    view: 'list',             // list, detail, compose
+    mode: 'normal',           // normal, insert, command, search, awaiting
+    view: 'list',             // list, detail, compose, settings
     accounts: [],
     currentAccount: null,
     mailboxes: [],
@@ -23,7 +23,17 @@ const state = {
     pendingAttachments: [],   // files being uploaded for compose
     splitCounts: {},          // email counts per split tab
     starredOnly: false,       // sidebar "Starred" filter — restricts list to $flagged emails
+    // Settings view (account management)
+    selectedAccountId: null,  // which account is focused in settings
+    settingsMode: 'view',     // 'view' | 'edit' | 'awaiting'
+    authController: null,     // AbortController for the in-flight authorize fetch
+    timezone: null,           // { primary, display, system, system_changed, use_system, ... }
+    tzZones: [],              // cached list of IANA names from /api/timezone/zones
 };
+
+// Only these top-level path prefixes (after /api) get the ?account= query
+// param auto-appended. Settings routes are GLOBAL and must not be tagged.
+const ACCOUNT_SCOPED_API = /^\/(emails|mailboxes|identities|splits|upload|split-counts|calendar)/;
 
 // Simple cache: email id -> full email object with body
 const emailCache = {};
@@ -116,6 +126,50 @@ function init() {
     els.starredItem = document.getElementById('starred-item');
     els.accountErrorBanner = document.getElementById('account-error-banner');
     els.accountErrorDetails = document.getElementById('account-error-details');
+    // Timezone banner + settings
+    els.tzChangeBanner = document.getElementById('tz-change-banner');
+    els.tzChangeText = document.getElementById('tz-change-text');
+    els.tzAcceptSystem = document.getElementById('tz-accept-system');
+    els.tzKeepCurrent = document.getElementById('tz-keep-current');
+    els.tzRecheck = document.getElementById('tz-recheck');
+    els.tzDetected = document.getElementById('tz-detected');
+    els.tzModeSystem = document.getElementById('tz-mode-system');
+    els.tzModeManual = document.getElementById('tz-mode-manual');
+    els.tzManualPrimary = document.getElementById('tz-manual-primary');
+    els.tzAdditionalChips = document.getElementById('tz-additional-chips');
+    els.tzAdditionalInput = document.getElementById('tz-additional-input');
+    els.tzAdditionalAdd = document.getElementById('tz-additional-add');
+    els.tzSave = document.getElementById('tz-save');
+    els.tzSaveStatus = document.getElementById('tz-save-status');
+    els.tzIanaList = document.getElementById('tz-iana-list');
+    // Compose-invite
+    els.composeInviteEnabled = document.getElementById('compose-invite-enabled');
+    els.composeInviteFields = document.getElementById('compose-invite-fields');
+    els.inviteSummary = document.getElementById('invite-summary');
+    els.inviteLocation = document.getElementById('invite-location');
+    els.inviteStart = document.getElementById('invite-start');
+    els.inviteEnd = document.getElementById('invite-end');
+    els.inviteTz = document.getElementById('invite-tz');
+    // Settings view
+    els.settingsView = document.getElementById('settings-view');
+    els.accountPaneList = document.getElementById('account-pane-list');
+    els.accountEmpty = document.getElementById('account-empty');
+    els.accountForm = document.getElementById('account-form');
+    els.acctProvider = document.getElementById('acct-provider');
+    els.acctName = document.getElementById('acct-name');
+    els.acctUsername = document.getElementById('acct-username');
+    els.acctEmail = document.getElementById('acct-email');
+    els.acctApiToken = document.getElementById('acct-api-token');
+    els.acctClientId = document.getElementById('acct-client-id');
+    els.acctClientSecret = document.getElementById('acct-client-secret');
+    els.acctAuthPill = document.getElementById('acct-auth-pill');
+    els.acctAuthorizeBtn = document.getElementById('acct-authorize-btn');
+    els.acctDefaultMarker = document.getElementById('acct-default-marker');
+    els.acctSetDefault = document.getElementById('acct-set-default');
+    els.acctSave = document.getElementById('acct-save');
+    els.acctDelete = document.getElementById('acct-delete');
+    els.acctConfirmDelete = document.getElementById('acct-confirm-delete');
+    els.acctFormError = document.getElementById('acct-form-error');
     // Event listeners
     if (els.starredItem) {
         els.starredItem.addEventListener('click', toggleStarredOnly);
@@ -185,13 +239,74 @@ function init() {
         els.composeBody.style.height = els.composeBody.scrollHeight + 'px';
     }
 
+    // Settings event listeners
+    els.acctProvider.addEventListener('change', updateProviderFields);
+    els.accountForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        saveAccount();
+    });
+    els.acctAuthorizeBtn.addEventListener('click', () => {
+        if (state.selectedAccountId) authorize(state.selectedAccountId);
+    });
+    els.acctSetDefault.addEventListener('click', () => {
+        if (state.selectedAccountId) setDefaultAccount(state.selectedAccountId);
+    });
+    els.acctDelete.addEventListener('click', toggleConfirmDelete);
+    els.acctConfirmDelete.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-confirm]');
+        if (!btn) return;
+        if (btn.dataset.confirm === 'yes') actuallyDeleteAccount();
+        else els.acctConfirmDelete.classList.add('hidden');
+    });
+    els.accountForm.addEventListener('click', (e) => {
+        const btn = e.target.closest('.reveal-btn');
+        if (!btn) return;
+        const target = document.getElementById(btn.dataset.target);
+        if (!target) return;
+        const showing = target.type === 'text';
+        target.type = showing ? 'password' : 'text';
+        btn.classList.toggle('active', !showing);
+        btn.textContent = showing ? 'reveal' : 'hide';
+    });
+    els.accountPaneList.addEventListener('click', (e) => {
+        const row = e.target.closest('.account-row[data-id]');
+        if (!row) return;
+        state.selectedAccountId = row.dataset.id;
+        state.settingsMode = 'edit';
+        renderSettings();
+    });
+    document.querySelector('#settings-view .add-row').addEventListener('click', () => {
+        beginAddAccount();
+    });
     // Reload theme on window focus (pick up theme changes after alt-tabbing back)
     window.addEventListener('focus', loadTheme);
+
+    // Timezone listeners
+    els.tzAcceptSystem.addEventListener('click', acceptSystemTimezone);
+    els.tzKeepCurrent.addEventListener('click', dismissTimezoneChange);
+    els.tzRecheck.addEventListener('click', loadTimezone);
+    els.tzModeSystem.addEventListener('change', renderTimezoneSettings);
+    els.tzModeManual.addEventListener('change', renderTimezoneSettings);
+    els.tzAdditionalAdd.addEventListener('click', addAdditionalTz);
+    els.tzAdditionalInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); addAdditionalTz(); }
+    });
+    els.tzSave.addEventListener('click', saveTimezoneSettings);
+
+    // Compose-invite toggle
+    els.composeInviteEnabled.addEventListener('change', () => {
+        els.composeInviteFields.classList.toggle('hidden', !els.composeInviteEnabled.checked);
+        if (els.composeInviteEnabled.checked && !els.inviteTz.value && state.timezone) {
+            els.inviteTz.value = state.timezone.primary;
+        }
+    });
 
     // Load data
     loadTheme();
     loadAccounts();
     loadSplits();
+    loadTimezone();
+    loadTzZones();
 }
 
 // Theme
@@ -220,6 +335,171 @@ async function loadTheme() {
 // Live-update when macOS appearance changes
 window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', loadTheme);
 
+// Timezone
+
+async function loadTimezone() {
+    try {
+        const tz = await fetch('/api/timezone').then(r => r.json());
+        state.timezone = tz;
+        renderTzBanner();
+        renderTimezoneSettings();
+        // Refresh the calendar card if currently visible.
+        if (state.currentEmail?.calendarEvent) {
+            renderCalendarCard(state.currentEmail.calendarEvent);
+        }
+    } catch (err) {
+        console.warn('Failed to load timezone settings:', err);
+    }
+}
+
+async function loadTzZones() {
+    try {
+        const zones = await fetch('/api/timezone/zones').then(r => r.json());
+        state.tzZones = zones;
+        els.tzIanaList.innerHTML = zones
+            .map(z => `<option value="${escapeHtml(z)}">`).join('');
+    } catch (err) {
+        console.warn('Failed to load tz zone list:', err);
+    }
+}
+
+function renderTzBanner() {
+    if (!state.timezone) return;
+    if (state.timezone.system_changed) {
+        els.tzChangeText.textContent =
+            `System timezone changed to ${state.timezone.system}. Current primary: ${state.timezone.primary}.`;
+        els.tzChangeBanner.classList.remove('hidden');
+    } else {
+        els.tzChangeBanner.classList.add('hidden');
+    }
+}
+
+function renderTimezoneSettings() {
+    if (!state.timezone || !els.tzDetected) return;
+    els.tzDetected.textContent = state.timezone.system;
+
+    // Mode radios: respect the manual radio if the user just clicked it
+    // (the user may be configuring before saving), otherwise reflect persisted state.
+    const userPicking = document.activeElement === els.tzModeManual ||
+                        document.activeElement === els.tzModeSystem;
+    if (!userPicking) {
+        els.tzModeSystem.checked = state.timezone.use_system;
+        els.tzModeManual.checked = !state.timezone.use_system;
+    }
+    const manual = els.tzModeManual.checked;
+    els.tzManualPrimary.disabled = !manual;
+    if (!els.tzManualPrimary.value && !state.timezone.use_system) {
+        els.tzManualPrimary.value = state.timezone.primary;
+    }
+
+    // Additional TZ chips: derived from state.timezone.display minus primary
+    const additional = (state.timezone.display || [])
+        .filter(tz => tz !== state.timezone.primary);
+    els.tzAdditionalChips.innerHTML = additional.map(tz => `
+        <span class="tz-chip" data-tz="${escapeHtml(tz)}">
+            ${escapeHtml(tz)}
+            <button type="button" class="tz-chip-remove" data-tz="${escapeHtml(tz)}">&times;</button>
+        </span>
+    `).join('');
+    els.tzAdditionalChips.querySelectorAll('.tz-chip-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tz = btn.dataset.tz;
+            removeAdditionalTzFromState(tz);
+        });
+    });
+}
+
+function getAdditionalTzList() {
+    return Array.from(els.tzAdditionalChips.querySelectorAll('.tz-chip'))
+        .map(el => el.dataset.tz);
+}
+
+function addAdditionalTz() {
+    const tz = els.tzAdditionalInput.value.trim();
+    if (!tz) return;
+    if (state.tzZones.length && !state.tzZones.includes(tz)) {
+        els.tzSaveStatus.textContent = `Unknown timezone: ${tz}`;
+        els.tzSaveStatus.className = 'tz-save-status error';
+        els.tzSaveStatus.classList.remove('hidden');
+        return;
+    }
+    if (getAdditionalTzList().includes(tz)) {
+        els.tzAdditionalInput.value = '';
+        return;
+    }
+    const chip = document.createElement('span');
+    chip.className = 'tz-chip';
+    chip.dataset.tz = tz;
+    chip.innerHTML = `${escapeHtml(tz)}
+        <button type="button" class="tz-chip-remove" data-tz="${escapeHtml(tz)}">&times;</button>`;
+    chip.querySelector('.tz-chip-remove').addEventListener('click', () => chip.remove());
+    els.tzAdditionalChips.appendChild(chip);
+    els.tzAdditionalInput.value = '';
+    els.tzSaveStatus.classList.add('hidden');
+}
+
+function removeAdditionalTzFromState(tz) {
+    const chip = els.tzAdditionalChips.querySelector(`.tz-chip[data-tz="${CSS.escape(tz)}"]`);
+    if (chip) chip.remove();
+}
+
+async function saveTimezoneSettings() {
+    const body = {
+        use_system: els.tzModeSystem.checked,
+        manual_primary: els.tzManualPrimary.value.trim() || null,
+        additional: getAdditionalTzList(),
+    };
+    try {
+        const resp = await fetch('/api/timezone', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        state.timezone = await resp.json();
+        els.tzSaveStatus.textContent = 'Saved.';
+        els.tzSaveStatus.className = 'tz-save-status ok';
+        els.tzSaveStatus.classList.remove('hidden');
+        setTimeout(() => els.tzSaveStatus.classList.add('hidden'), 2000);
+        renderTzBanner();
+        renderTimezoneSettings();
+        // Re-render the visible calendar card so the new display TZs take effect.
+        if (state.currentEmail?.calendarEvent) {
+            renderCalendarCard(state.currentEmail.calendarEvent);
+        }
+    } catch (err) {
+        els.tzSaveStatus.textContent = `Save failed: ${err.message}`;
+        els.tzSaveStatus.className = 'tz-save-status error';
+        els.tzSaveStatus.classList.remove('hidden');
+    }
+}
+
+async function acceptSystemTimezone() {
+    try {
+        const resp = await fetch('/api/timezone/accept-system', { method: 'POST' });
+        if (!resp.ok) throw new Error(await resp.text());
+        state.timezone = await resp.json();
+        renderTzBanner();
+        renderTimezoneSettings();
+        if (state.currentEmail?.calendarEvent) {
+            renderCalendarCard(state.currentEmail.calendarEvent);
+        }
+    } catch (err) {
+        showStatus('Failed to update timezone: ' + err.message, 'error');
+    }
+}
+
+async function dismissTimezoneChange() {
+    try {
+        const resp = await fetch('/api/timezone/dismiss-change', { method: 'POST' });
+        if (!resp.ok) throw new Error(await resp.text());
+        state.timezone = await resp.json();
+        renderTzBanner();
+    } catch (err) {
+        showStatus('Failed to dismiss: ' + err.message, 'error');
+    }
+}
+
 // API calls
 
 async function api(method, path, body = null, signal = null) {
@@ -230,9 +510,10 @@ async function api(method, path, body = null, signal = null) {
     if (body) opts.body = JSON.stringify(body);
     if (signal) opts.signal = signal;
 
-    // Add account parameter if we have a current account
+    // Auto-append ?account= ONLY for account-scoped routes. Settings routes
+    // (`/accounts/...`, `/theme`) are global and must never be tagged.
     let url = '/api' + path;
-    if (state.currentAccount) {
+    if (state.currentAccount && ACCOUNT_SCOPED_API.test(path)) {
         const separator = url.includes('?') ? '&' : '?';
         url += `${separator}account=${state.currentAccount.id}`;
     }
@@ -242,7 +523,9 @@ async function api(method, path, body = null, signal = null) {
         const err = await resp.text();
         throw new Error(err);
     }
-    return resp.json();
+    if (resp.status === 204) return null;
+    const text = await resp.text();
+    return text ? JSON.parse(text) : null;
 }
 
 async function loadAccounts() {
@@ -251,15 +534,29 @@ async function loadAccounts() {
         state.accounts = data.accounts;
         renderAccounts();
 
-        if (data.errors && data.errors.length > 0) {
-            showAccountErrors(data.errors);
+        const nonSetupErrors = (data.errors || []).filter(e => e.provider !== 'setup');
+        if (nonSetupErrors.length > 0) {
+            showAccountErrors(nonSetupErrors);
+        } else {
+            els.accountErrorBanner.classList.add('hidden');
+        }
+
+        // First-run: no accounts at all → land directly in settings.
+        if (!state.accounts.length) {
+            state.currentAccount = null;
+            state.currentMailbox = null;
+            state.emails = [];
+            els.mailboxName.textContent = 'NO ACCOUNTS';
+            openSettings({ firstRun: true });
+            return;
         }
 
         const defaultAcc = state.accounts.find(a => a.isDefault) || state.accounts[0];
         if (defaultAcc) selectAccount(defaultAcc);
-        else if (data.errors && data.errors.length > 0) {
-            showStatus('No accounts connected', 'error');
-        }
+
+        // If we were already in settings (e.g. just completed first-run save),
+        // re-render to show the new account list rather than the firstRun pane.
+        if (state.view === 'settings') renderSettings();
     } catch (err) {
         showStatus('Failed to load accounts: ' + err.message, 'error');
     }
@@ -722,6 +1019,41 @@ async function sendEmail() {
         .filter(a => a.status === 'ready')
         .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
 
+    const includeInvite = els.composeInviteEnabled && els.composeInviteEnabled.checked;
+    if (includeInvite) {
+        const summary = els.inviteSummary.value.trim();
+        const start = els.inviteStart.value;
+        const end = els.inviteEnd.value;
+        if (!summary || !start || !end) {
+            showStatus('Invite needs title, start, and end', 'error');
+            return;
+        }
+        const tz = (els.inviteTz.value.trim() || state.timezone?.primary || '').trim();
+        const inviteAttendees = to.concat(cc).map(email => ({ email }));
+        try {
+            await api('POST', '/calendar/invite', {
+                to,
+                cc,
+                subject,
+                body: fullTextBody,
+                summary,
+                location: els.inviteLocation.value.trim() || null,
+                description: null,
+                start,
+                end,
+                tz: tz || null,
+                attendees: inviteAttendees,
+                from_address: fromAddress,
+            });
+            showStatus('Invite sent!', 'success');
+            clearCompose();
+            showView('list');
+        } catch (err) {
+            showStatus('Invite send failed: ' + err.message, 'error');
+        }
+        return;
+    }
+
     try {
         await api('POST', '/emails/send', {
             to,
@@ -927,6 +1259,7 @@ function showView(view) {
     els.emailListView.classList.toggle('active', view === 'list');
     els.emailDetailView.classList.toggle('active', view === 'detail');
     els.composeView.classList.toggle('active', view === 'compose');
+    els.settingsView.classList.toggle('active', view === 'settings');
 
     if (view === 'compose') {
         els.composeTo.focus();
@@ -949,8 +1282,241 @@ function selectMailbox(mailbox) {
 
 function setMode(mode) {
     state.mode = mode;
-    els.modeIndicator.textContent = mode.toUpperCase();
+    els.modeIndicator.textContent = mode === 'awaiting' ? '-- AWAITING AUTHORIZATION --' : mode.toUpperCase();
     els.modeIndicator.className = mode;
+}
+
+// ============================================================================
+// Settings view
+// ============================================================================
+
+function openSettings({ firstRun = false } = {}) {
+    if (firstRun) {
+        state.selectedAccountId = null;
+        state.settingsMode = 'view';
+    }
+    showView('settings');
+    renderSettings();
+}
+
+function closeSettings() {
+    if (state.authController) {
+        state.authController.abort();
+        state.authController = null;
+    }
+    els.acctConfirmDelete.classList.add('hidden');
+    els.acctFormError.classList.add('hidden');
+    state.settingsMode = 'view';
+    if (state.accounts.length === 0) return; // first-run: stay until they add one
+    showView('list');
+    setMode('normal');
+}
+
+function renderSettings() {
+    // Master list
+    els.accountPaneList.innerHTML = state.accounts.map((a, idx) => {
+        const isSel = a.id === state.selectedAccountId;
+        const star = a.isDefault ? '<span class="default-star">★</span>' : '';
+        return `
+            <div class="account-row ${isSel ? 'selected' : ''}" data-id="${escapeHtml(a.id)}">
+                <span class="account-row-key">${idx + 1}</span>
+                <span class="account-row-email">${star} ${escapeHtml(a.email || a.id)}</span>
+                <span class="account-row-provider">${escapeHtml(a.provider)}</span>
+            </div>`;
+    }).join('');
+
+    // Detail pane: empty/firstrun shell vs. edit form
+    if (state.settingsMode === 'view' && !state.selectedAccountId) {
+        els.accountForm.classList.add('hidden');
+        els.accountEmpty.classList.remove('hidden');
+        if (state.accounts.length === 0) {
+            els.accountEmpty.innerHTML = `
+                <h2>No accounts configured.</h2>
+                <p>Press <kbd>a</kbd> or click <em>+ Add account</em> to set up your first one.</p>
+                <p>Your config will be saved to <code>~/.config/supervillain/config</code>.</p>`;
+        } else {
+            els.accountEmpty.innerHTML = `
+                <p>Select an account on the left, or press <kbd>a</kbd> to add a new one.</p>`;
+        }
+        return;
+    }
+
+    // Edit form
+    els.accountEmpty.classList.add('hidden');
+    els.accountForm.classList.remove('hidden');
+    els.acctFormError.classList.add('hidden');
+
+    const existing = state.accounts.find(a => a.id === state.selectedAccountId);
+    const editingExisting = !!existing;
+
+    // Mode flags
+    els.accountForm.querySelectorAll('[data-when-editing]').forEach(el => {
+        el.style.display = editingExisting ? '' : 'none';
+    });
+
+    // Provider + name (immutable for existing accounts; type = re-add otherwise)
+    if (existing) {
+        els.acctProvider.value = existing.provider;
+        els.acctProvider.disabled = true;
+        els.acctName.value = existing.id;
+        els.acctName.disabled = true;
+    } else {
+        els.acctProvider.disabled = false;
+        els.acctName.disabled = false;
+    }
+
+    // Populate fields
+    if (existing) {
+        els.acctEmail.value = existing.email || '';
+        els.acctUsername.value = existing.email || '';
+        // Secrets are never echoed: blank = preserve existing.
+        els.acctApiToken.value = '';
+        els.acctApiToken.placeholder = 'unchanged (leave blank to keep)';
+        els.acctClientSecret.value = '';
+        els.acctClientSecret.placeholder = 'unchanged (leave blank to keep)';
+        // client-id is not a secret — backend returns it on the existing record.
+        els.acctClientId.value = existing.clientId || '';
+        els.acctClientId.placeholder = '';
+        els.acctDefaultMarker.textContent = existing.isDefault ? 'yes ★' : 'no';
+        const pending = existing.authStatus === 'pending';
+        els.acctAuthPill.className = 'auth-status-pill ' + (pending ? 'failed' : 'authorized');
+        els.acctAuthPill.textContent = pending ? 'NEEDS AUTH' : 'AUTHORIZED';
+    } else {
+        els.acctName.value = '';
+        els.acctUsername.value = '';
+        els.acctEmail.value = '';
+        els.acctApiToken.value = '';
+        els.acctApiToken.placeholder = 'fmu1-...';
+        els.acctClientId.value = '';
+        els.acctClientId.placeholder = '';
+        els.acctClientSecret.value = '';
+        els.acctClientSecret.placeholder = '';
+        els.acctDefaultMarker.textContent = 'no';
+        els.acctAuthPill.className = 'auth-status-pill idle';
+        els.acctAuthPill.textContent = 'IDLE';
+    }
+
+    updateProviderFields();
+}
+
+function updateProviderFields() {
+    const provider = els.acctProvider.value;
+    els.accountForm.querySelectorAll('[data-provider]').forEach(el => {
+        const providers = el.dataset.provider.split(',');
+        el.style.display = providers.includes(provider) ? '' : 'none';
+    });
+}
+
+function beginAddAccount() {
+    state.selectedAccountId = null;
+    state.settingsMode = 'edit';
+    renderSettings();
+    setMode('insert');
+    els.acctName.focus();
+}
+
+async function saveAccount() {
+    const provider = els.acctProvider.value;
+    let payload;
+    if (provider === 'fastmail') {
+        payload = {
+            provider: 'fastmail',
+            username: els.acctUsername.value.trim(),
+            'api-token': els.acctApiToken.value, // empty → server preserves on update
+        };
+    } else if (provider === 'outlook') {
+        payload = {
+            provider: 'outlook',
+            'client-id': els.acctClientId.value.trim(),
+        };
+    } else {
+        payload = {
+            provider: 'gmail',
+            'client-id': els.acctClientId.value.trim(),
+            'client-secret': els.acctClientSecret.value,
+        };
+    }
+    const id = (els.acctName.value || state.selectedAccountId || '').trim();
+    if (!id) {
+        showFormError('Name is required');
+        return;
+    }
+    try {
+        const resp = await api('POST', `/accounts/${encodeURIComponent(id)}`, payload);
+        showStatus(`Saved ${id}`, 'success');
+        state.selectedAccountId = id;
+        state.settingsMode = 'edit';
+        await loadAccounts();
+        setMode('normal');
+        // OAuth providers need a second step.
+        if (resp && resp.authStatus === 'pending') {
+            showStatus(`Click [Authorize] to complete ${id} setup`, 'info');
+        }
+    } catch (err) {
+        showFormError(err.message);
+    }
+}
+
+function showFormError(msg) {
+    els.acctFormError.textContent = msg;
+    els.acctFormError.classList.remove('hidden');
+}
+
+function toggleConfirmDelete() {
+    els.acctConfirmDelete.classList.toggle('hidden');
+}
+
+async function actuallyDeleteAccount() {
+    if (!state.selectedAccountId) return;
+    try {
+        await api('DELETE', `/accounts/${encodeURIComponent(state.selectedAccountId)}`);
+        showStatus(`Deleted ${state.selectedAccountId}`, 'success');
+        state.selectedAccountId = null;
+        state.settingsMode = 'view';
+        state.currentEmail = null;
+        state.emails = [];
+        await loadAccounts();
+    } catch (err) {
+        showFormError(err.message);
+    }
+}
+
+async function setDefaultAccount(id) {
+    try {
+        await api('PUT', `/accounts/${encodeURIComponent(id)}/default`);
+        showStatus(`Default → ${id}`, 'success');
+        await loadAccounts();
+    } catch (err) {
+        showFormError(err.message);
+    }
+}
+
+async function authorize(id) {
+    if (state.authController) state.authController.abort();
+    state.authController = new AbortController();
+    state.settingsMode = 'awaiting';
+    setMode('awaiting');
+    els.acctAuthPill.className = 'auth-status-pill awaiting';
+    els.acctAuthPill.textContent = 'AWAITING';
+    els.acctAuthorizeBtn.disabled = true;
+    try {
+        // Long-poll: server returns 200 when OAuth completes, 502 on failure.
+        // The existing acquire_oauth_callback's 5-minute timeout caps the wait.
+        await api('POST', `/accounts/${encodeURIComponent(id)}/authorize`,
+            null, state.authController.signal);
+        showStatus(`Authorized ${id}`, 'success');
+        await loadAccounts();
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        els.acctAuthPill.className = 'auth-status-pill failed';
+        els.acctAuthPill.textContent = 'FAILED';
+        showFormError(err.message);
+    } finally {
+        els.acctAuthorizeBtn.disabled = false;
+        state.authController = null;
+        state.settingsMode = 'edit';
+        setMode('normal');
+    }
 }
 
 function showStatus(message, type = 'info') {
@@ -997,6 +1563,27 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Settings: insert mode (editing a form field) — Ctrl+Enter saves,
+    // Escape blurs the field and returns to normal mode. Other keys fall
+    // through to the native input handling.
+    if (state.view === 'settings' && state.mode === 'insert') {
+        if (e.key === 'Escape') {
+            e.target.blur();
+            setMode('normal');
+            e.preventDefault();
+        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            saveAccount();
+            e.preventDefault();
+        }
+        return;
+    }
+
+    // Settings: normal mode — vim-style navigation + edit triggers
+    if (state.view === 'settings' && state.mode === 'normal') {
+        handleSettingsNormalKey(e);
+        return;
+    }
+
     // Handle compose mode
     if (state.view === 'compose' && state.mode === 'insert') {
         if (e.key === 'Escape') {
@@ -1040,14 +1627,70 @@ function handleKeyDown(e) {
     }
 }
 
+function handleSettingsNormalKey(e) {
+    const key = e.key;
+    if (key === 'Escape') {
+        if (!els.acctConfirmDelete.classList.contains('hidden')) {
+            els.acctConfirmDelete.classList.add('hidden');
+            return;
+        }
+        closeSettings();
+        return;
+    }
+    if (key === 'a') {
+        beginAddAccount();
+        e.preventDefault();
+        return;
+    }
+    if (state.selectedAccountId) {
+        if (key === 'd') {
+            toggleConfirmDelete();
+            return;
+        }
+        if (key === 'D') {
+            setDefaultAccount(state.selectedAccountId);
+            return;
+        }
+        if (key === 'Enter') {
+            // Enter edit mode by focusing the first editable field.
+            state.settingsMode = 'edit';
+            renderSettings();
+            // Pick the first editable visible field.
+            const first = els.accountForm.querySelector(
+                'input:not([readonly]):not([disabled])'
+            );
+            if (first) {
+                first.focus();
+                setMode('insert');
+            }
+            return;
+        }
+    }
+    if (key === 'j' || key === 'k') {
+        const dir = key === 'j' ? 1 : -1;
+        const ids = state.accounts.map(a => a.id);
+        if (!ids.length) return;
+        const cur = ids.indexOf(state.selectedAccountId);
+        const next = Math.max(0, Math.min(ids.length - 1, (cur < 0 ? 0 : cur) + dir));
+        state.selectedAccountId = ids[next];
+        state.settingsMode = 'edit';
+        renderSettings();
+        e.preventDefault();
+    }
+}
+
 function handleNormalModeKey(e) {
     const key = e.key;
 
-    // Handle gg sequence
+    // Handle g-prefix chords (gg = top, gs = settings)
     if (state.pendingG) {
         state.pendingG = false;
         if (key === 'g') {
             moveToTop();
+            return;
+        }
+        if (key === 's') {
+            openSettings();
             return;
         }
     }
@@ -1173,15 +1816,17 @@ function handleNormalModeKey(e) {
             e.preventDefault();
             break;
 
-        // Account switching (1-9)
+        // Account switching (1-9) — disabled inside settings view
         case '1': case '2': case '3': case '4': case '5':
-        case '6': case '7': case '8': case '9':
+        case '6': case '7': case '8': case '9': {
+            if (state.view === 'settings') break;
             const accIndex = parseInt(key) - 1;
             if (accIndex < state.accounts.length) {
                 selectAccount(state.accounts[accIndex]);
                 showStatus(`Switched to ${state.accounts[accIndex].email}`, 'success');
             }
             break;
+        }
     }
 }
 
@@ -1559,6 +2204,16 @@ function clearCompose() {
     els.composeAttachments.classList.add('hidden');
     els.composeAttachmentsList.innerHTML = '';
     els.composeFileInput.value = '';
+    // Reset invite-compose fields
+    if (els.composeInviteEnabled) {
+        els.composeInviteEnabled.checked = false;
+        els.composeInviteFields.classList.add('hidden');
+        els.inviteSummary.value = '';
+        els.inviteLocation.value = '';
+        els.inviteStart.value = '';
+        els.inviteEnd.value = '';
+        els.inviteTz.value = '';
+    }
 }
 
 let attachmentIdCounter = 0;
@@ -2401,7 +3056,7 @@ function renderCalendarCard(event) {
     card.classList.toggle('cancelled', cancelled);
 
     els.calTitle.textContent = event.summary || 'Calendar Event';
-    els.calDatetime.textContent = formatEventTime(event.dtstart, event.dtend);
+    els.calDatetime.innerHTML = formatEventTimeMultiTz(event.dtstart, event.dtend);
     els.calLocation.textContent = event.location || '';
     els.calLocation.style.display = event.location ? 'block' : 'none';
 
@@ -2475,7 +3130,7 @@ function getUserRsvpStatus(event) {
     return null;
 }
 
-function formatEventTime(dtstart, dtend) {
+function formatEventTime(dtstart, dtend, timeZone) {
     if (!dtstart) return '';
     const start = new Date(dtstart);
     const options = {
@@ -2483,20 +3138,43 @@ function formatEventTime(dtstart, dtend) {
         month: 'short',
         day: 'numeric',
         hour: 'numeric',
-        minute: '2-digit'
+        minute: '2-digit',
+        timeZoneName: 'short'
     };
+    if (timeZone) options.timeZone = timeZone;
     let result = start.toLocaleString(undefined, options);
 
     if (dtend) {
         const end = new Date(dtend);
-        // If same day, just show end time
-        if (start.toDateString() === end.toDateString()) {
-            result += ' - ' + end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+        const endTimeOpts = { hour: 'numeric', minute: '2-digit' };
+        if (timeZone) endTimeOpts.timeZone = timeZone;
+        const sameDay = sameDayInTz(start, end, timeZone);
+        if (sameDay) {
+            result += ' – ' + end.toLocaleTimeString(undefined, endTimeOpts);
         } else {
-            result += ' - ' + end.toLocaleString(undefined, options);
+            result += ' – ' + end.toLocaleString(undefined, options);
         }
     }
     return result;
+}
+
+function sameDayInTz(a, b, timeZone) {
+    if (!timeZone) return a.toDateString() === b.toDateString();
+    const fmt = new Intl.DateTimeFormat(undefined, {
+        timeZone, year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    return fmt.format(a) === fmt.format(b);
+}
+
+function formatEventTimeMultiTz(dtstart, dtend) {
+    const zones = (state.timezone && state.timezone.display && state.timezone.display.length)
+        ? state.timezone.display
+        : [undefined];  // fall back to browser local
+    return zones.map((tz, i) => {
+        const line = formatEventTime(dtstart, dtend, tz);
+        const cls = i === 0 ? 'event-time primary' : 'event-time secondary';
+        return `<div class="${cls}">${escapeHtml(line)}</div>`;
+    }).join('');
 }
 
 function getStatusIcon(status) {

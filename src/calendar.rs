@@ -1,7 +1,11 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{
+    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
+};
+use chrono_tz::Tz;
 use regex::Regex;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
@@ -106,11 +110,10 @@ fn extract_property(text: &str, name: &str) -> Option<String> {
 /// Parse VTIMEZONE blocks from the full ICS data. Returns a map from TZID
 /// to the STANDARD component's UTCOFFSETTO (falls back to DAYLIGHT if no STANDARD).
 ///
-/// Known limitation: this picks a single offset per TZID and uses it for all events,
-/// so events during DST will be off by ~1 hour. In practice, most calendar providers
-/// send times with a trailing Z (already UTC), making this the rare fallback path.
-/// Correct DST resolution would require checking whether the event date falls within
-/// the DAYLIGHT period using DTSTART/RRULE from each sub-block.
+/// This is the fallback path used only when a TZID is not a recognized IANA
+/// name (e.g. Outlook's "Pacific Standard Time"). For IANA-named TZIDs, the
+/// parser uses chrono-tz directly, which resolves DST correctly at the
+/// event's instant.
 fn parse_vtimezone_offsets(data: &str) -> HashMap<String, FixedOffset> {
     let mut offsets = HashMap::new();
     let unfolded = unfold_lines(data);
@@ -207,12 +210,22 @@ fn parse_ics_datetime_property(
 
         let dt = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
 
-        // Case 2: TZID parameter — look up offset from VTIMEZONE block
-        if let Some(tzid) = extract_param_from_str(params, "TZID")
-            && let Some(offset) = tz_offsets.get(&tzid)
-        {
-            let local = offset.from_local_datetime(&dt).earliest()?;
-            return Some(local.with_timezone(&Utc));
+        // Case 2: TZID parameter. Prefer chrono-tz (IANA-aware, handles DST
+        // correctly at the event's instant). Fall back to the VTIMEZONE
+        // offset table for non-IANA TZIDs (e.g. Outlook's "Pacific Standard
+        // Time" labels).
+        if let Some(tzid) = extract_param_from_str(params, "TZID") {
+            if let Ok(tz) = Tz::from_str(&tzid) {
+                let resolved = tz
+                    .from_local_datetime(&dt)
+                    .earliest()
+                    .or_else(|| tz.from_local_datetime(&dt).latest())?;
+                return Some(resolved.with_timezone(&Utc));
+            }
+            if let Some(offset) = tz_offsets.get(&tzid) {
+                let local = offset.from_local_datetime(&dt).earliest()?;
+                return Some(local.with_timezone(&Utc));
+            }
         }
 
         // Case 3: Floating time (no Z, no TZID) — interpret as system local tz.
@@ -401,6 +414,204 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &RsvpS
 
 fn format_ics_datetime(dt: DateTime<Utc>) -> String {
     dt.format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+fn format_ics_datetime_local(dt: DateTime<Tz>) -> String {
+    dt.format("%Y%m%dT%H%M%S").to_string()
+}
+
+fn format_offset_hhmm(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let abs = offset_seconds.unsigned_abs() as i32;
+    let h = abs / 3600;
+    let m = (abs % 3600) / 60;
+    format!("{sign}{h:02}{m:02}")
+}
+
+/// Synthesize a minimal VTIMEZONE block covering the offset that applies at
+/// the given instant in the given IANA timezone. Sufficient for one-shot
+/// events; we don't emit DST transition rules because we don't generate
+/// recurring events.
+fn synth_vtimezone(tz: Tz, dt: DateTime<Tz>) -> String {
+    let offset = dt.offset().fix();
+    let offset_str = format_offset_hhmm(offset.local_minus_utc());
+    let tzname = format!("{}", dt.format("%Z"));
+    format!(
+        "BEGIN:VTIMEZONE\r\n\
+         TZID:{tzid}\r\n\
+         BEGIN:STANDARD\r\n\
+         DTSTART:19700101T000000\r\n\
+         TZOFFSETFROM:{offset}\r\n\
+         TZOFFSETTO:{offset}\r\n\
+         TZNAME:{tzname}\r\n\
+         END:STANDARD\r\n\
+         END:VTIMEZONE\r\n",
+        tzid = tz.name(),
+        offset = offset_str,
+        tzname = if tzname.is_empty() {
+            tz.name().to_string()
+        } else {
+            tzname
+        },
+    )
+}
+
+fn attendee_line(att: &Attendee) -> String {
+    let cn_param = att
+        .name
+        .as_ref()
+        .map(|n| format!(";CN={n}"))
+        .unwrap_or_default();
+    let partstat = if att.status.is_empty() {
+        "NEEDS-ACTION".to_string()
+    } else {
+        att.status.clone()
+    };
+    format!(
+        "ATTENDEE{cn};RSVP=TRUE;PARTSTAT={partstat}:mailto:{email}\r\n",
+        cn = cn_param,
+        partstat = partstat,
+        email = att.email,
+    )
+}
+
+/// Build an iTIP REQUEST (a calendar invite) with TZID-qualified DTSTART/DTEND.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_invite(
+    organizer_email: &str,
+    organizer_name: Option<&str>,
+    summary: &str,
+    description: Option<&str>,
+    location: Option<&str>,
+    dtstart: DateTime<Tz>,
+    dtend: DateTime<Tz>,
+    attendees: &[Attendee],
+    uid: Option<&str>,
+) -> String {
+    let tz = dtstart.timezone();
+    let uid = uid
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}@supervillain", uuid::Uuid::new_v4()));
+    let tzid = tz.name();
+    let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+
+    let vtimezone = synth_vtimezone(tz, dtstart);
+
+    let organizer_cn = organizer_name
+        .map(|n| format!(";CN={n}"))
+        .unwrap_or_default();
+
+    let mut attendee_lines = String::new();
+    for att in attendees {
+        attendee_lines.push_str(&attendee_line(att));
+    }
+
+    let description_line = description
+        .map(|d| format!("DESCRIPTION:{}\r\n", escape_text(d)))
+        .unwrap_or_default();
+    let location_line = location
+        .map(|l| format!("LOCATION:{}\r\n", escape_text(l)))
+        .unwrap_or_default();
+
+    format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//Supervillain//EN\r\n\
+         METHOD:REQUEST\r\n\
+         {vtimezone}\
+         BEGIN:VEVENT\r\n\
+         UID:{uid}\r\n\
+         DTSTAMP:{dtstamp}\r\n\
+         DTSTART;TZID={tzid}:{dtstart}\r\n\
+         DTEND;TZID={tzid}:{dtend}\r\n\
+         SUMMARY:{summary}\r\n\
+         {description_line}\
+         {location_line}\
+         ORGANIZER{organizer_cn}:mailto:{organizer_email}\r\n\
+         {attendee_lines}\
+         SEQUENCE:0\r\n\
+         STATUS:CONFIRMED\r\n\
+         END:VEVENT\r\n\
+         END:VCALENDAR",
+        dtstart = format_ics_datetime_local(dtstart),
+        dtend = format_ics_datetime_local(dtend),
+        summary = escape_text(summary),
+    )
+}
+
+/// Build an iTIP REPLY that quotes the event time in the responder's primary TZ
+/// (rather than UTC-Z). Recipients see times in the TZ the responder set, which
+/// is friendlier than a raw Zulu timestamp when their client doesn't reformat.
+pub fn generate_rsvp_with_tz(
+    event: &CalendarEvent,
+    attendee_email: &str,
+    status: &RsvpStatus,
+    reply_tz: Tz,
+) -> String {
+    debug_assert!(
+        !attendee_email.is_empty(),
+        "attendee_email must not be empty"
+    );
+
+    let cn = event
+        .attendees
+        .iter()
+        .find(|a| a.email.eq_ignore_ascii_case(attendee_email))
+        .and_then(|a| a.name.clone());
+    let cn_param = match &cn {
+        Some(name) => format!(";CN={name}"),
+        None => String::new(),
+    };
+
+    let dtstart_local = event.dtstart.with_timezone(&reply_tz);
+    let dtend_local = event.dtend.map(|dt| dt.with_timezone(&reply_tz));
+    let tzid = reply_tz.name();
+    let vtimezone = synth_vtimezone(reply_tz, dtstart_local);
+
+    let dtstart_line = format!(
+        "DTSTART;TZID={tzid}:{}\r\n",
+        format_ics_datetime_local(dtstart_local)
+    );
+    let dtend_line = dtend_local
+        .map(|dt| format!("DTEND;TZID={tzid}:{}\r\n", format_ics_datetime_local(dt)))
+        .unwrap_or_default();
+
+    let organizer_cn = event
+        .organizer_name
+        .as_ref()
+        .map(|n| format!(";CN={n}"))
+        .unwrap_or_default();
+
+    format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//Supervillain//EN\r\n\
+         METHOD:REPLY\r\n\
+         {vtimezone}\
+         BEGIN:VEVENT\r\n\
+         UID:{uid}\r\n\
+         {dtstart_line}\
+         {dtend_line}\
+         SUMMARY:{summary}\r\n\
+         ORGANIZER{organizer_cn}:mailto:{organizer_email}\r\n\
+         ATTENDEE{cn_param};PARTSTAT={partstat}:mailto:{attendee_email}\r\n\
+         SEQUENCE:{sequence}\r\n\
+         END:VEVENT\r\n\
+         END:VCALENDAR",
+        uid = event.uid,
+        summary = event.summary,
+        organizer_email = event.organizer_email,
+        partstat = status.as_ics_str(),
+        sequence = event.sequence,
+    )
+}
+
+fn escape_text(s: &str) -> String {
+    // RFC 5545: backslash, newline, comma, semicolon need escaping in TEXT values.
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
 }
 
 /// RFC 4791: stored calendar objects must not contain METHOD.
@@ -616,6 +827,52 @@ END:VCALENDAR";
         assert_eq!(event.dtstart.month(), 2);
         assert_eq!(event.dtstart.day(), 15);
         assert_eq!(event.dtstart.hour(), 10);
+    }
+
+    /// Regression for the documented DST limitation in the previous
+    /// parse_vtimezone_offsets-only path: an event on a date where DST is in
+    /// effect must use the *DST* offset. 2026-07-15 10:00 LA is PDT (-07:00)
+    /// → 17:00 UTC. The old single-offset path used PST (-08:00) → 18:00.
+    #[test]
+    fn parse_tzid_uses_dst_when_event_in_summer() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:dst-test@example.com\r\n\
+SUMMARY:Summer meeting\r\n\
+DTSTART;TZID=America/Los_Angeles:20260715T100000\r\n\
+DTEND;TZID=America/Los_Angeles:20260715T110000\r\n\
+ORGANIZER:mailto:alice@example.com\r\n\
+ATTENDEE:mailto:bob@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.dtstart.hour(), 17, "PDT → 17:00 UTC, not 18:00");
+        assert_eq!(event.dtstart.day(), 15);
+    }
+
+    /// And the standard-time counterpart: 2026-01-15 10:00 LA = 18:00 UTC.
+    #[test]
+    fn parse_tzid_uses_standard_when_event_in_winter() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:dst-test-winter@example.com\r\n\
+SUMMARY:Winter meeting\r\n\
+DTSTART;TZID=America/Los_Angeles:20260115T100000\r\n\
+DTEND;TZID=America/Los_Angeles:20260115T110000\r\n\
+ORGANIZER:mailto:alice@example.com\r\n\
+ATTENDEE:mailto:bob@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let event = parse_ics(ics).unwrap();
+        assert_eq!(event.dtstart.hour(), 18);
     }
 
     // --- generate_rsvp tests ---
@@ -1453,5 +1710,89 @@ END:VCALENDAR";
             .unwrap();
         assert_eq!(bob.status, "ACCEPTED");
         assert_eq!(carol.status, "DECLINED");
+    }
+
+    // --- generate_invite + generate_rsvp_with_tz tests ---
+
+    #[test]
+    fn invite_emits_tzid_dtstart_and_vtimezone() {
+        let tz: Tz = "America/Los_Angeles".parse().unwrap();
+        let start = tz.with_ymd_and_hms(2026, 6, 1, 10, 0, 0).unwrap();
+        let end = tz.with_ymd_and_hms(2026, 6, 1, 11, 0, 0).unwrap();
+        let ics = generate_invite(
+            "alice@example.com",
+            Some("Alice"),
+            "Sync up",
+            None,
+            Some("Coffee shop"),
+            start,
+            end,
+            &[Attendee {
+                email: "bob@example.com".into(),
+                name: Some("Bob".into()),
+                status: "NEEDS-ACTION".into(),
+            }],
+            Some("test-uid"),
+        );
+        assert!(ics.contains("METHOD:REQUEST"));
+        assert!(ics.contains("DTSTART;TZID=America/Los_Angeles:20260601T100000"));
+        assert!(ics.contains("DTEND;TZID=America/Los_Angeles:20260601T110000"));
+        assert!(ics.contains("UID:test-uid"));
+        assert!(ics.contains("SUMMARY:Sync up"));
+        assert!(ics.contains("LOCATION:Coffee shop"));
+        assert!(ics.contains("BEGIN:VTIMEZONE"));
+        assert!(ics.contains("TZID:America/Los_Angeles"));
+    }
+
+    #[test]
+    fn invite_roundtrips_through_parser() {
+        let tz: Tz = "Europe/London".parse().unwrap();
+        let start = tz.with_ymd_and_hms(2026, 7, 1, 14, 30, 0).unwrap();
+        let end = tz.with_ymd_and_hms(2026, 7, 1, 15, 30, 0).unwrap();
+        let ics = generate_invite(
+            "alice@example.com",
+            None,
+            "Quarterly review",
+            None,
+            None,
+            start,
+            end,
+            &[Attendee {
+                email: "bob@example.com".into(),
+                name: None,
+                status: "NEEDS-ACTION".into(),
+            }],
+            None,
+        );
+        let parsed = parse_ics(&ics).unwrap();
+        // 14:30 London in July is BST (UTC+1) → 13:30 UTC.
+        assert_eq!(parsed.dtstart.hour(), 13);
+        assert_eq!(parsed.dtstart.minute(), 30);
+    }
+
+    #[test]
+    fn rsvp_with_tz_emits_tzid_not_z() {
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let rsvp = generate_rsvp_with_tz(
+            &sample_event(),
+            "bob@example.com",
+            &RsvpStatus::Accepted,
+            tz,
+        );
+        assert!(rsvp.contains("METHOD:REPLY"));
+        assert!(rsvp.contains("DTSTART;TZID=America/New_York:"));
+        assert!(!rsvp.contains("DTSTART:20260215T100000Z"));
+        assert!(rsvp.contains("PARTSTAT=ACCEPTED"));
+    }
+
+    #[test]
+    fn rsvp_with_tz_roundtrip_preserves_instant() {
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let original = sample_event();
+        let rsvp = generate_rsvp_with_tz(&original, "bob@example.com", &RsvpStatus::Accepted, tz);
+        let parsed = parse_ics(&rsvp).unwrap();
+        // The UTC instant must round-trip even though wall-clock is now NYC.
+        assert_eq!(parsed.dtstart, original.dtstart);
+        assert_eq!(parsed.method, "REPLY");
     }
 }

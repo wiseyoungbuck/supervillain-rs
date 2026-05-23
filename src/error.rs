@@ -9,6 +9,7 @@ pub enum Error {
     NotConnected,
     NotFound(String),
     BadRequest(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -20,6 +21,7 @@ impl fmt::Display for Error {
             Error::NotConnected => write!(f, "not connected to email server"),
             Error::NotFound(msg) => write!(f, "not found: {msg}"),
             Error::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            Error::Conflict(msg) => write!(f, "conflict: {msg}"),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -51,6 +53,7 @@ impl IntoResponse for Error {
             Error::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".into()),
             Error::NotFound(msg) => (StatusCode::NOT_FOUND, format!("not found: {msg}")),
             Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, format!("bad request: {msg}")),
+            Error::Conflict(msg) => (StatusCode::CONFLICT, format!("conflict: {msg}")),
             Error::NotConnected => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "not connected to email server".into(),

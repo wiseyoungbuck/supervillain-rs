@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::types::*;
-use crate::{calendar, provider, search, splits, theme};
+use crate::{accounts, calendar, provider, search, splits, theme, timezone};
 
 const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
 
@@ -36,6 +36,7 @@ const SUPERVILLAIN_JPG: &[u8] = include_bytes!("../static/supervillain.jpg");
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .merge(accounts::router())
         .route("/api/accounts", get(list_accounts))
         .route("/api/identities", get(list_identities))
         .route("/api/theme", get(get_theme))
@@ -69,6 +70,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/splits/{split_id}",
             put(update_split).delete(delete_split),
         )
+        .route("/api/timezone", get(get_timezone).put(put_timezone))
+        .route("/api/timezone/accept-system", post(accept_system_timezone))
+        .route(
+            "/api/timezone/dismiss-change",
+            post(dismiss_timezone_change),
+        )
+        .route("/api/timezone/zones", get(list_timezones))
+        .route("/api/calendar/invite", post(send_invite_handler))
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))
@@ -212,14 +221,12 @@ struct AccountParam {
 // Account resolution
 // =============================================================================
 
-fn resolve_session<'a>(
-    state: &'a AppState,
-    account: Option<&str>,
-) -> Result<&'a tokio::sync::RwLock<crate::provider::ProviderSession>, Error> {
-    let key = account.unwrap_or(&state.default_account);
-    state
-        .sessions
+async fn resolve_session(state: &AppState, account: Option<&str>) -> Result<SessionLock, Error> {
+    let reg = state.accounts.read().await;
+    let key = account.unwrap_or(&reg.default_account);
+    reg.sessions
         .get(key)
+        .cloned()
         .ok_or_else(|| Error::BadRequest(format!("Unknown account: {key}")))
 }
 
@@ -228,19 +235,21 @@ fn resolve_session<'a>(
 // =============================================================================
 
 async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let reg = state.accounts.read().await;
     let mut accounts = Vec::new();
-    for (name, session_lock) in &state.sessions {
+    for (name, session_lock) in &reg.sessions {
         let session = session_lock.read().await;
         accounts.push(serde_json::json!({
             "id": name,
             "email": session.username(),
             "provider": session.provider_name(),
-            "isDefault": *name == state.default_account
+            "isDefault": *name == reg.default_account
         }));
     }
+    let errors = state.account_errors.read().await.clone();
     Json(serde_json::json!({
         "accounts": accounts,
-        "errors": state.account_errors,
+        "errors": errors,
     }))
 }
 
@@ -248,7 +257,7 @@ async fn list_identities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let mut session = session_lock.write().await;
     let identities = provider::get_identities(&mut session).await?;
     Ok(Json(serde_json::json!(identities)))
@@ -285,7 +294,7 @@ async fn list_mailboxes(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let mailboxes = provider::get_mailboxes(&session).await?;
     Ok(Json(serde_json::json!(mailboxes)))
@@ -295,7 +304,7 @@ async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let limit = params.limit.unwrap_or(150);
     let offset = params.offset.unwrap_or(0);
@@ -365,11 +374,11 @@ async fn get_email(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let account_key = params
-        .account
-        .clone()
-        .unwrap_or_else(|| state.default_account.clone());
-    let session_lock = resolve_session(&state, Some(&account_key))?;
+    let account_key = match params.account.clone() {
+        Some(a) => a,
+        None => state.accounts.read().await.default_account.clone(),
+    };
+    let session_lock = resolve_session(&state, Some(&account_key)).await?;
     let session = session_lock.read().await;
 
     let emails =
@@ -396,7 +405,7 @@ async fn get_email(
             let uid = event.uid.clone();
             let acct = account_key.clone();
             tokio::spawn(async move {
-                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)) {
+                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                     let s = s_lock.read().await;
                     if let Err(e) = provider::add_to_calendar(&s, &ics_clone, &uid, true).await {
                         tracing::warn!("Calendar auto-add failed for {uid}: {e}");
@@ -408,7 +417,7 @@ async fn get_email(
             let uid = event.uid.clone();
             let acct = account_key.clone();
             tokio::spawn(async move {
-                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)) {
+                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                     let s = s_lock.read().await;
                     if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
                         tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
@@ -499,7 +508,7 @@ async fn download_attachment(
         return Err(Error::BadRequest("Invalid blob_id or filename".into()));
     }
 
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
 
     let (content_type, bytes) = provider::download_blob(&session, &blob_id, &filename).await?;
@@ -529,7 +538,7 @@ async fn archive_email(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::archive(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -540,7 +549,7 @@ async fn trash_email(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::trash(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -551,7 +560,7 @@ async fn mark_read(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::mark_read(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -562,7 +571,7 @@ async fn mark_unread(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::mark_unread(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -573,7 +582,7 @@ async fn toggle_flag(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::toggle_flag(&session, &email_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -585,7 +594,7 @@ async fn move_email(
     Query(params): Query<AccountParam>,
     Json(body): Json<MoveBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
     let success = provider::move_to_mailbox(&session, &email_id, &body.mailbox_id).await?;
     Ok(Json(serde_json::json!({"success": success})))
@@ -596,7 +605,7 @@ async fn send_email_handler(
     Query(params): Query<AccountParam>,
     Json(body): Json<SendEmailBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let mut session = session_lock.write().await;
     let from_addr = body
         .from_address
@@ -656,7 +665,7 @@ async fn upload_blob(
         .unwrap_or("attachment");
     let filename = sanitize_filename_for_header(raw_filename);
 
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
 
     let (blob_id, size) = provider::upload_blob(&session, content_type, &body).await?;
@@ -688,7 +697,7 @@ async fn rsvp(
     Query(params): Query<AccountParam>,
     Json(body): Json<RsvpBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let mut session_guard = session_lock.write().await;
 
     // Get calendar data
@@ -710,6 +719,11 @@ async fn rsvp(
         determine_attendee_email(email, &event, session_guard.username())
     };
 
+    let reply_tz = timezone::primary_tz(&timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    ));
+
     // Dispatch full RSVP flow to provider (Fastmail: iTIP email + CalDAV, Outlook: Graph API)
     provider::rsvp(
         &mut session_guard,
@@ -717,6 +731,7 @@ async fn rsvp(
         &event,
         &attendee_email,
         &body.status,
+        reply_tz,
     )
     .await?;
 
@@ -738,7 +753,7 @@ async fn add_to_calendar(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
 
     let ics_data = provider::get_calendar_data(&session, &email_id)
@@ -767,7 +782,7 @@ async fn unsubscribe_and_archive(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
 
     // Get the email to find the sender
@@ -829,7 +844,7 @@ async fn split_counts(
         return Ok(Json(serde_json::json!({})));
     }
 
-    let session_lock = resolve_session(&state, params.account.as_deref())?;
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
 
     // When the sidebar Starred filter is active, restrict the count query to
@@ -952,6 +967,235 @@ async fn delete_split(
     Ok(Json(serde_json::json!(config.splits)))
 }
 
+// =============================================================================
+// Timezone settings
+// =============================================================================
+
+#[derive(serde::Deserialize)]
+struct TimezoneConfigBody {
+    #[serde(default = "default_true_bool")]
+    use_system: bool,
+    #[serde(default)]
+    manual_primary: Option<String>,
+    #[serde(default)]
+    additional: Vec<String>,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+fn timezone_env_override() -> Option<String> {
+    std::env::var("VIMMAIL_TIMEZONE").ok()
+}
+
+async fn get_timezone(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    );
+    Json(serde_json::to_value(timezone::resolve(&cfg)).unwrap_or_default())
+}
+
+async fn put_timezone(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TimezoneConfigBody>,
+) -> Result<impl IntoResponse, Error> {
+    if let Some(ref primary) = body.manual_primary
+        && !primary.is_empty()
+        && !timezone::validate_iana(primary)
+    {
+        return Err(Error::BadRequest(format!(
+            "Unknown IANA timezone: {primary}"
+        )));
+    }
+    for tz in &body.additional {
+        if !timezone::validate_iana(tz) {
+            return Err(Error::BadRequest(format!("Unknown IANA timezone: {tz}")));
+        }
+    }
+
+    let mut existing = timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    );
+    existing.use_system = body.use_system;
+    existing.manual_primary = body.manual_primary.filter(|s| !s.is_empty());
+    existing.additional = body.additional;
+    // Seed last_known_system_tz on first save so the change banner has a baseline.
+    if existing.last_known_system_tz.is_none() {
+        existing.last_known_system_tz = Some(timezone::detect_system_tz());
+    }
+    timezone::save_config(&existing, &state.timezone_config_path)?;
+
+    Ok(Json(
+        serde_json::to_value(timezone::resolve(&existing)).unwrap_or_default(),
+    ))
+}
+
+async fn accept_system_timezone(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Error> {
+    let mut cfg = timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    );
+    let system = timezone::detect_system_tz();
+    cfg.last_known_system_tz = Some(system.clone());
+    cfg.dismissed_change_to = None;
+    // If the user wants to track system, that's already wired through use_system.
+    // Don't toggle use_system here; "Accept system" means "the new system TZ is fine".
+    timezone::save_config(&cfg, &state.timezone_config_path)?;
+    Ok(Json(
+        serde_json::to_value(timezone::resolve(&cfg)).unwrap_or_default(),
+    ))
+}
+
+async fn dismiss_timezone_change(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Error> {
+    let mut cfg = timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    );
+    cfg.dismissed_change_to = Some(timezone::detect_system_tz());
+    timezone::save_config(&cfg, &state.timezone_config_path)?;
+    Ok(Json(
+        serde_json::to_value(timezone::resolve(&cfg)).unwrap_or_default(),
+    ))
+}
+
+async fn list_timezones() -> impl IntoResponse {
+    let names: Vec<&'static str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
+    Json(serde_json::json!(names))
+}
+
+// =============================================================================
+// Calendar invite composition
+// =============================================================================
+
+#[derive(serde::Deserialize)]
+struct InviteAttendee {
+    email: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SendInviteBody {
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    subject: String,
+    #[serde(default)]
+    body: String,
+    summary: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    start: String, // "2026-06-01T10:00:00"
+    end: String,
+    #[serde(default)]
+    tz: Option<String>,
+    #[serde(default)]
+    attendees: Vec<InviteAttendee>,
+    #[serde(default)]
+    from_address: Option<String>,
+}
+
+async fn send_invite_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+    Json(body): Json<SendInviteBody>,
+) -> Result<impl IntoResponse, Error> {
+    let tz_cfg = timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    );
+    let resolved = timezone::resolve(&tz_cfg);
+    let tz_name = body
+        .tz
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(resolved.primary.clone());
+    if !timezone::validate_iana(&tz_name) {
+        return Err(Error::BadRequest(format!(
+            "Unknown IANA timezone: {tz_name}"
+        )));
+    }
+    let tz: chrono_tz::Tz = std::str::FromStr::from_str(&tz_name)
+        .map_err(|_| Error::BadRequest(format!("Unknown IANA timezone: {tz_name}")))?;
+
+    let start_naive = chrono::NaiveDateTime::parse_from_str(&body.start, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&body.start, "%Y-%m-%dT%H:%M"))
+        .map_err(|e| Error::BadRequest(format!("Invalid start time: {e}")))?;
+    let end_naive = chrono::NaiveDateTime::parse_from_str(&body.end, "%Y-%m-%dT%H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(&body.end, "%Y-%m-%dT%H:%M"))
+        .map_err(|e| Error::BadRequest(format!("Invalid end time: {e}")))?;
+    let dtstart = chrono::TimeZone::from_local_datetime(&tz, &start_naive)
+        .earliest()
+        .ok_or_else(|| Error::BadRequest("start time has no valid mapping in tz".into()))?;
+    let dtend = chrono::TimeZone::from_local_datetime(&tz, &end_naive)
+        .earliest()
+        .ok_or_else(|| Error::BadRequest("end time has no valid mapping in tz".into()))?;
+
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let mut session = session_lock.write().await;
+    let from_addr = body
+        .from_address
+        .clone()
+        .unwrap_or_else(|| session.username().to_string());
+
+    let organizer_email = from_addr.clone();
+    let attendees: Vec<Attendee> = body
+        .attendees
+        .iter()
+        .map(|a| Attendee {
+            email: a.email.clone(),
+            name: a.name.clone(),
+            status: "NEEDS-ACTION".into(),
+        })
+        .collect();
+
+    let ics = calendar::generate_invite(
+        &organizer_email,
+        None,
+        &body.summary,
+        body.description.as_deref(),
+        body.location.as_deref(),
+        dtstart,
+        dtend,
+        &attendees,
+        None,
+    );
+
+    let submission = EmailSubmission {
+        to: body.to,
+        cc: body.cc,
+        subject: body.subject,
+        text_body: body.body,
+        bcc: if body.bcc.is_empty() {
+            None
+        } else {
+            Some(body.bcc)
+        },
+        html_body: None,
+        in_reply_to: None,
+        references: None,
+        attachments: vec![],
+        calendar_ics: Some(ics),
+    };
+
+    let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
+    match result {
+        Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
+        None => Err(Error::Internal("Failed to send invite".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1307,91 @@ mod tests {
         assert!(
             APP_JS.contains("state.identities[0].email"),
             "clearCompose should default to the first identity's email"
+        );
+    }
+
+    // ====================================================================
+    // Settings view (account management) regression sentinels
+    // ====================================================================
+
+    #[test]
+    fn settings_view_present_in_html() {
+        assert!(INDEX_HTML.contains(r#"id="settings-view""#));
+        assert!(INDEX_HTML.contains(r#"id="account-pane-list""#));
+        assert!(INDEX_HTML.contains(r#"id="account-form""#));
+    }
+
+    #[test]
+    fn settings_form_uses_data_provider_attribute() {
+        // Locality of behaviour: visibility-by-provider rule lives in HTML.
+        assert!(
+            INDEX_HTML.contains(r#"data-provider="fastmail""#),
+            "fastmail-only fields must declare visibility via data-provider"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"data-provider="outlook,gmail""#),
+            "OAuth shared fields must declare visibility via data-provider"
+        );
+    }
+
+    #[test]
+    fn settings_styles_present() {
+        assert!(STYLE_CSS.contains(".account-pane"));
+        assert!(STYLE_CSS.contains(".secret-input"));
+        assert!(STYLE_CSS.contains(".confirm-delete"));
+        assert!(STYLE_CSS.contains("#mode-indicator.awaiting"));
+        assert!(STYLE_CSS.contains(".auth-status-pill"));
+    }
+
+    #[test]
+    fn settings_authorize_uses_long_poll_not_polling() {
+        // Long-poll: one POST to /authorize. No /auth-status polling.
+        assert!(
+            APP_JS.contains("/authorize"),
+            "settings must call POST /authorize"
+        );
+        assert!(
+            !APP_JS.contains("/auth-status"),
+            "must not poll a /auth-status endpoint — long-poll is the state machine"
+        );
+        assert!(APP_JS.contains("AbortController"));
+    }
+
+    #[test]
+    fn settings_first_run_auto_routes() {
+        assert!(
+            APP_JS.contains("openSettings({ firstRun: true })"),
+            "loadAccounts must auto-route to settings when no accounts exist"
+        );
+    }
+
+    #[test]
+    fn help_overlay_documents_new_shortcuts() {
+        assert!(
+            INDEX_HTML.contains(">g s<"),
+            "help overlay should document the g s chord"
+        );
+        assert!(
+            INDEX_HTML.contains(">Shift+D<"),
+            "help overlay should document Shift+D (set default)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Ctrl+Enter<"),
+            "help overlay should document Ctrl+Enter (save)"
+        );
+    }
+
+    #[test]
+    fn api_helper_excludes_settings_from_account_param() {
+        // The api() helper allowlists which paths receive ?account=.
+        // Settings paths (`/accounts/...`) must NOT be auto-tagged.
+        assert!(
+            APP_JS.contains("ACCOUNT_SCOPED_API"),
+            "api() must use an allowlist regex for ?account= injection"
+        );
+        assert!(
+            APP_JS.contains("/(emails|mailboxes|identities|splits|upload|split-counts|calendar)"),
+            "allowlist regex must enumerate account-scoped path prefixes"
         );
     }
 

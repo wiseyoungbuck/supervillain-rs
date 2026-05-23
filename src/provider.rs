@@ -316,11 +316,13 @@ pub async fn rsvp(
     event: &CalendarEvent,
     attendee_email: &str,
     status: &RsvpStatus,
+    reply_tz: chrono_tz::Tz,
 ) -> Result<(), Error> {
     match s {
         ProviderSession::Fastmail(s) => {
-            // Send iTIP reply email to organizer
-            let rsvp_ics = calendar::generate_rsvp(event, attendee_email, status);
+            // Send iTIP reply email to organizer, with DTSTART quoted in the user's
+            // primary timezone instead of UTC-Z.
+            let rsvp_ics = calendar::generate_rsvp_with_tz(event, attendee_email, status, reply_tz);
             let submission = EmailSubmission {
                 to: vec![event.organizer_email.clone()],
                 cc: vec![],
@@ -409,7 +411,10 @@ mod tests {
     use std::sync::Arc;
 
     fn make_fastmail_session() -> ProviderSession {
-        ProviderSession::Fastmail(Box::new(JmapSession::new("user@fastmail.com", "Bearer token")))
+        ProviderSession::Fastmail(Box::new(JmapSession::new(
+            "user@fastmail.com",
+            "Bearer token",
+        )))
     }
 
     fn make_outlook_session() -> ProviderSession {
