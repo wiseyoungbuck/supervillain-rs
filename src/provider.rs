@@ -113,9 +113,7 @@ pub async fn get_emails(
 pub async fn mark_read(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::mark_read(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::mark_read(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::mark_read(s, email_id).await,
     }
 }
@@ -123,9 +121,7 @@ pub async fn mark_read(s: &ProviderSession, email_id: &str) -> Result<bool, Erro
 pub async fn mark_unread(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::mark_unread(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::mark_unread(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::mark_unread(s, email_id).await,
     }
 }
@@ -133,9 +129,7 @@ pub async fn mark_unread(s: &ProviderSession, email_id: &str) -> Result<bool, Er
 pub async fn toggle_flag(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::toggle_flag(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::toggle_flag(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::toggle_flag(s, email_id).await,
     }
 }
@@ -143,9 +137,7 @@ pub async fn toggle_flag(s: &ProviderSession, email_id: &str) -> Result<bool, Er
 pub async fn archive(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::archive(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::archive(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::archive(s, email_id).await,
     }
 }
@@ -153,9 +145,7 @@ pub async fn archive(s: &ProviderSession, email_id: &str) -> Result<bool, Error>
 pub async fn trash(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::trash(s, email_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::trash(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::trash(s, email_id).await,
     }
 }
@@ -167,9 +157,7 @@ pub async fn move_to_mailbox(
 ) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::move_to_mailbox(s, email_id, mailbox_id).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::move_to_mailbox(s, email_id, mailbox_id).await,
         ProviderSession::Gmail(s) => gmail::move_to_mailbox(s, email_id, mailbox_id).await,
     }
 }
@@ -177,9 +165,7 @@ pub async fn move_to_mailbox(
 pub async fn archive_batch(s: &ProviderSession, email_ids: &[String]) -> Result<usize, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::archive_batch(s, email_ids).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Email operations not yet supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::archive_batch(s, email_ids).await,
         ProviderSession::Gmail(s) => gmail::archive_batch(s, email_ids).await,
     }
 }
@@ -254,9 +240,7 @@ pub async fn download_blob(
 ) -> Result<(String, Vec<u8>), Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::download_blob(s, blob_id, filename).await,
-        ProviderSession::Outlook(_) => Err(Error::BadRequest(
-            "Attachment downloads not supported for Outlook accounts".into(),
-        )),
+        ProviderSession::Outlook(s) => outlook::download_blob(s, blob_id, filename).await,
         ProviderSession::Gmail(s) => gmail::download_blob(s, blob_id, filename).await,
     }
 }

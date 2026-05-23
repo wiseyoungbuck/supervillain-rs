@@ -618,6 +618,80 @@ pub(crate) fn outlook_folder_role(folder_id: &str) -> Option<String> {
     }
 }
 
+// =============================================================================
+// Phase 4: Outlook email — mutation helpers (pure)
+// =============================================================================
+
+/// What `move_to_mailbox` should do for a given target folder ID. Mirrors
+/// Gmail's `move_plan`. Pure — extracted for unit testing the "reject
+/// system folders that need dedicated endpoints" discipline without HTTP.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MovePlanOutlook {
+    /// Reject with `BadRequest`. Static text — these are all fixed
+    /// strings so the variant doesn't carry an owning String.
+    Reject(&'static str),
+    /// Issue `POST /me/messages/{id}/move` with this `destinationId`.
+    Move { destination: String },
+}
+
+pub(crate) fn move_plan_outlook(target_folder_id: &str) -> MovePlanOutlook {
+    match target_folder_id {
+        // Drafts can only be reached via create / createReply, not /move.
+        "drafts" => MovePlanOutlook::Reject(
+            "Outlook: cannot move messages into Drafts. Drafts are created \
+             via send/reply endpoints, not /me/messages/{id}/move.",
+        ),
+        // Sent gets the SENT flag set automatically when sendMail / send
+        // is called — moving a non-sent message into it would be a lie.
+        "sentitems" => MovePlanOutlook::Reject(
+            "Outlook: cannot move messages into Sent. The Sent folder is \
+             populated automatically when you send a message.",
+        ),
+        // "Mark as junk" needs the markAsJunk action so Outlook's junk
+        // filter learns from the user signal; plain /move bypasses that.
+        "junkemail" => MovePlanOutlook::Reject(
+            "Outlook: 'Mark as junk' must use the markAsJunk action so the \
+             junk filter learns — plain /move skips that signal.",
+        ),
+        // Everything else (inbox, archive, deleteditems, user folders) is
+        // a valid /move target.
+        other => MovePlanOutlook::Move {
+            destination: other.to_string(),
+        },
+    }
+}
+
+/// JSON body for `PATCH /me/messages/{id}` to mark read / unread.
+pub(crate) fn mark_read_body(is_read: bool) -> serde_json::Value {
+    serde_json::json!({ "isRead": is_read })
+}
+
+/// JSON body for `PATCH /me/messages/{id}` to flag / unflag.
+pub(crate) fn flag_body(flagged: bool) -> serde_json::Value {
+    serde_json::json!({
+        "flag": { "flagStatus": if flagged { "flagged" } else { "notFlagged" } }
+    })
+}
+
+/// JSON body for `POST /me/messages/{id}/move`.
+pub(crate) fn move_body(destination_folder_id: &str) -> serde_json::Value {
+    serde_json::json!({ "destinationId": destination_folder_id })
+}
+
+/// Split message IDs into batches of at most 20 — Graph's `/$batch`
+/// per-request cap. Empty input → empty output (no degenerate empty
+/// chunks). Pure; tests assert boundary cases (1, exactly 20, 21, 50).
+pub(crate) fn chunk_batch_requests(ids: &[String]) -> Vec<Vec<&str>> {
+    /// Graph's documented `/$batch` per-request limit.
+    const BATCH_SIZE: usize = 20;
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    ids.chunks(BATCH_SIZE)
+        .map(|chunk| chunk.iter().map(String::as_str).collect())
+        .collect()
+}
+
 /// Map a Microsoft Graph HTTP error to the right `Error` variant so the
 /// frontend can distinguish "your input/state is stale" (4xx) from
 /// "Graph is down" (5xx). Mirror of Gmail's `classify_gmail_error`; lives
@@ -1025,6 +1099,274 @@ pub async fn get_calendar_data(
     let ics = String::from_utf8(bytes)
         .map_err(|e| Error::Internal(format!("Outlook ICS not UTF-8: {e}")))?;
     Ok(Some(ics))
+}
+
+// =============================================================================
+// Phase 4 Milestone B — async write paths
+// =============================================================================
+//
+// Each mutation invalidates BOTH folder_cache (unread counts shift) and
+// page_cache (cached @odata.nextLink URLs would otherwise skip the moved
+// or modified messages). Roborev 179 #3 codified the page_cache
+// invalidation requirement.
+
+/// Invalidate both caches that a mutation could stale. Single helper so
+/// no mutation forgets one half.
+async fn invalidate_caches_after_mutation(session: &OutlookSession) {
+    invalidate_folder_cache(session).await;
+    invalidate_page_cache(session).await;
+}
+
+/// PATCH a message with the given JSON body. Shared by mark_read/unread
+/// and toggle_flag (and any future single-message PATCH mutation).
+async fn patch_message(
+    session: &OutlookSession,
+    msg_id: &str,
+    body: &serde_json::Value,
+    op: &str,
+) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    let encoded = crate::provider_utils::encode_path_segment(msg_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{encoded}");
+    let resp = session
+        .client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("{op} {msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    invalidate_caches_after_mutation(session).await;
+    Ok(true)
+}
+
+pub async fn mark_read(session: &OutlookSession, msg_id: &str) -> Result<bool, Error> {
+    patch_message(session, msg_id, &mark_read_body(true), "mark_read").await
+}
+
+pub async fn mark_unread(session: &OutlookSession, msg_id: &str) -> Result<bool, Error> {
+    patch_message(session, msg_id, &mark_read_body(false), "mark_unread").await
+}
+
+/// Toggle the flag status by reading the current state then PATCHing the
+/// opposite. Two API calls; same TOCTOU caveat as Gmail's toggle_flag.
+pub async fn toggle_flag(session: &OutlookSession, msg_id: &str) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    let encoded = crate::provider_utils::encode_path_segment(msg_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{encoded}?$select=flag");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            &format!("toggle_flag.get {msg_id}"),
+            status,
+            &text,
+        ));
+    }
+    let parsed: serde_json::Value = resp.json().await?;
+    let currently_flagged = parsed["flag"]["flagStatus"].as_str() == Some("flagged");
+    patch_message(
+        session,
+        msg_id,
+        &flag_body(!currently_flagged),
+        "toggle_flag",
+    )
+    .await
+}
+
+/// Move a message to the destination folder. Pure routing happens via
+/// `move_plan_outlook`; the HTTP request is `POST .../move`. On 404 from
+/// Graph (folder missing — most commonly the Archive folder on accounts
+/// that haven't enabled it), surface a `BadRequest` with actionable text
+/// rather than a silent failure (roborev 175 / plan top-5 finding).
+async fn move_message(
+    session: &OutlookSession,
+    msg_id: &str,
+    destination: &str,
+    op: &str,
+) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+    let encoded = crate::provider_utils::encode_path_segment(msg_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{encoded}/move");
+    let resp = session
+        .client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&move_body(destination))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        // Special-case 404 for the Archive folder so the user sees an
+        // actionable message instead of "Outlook archive failed (404):".
+        if status == reqwest::StatusCode::NOT_FOUND && destination == "archive" {
+            return Err(Error::BadRequest(
+                "This Outlook account has no Archive folder. Create one in \
+                 Outlook web (Settings → Mail → Layout → Archive folder), \
+                 then retry."
+                    .into(),
+            ));
+        }
+        return Err(classify_outlook_error(
+            &format!("{op} {msg_id} -> {destination}"),
+            status,
+            &text,
+        ));
+    }
+    invalidate_caches_after_mutation(session).await;
+    Ok(true)
+}
+
+pub async fn archive(session: &OutlookSession, msg_id: &str) -> Result<bool, Error> {
+    move_message(session, msg_id, "archive", "archive").await
+}
+
+pub async fn trash(session: &OutlookSession, msg_id: &str) -> Result<bool, Error> {
+    move_message(session, msg_id, "deleteditems", "trash").await
+}
+
+pub async fn move_to_mailbox(
+    session: &OutlookSession,
+    msg_id: &str,
+    mailbox_id: &str,
+) -> Result<bool, Error> {
+    match move_plan_outlook(mailbox_id) {
+        MovePlanOutlook::Reject(reason) => Err(Error::BadRequest(reason.into())),
+        MovePlanOutlook::Move { destination } => {
+            move_message(session, msg_id, &destination, "move").await
+        }
+    }
+}
+
+/// Archive a batch of messages via Graph's `/$batch` endpoint, chunked at
+/// the documented 20-per-batch cap. Returns the count of messages
+/// *submitted in successful batches*; per-batch failure aborts the rest
+/// to keep the contract simple (matching Gmail's archive_batch shape).
+pub async fn archive_batch(session: &OutlookSession, msg_ids: &[String]) -> Result<usize, Error> {
+    if msg_ids.is_empty() {
+        return Ok(0);
+    }
+    let token = access_token(session).await?;
+    let chunks = chunk_batch_requests(msg_ids);
+    let mut succeeded = 0usize;
+    for chunk in chunks {
+        let body = build_batch_archive_body(&chunk);
+        let resp = session
+            .client
+            .post(format!("{GRAPH_BASE}/$batch"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(classify_outlook_error("$batch.archive", status, &text));
+        }
+        // Per-item failures inside a batch are reported in the response
+        // `responses[].status`, but Graph's overall HTTP status is still
+        // 200. Bail on individual non-2xx so the caller sees the failure
+        // rather than over-counting `succeeded`.
+        let parsed: serde_json::Value = resp.json().await?;
+        if let Some(arr) = parsed["responses"].as_array() {
+            for r in arr {
+                let item_status = r["status"].as_u64().unwrap_or(0);
+                if !(200..300).contains(&item_status) {
+                    return Err(Error::BadRequest(format!(
+                        "Outlook $batch archive partial failure: {r}"
+                    )));
+                }
+            }
+        }
+        succeeded += chunk.len();
+    }
+    invalidate_caches_after_mutation(session).await;
+    Ok(succeeded)
+}
+
+/// Build a Graph `/$batch` request body for archiving a chunk of msg IDs.
+/// Each entry POSTs to the per-message /move endpoint with destinationId
+/// "archive". Pure — extracted so the JSON shape is unit-testable.
+fn build_batch_archive_body(msg_ids: &[&str]) -> serde_json::Value {
+    let requests: Vec<serde_json::Value> = msg_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let encoded = crate::provider_utils::encode_path_segment(id);
+            serde_json::json!({
+                "id": (i + 1).to_string(),
+                "method": "POST",
+                "url": format!("/me/messages/{encoded}/move"),
+                "headers": { "Content-Type": "application/json" },
+                "body": { "destinationId": "archive" }
+            })
+        })
+        .collect();
+    serde_json::json!({ "requests": requests })
+}
+
+// =============================================================================
+// Phase 4 Milestone B — download_blob
+// =============================================================================
+
+/// Download attachment bytes by `BlobRef::OutlookAttachment`. Graph's
+/// `/$value` endpoint returns raw bytes with `Content-Type` set from the
+/// attachment's stored contentType — more accurate than guessing from
+/// the filename extension (which Gmail has to do).
+pub async fn download_blob(
+    session: &OutlookSession,
+    blob_id: &str,
+    _filename: &str,
+) -> Result<(String, Vec<u8>), Error> {
+    let blob_ref = crate::types::BlobRef::parse(blob_id)?;
+    let (msg_id, att_id) = match blob_ref {
+        crate::types::BlobRef::OutlookAttachment { msg_id, att_id } => (msg_id, att_id),
+        crate::types::BlobRef::Synthetic(_) => {
+            return Err(Error::BadRequest(
+                "synthetic blob_id passed to outlook::download_blob — compose \
+                 uploads aren't downloadable until they're sent"
+                    .into(),
+            ));
+        }
+        crate::types::BlobRef::GmailAttachment { .. } => {
+            return Err(Error::BadRequest(
+                "gmail blob_id passed to outlook::download_blob — wrong provider".into(),
+            ));
+        }
+    };
+
+    let token = access_token(session).await?;
+    let msg_enc = crate::provider_utils::encode_path_segment(&msg_id);
+    let att_enc = crate::provider_utils::encode_path_segment(&att_id);
+    let url = format!("{GRAPH_BASE}/me/messages/{msg_enc}/attachments/{att_enc}/$value");
+    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error(
+            "messages.attachments.get/$value",
+            status,
+            &text,
+        ));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = resp.bytes().await?.to_vec();
+    Ok((content_type, bytes))
 }
 
 // =============================================================================
@@ -2440,5 +2782,170 @@ mod tests {
         assert!(msg.contains("messages.send"));
         assert!(msg.contains("400"));
         assert!(msg.contains("missing field"));
+    }
+
+    // =========================================================================
+    // Phase 4 Milestone B — write actions
+    // =========================================================================
+
+    // ---- move_plan_outlook ----
+    //
+    // Mirrors Gmail's move_plan from src/gmail.rs. Outlook's move semantics
+    // differ in detail (folder IDs vs labels, dedicated `/move` endpoint
+    // for both archive and trash), but the discipline is the same:
+    // reject system folders that need dedicated endpoints, route INBOX to
+    // a restore-from-trash flow, vanilla moves go to user folders.
+
+    #[test]
+    fn move_plan_outlook_inbox_restores_from_trash_and_junk() {
+        // "Move to Inbox" = restore from any non-inbox location. The plan
+        // returns the inbox folder ID as the move target; calling code is
+        // responsible for issuing /messages/{id}/move with destinationId.
+        assert_eq!(
+            move_plan_outlook("inbox"),
+            MovePlanOutlook::Move {
+                destination: "inbox".into()
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_outlook_trash_routes_to_deleteditems() {
+        // Outlook's trash is a folder, not a verb — "move to deleteditems"
+        // is the correct restoration of standard semantics.
+        assert_eq!(
+            move_plan_outlook("deleteditems"),
+            MovePlanOutlook::Move {
+                destination: "deleteditems".into()
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_outlook_archive_routes_to_archive_folder() {
+        assert_eq!(
+            move_plan_outlook("archive"),
+            MovePlanOutlook::Move {
+                destination: "archive".into()
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_outlook_user_folder_passes_through() {
+        // User-created folder IDs are long base64 strings; the plan
+        // accepts them as-is.
+        let folder_id = "AAMkADA1ZTI5USERFOLDER";
+        assert_eq!(
+            move_plan_outlook(folder_id),
+            MovePlanOutlook::Move {
+                destination: folder_id.into()
+            }
+        );
+    }
+
+    #[test]
+    fn move_plan_outlook_rejects_sentitems() {
+        // "Move to Sent" doesn't make sense — Sent is set by the send
+        // endpoint automatically. Reject so callers can surface a clear
+        // user-visible error.
+        match move_plan_outlook("sentitems") {
+            MovePlanOutlook::Reject(msg) => assert!(msg.contains("Sent")),
+            other => panic!("expected Reject for sentitems, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_plan_outlook_rejects_drafts() {
+        // Drafts are created via /me/messages POST or createReply,
+        // not via /move from another folder.
+        assert!(matches!(
+            move_plan_outlook("drafts"),
+            MovePlanOutlook::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn move_plan_outlook_rejects_junkemail() {
+        // "Move to Junk" wants the markAsJunk action, not a plain folder
+        // move (which would skip Outlook's junk-filter learning).
+        assert!(matches!(
+            move_plan_outlook("junkemail"),
+            MovePlanOutlook::Reject(_)
+        ));
+    }
+
+    // ---- mutation body builders ----
+
+    #[test]
+    fn mark_read_body_shape() {
+        assert_eq!(mark_read_body(true), serde_json::json!({ "isRead": true }));
+        assert_eq!(
+            mark_read_body(false),
+            serde_json::json!({ "isRead": false })
+        );
+    }
+
+    #[test]
+    fn flag_body_flagged() {
+        let body = flag_body(true);
+        assert_eq!(body["flag"]["flagStatus"], "flagged");
+    }
+
+    #[test]
+    fn flag_body_not_flagged() {
+        let body = flag_body(false);
+        assert_eq!(body["flag"]["flagStatus"], "notFlagged");
+    }
+
+    #[test]
+    fn move_body_shape() {
+        let body = move_body("inbox");
+        assert_eq!(body, serde_json::json!({ "destinationId": "inbox" }));
+    }
+
+    // ---- chunk_batch_requests ----
+
+    #[test]
+    fn chunk_batch_empty_returns_no_chunks() {
+        let ids: Vec<String> = vec![];
+        let chunks = chunk_batch_requests(&ids);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_batch_one_message_returns_one_chunk() {
+        let ids = vec!["m1".to_string()];
+        let chunks = chunk_batch_requests(&ids);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[test]
+    fn chunk_batch_exactly_20_returns_one_chunk() {
+        // Graph's /$batch cap is 20. Boundary case must stay in 1 chunk.
+        let ids: Vec<String> = (0..20).map(|i| format!("m{i}")).collect();
+        let chunks = chunk_batch_requests(&ids);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 20);
+    }
+
+    #[test]
+    fn chunk_batch_21_spans_two_chunks() {
+        let ids: Vec<String> = (0..21).map(|i| format!("m{i}")).collect();
+        let chunks = chunk_batch_requests(&ids);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 20);
+        assert_eq!(chunks[1].len(), 1);
+    }
+
+    #[test]
+    fn chunk_batch_50_spans_three_chunks() {
+        let ids: Vec<String> = (0..50).map(|i| format!("m{i}")).collect();
+        let chunks = chunk_batch_requests(&ids);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 20);
+        assert_eq!(chunks[1].len(), 20);
+        assert_eq!(chunks[2].len(), 10);
     }
 }
