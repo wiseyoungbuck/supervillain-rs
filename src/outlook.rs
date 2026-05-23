@@ -1523,39 +1523,45 @@ pub async fn download_blob(
 
 use crate::types::EmailSubmission;
 
-/// Which Graph API path to use to send `sub`. Top-5 greats finding:
-/// no-attachment replies hit `/reply` in one call; attachment-bearing
-/// replies need the 3-call createReply → PATCH → send dance because
-/// `/reply` doesn't accept attachments in the body.
+/// Which Graph API path to use to send `sub`. Top-5 greats finding plus
+/// roborev 181 #1 refinement:
+/// - `NewMail` always uses sendMail (attachments inline OK).
+/// - `ReplyOneShot` (was `ReplyNoAttachments`) uses `/reply` in 1 RTT
+///   ONLY when the user composed HTML AND there are no attachments.
+///   Graph's `/reply` treats `comment` as HTML; a plain-text body would
+///   have its newlines collapsed by HTML rendering.
+/// - `ReplyWithAttachments` runs the 3-call createReply → PATCH → send
+///   dance for everything else (plain-text replies, attachments, or
+///   Cc/Bcc additions). The PATCH can set body.contentType="text"
+///   correctly.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SendPath {
-    /// `POST /me/sendMail` — handles new mail with or without attachments.
     NewMail,
-    /// `POST /me/messages/{parent}/reply` — single-call, Graph handles
-    /// threading server-side, no draft state.
-    ReplyNoAttachments,
-    /// `POST /me/messages/{parent}/createReply` → `PATCH /me/messages/{draft}`
-    /// → `POST /me/messages/{draft}/send`. Three RTTs because attachments
-    /// must be inlined via PATCH on the draft.
+    ReplyOneShot,
     ReplyWithAttachments,
 }
 
-/// Pure dispatch on (in_reply_to, attachments). Treats `None` and empty
-/// `attachments` identically (defensive against frontend habits).
+/// Pure dispatch on (in_reply_to, html_body, attachments). Treats `None`
+/// and empty `attachments` identically (defensive against frontend habits).
 pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
-    match (&sub.in_reply_to, sub.attachments.is_empty()) {
-        (None, _) => SendPath::NewMail,
-        (Some(_), true) => SendPath::ReplyNoAttachments,
-        (Some(_), false) => SendPath::ReplyWithAttachments,
+    match (&sub.in_reply_to, &sub.html_body, sub.attachments.is_empty()) {
+        (None, _, _) => SendPath::NewMail,
+        // Reply with HTML body + no attachments: 1-RTT /reply path.
+        (Some(_), Some(_), true) => SendPath::ReplyOneShot,
+        // Plain-text reply OR has attachments: 3-call path so we can
+        // PATCH the draft with contentType="text" / attachments inlined.
+        (Some(_), _, _) => SendPath::ReplyWithAttachments,
     }
 }
 
-/// Build the Graph `Message` JSON resource for sendMail / draft PATCH.
+/// Build a Graph `Message` resource with an optional `from` field.
+/// Used for shared-mailbox / send-as scenarios where the caller wants to
+/// pick the From address (roborev 181 #5). For personal mailboxes pass
+/// `None` and Graph defaults to the authenticated user.
 ///
-/// `resolved_attachments` is the already-resolved `(name, mime, bytes)`
-/// triples produced by `peek_blob_bytes` over the EmailSubmission's
-/// attachment list — split out so this builder stays pure (no async, no
-/// session state).
+/// Empty `from_addr` is treated as `None` (defensive against the
+/// frontend always sending the user's primary address even when no
+/// override is needed).
 ///
 /// Body: HTML if present, else text. Graph picks contentType from the
 /// `body.contentType` field, not a header.
@@ -1563,9 +1569,10 @@ pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
 /// Attachments inline as `fileAttachment` entries with base64-encoded
 /// `contentBytes` (Graph has no standalone blob store — bytes must be
 /// in the message body itself).
-pub(crate) fn build_graph_message(
+pub(crate) fn build_graph_message_with_from(
     sub: &EmailSubmission,
     resolved_attachments: &[(String, String, Vec<u8>)],
+    from_addr: Option<&str>,
 ) -> serde_json::Value {
     fn recipients(addrs: &[String]) -> serde_json::Value {
         let arr: Vec<serde_json::Value> = addrs
@@ -1597,24 +1604,83 @@ pub(crate) fn build_graph_message(
     {
         msg["bccRecipients"] = recipients(bcc);
     }
+    // Roborev 181 #5: send-as / shared-mailbox support. Only set if the
+    // caller explicitly asked for a non-default sender.
+    if let Some(addr) = from_addr
+        && !addr.is_empty()
+    {
+        msg["from"] = serde_json::json!({ "emailAddress": { "address": addr } });
+    }
 
     if !resolved_attachments.is_empty() {
-        use base64::Engine;
-        let atts: Vec<serde_json::Value> = resolved_attachments
-            .iter()
-            .map(|(name, mime, bytes)| {
-                serde_json::json!({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": name,
-                    "contentType": mime,
-                    "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
-                })
-            })
-            .collect();
-        msg["attachments"] = serde_json::json!(atts);
+        msg["attachments"] = build_graph_attachments_array(resolved_attachments);
     }
 
     msg
+}
+
+/// Minimal PATCH body for the 3-call reply path. Roborev 181 #6:
+/// createReply pre-populates the draft's `subject`, `toRecipients`,
+/// `inReplyTo`, `references`, `conversationId`, and threading
+/// `internetMessageHeaders`. PATCHing those again would clobber the
+/// correct values with whatever the frontend happened to send.
+///
+/// What we DO set (the things the user actually edited):
+/// - `body` with `contentType` text vs html so plain-text replies
+///   preserve newlines (the root of roborev 181 #1).
+/// - `ccRecipients` / `bccRecipients` when the user added them.
+/// - `attachments` when resolved.
+pub(crate) fn build_graph_reply_patch_body(
+    sub: &EmailSubmission,
+    resolved_attachments: &[(String, String, Vec<u8>)],
+) -> serde_json::Value {
+    fn recipients(addrs: &[String]) -> serde_json::Value {
+        let arr: Vec<serde_json::Value> = addrs
+            .iter()
+            .map(|a| serde_json::json!({ "emailAddress": { "address": a } }))
+            .collect();
+        serde_json::json!(arr)
+    }
+    let (content_type, content) = match &sub.html_body {
+        Some(html) => ("html", html.clone()),
+        None => ("text", sub.text_body.clone()),
+    };
+    let mut body = serde_json::json!({
+        "body": { "contentType": content_type, "content": content },
+    });
+    if !sub.cc.is_empty() {
+        body["ccRecipients"] = recipients(&sub.cc);
+    }
+    if let Some(bcc) = &sub.bcc
+        && !bcc.is_empty()
+    {
+        body["bccRecipients"] = recipients(bcc);
+    }
+    if !resolved_attachments.is_empty() {
+        body["attachments"] = build_graph_attachments_array(resolved_attachments);
+    }
+    body
+}
+
+/// Build the `attachments[]` JSON array shared by sendMail and draft
+/// PATCH builders. Pure — extracted to keep both call sites consistent
+/// (one place to fix Graph schema drift).
+fn build_graph_attachments_array(
+    resolved_attachments: &[(String, String, Vec<u8>)],
+) -> serde_json::Value {
+    use base64::Engine;
+    let atts: Vec<serde_json::Value> = resolved_attachments
+        .iter()
+        .map(|(name, mime, bytes)| {
+            serde_json::json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": name,
+                "contentType": mime,
+                "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+        })
+        .collect();
+    serde_json::json!(atts)
 }
 
 /// Stash compose-time bytes in the session's synthetic-blob cache; return
@@ -1720,7 +1786,15 @@ async fn resolve_all_attachments(
         let (mime, bytes) = peek_blob_bytes(session, &att.blob_id).await?;
         // Prefer the attachment's declared mime_type; fall back to what
         // peek returned. Matches Gmail's discipline.
+        // Roborev 181 #8: surface empty-mime fallbacks in logs so a
+        // frontend bug doesn't silently corrupt content-types in Sent.
         let final_mime = if att.mime_type.is_empty() {
+            tracing::warn!(
+                attachment_name = %att.name,
+                fallback_mime = %mime,
+                "Outlook send: attachment mime_type was empty; falling back \
+                 to the resolved blob's MIME"
+            );
             mime
         } else {
             att.mime_type.clone()
@@ -1742,27 +1816,30 @@ async fn resolve_all_attachments(
 pub async fn send_email(
     session: &OutlookSession,
     sub: &EmailSubmission,
+    from_addr: Option<&str>,
 ) -> Result<Option<String>, Error> {
     // Resolve attachments BEFORE deciding the send path — even the
-    // ReplyNoAttachments branch needs the (empty) resolve to validate
-    // the upload cache state. (Resolves to Ok(vec![]) cheaply.)
+    // ReplyOneShot branch validates the upload cache state (resolves to
+    // Ok(vec![]) cheaply when there are none).
     let resolved = resolve_all_attachments(session, &sub.attachments).await?;
     let path = pick_send_path(sub);
+    // Roborev 181 #10: replace expect() with ok_or_else so a future
+    // contributor synthesizing a SendPath from outside pick_send_path
+    // doesn't panic — graceful degradation to Internal error instead.
+    let parent = || -> Result<&str, Error> {
+        sub.in_reply_to.as_deref().ok_or_else(|| {
+            Error::Internal(
+                "SendPath reply variant produced with no in_reply_to — \
+                 pick_send_path invariant violated"
+                    .into(),
+            )
+        })
+    };
     let new_id = match path {
-        SendPath::NewMail => send_new_mail(session, sub, &resolved).await?,
-        SendPath::ReplyNoAttachments => {
-            let parent = sub
-                .in_reply_to
-                .as_deref()
-                .expect("ReplyNoAttachments implies in_reply_to is Some");
-            send_reply_text_only(session, sub, parent).await?
-        }
+        SendPath::NewMail => send_new_mail(session, sub, &resolved, from_addr).await?,
+        SendPath::ReplyOneShot => send_reply_one_shot(session, sub, parent()?).await?,
         SendPath::ReplyWithAttachments => {
-            let parent = sub
-                .in_reply_to
-                .as_deref()
-                .expect("ReplyWithAttachments implies in_reply_to is Some");
-            send_reply_with_attachments(session, sub, parent, &resolved).await?
+            send_reply_with_attachments(session, sub, parent()?, &resolved).await?
         }
     };
     drain_consumed_synthetic_blobs(session, &sub.attachments).await;
@@ -1779,9 +1856,10 @@ async fn send_new_mail(
     session: &OutlookSession,
     sub: &EmailSubmission,
     resolved: &[(String, String, Vec<u8>)],
+    from_addr: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
-    let message = build_graph_message(sub, resolved);
+    let message = build_graph_message_with_from(sub, resolved, from_addr);
     // saveToSentItems defaults to true on the Graph side but spec it
     // explicitly so the wire shape doesn't depend on tenant defaults.
     let body = serde_json::json!({
@@ -1804,32 +1882,41 @@ async fn send_new_mail(
 }
 
 /// `POST /me/messages/{parent}/reply` — single call, Graph threads it
-/// server-side via the parent message ID, no draft state. Body is just
-/// `{ "comment": "..." }` — additional headers/recipients are inherited
-/// from the parent (which is the Outlook UX users expect for "Reply").
+/// server-side via the parent message ID, no draft state. Body is
+/// `{ "comment": "<html>" }` — Graph treats `comment` as HTML and
+/// inherits headers/recipients from the parent.
 ///
-/// Limitation: this path can't add Cc/Bcc beyond what's on the parent.
-/// If the EmailSubmission carries new Cc/Bcc, fall back to the 3-call
-/// createReply path so the PATCH can set those fields.
-async fn send_reply_text_only(
+/// Roborev 181 #1: this path is reachable only when `pick_send_path`
+/// returns `ReplyOneShot`, which requires `html_body.is_some()` AND no
+/// attachments — plain-text replies route through the 3-call path so
+/// their newlines don't get HTML-collapsed.
+///
+/// If the EmailSubmission carries new Cc/Bcc (which the 1-call path
+/// can't apply), fall back to the 3-call createReply path so the PATCH
+/// can set those fields.
+async fn send_reply_one_shot(
     session: &OutlookSession,
     sub: &EmailSubmission,
     parent_msg_id: &str,
 ) -> Result<Option<String>, Error> {
-    // If the user added recipients beyond the parent's set, we need the
-    // 3-call path to actually attach them. Detect and bail upward (the
-    // caller hasn't routed here in that case if pick_send_path is honest,
-    // but defend anyway).
     if !sub.cc.is_empty() || sub.bcc.as_ref().is_some_and(|v| !v.is_empty()) {
         return send_reply_with_attachments(session, sub, parent_msg_id, &[]).await;
     }
     let token = access_token(session).await?;
     let encoded = crate::provider_utils::encode_path_segment(parent_msg_id);
     let url = format!("{GRAPH_BASE}/me/messages/{encoded}/reply");
-    let comment = if let Some(html) = &sub.html_body {
-        html.clone()
-    } else {
-        sub.text_body.clone()
+    // Invariant from pick_send_path: html_body is Some on this branch.
+    // Defensive: if somehow not, fall back to plain text wrapped in <pre>
+    // to preserve formatting rather than corrupting it.
+    let comment = match &sub.html_body {
+        Some(html) => html.clone(),
+        None => format!(
+            "<pre>{}</pre>",
+            sub.text_body
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        ),
     };
     let body = serde_json::json!({ "comment": comment });
     let resp = session
@@ -1895,18 +1982,17 @@ async fn send_reply_with_attachments(
     //    build_graph_message and then trim the wrapper so we PATCH the
     //    Message resource directly (not wrapped in {message: ...}).
     match patch_and_send_draft(session, &token, &draft_id, sub, resolved).await {
-        Ok(()) => Ok(Some(draft_id)),
+        // Roborev 181 #2: return Ok(None) for parity with send_new_mail.
+        // After /send, the draft is consumed and gets a new ID in Sent
+        // Items that Graph doesn't return; surfacing the now-defunct
+        // draft_id would 404 on any caller trying to use it.
+        Ok(()) => Ok(None),
         Err(e) => {
-            // Orphan-draft cleanup. Best-effort; surface the original
-            // error either way.
-            let cleanup_result = delete_draft(session, &token, &draft_id).await;
-            match cleanup_result {
-                Ok(()) => Err(e),
-                Err(cleanup_err) => Err(Error::Internal(format!(
-                    "send failed ({e}); orphan draft cleanup also failed \
-                     ({cleanup_err}); draft remains in Drafts folder as {draft_id}"
-                ))),
-            }
+            // Roborev 181 #3: pure helper maps cleanup outcome to the
+            // final error so the wording — especially the AlreadyGone
+            // "check Sent Items" warning — stays unit-pinned.
+            let cleanup = delete_draft(session, &token, &draft_id).await;
+            Err(format_send_failure_with_cleanup(e, cleanup, &draft_id))
         }
     }
 }
@@ -1919,7 +2005,10 @@ async fn patch_and_send_draft(
     resolved: &[(String, String, Vec<u8>)],
 ) -> Result<(), Error> {
     let encoded_draft = crate::provider_utils::encode_path_segment(draft_id);
-    let patch_body = build_graph_message(sub, resolved);
+    // Roborev 181 #6: use the minimal PATCH builder so we don't clobber
+    // subject/toRecipients/threading headers that createReply
+    // pre-populated correctly.
+    let patch_body = build_graph_reply_patch_body(sub, resolved);
     let patch_url = format!("{GRAPH_BASE}/me/messages/{encoded_draft}");
     let resp = session
         .client
@@ -1956,25 +2045,59 @@ async fn patch_and_send_draft(
     Ok(())
 }
 
-async fn delete_draft(session: &OutlookSession, token: &str, draft_id: &str) -> Result<(), Error> {
+/// Result of a draft-cleanup attempt. Distinguishes "draft was gone
+/// when we tried to delete" (which strongly suggests the prior send call
+/// did succeed even though we saw a network error — roborev 181 #3)
+/// from "we actually deleted the draft" and "delete itself failed".
+#[derive(Debug, PartialEq, Eq)]
+enum DraftCleanup {
+    Deleted,
+    AlreadyGone,
+    Failed(String),
+}
+
+/// Map (send_err, cleanup, draft_id) → final error surfaced to the
+/// caller. Pure so the `AlreadyGone` "check Sent Items" wording is
+/// pinned by unit tests (roborev 181 #3).
+fn format_send_failure_with_cleanup(
+    send_err: Error,
+    cleanup: DraftCleanup,
+    draft_id: &str,
+) -> Error {
+    match cleanup {
+        DraftCleanup::Deleted => send_err,
+        DraftCleanup::AlreadyGone => Error::Internal(format!(
+            "send appeared to fail ({send_err}), but the draft was already \
+             gone when we tried to clean it up — the message may have \
+             actually been sent. Check your Outlook Sent Items folder \
+             BEFORE resending to avoid a duplicate."
+        )),
+        DraftCleanup::Failed(cleanup_err) => Error::Internal(format!(
+            "send failed ({send_err}); orphan draft cleanup also failed \
+             ({cleanup_err}); draft remains in Drafts folder as {draft_id}"
+        )),
+    }
+}
+
+async fn delete_draft(session: &OutlookSession, token: &str, draft_id: &str) -> DraftCleanup {
     let encoded = crate::provider_utils::encode_path_segment(draft_id);
     let url = format!("{GRAPH_BASE}/me/messages/{encoded}");
-    let resp = session
-        .client
-        .delete(&url)
-        .bearer_auth(token)
-        .send()
-        .await?;
+    let resp = match session.client.delete(&url).bearer_auth(token).send().await {
+        Ok(r) => r,
+        Err(e) => return DraftCleanup::Failed(e.to_string()),
+    };
     let status = resp.status();
-    if status.is_success() || status.as_u16() == 404 {
-        Ok(())
+    if status.is_success() {
+        DraftCleanup::Deleted
+    } else if status.as_u16() == 404 {
+        // The draft is gone. Two possibilities:
+        // 1. The prior send actually completed despite our network error,
+        //    so Graph consumed the draft and moved it to Sent Items.
+        // 2. Concurrent UI deleted the draft. Rare; the user-facing
+        //    message handles both by mentioning Sent Items.
+        DraftCleanup::AlreadyGone
     } else {
-        let text = resp.text().await.unwrap_or_default();
-        Err(classify_outlook_error(
-            &format!("draft.delete {draft_id}"),
-            status,
-            &text,
-        ))
+        DraftCleanup::Failed(format!("delete returned {status}"))
     }
 }
 
@@ -3734,11 +3857,26 @@ mod tests {
     }
 
     #[test]
-    fn pick_send_path_reply_no_attachments_is_one_call_reply() {
+    fn pick_send_path_reply_html_only_no_attachments_is_one_call() {
+        // Roborev 181 #1: the 1-call /reply path treats `comment` as
+        // HTML. Only safe when the user composed HTML.
         let mut sub = empty_sub();
         sub.in_reply_to = Some("parent-msg-id".into());
-        // Graph's /reply takes a comment + threads server-side. 1 RTT.
-        assert_eq!(pick_send_path(&sub), SendPath::ReplyNoAttachments);
+        sub.html_body = Some("<p>hi</p>".into());
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyOneShot);
+    }
+
+    #[test]
+    fn pick_send_path_reply_plain_text_no_attachments_uses_three_call() {
+        // Roborev 181 #1 (the bug): a plain-text reply with newlines
+        // collapses to one paragraph if sent via /reply's HTML-rendered
+        // `comment` field. Route through the 3-call createReply path
+        // which lets us PATCH with contentType="text".
+        let mut sub = empty_sub();
+        sub.in_reply_to = Some("parent-msg-id".into());
+        sub.text_body = "line one\nline two\nline three".into();
+        sub.html_body = None;
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyWithAttachments);
     }
 
     #[test]
@@ -3746,20 +3884,16 @@ mod tests {
         let mut sub = empty_sub();
         sub.in_reply_to = Some("parent-msg-id".into());
         sub.attachments = vec![fake_attachment()];
-        // Attachments can't be inlined in /reply; need createReply →
-        // PATCH attachments → send (3 RTTs + orphan-draft cleanup risk).
         assert_eq!(pick_send_path(&sub), SendPath::ReplyWithAttachments);
     }
 
     #[test]
-    fn pick_send_path_reply_with_empty_attachments_vec_is_one_call_reply() {
-        // Empty vec must be treated the same as None — defensive against
-        // frontend always sending [] regardless of attachments actually
-        // attached.
+    fn pick_send_path_reply_with_empty_attachments_vec_but_html_is_one_shot() {
         let mut sub = empty_sub();
         sub.in_reply_to = Some("parent-msg-id".into());
         sub.attachments = vec![];
-        assert_eq!(pick_send_path(&sub), SendPath::ReplyNoAttachments);
+        sub.html_body = Some("<p>x</p>".into());
+        assert_eq!(pick_send_path(&sub), SendPath::ReplyOneShot);
     }
 
     // ---- build_graph_message ----
@@ -3772,7 +3906,7 @@ mod tests {
     #[test]
     fn graph_message_text_only_has_required_fields() {
         let sub = empty_sub();
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         assert_eq!(msg["subject"], "S");
         assert_eq!(msg["body"]["contentType"], "text");
         assert_eq!(msg["body"]["content"], "B");
@@ -3785,7 +3919,7 @@ mod tests {
     fn graph_message_html_body_uses_html_contenttype() {
         let mut sub = empty_sub();
         sub.html_body = Some("<p>hi</p>".into());
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         // HTML body wins when present (matches the body the user composed).
         assert_eq!(msg["body"]["contentType"], "html");
         assert_eq!(msg["body"]["content"], "<p>hi</p>");
@@ -3795,7 +3929,7 @@ mod tests {
     fn graph_message_includes_cc_recipients() {
         let mut sub = empty_sub();
         sub.cc = vec!["bob@example.com".into()];
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         let cc_arr = msg["ccRecipients"].as_array().unwrap();
         assert_eq!(cc_arr.len(), 1);
         assert_eq!(cc_arr[0]["emailAddress"]["address"], "bob@example.com");
@@ -3805,7 +3939,7 @@ mod tests {
     fn graph_message_includes_bcc_recipients_when_set() {
         let mut sub = empty_sub();
         sub.bcc = Some(vec!["carol@example.com".into()]);
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         let bcc_arr = msg["bccRecipients"].as_array().unwrap();
         assert_eq!(bcc_arr.len(), 1);
         assert_eq!(bcc_arr[0]["emailAddress"]["address"], "carol@example.com");
@@ -3814,7 +3948,7 @@ mod tests {
     #[test]
     fn graph_message_omits_bcc_when_none() {
         let sub = empty_sub();
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         // Graph treats absence and `[]` differently for bcc — absent is
         // cleaner. Don't add an empty bccRecipients key.
         assert!(msg.get("bccRecipients").is_none());
@@ -3831,7 +3965,7 @@ mod tests {
             "application/pdf".to_string(),
             b"%PDF-fake".to_vec(),
         )];
-        let msg = build_graph_message(&sub, &resolved);
+        let msg = build_graph_message_with_from(&sub, &resolved, None);
         let atts = msg["attachments"].as_array().unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["@odata.type"], "#microsoft.graph.fileAttachment");
@@ -3846,7 +3980,7 @@ mod tests {
     #[test]
     fn graph_message_omits_attachments_when_resolved_empty() {
         let sub = empty_sub();
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         assert!(msg.get("attachments").is_none());
     }
 
@@ -3854,9 +3988,177 @@ mod tests {
     fn graph_message_multiple_to_recipients() {
         let mut sub = empty_sub();
         sub.to = vec!["a@x.com".into(), "b@y.com".into(), "c@z.com".into()];
-        let msg = build_graph_message(&sub, &[]);
+        let msg = build_graph_message_with_from(&sub, &[], None);
         let to_arr = msg["toRecipients"].as_array().unwrap();
         assert_eq!(to_arr.len(), 3);
+    }
+
+    // ---- Roborev 181 #6: build_graph_reply_patch_body ----
+    //
+    // The 3-call reply path uses createReply, which pre-populates the
+    // draft with subject ("RE: …"), parent's toRecipients,
+    // inReplyTo / references / conversationId, and the threading
+    // internetMessageHeaders. PATCHing the draft must NOT clobber those
+    // — set only the fields the user actually edits (body, attachments,
+    // additional cc/bcc).
+
+    #[test]
+    fn reply_patch_body_omits_subject_and_to() {
+        let mut sub = empty_sub();
+        sub.subject = "Re: original".into();
+        sub.to = vec!["whatever@example.com".into()];
+        let body = build_graph_reply_patch_body(&sub, &[]);
+        assert!(
+            body.get("subject").is_none(),
+            "subject must NOT be in PATCH — createReply set it"
+        );
+        assert!(
+            body.get("toRecipients").is_none(),
+            "toRecipients must NOT be in PATCH — createReply set them"
+        );
+    }
+
+    #[test]
+    fn reply_patch_body_includes_html_body_when_set() {
+        let mut sub = empty_sub();
+        sub.html_body = Some("<p>html reply</p>".into());
+        let body = build_graph_reply_patch_body(&sub, &[]);
+        assert_eq!(body["body"]["contentType"], "html");
+        assert_eq!(body["body"]["content"], "<p>html reply</p>");
+    }
+
+    #[test]
+    fn reply_patch_body_uses_text_contenttype_for_plain_text() {
+        // Roborev 181 #1 fix verification: PATCH path must set
+        // contentType="text" so plain-text replies preserve newlines.
+        let mut sub = empty_sub();
+        sub.text_body = "line one\nline two".into();
+        sub.html_body = None;
+        let body = build_graph_reply_patch_body(&sub, &[]);
+        assert_eq!(body["body"]["contentType"], "text");
+        assert_eq!(body["body"]["content"], "line one\nline two");
+    }
+
+    #[test]
+    fn reply_patch_body_includes_added_cc_bcc() {
+        let mut sub = empty_sub();
+        sub.cc = vec!["added-cc@example.com".into()];
+        sub.bcc = Some(vec!["added-bcc@example.com".into()]);
+        let body = build_graph_reply_patch_body(&sub, &[]);
+        assert_eq!(
+            body["ccRecipients"][0]["emailAddress"]["address"],
+            "added-cc@example.com"
+        );
+        assert_eq!(
+            body["bccRecipients"][0]["emailAddress"]["address"],
+            "added-bcc@example.com"
+        );
+    }
+
+    #[test]
+    fn reply_patch_body_includes_attachments() {
+        let sub = empty_sub();
+        let resolved = vec![(
+            "report.pdf".to_string(),
+            "application/pdf".to_string(),
+            b"%PDF".to_vec(),
+        )];
+        let body = build_graph_reply_patch_body(&sub, &resolved);
+        let atts = body["attachments"].as_array().unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["name"], "report.pdf");
+    }
+
+    // ---- Roborev 181 #5: build_graph_message with from_addr ----
+
+    #[test]
+    fn graph_message_includes_from_when_provided() {
+        let sub = empty_sub();
+        let msg = build_graph_message_with_from(&sub, &[], Some("shared@org.com"));
+        assert_eq!(msg["from"]["emailAddress"]["address"], "shared@org.com");
+    }
+
+    #[test]
+    fn graph_message_omits_from_when_none() {
+        let sub = empty_sub();
+        let msg = build_graph_message_with_from(&sub, &[], None);
+        assert!(
+            msg.get("from").is_none(),
+            "no 'from' field when caller didn't provide one — Graph picks default"
+        );
+    }
+
+    #[test]
+    fn graph_message_omits_from_when_empty_string() {
+        let sub = empty_sub();
+        let msg = build_graph_message_with_from(&sub, &[], Some(""));
+        assert!(msg.get("from").is_none());
+    }
+
+    // ---- Roborev 181 #3: format_send_failure_with_cleanup ----
+    //
+    // Pure helper that maps (send_err, cleanup_outcome, draft_id) to the
+    // final user-facing Error. Pinned here so the AlreadyGone path keeps
+    // mentioning "Sent Items" — the user must be told to check before
+    // resending to avoid a duplicate.
+
+    #[test]
+    fn cleanup_deleted_returns_original_send_error_unchanged() {
+        let original = Error::Internal("graph 503".into());
+        let out = format_send_failure_with_cleanup(original, DraftCleanup::Deleted, "draft-1");
+        match out {
+            Error::Internal(msg) => assert_eq!(msg, "graph 503"),
+            other => panic!("expected unchanged Internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_already_gone_message_warns_about_sent_items() {
+        let original = Error::Internal("network reset".into());
+        let out = format_send_failure_with_cleanup(original, DraftCleanup::AlreadyGone, "draft-2");
+        let msg = match out {
+            Error::Internal(m) => m,
+            other => panic!("expected Internal error, got {other:?}"),
+        };
+        // Must reference Sent Items so the user checks before resending —
+        // this is the duplicate-send guard the roborev finding called out.
+        assert!(
+            msg.contains("Sent Items"),
+            "AlreadyGone message must mention Sent Items: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("before resending")
+                || msg.to_ascii_lowercase().contains("avoid a duplicate"),
+            "AlreadyGone message must warn about duplicate sends: {msg}"
+        );
+        // Original send error context must survive — otherwise the user
+        // loses the actual diagnostic.
+        assert!(
+            msg.contains("network reset"),
+            "AlreadyGone message must preserve the original send error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cleanup_failed_message_names_the_orphan_draft() {
+        let original = Error::Internal("graph 500".into());
+        let out = format_send_failure_with_cleanup(
+            original,
+            DraftCleanup::Failed("delete returned 503".into()),
+            "AAMkAGI-orphan-id",
+        );
+        let msg = match out {
+            Error::Internal(m) => m,
+            other => panic!("expected Internal error, got {other:?}"),
+        };
+        // Need the draft_id so the user can find / clean it up manually.
+        assert!(
+            msg.contains("AAMkAGI-orphan-id"),
+            "Failed cleanup message must include draft_id: {msg}"
+        );
+        // Both error contexts must survive.
+        assert!(msg.contains("graph 500"));
+        assert!(msg.contains("delete returned 503"));
     }
 
     // ---- upload_blob + peek_blob_bytes + drain_consumed_synthetic_blobs ----

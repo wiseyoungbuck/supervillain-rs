@@ -181,11 +181,18 @@ pub async fn send_email(
             jmap::send_email(s, sub, from_addr, identity_id_override).await
         }
         ProviderSession::Outlook(s) => {
-            // Outlook has a single identity from /me — from_addr and
-            // identity_id_override are informational only (Graph picks
-            // the From from the authenticated user).
-            let _ = (from_addr, identity_id_override);
-            outlook::send_email(s, sub).await
+            // Roborev 181 #5: honor from_addr for shared-mailbox /
+            // send-as scenarios. Pass through to outlook::send_email
+            // which sets message.from.emailAddress when non-empty.
+            // identity_id_override is JMAP-specific; Outlook has no
+            // identity ID concept beyond the user's mail address.
+            let _ = identity_id_override;
+            let from = if from_addr.is_empty() {
+                None
+            } else {
+                Some(from_addr)
+            };
+            outlook::send_email(s, sub, from).await
         }
         ProviderSession::Gmail(s) => {
             gmail::send_email(s, sub, from_addr, identity_id_override).await
