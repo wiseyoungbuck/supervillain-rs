@@ -406,6 +406,11 @@ pub struct AppState {
     pub account_errors: tokio::sync::RwLock<Vec<AccountError>>,
     pub splits_config_path: PathBuf,
     pub timezone_config_path: PathBuf,
+    /// Serializes timezone load→mutate→save so two concurrent settings
+    /// writes can't lose-update each other. The value is unit because the
+    /// authoritative state lives on disk; this lock just bracketizes the
+    /// load-modify-store window.
+    pub timezone_write_lock: tokio::sync::Mutex<()>,
     pub config_path: PathBuf,
     pub tokens_dir: PathBuf,
     pub token_store: std::sync::Arc<dyn crate::platform::TokenStore>,

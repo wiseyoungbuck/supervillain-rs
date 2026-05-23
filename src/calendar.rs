@@ -368,7 +368,7 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &RsvpS
         .and_then(|a| a.name.clone());
 
     let cn_param = match &cn {
-        Some(name) => format!(";CN={name}"),
+        Some(name) => format!(";CN={}", escape_param_value(name)),
         None => String::new(),
     };
 
@@ -381,7 +381,7 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &RsvpS
     let organizer_cn = event
         .organizer_name
         .as_ref()
-        .map(|n| format!(";CN={n}"))
+        .map(|n| format!(";CN={}", escape_param_value(n)))
         .unwrap_or_default();
 
     format!(
@@ -402,12 +402,12 @@ pub fn generate_rsvp(event: &CalendarEvent, attendee_email: &str, status: &RsvpS
         uid = event.uid,
         dtstart = dtstart,
         dtend_line = dtend_line,
-        summary = event.summary,
+        summary = escape_text(&event.summary),
         organizer_cn = organizer_cn,
-        organizer_email = event.organizer_email,
+        organizer_email = sanitize_address(&event.organizer_email),
         cn_param = cn_param,
         partstat = status.as_ics_str(),
-        attendee_email = attendee_email,
+        attendee_email = sanitize_address(attendee_email),
         sequence = event.sequence,
     )
 }
@@ -429,16 +429,32 @@ fn format_offset_hhmm(offset_seconds: i32) -> String {
 }
 
 /// Synthesize a minimal VTIMEZONE block covering the offset that applies at
-/// the given instant in the given IANA timezone. Sufficient for one-shot
-/// events; we don't emit DST transition rules because we don't generate
-/// recurring events.
+/// the given instant in the given IANA timezone.
+///
+/// This deliberately emits a single STANDARD sub-block carrying the offset
+/// effective at `dt`, not the full set of DST transition rules. That is
+/// correct for one-shot events (the only kind we generate — we don't emit
+/// RRULE) because RFC 5545 only requires VTIMEZONE to cover the date range
+/// referenced by VEVENTs in the same calendar object. Recipients see the
+/// right wall-clock time. Receiving clients that follow up by computing
+/// DST transitions for the same TZID will fall back to their own tzdata,
+/// since the TZID is an IANA name they already know.
+///
+/// If we ever start generating recurring events, this needs to grow real
+/// STANDARD/DAYLIGHT pairs derived from `chrono_tz::Tz` transitions.
 fn synth_vtimezone(tz: Tz, dt: DateTime<Tz>) -> String {
     let offset = dt.offset().fix();
     let offset_str = format_offset_hhmm(offset.local_minus_utc());
     let tzname = format!("{}", dt.format("%Z"));
+    // X-LIC-LOCATION (libical extension, RFC 7808 §7.1.1) labels the
+    // VTIMEZONE with its IANA name so strict parsers that cache VTIMEZONE
+    // definitions by TZID can map back to their own IANA rules for *other*
+    // events sharing the same TZID — even though our single STANDARD with
+    // TZOFFSETFROM==TZOFFSETTO advertises one year-round offset. Roborev 186 #9.
     format!(
         "BEGIN:VTIMEZONE\r\n\
          TZID:{tzid}\r\n\
+         X-LIC-LOCATION:{tzid}\r\n\
          BEGIN:STANDARD\r\n\
          DTSTART:19700101T000000\r\n\
          TZOFFSETFROM:{offset}\r\n\
@@ -460,7 +476,7 @@ fn attendee_line(att: &Attendee) -> String {
     let cn_param = att
         .name
         .as_ref()
-        .map(|n| format!(";CN={n}"))
+        .map(|n| format!(";CN={}", escape_param_value(n)))
         .unwrap_or_default();
     let partstat = if att.status.is_empty() {
         "NEEDS-ACTION".to_string()
@@ -471,8 +487,41 @@ fn attendee_line(att: &Attendee) -> String {
         "ATTENDEE{cn};RSVP=TRUE;PARTSTAT={partstat}:mailto:{email}\r\n",
         cn = cn_param,
         partstat = partstat,
-        email = att.email,
+        email = sanitize_address(&att.email),
     )
+}
+
+/// Escape a parameter value (e.g. `CN=...`) per RFC 5545 §3.1, with
+/// defense-in-depth against naive parsers.
+///
+/// Without this, `name: "Bob\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:victim@x"`
+/// would inject a second ATTENDEE line into the calendar object (the
+/// receiver's client may show fake attendees or auto-accept on the user's
+/// behalf). Spec-wise DQUOTE-wrapping handles `,`, `;`, `:`, but a naive
+/// parser that splits on the first unescaped `:` would still see a colon
+/// inside a quoted CN as the property-value separator. We therefore strip
+/// `:` and `"` outright — neither is legitimate in a display name — and
+/// DQUOTE-wrap when the value contains other terminator chars.
+fn escape_param_value(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"' && *c != ':')
+        .collect();
+    if cleaned.chars().any(|c| c == ',' || c == ';' || c == ' ') {
+        format!("\"{cleaned}\"")
+    } else {
+        cleaned
+    }
+}
+
+/// Sanitize a value emitted after `mailto:` so it can't terminate the line
+/// or smuggle in additional iCal properties. Email addresses may not
+/// legitimately contain CR/LF or `:` in the visible portion; rejecting
+/// those characters by stripping them is the safe + ergonomic choice.
+fn sanitize_address(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != ',' && *c != ';' && *c != '"')
+        .collect()
 }
 
 /// Build an iTIP REQUEST (a calendar invite) with TZID-qualified DTSTART/DTEND.
@@ -498,8 +547,9 @@ pub fn generate_invite(
     let vtimezone = synth_vtimezone(tz, dtstart);
 
     let organizer_cn = organizer_name
-        .map(|n| format!(";CN={n}"))
+        .map(|n| format!(";CN={}", escape_param_value(n)))
         .unwrap_or_default();
+    let organizer_email_safe = sanitize_address(organizer_email);
 
     let mut attendee_lines = String::new();
     for att in attendees {
@@ -536,6 +586,7 @@ pub fn generate_invite(
         dtstart = format_ics_datetime_local(dtstart),
         dtend = format_ics_datetime_local(dtend),
         summary = escape_text(summary),
+        organizer_email = organizer_email_safe,
     )
 }
 
@@ -559,7 +610,7 @@ pub fn generate_rsvp_with_tz(
         .find(|a| a.email.eq_ignore_ascii_case(attendee_email))
         .and_then(|a| a.name.clone());
     let cn_param = match &cn {
-        Some(name) => format!(";CN={name}"),
+        Some(name) => format!(";CN={}", escape_param_value(name)),
         None => String::new(),
     };
 
@@ -579,7 +630,7 @@ pub fn generate_rsvp_with_tz(
     let organizer_cn = event
         .organizer_name
         .as_ref()
-        .map(|n| format!(";CN={n}"))
+        .map(|n| format!(";CN={}", escape_param_value(n)))
         .unwrap_or_default();
 
     format!(
@@ -598,9 +649,10 @@ pub fn generate_rsvp_with_tz(
          SEQUENCE:{sequence}\r\n\
          END:VEVENT\r\n\
          END:VCALENDAR",
-        uid = event.uid,
-        summary = event.summary,
-        organizer_email = event.organizer_email,
+        uid = sanitize_token(&event.uid),
+        summary = escape_text(&event.summary),
+        organizer_email = sanitize_address(&event.organizer_email),
+        attendee_email = sanitize_address(attendee_email),
         partstat = status.as_ics_str(),
         sequence = event.sequence,
     )
@@ -608,10 +660,25 @@ pub fn generate_rsvp_with_tz(
 
 fn escape_text(s: &str) -> String {
     // RFC 5545: backslash, newline, comma, semicolon need escaping in TEXT values.
-    s.replace('\\', "\\\\")
+    // CR has no escape — strict parsers reject a bare CR mid-line. Normalize
+    // CR/CRLF to a single escaped \n so a `summary` containing \r can't
+    // produce malformed ICS or smuggle in a property break on receipt.
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace(',', "\\,")
         .replace(';', "\\;")
+}
+
+/// Sanitize an opaque token (UID, SEQUENCE-adjacent values) so an attacker-
+/// controlled invite can't smuggle line breaks into the REPLY we generate.
+/// UIDs in the wild are usually UUIDs or base64; control characters and the
+/// iCal terminators have no legitimate place there.
+fn sanitize_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && *c != ';' && *c != ':' && *c != ',' && *c != '"')
+        .collect()
 }
 
 /// RFC 4791: stored calendar objects must not contain METHOD.
@@ -1771,6 +1838,30 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn vtimezone_includes_x_lic_location() {
+        // Roborev 186 #9: strict parsers caching VTIMEZONE by TZID can use
+        // X-LIC-LOCATION to map back to IANA rules.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let dtstart = tz.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let dtend = tz.with_ymd_and_hms(2026, 7, 4, 13, 0, 0).unwrap();
+        let ics = generate_invite(
+            "a@x.com",
+            None,
+            "Test",
+            None,
+            None,
+            dtstart,
+            dtend,
+            &[],
+            None,
+        );
+        assert!(
+            ics.contains("X-LIC-LOCATION:America/New_York"),
+            "VTIMEZONE must include X-LIC-LOCATION for IANA mapping"
+        );
+    }
+
+    #[test]
     fn rsvp_with_tz_emits_tzid_not_z() {
         let tz: Tz = "America/New_York".parse().unwrap();
         let rsvp = generate_rsvp_with_tz(
@@ -1794,5 +1885,110 @@ END:VCALENDAR";
         // The UTC instant must round-trip even though wall-clock is now NYC.
         assert_eq!(parsed.dtstart, original.dtstart);
         assert_eq!(parsed.method, "REPLY");
+    }
+
+    // ---- ICS property-injection hardening (roborev 186 #2) ----
+
+    #[test]
+    fn invite_with_crlf_in_attendee_name_does_not_inject_property() {
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let dtstart = tz.with_ymd_and_hms(2026, 2, 15, 10, 0, 0).unwrap();
+        let dtend = tz.with_ymd_and_hms(2026, 2, 15, 11, 0, 0).unwrap();
+        let attendees = vec![Attendee {
+            email: "victim@example.com".into(),
+            // Classic CRLF-injection payload: a malicious calendar invite
+            // would attempt to inject a second ATTENDEE line that the
+            // receiver's client treats as auto-accepted.
+            name: Some(
+                "Bob\r\nATTENDEE;PARTSTAT=ACCEPTED;CN=Spoofed:mailto:attacker@evil.example".into(),
+            ),
+            status: "NEEDS-ACTION".into(),
+        }];
+        let ics = generate_invite(
+            "alice@example.com",
+            Some("Alice"),
+            "Meeting",
+            None,
+            None,
+            dtstart,
+            dtend,
+            &attendees,
+            None,
+        );
+        // Exactly one line begins with ATTENDEE — the legitimate one.
+        // The attacker's name may appear *inside* the (quoted) CN value
+        // as harmless text; the security property is that no second
+        // property line is emitted AND a real ICS parser sees only the
+        // legitimate attendee.
+        let attendee_lines = ics
+            .split("\r\n")
+            .filter(|line| line.starts_with("ATTENDEE"))
+            .count();
+        assert_eq!(
+            attendee_lines, 1,
+            "must not inject a second ATTENDEE line via CN= CRLF injection"
+        );
+        let parsed = parse_ics(&ics).expect("must round-trip through parser");
+        assert_eq!(
+            parsed.attendees.len(),
+            1,
+            "parser must see exactly one attendee, not the smuggled second"
+        );
+        assert_eq!(
+            parsed.attendees[0].email, "victim@example.com",
+            "parser must resolve to the legitimate attendee email"
+        );
+    }
+
+    #[test]
+    fn invite_quotes_cn_containing_param_terminators() {
+        // RFC 5545 §3.1: param values containing ',' ':' ';' must be DQUOTE-wrapped.
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let dtstart = tz.with_ymd_and_hms(2026, 2, 15, 10, 0, 0).unwrap();
+        let dtend = tz.with_ymd_and_hms(2026, 2, 15, 11, 0, 0).unwrap();
+        let attendees = vec![Attendee {
+            email: "bob@example.com".into(),
+            name: Some("Smith, Bob".into()),
+            status: "NEEDS-ACTION".into(),
+        }];
+        let ics = generate_invite(
+            "alice@example.com",
+            None,
+            "Meeting",
+            None,
+            None,
+            dtstart,
+            dtend,
+            &attendees,
+            None,
+        );
+        assert!(
+            ics.contains(r#";CN="Smith, Bob""#),
+            "CN containing ',' must be DQUOTE-wrapped, got: {ics}"
+        );
+    }
+
+    #[test]
+    fn rsvp_with_crlf_in_organizer_does_not_inject_property() {
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let mut evil = sample_event();
+        evil.organizer_email = "alice@example.com\r\nATTENDEE:mailto:spoof@evil.example".into();
+        let rsvp = generate_rsvp_with_tz(&evil, "bob@example.com", &RsvpStatus::Accepted, tz);
+        // Exactly one ORGANIZER property line. The injection's `ATTENDEE:`
+        // and the trailing `mailto:` may survive as harmless characters
+        // inside the ORGANIZER value (no parser recognizes them as a new
+        // property after `\r\n` stripping); the security property is that
+        // no second property line appears.
+        let organizer_lines = rsvp
+            .split("\r\n")
+            .filter(|line| line.starts_with("ORGANIZER"))
+            .count();
+        assert_eq!(organizer_lines, 1);
+        for line in rsvp.split("\r\n") {
+            assert!(
+                !line.starts_with("ATTENDEE") || !line.contains(":mailto:spoof@evil.example"),
+                "smuggled mailto must not become a standalone ATTENDEE line"
+            );
+        }
     }
 }

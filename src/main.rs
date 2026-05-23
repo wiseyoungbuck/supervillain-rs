@@ -84,6 +84,7 @@ async fn main() {
         account_errors: tokio::sync::RwLock::new(account_errors),
         splits_config_path,
         timezone_config_path,
+        timezone_write_lock: tokio::sync::Mutex::new(()),
         config_path,
         tokens_dir,
         token_store,

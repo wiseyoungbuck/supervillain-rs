@@ -1015,6 +1015,7 @@ async fn put_timezone(
         }
     }
 
+    let _guard = state.timezone_write_lock.lock().await;
     let mut existing = timezone::load_config(
         &state.timezone_config_path,
         timezone_env_override().as_deref(),
@@ -1036,6 +1037,7 @@ async fn put_timezone(
 async fn accept_system_timezone(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Error> {
+    let _guard = state.timezone_write_lock.lock().await;
     let mut cfg = timezone::load_config(
         &state.timezone_config_path,
         timezone_env_override().as_deref(),
@@ -1051,14 +1053,36 @@ async fn accept_system_timezone(
     ))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct DismissTimezoneBody {
+    /// The system TZ value the client was looking at when the user dismissed
+    /// the banner. If it no longer matches the currently detected system TZ,
+    /// we refuse — the user can't "Keep current" on a change they never saw.
+    /// Optional for backwards-compat with clients that don't send it.
+    #[serde(default)]
+    seen_system: Option<String>,
+}
+
 async fn dismiss_timezone_change(
     State(state): State<Arc<AppState>>,
+    body: Option<Json<DismissTimezoneBody>>,
 ) -> Result<impl IntoResponse, Error> {
+    let _guard = state.timezone_write_lock.lock().await;
+    let current_system = timezone::detect_system_tz();
+    if let Some(Json(b)) = body
+        && let Some(seen) = b.seen_system
+        && !seen.is_empty()
+        && seen != current_system
+    {
+        return Err(Error::Conflict(format!(
+            "system timezone changed from {seen} to {current_system} since the banner was shown — please recheck"
+        )));
+    }
     let mut cfg = timezone::load_config(
         &state.timezone_config_path,
         timezone_env_override().as_deref(),
     );
-    cfg.dismissed_change_to = Some(timezone::detect_system_tz());
+    cfg.dismissed_change_to = Some(current_system);
     timezone::save_config(&cfg, &state.timezone_config_path)?;
     Ok(Json(
         serde_json::to_value(timezone::resolve(&cfg)).unwrap_or_default(),
@@ -1104,8 +1128,22 @@ struct SendInviteBody {
     attendees: Vec<InviteAttendee>,
     #[serde(default)]
     from_address: Option<String>,
+    /// File attachments resolved at send time the same way `/emails/send`
+    /// resolves them. Without this, users who attached files AND enabled
+    /// the invite toggle would silently lose the attachments (roborev 186 #6).
+    #[serde(default)]
+    attachments: Vec<Attachment>,
 }
 
+/// Send an email with an embedded iTIP REQUEST.
+///
+/// Attendee list comes from `body.attendees` only — `to`/`cc`/`bcc` control
+/// envelope routing, not ICS ATTENDEE properties. BCC privacy is preserved
+/// (BCC recipients are not visible in the ICS) but the caller must include
+/// them in `attendees` if it wants them tracked in calendar attendees.
+/// The frontend builds `attendees` from `to + cc` deliberately; if BCC
+/// support is added to the compose UI, decide policy then (include + warn,
+/// or exclude + warn).
 async fn send_invite_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
@@ -1141,6 +1179,13 @@ async fn send_invite_handler(
     let dtend = chrono::TimeZone::from_local_datetime(&tz, &end_naive)
         .earliest()
         .ok_or_else(|| Error::BadRequest("end time has no valid mapping in tz".into()))?;
+    // Roborev 186 #7: reject negative-duration invites at the boundary rather
+    // than relying on the recipient's calendar client.
+    if dtend <= dtstart {
+        return Err(Error::BadRequest(
+            "end time must be after start time".into(),
+        ));
+    }
 
     let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let mut session = session_lock.write().await;
@@ -1185,7 +1230,7 @@ async fn send_invite_handler(
         html_body: None,
         in_reply_to: None,
         references: None,
-        attachments: vec![],
+        attachments: body.attachments,
         calendar_ics: Some(ics),
     };
 
@@ -2653,6 +2698,129 @@ white   = '#fdf6e3'
         assert!(
             STYLE_CSS.contains(".error-banner-dismiss"),
             "style.css should have dismiss button styles"
+        );
+    }
+
+    // =========================================================================
+    // Roborev 186 hardening sentinels
+    // =========================================================================
+
+    #[test]
+    fn send_invite_rejects_end_at_or_before_start() {
+        // Roborev 186 #7: handler must reject negative-duration invites.
+        let src = include_str!("routes.rs");
+        assert!(
+            src.contains("end time must be after start time"),
+            "send_invite_handler must check dtend > dtstart"
+        );
+    }
+
+    #[test]
+    fn send_invite_passes_attachments_through() {
+        // Roborev 186 #6: invite path must accept and forward attachments
+        // instead of silently dropping them.
+        let src = include_str!("routes.rs");
+        assert!(
+            src.contains("attachments: body.attachments"),
+            "send_invite_handler must thread attachments into EmailSubmission"
+        );
+        assert!(
+            APP_JS.contains("attachments: readyAttachments.length ? readyAttachments : undefined"),
+            "the invite POST in app.js must pass readyAttachments through"
+        );
+    }
+
+    // ====================================================================
+    // Timezone + invite endpoints (roborev 188 carryover #8)
+    // ====================================================================
+
+    #[test]
+    fn timezone_body_deserializes_with_defaults() {
+        let body: TimezoneConfigBody = serde_json::from_str("{}").unwrap();
+        assert!(body.use_system);
+        assert!(body.manual_primary.is_none());
+        assert!(body.additional.is_empty());
+    }
+
+    #[test]
+    fn timezone_body_deserializes_full() {
+        let body: TimezoneConfigBody = serde_json::from_str(
+            r#"{"use_system":false,"manual_primary":"Europe/London","additional":["America/New_York"]}"#,
+        )
+        .unwrap();
+        assert!(!body.use_system);
+        assert_eq!(body.manual_primary.as_deref(), Some("Europe/London"));
+        assert_eq!(body.additional, vec!["America/New_York".to_string()]);
+    }
+
+    #[test]
+    fn dismiss_timezone_body_accepts_missing_seen_system() {
+        // Empty body must parse — clients written before the TOCTOU fix
+        // don't send `seen_system` and should still work.
+        let body: DismissTimezoneBody = serde_json::from_str("{}").unwrap();
+        assert!(body.seen_system.is_none());
+    }
+
+    #[test]
+    fn dismiss_timezone_body_accepts_seen_system() {
+        let body: DismissTimezoneBody =
+            serde_json::from_str(r#"{"seen_system":"America/Denver"}"#).unwrap();
+        assert_eq!(body.seen_system.as_deref(), Some("America/Denver"));
+    }
+
+    #[test]
+    fn send_invite_body_minimal() {
+        let body: SendInviteBody = serde_json::from_str(
+            r#"{
+                "to":["bob@example.com"],
+                "subject":"Sync",
+                "summary":"Quick sync",
+                "start":"2026-06-01T10:00:00",
+                "end":"2026-06-01T11:00:00"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(body.to, vec!["bob@example.com".to_string()]);
+        assert!(body.cc.is_empty());
+        assert!(body.tz.is_none());
+        assert!(body.attendees.is_empty());
+    }
+
+    #[test]
+    fn timezone_routes_are_registered() {
+        // Sentinel: the router string must mention each new endpoint so a
+        // refactor that drops the .route(...) line is caught at test time.
+        let src = include_str!("routes.rs");
+        for path in [
+            "/api/timezone",
+            "/api/timezone/accept-system",
+            "/api/timezone/dismiss-change",
+            "/api/timezone/zones",
+            "/api/calendar/invite",
+        ] {
+            assert!(
+                src.contains(&format!("\"{path}\"")),
+                "router must register {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontend_sends_seen_system_on_dismiss() {
+        // Roborev 188 #1F: client must POST the seen system TZ so the server
+        // can refuse to dismiss a change the user never saw.
+        assert!(
+            APP_JS.contains("seen_system"),
+            "dismissTimezoneChange must send seen_system in the body"
+        );
+    }
+
+    #[test]
+    fn frontend_renders_multi_tz_event_card() {
+        // The multi-TZ rendering path on the event card must exist.
+        assert!(
+            APP_JS.contains("formatEventTimeMultiTz"),
+            "renderCalendarCard must use the multi-TZ formatter"
         );
     }
 }

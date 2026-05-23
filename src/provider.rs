@@ -310,6 +310,14 @@ pub async fn remove_from_calendar(s: &ProviderSession, uid: &str) -> Result<bool
 ///
 /// Fastmail: generate iTIP reply email + CalDAV upsert/delete
 /// Outlook: Graph API respond_to_event (sends RSVP email automatically)
+///
+/// `reply_tz` only affects the **Fastmail** path: it controls the timezone
+/// in which `DTSTART`/`DTEND` are quoted in the client-generated iTIP REPLY
+/// (`generate_rsvp_with_tz`). Outlook and Gmail use Graph's
+/// `respond_to_event` / Calendar API which the providers render in the
+/// recipient's display timezone; the parameter is accepted but unused by
+/// those arms. Roborev 186 #5: this asymmetry is intentional, documented
+/// here so future maintainers don't assume `reply_tz` is universal.
 pub async fn rsvp(
     s: &mut ProviderSession,
     ics_data: &str,
@@ -361,6 +369,10 @@ pub async fn rsvp(
             }
         }
         ProviderSession::Outlook(s) => {
+            // `reply_tz` is intentionally unused: Graph's respond_to_event
+            // renders the response in the recipient's display TZ. See doc
+            // comment on this fn (roborev 186 #5).
+            let _ = reply_tz;
             // Ensure the event exists in the calendar first
             let event_parsed = calendar::parse_ics(ics_data)
                 .ok_or_else(|| Error::Internal("Failed to parse ICS for Outlook RSVP".into()))?;
@@ -375,6 +387,10 @@ pub async fn rsvp(
             }
         }
         ProviderSession::Gmail(s) => {
+            // `reply_tz` is intentionally unused: Google Calendar's
+            // PATCH+sendUpdates handles the recipient's TZ. See doc
+            // comment on this fn (roborev 186 #5).
+            let _ = reply_tz;
             // Ensure the event exists before we try to PATCH its attendees.
             // `add_to_calendar` is idempotent (Ok(true) when already present);
             // we log-and-continue on failure so the more diagnostic upstream

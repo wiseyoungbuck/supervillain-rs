@@ -52,11 +52,8 @@ pub fn load_config(config_path: &Path, env_override: Option<&str>) -> TimezoneCo
 }
 
 pub fn save_config(config: &TimezoneConfig, config_path: &Path) -> Result<(), Error> {
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(config_path, json)?;
+    crate::accounts::atomic_write_bytes(config_path, json.as_bytes(), /* secret */ false)?;
     Ok(())
 }
 

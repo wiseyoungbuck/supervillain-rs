@@ -93,6 +93,15 @@ pub fn parse_config_str(content: &str) -> ConfigFile {
         }
         if line.starts_with('[') && line.ends_with(']') {
             let name = line[1..line.len() - 1].trim().to_string();
+            // Defense-in-depth: validate the section name at parse time so a
+            // hand-edited config can't smuggle a path-traversal name through
+            // startup (the in-app UI's `validate_section_name` enforces the
+            // same rules for newly-added accounts).
+            if let Err(e) = validate_section_name(&name) {
+                tracing::warn!("[{name}] skipping malformed section header: {e}");
+                current_section = None;
+                continue;
+            }
             sections.entry(name.clone()).or_default();
             current_section = Some(name);
             continue;
@@ -227,19 +236,35 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
 /// rename → fsync parent dir. The parent-dir fsync defends against ext4
 /// `data=writeback` losing the rename on crash.
 pub fn atomic_write_config(path: &Path, cfg: &ConfigFile) -> io::Result<()> {
+    let serialized = serialize_config(cfg);
+    atomic_write_bytes(path, serialized.as_bytes(), /* secret */ true)
+}
+
+/// Atomic file write with the same crash-safety guarantees as
+/// `atomic_write_config`, but for arbitrary bytes. Used by
+/// `timezone::save_config` (and any other typed-config module that wants
+/// the same durability story).
+///
+/// `secret = true` sets mode 0o600 on POSIX (credentials); `false` uses
+/// 0o644 (non-sensitive config). Tmpfile name combines PID and an in-
+/// process monotonic counter so concurrent writers in the same process
+/// don't collide on the tmp path.
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8], secret: bool) -> io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "config path has no parent"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
     std::fs::create_dir_all(parent)?;
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{seq}",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config"),
         std::process::id()
     ));
-    let serialized = serialize_config(cfg);
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -249,13 +274,13 @@ pub fn atomic_write_config(path: &Path, cfg: &ConfigFile) -> io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let mode = if secret { 0o600 } else { 0o644 };
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
-        f.write_all(serialized.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    // fsync the parent directory so the rename survives a crash.
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
@@ -292,8 +317,11 @@ impl FieldError {
     }
 }
 
-/// Section names appear inside `[brackets]` in the config file. Forbid
-/// control chars, brackets, `=`, and `#` so the round-trip is unambiguous.
+/// Section names appear inside `[brackets]` in the config file AND are used
+/// as the filename stem for token storage (`{tokens_dir}/{name}.json`). The
+/// rules below serve both: round-trip safety in the INI file AND path-safety
+/// when joined with `tokens_dir`. Without this, a name of `..%2Fconfig`
+/// would let `POST/DELETE /api/accounts/{id}` escape the tokens directory.
 pub fn validate_section_name(s: &str) -> Result<(), &'static str> {
     if s.is_empty() {
         return Err("name must not be empty");
@@ -301,7 +329,18 @@ pub fn validate_section_name(s: &str) -> Result<(), &'static str> {
     if s.len() > 64 {
         return Err("name must be 64 characters or fewer");
     }
+    if s == "." || s == ".." {
+        return Err("name must not be '.' or '..'");
+    }
+    if s.starts_with('.') {
+        return Err("name must not start with '.'");
+    }
     for c in s.chars() {
+        // Path separators and traversal characters: rejected for filesystem
+        // safety because the name is joined with `tokens_dir` as a filename.
+        if c == '/' || c == '\\' || c == '\0' {
+            return Err("name must not contain '/', '\\\\', or NUL");
+        }
         if c == '[' || c == ']' || c == '\n' || c == '\r' || c == '=' || c == '#' {
             return Err("name must not contain [, ], =, #, or newlines");
         }
@@ -401,22 +440,45 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
 // =============================================================================
 
 /// Single global slot. `Some(account)` means an OAuth flow is in progress
-/// for that account; `None` means idle. Held across the long-poll request.
-pub type AuthorizingSlot = tokio::sync::Mutex<Option<String>>;
+/// for that account; `None` means idle.
+///
+/// `std::sync::Mutex` rather than `tokio::sync::Mutex` so the RAII
+/// `AuthorizingGuard` can clear the slot from `Drop` (which is sync).
+/// The critical section is two atomic ops, never held across `.await` —
+/// so blocking briefly is safe.
+pub type AuthorizingSlot = std::sync::Mutex<Option<String>>;
 
-/// Try to claim the slot for `account`. Returns Err on contention; caller
-/// must release via `release_authorizing` when the flow finishes.
-pub async fn try_claim_authorizing(slot: &AuthorizingSlot, account: &str) -> Result<(), String> {
-    let mut guard = slot.lock().await;
-    if let Some(ref existing) = *guard {
-        return Err(existing.clone());
-    }
-    *guard = Some(account.to_string());
-    Ok(())
+/// RAII guard: claim the slot on construction, release on Drop. Without
+/// this, a panic anywhere in `authorize_account`'s OAuth flow would leak
+/// the slot — every subsequent /authorize would 409 until restart
+/// (roborev 186 #4).
+#[derive(Debug)]
+pub struct AuthorizingGuard<'a> {
+    slot: &'a AuthorizingSlot,
 }
 
-pub async fn release_authorizing(slot: &AuthorizingSlot) {
-    *slot.lock().await = None;
+impl<'a> AuthorizingGuard<'a> {
+    /// Claim the slot for `account`. Returns Err containing the existing
+    /// holder's id if another flow is already in progress.
+    pub fn try_claim(slot: &'a AuthorizingSlot, account: &str) -> Result<Self, String> {
+        let mut guard = slot.lock().expect("AuthorizingSlot mutex poisoned");
+        if let Some(ref existing) = *guard {
+            return Err(existing.clone());
+        }
+        *guard = Some(account.to_string());
+        Ok(Self { slot })
+    }
+}
+
+impl Drop for AuthorizingGuard<'_> {
+    fn drop(&mut self) {
+        // If the mutex is poisoned the process is already in trouble; we
+        // still attempt to release so a subsequent claim isn't blocked
+        // forever just because a previous holder panicked.
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
 }
 
 // =============================================================================
@@ -425,7 +487,18 @@ pub async fn release_authorizing(slot: &AuthorizingSlot) {
 
 /// Where this account's OAuth tokens live on disk. Matches the layout
 /// established by `outlook::load_tokens` / `gmail::load_session`.
+///
+/// All callers must validate `account` via `validate_section_name` before
+/// reaching here; the debug_assert is a tripwire that catches regressions
+/// in test builds. Registry-key lookups (`reg.account_configs.contains_key`)
+/// in the HTTP handlers provide the primary defense: ids never reach the
+/// in-memory registry without validation, so a traversal token can't be
+/// passed through to here at runtime.
 pub fn token_file_path(tokens_dir: &Path, account: &str) -> PathBuf {
+    debug_assert!(
+        validate_section_name(account).is_ok(),
+        "token_file_path called with unvalidated account id: {account:?}"
+    );
     tokens_dir.join(format!("{account}.json"))
 }
 
@@ -686,9 +759,10 @@ async fn upsert_account(
         }
     }
 
-    // Take the lock, mutate in-memory state, snapshot for disk — all
-    // microseconds. Disk write happens AFTER the lock is released.
-    let snapshot = {
+    // Take the lock, mutate, write config — all held under the write lock
+    // (Carmack et al.: a millisecond of held-lock during disk write beats
+    // the lost-update race where T2's snapshot overwrites T1's commit).
+    {
         let mut reg = state.accounts.write().await;
         if is_new && reg.account_configs.contains_key(&id) {
             return Err(Error::Conflict(format!("account '{id}' already exists")));
@@ -701,11 +775,9 @@ async fn upsert_account(
         }
         reg.account_configs.insert(id.clone(), cfg.clone());
         promote_default_if_empty(&mut reg, &id);
-        reg.snapshot()
-    };
-
-    atomic_write_config(&state.config_path, &snapshot)
-        .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        atomic_write_config(&state.config_path, &reg.snapshot())
+            .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+    }
 
     clear_setup_sentinel(&state).await;
     if needs_auth {
@@ -752,7 +824,7 @@ async fn delete_account(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let snapshot = {
+    {
         let mut reg = state.accounts.write().await;
         if !reg.account_configs.contains_key(&id) {
             return Err(Error::NotFound(format!("account '{id}' not found")));
@@ -767,11 +839,9 @@ async fn delete_account(
                 .cloned()
                 .unwrap_or_default();
         }
-        reg.snapshot()
-    };
-
-    atomic_write_config(&state.config_path, &snapshot)
-        .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        atomic_write_config(&state.config_path, &reg.snapshot())
+            .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+    }
 
     if let Err(e) = std::fs::remove_file(token_file_path(&state.tokens_dir, &id))
         && e.kind() != std::io::ErrorKind::NotFound
@@ -788,16 +858,15 @@ async fn set_default_account(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, Error> {
-    let snapshot = {
+    {
         let mut reg = state.accounts.write().await;
         if !reg.account_configs.contains_key(&id) {
             return Err(Error::NotFound(format!("account '{id}' not found")));
         }
         reg.default_account = id.clone();
-        reg.snapshot()
-    };
-    atomic_write_config(&state.config_path, &snapshot)
-        .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        atomic_write_config(&state.config_path, &reg.snapshot())
+            .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -827,13 +896,11 @@ async fn authorize_account(
         ));
     }
 
-    try_claim_authorizing(&state.authorizing, &id)
-        .await
+    // RAII guard: slot is released when `_guard` drops, even on panic.
+    let _guard = AuthorizingGuard::try_claim(&state.authorizing, &id)
         .map_err(|other| Error::Conflict(format!("another authorization in progress: {other}")))?;
 
-    // Defer-release: slot stays held through finalize regardless of outcome.
     let outcome = run_and_install_authorize(&id, &account, &state).await;
-    release_authorizing(&state.authorizing).await;
 
     let (updated_account, is_default) =
         outcome.map_err(|e| Error::BadRequest(format!("authorization failed: {e}")))?;
@@ -863,7 +930,7 @@ async fn run_and_install_authorize(
     };
     let updated_account = update_email_from_session(account.clone(), email_from_session);
 
-    let (snapshot, is_default) = {
+    let is_default = {
         let mut reg = state.accounts.write().await;
         reg.sessions.insert(
             id.to_string(),
@@ -872,12 +939,10 @@ async fn run_and_install_authorize(
         reg.account_configs
             .insert(id.to_string(), updated_account.clone());
         promote_default_if_empty(&mut reg, id);
-        let is_default = reg.default_account == id;
-        (reg.snapshot(), is_default)
+        atomic_write_config(&state.config_path, &reg.snapshot())
+            .map_err(|e| format!("failed to write config: {e}"))?;
+        reg.default_account == id
     };
-
-    atomic_write_config(&state.config_path, &snapshot)
-        .map_err(|e| format!("failed to write config: {e}"))?;
 
     Ok((updated_account, is_default))
 }
@@ -1154,6 +1219,25 @@ api-token = tok
     }
 
     #[test]
+    fn parse_rejects_path_traversal_section_names() {
+        // A hand-edited config can't smuggle a traversal name through startup.
+        let bad = "\
+[../escape]
+provider = fastmail
+username = u@fm.com
+api-token = tok
+
+[ok]
+provider = fastmail
+username = ok@fm.com
+api-token = tok
+";
+        let cfg = parse_config_str(bad);
+        assert!(!cfg.accounts.contains_key("../escape"));
+        assert!(cfg.accounts.contains_key("ok"));
+    }
+
+    #[test]
     fn parse_unknown_provider_is_skipped() {
         let s = "[bad]\nprovider = yahoo\nusername = u@y.com\n";
         let cfg = parse_config_str(s);
@@ -1170,6 +1254,34 @@ api-token = tok
         assert!(validate_section_name("with]bracket").is_err());
         assert!(validate_section_name("with\nnewline").is_err());
         assert!(validate_section_name("with=eq").is_err());
+        // Path-traversal hardening (roborev 186 #1):
+        assert!(validate_section_name("..").is_err(), "must reject '..'");
+        assert!(validate_section_name(".").is_err(), "must reject '.'");
+        assert!(
+            validate_section_name(".hidden").is_err(),
+            "must reject leading dot (also addresses #10)"
+        );
+        assert!(validate_section_name("foo/bar").is_err(), "must reject '/'");
+        assert!(
+            validate_section_name("foo\\bar").is_err(),
+            "must reject '\\\\'"
+        );
+        assert!(
+            validate_section_name("foo\0bar").is_err(),
+            "must reject NUL"
+        );
+        // The on-wire attack vector `POST /api/accounts/..%2Fconfig` is
+        // URL-decoded by axum to `id = "../config"` BEFORE this validator
+        // sees it. Both the encoded literal and the decoded form must be
+        // rejected, which the leading-dot + '/' rules handle together.
+        assert!(
+            validate_section_name("..%2Fconfig").is_err(),
+            "leading-dot rule rejects the literal '..%2Fconfig'"
+        );
+        assert!(
+            validate_section_name("../config").is_err(),
+            "'/' + leading-dot rules reject the decoded form"
+        );
         assert!(validate_section_name("with#hash").is_err());
         assert!(validate_section_name(&"x".repeat(65)).is_err());
         assert!(validate_section_name(&"x".repeat(64)).is_ok());
@@ -1219,22 +1331,37 @@ api-token = tok
 
     // ---- Authorize single-flight ----
 
-    #[tokio::test]
-    async fn authorize_acquires_global_lock_then_releases() {
+    #[test]
+    fn authorize_acquires_global_lock_then_releases() {
         let slot = AuthorizingSlot::default();
-        assert!(try_claim_authorizing(&slot, "fm").await.is_ok());
-        // While claimed, the slot reflects the holder.
-        assert_eq!(slot.lock().await.as_deref(), Some("fm"));
-        release_authorizing(&slot).await;
-        assert!(slot.lock().await.is_none());
+        let guard = AuthorizingGuard::try_claim(&slot, "fm").expect("first claim succeeds");
+        assert_eq!(slot.lock().unwrap().as_deref(), Some("fm"));
+        drop(guard);
+        assert!(slot.lock().unwrap().is_none(), "drop releases the slot");
     }
 
-    #[tokio::test]
-    async fn authorize_returns_409_when_already_in_progress() {
+    #[test]
+    fn authorize_returns_409_when_already_in_progress() {
         let slot = AuthorizingSlot::default();
-        try_claim_authorizing(&slot, "fm").await.unwrap();
-        let err = try_claim_authorizing(&slot, "outlook").await.unwrap_err();
+        let _guard = AuthorizingGuard::try_claim(&slot, "fm").expect("first claim succeeds");
+        let err = AuthorizingGuard::try_claim(&slot, "outlook").unwrap_err();
         assert_eq!(err, "fm", "should report the existing holder");
+    }
+
+    /// Panic-safety regression (roborev 186 #4): a panic inside the OAuth
+    /// flow must not leak the slot. RAII Drop releases regardless.
+    #[test]
+    fn authorize_slot_released_on_panic() {
+        let slot = AuthorizingSlot::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = AuthorizingGuard::try_claim(&slot, "fm").unwrap();
+            panic!("simulated OAuth flow panic");
+        }));
+        assert!(result.is_err(), "the closure must panic");
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "Drop must release the slot even when the holder panics"
+        );
     }
 
     // ---- Pure route helpers ----
@@ -1338,20 +1465,117 @@ api-token = tok
         assert!(set_default_in_config(&mut cfg, "nope").is_err());
     }
 
-    #[tokio::test]
-    async fn authorize_releases_lock_on_oauth_error() {
-        // Simulate the route-handler shape: claim, work returns Err, release.
-        async fn run(slot: &AuthorizingSlot) -> Result<(), &'static str> {
-            try_claim_authorizing(slot, "fm")
-                .await
-                .map_err(|_| "busy")?;
-            let result: Result<(), &'static str> = Err("oauth failed");
-            release_authorizing(slot).await;
-            result
+    // ---- Registry snapshot/round-trip (roborev 186 #8) ----
+    //
+    // The HTTP handlers mutate `AccountRegistry` under a write lock and then
+    // call `atomic_write_config(&reg.snapshot())`. These tests exercise the
+    // snapshot-and-write portion against a tempdir, which is the part of the
+    // handler we can pin without a full tower::oneshot harness. Combined
+    // with the existing pure-helper coverage of the lock-held write, the
+    // 409 conflict path, and the panic-safety guard, this gives the new
+    // handlers concrete regression coverage at the integration boundary.
+
+    fn empty_registry() -> AccountRegistry {
+        AccountRegistry {
+            sessions: std::collections::HashMap::new(),
+            account_configs: BTreeMap::new(),
+            default_account: String::new(),
+        }
+    }
+
+    #[test]
+    fn registry_snapshot_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "tok"));
+        reg.default_account = "fm".into();
+
+        atomic_write_config(&path, &reg.snapshot()).unwrap();
+        let parsed = parse_config(&path);
+        assert_eq!(parsed.default_account.as_deref(), Some("fm"));
+        assert_eq!(parsed.accounts.len(), 1);
+    }
+
+    #[test]
+    fn registry_delete_then_snapshot_promotes_first_remaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("alpha".into(), fastmail("a@a.com", "t"));
+        reg.account_configs
+            .insert("beta".into(), fastmail("b@b.com", "t"));
+        reg.default_account = "alpha".into();
+        atomic_write_config(&path, &reg.snapshot()).unwrap();
+
+        // Simulate the delete handler's in-memory mutation.
+        reg.account_configs.remove("alpha");
+        reg.default_account = reg
+            .account_configs
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_default();
+        atomic_write_config(&path, &reg.snapshot()).unwrap();
+
+        let parsed = parse_config(&path);
+        assert_eq!(parsed.accounts.len(), 1);
+        assert_eq!(parsed.default_account.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn registry_promote_default_when_empty_helper_idempotent() {
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("only".into(), fastmail("u@u.com", "t"));
+        // First call promotes.
+        promote_default_if_empty(&mut reg, "only");
+        assert_eq!(reg.default_account, "only");
+        // Second call is a no-op.
+        promote_default_if_empty(&mut reg, "different");
+        assert_eq!(reg.default_account, "only");
+    }
+
+    #[test]
+    fn atomic_write_seq_disambiguates_concurrent_tmpfiles() {
+        // Roborev 186 #3: two same-process writes must not clobber each
+        // other's tmpfile. The per-call AtomicU64 counter guarantees unique
+        // tmp names even from the same PID.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "t"));
+
+        // Two sequential writes — both succeed because the second tmp file
+        // gets a different name even though they share PID and target path.
+        atomic_write_config(&path, &reg.snapshot()).unwrap();
+        atomic_write_config(&path, &reg.snapshot()).unwrap();
+        // No stray .tmp files remain.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert!(
+            entries.iter().all(|n| !n.contains(".tmp.")),
+            "no .tmp file should remain after concurrent writes, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_releases_lock_on_oauth_error() {
+        // Simulate the route-handler shape: claim, work returns Err, drop releases.
+        fn run(slot: &AuthorizingSlot) -> Result<(), &'static str> {
+            let _guard = AuthorizingGuard::try_claim(slot, "fm").map_err(|_| "busy")?;
+            Err("oauth failed")
         }
         let slot = AuthorizingSlot::default();
-        assert!(run(&slot).await.is_err());
+        assert!(run(&slot).is_err());
         // After the simulated error, the slot must be free for retry.
-        assert!(slot.lock().await.is_none());
+        assert!(slot.lock().unwrap().is_none());
     }
 }

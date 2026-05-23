@@ -491,8 +491,23 @@ async function acceptSystemTimezone() {
 
 async function dismissTimezoneChange() {
     try {
-        const resp = await fetch('/api/timezone/dismiss-change', { method: 'POST' });
-        if (!resp.ok) throw new Error(await resp.text());
+        // Send the system TZ value the user was looking at so the server can
+        // refuse if the system TZ moved between banner-display and click.
+        const seen_system = state.timezone?.system || null;
+        const resp = await fetch('/api/timezone/dismiss-change', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ seen_system }),
+        });
+        if (!resp.ok) {
+            // 409 Conflict: the system TZ changed again; refresh the banner.
+            if (resp.status === 409) {
+                await loadTimezone();
+                showStatus('System timezone changed again — please review the banner.', 'error');
+                return;
+            }
+            throw new Error(await resp.text());
+        }
         state.timezone = await resp.json();
         renderTzBanner();
     } catch (err) {
@@ -1044,6 +1059,9 @@ async function sendEmail() {
                 tz: tz || null,
                 attendees: inviteAttendees,
                 from_address: fromAddress,
+                // Roborev 186 #6: pass through attachments so the invite+files
+                // combo doesn't silently drop the user's uploads.
+                attachments: readyAttachments.length ? readyAttachments : undefined,
             });
             showStatus('Invite sent!', 'success');
             clearCompose();
