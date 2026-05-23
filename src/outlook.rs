@@ -33,6 +33,10 @@ pub struct OutlookSession {
     /// send via `drain_consumed_synthetic_blobs`. Same shape as Gmail's
     /// upload_cache — cap discipline shared via provider_utils constants.
     pub upload_cache: tokio::sync::Mutex<HashMap<uuid::Uuid, (String, Vec<u8>)>>,
+    /// 60s TTL cache of the identity list (just `/me` today). Roborev
+    /// 183 #3: avoids an extra Graph RTT on every send-with-from_addr,
+    /// since `/me` fields are essentially session-immutable.
+    pub identity_cache: tokio::sync::Mutex<Option<IdentityCacheEntry>>,
 }
 
 /// A snapshot of the folder list, anchored at a fetch time for TTL math.
@@ -54,6 +58,18 @@ pub struct OutlookPageCursor {
 
 /// Folder cache TTL (same as Gmail's label cache).
 pub const FOLDER_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Identity cache TTL. /me data (mail / displayName / id) is essentially
+/// session-immutable; the cache exists to avoid an extra RTT on every
+/// send-with-from_addr (roborev 183 #3), not to track changing state.
+pub const IDENTITY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Snapshot of the identity list anchored at a fetch time for TTL math.
+#[derive(Clone)]
+pub struct IdentityCacheEntry {
+    pub fetched_at: Instant,
+    pub identities: Vec<crate::types::Identity>,
+}
 
 /// Cap on the page_cache to bound memory if a long-running session
 /// accumulates many unique (folder, filter, search) queries. When the
@@ -230,6 +246,7 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
         folder_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+        identity_cache: tokio::sync::Mutex::new(None),
     })
 }
 
@@ -268,6 +285,7 @@ pub async fn oauth_flow(
         folder_cache: tokio::sync::Mutex::new(None),
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+        identity_cache: tokio::sync::Mutex::new(None),
     };
 
     save_tokens(&session)?;
@@ -903,9 +921,23 @@ pub async fn invalidate_page_cache(session: &OutlookSession) {
 /// `/me` returns the single primary identity. Aliases via
 /// `/me/mailboxSettings/aliases` exist on enterprise accounts but most
 /// users don't have them; defer until requested.
+///
+/// Roborev 183 #3: 60s TTL cache. /me fields (mail, displayName, id) are
+/// essentially session-immutable, so the cache mostly exists to remove
+/// the extra RTT on every send-with-from_addr — not to track changing
+/// state.
 pub async fn get_identities(
     session: &OutlookSession,
 ) -> Result<Vec<crate::types::Identity>, Error> {
+    {
+        let cache = session.identity_cache.lock().await;
+        if let Some(entry) = cache.as_ref()
+            && entry.fetched_at.elapsed() < IDENTITY_CACHE_TTL
+        {
+            return Ok(entry.identities.clone());
+        }
+    }
+
     let token = access_token(session).await?;
     let url = format!("{GRAPH_BASE}/me?$select=mail,userPrincipalName,displayName,id");
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
@@ -923,11 +955,16 @@ pub async fn get_identities(
     let display_name = parsed["displayName"].as_str().unwrap_or("").to_string();
     let id = parsed["id"].as_str().unwrap_or(&email).to_string();
 
-    Ok(vec![crate::types::Identity {
+    let identities = vec![crate::types::Identity {
         id,
         email,
         name: display_name,
-    }])
+    }];
+    *session.identity_cache.lock().await = Some(IdentityCacheEntry {
+        fetched_at: Instant::now(),
+        identities: identities.clone(),
+    });
+    Ok(identities)
 }
 
 #[derive(Deserialize)]
@@ -1534,7 +1571,7 @@ use crate::types::{EmailSubmission, Identity};
 ///   dance for everything else (plain-text replies, attachments, or
 ///   Cc/Bcc additions). The PATCH can set body.contentType="text"
 ///   correctly.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum SendPath {
     NewMail,
     ReplyOneShot,
@@ -1554,18 +1591,44 @@ pub(crate) fn pick_send_path(sub: &EmailSubmission) -> SendPath {
     }
 }
 
+/// Pure wiring helper (roborev 183 #5): decides whether and how
+/// `send_email` should invoke the picker. Splitting this out from the
+/// async `send_email` body lets us pin the routing logic with unit
+/// tests instead of relying on HTTP mocking.
+///
+/// - Reply paths return `None` unconditionally — Graph inherits From
+///   from the parent message server-side, so any display name we
+///   resolve would be silently dropped anyway (and Graph doesn't
+///   honor `from.emailAddress.name` on the reply endpoints either).
+/// - `NewMail` with no `from_addr` returns `None` — there's no From
+///   to label.
+/// - Everything else delegates to `pick_outlook_display_name`.
+fn pick_from_name_for_send_path(
+    path: SendPath,
+    from_addr: Option<&str>,
+    identity_id_override: Option<&str>,
+    identities: &[Identity],
+) -> Option<String> {
+    match (path, from_addr) {
+        (SendPath::NewMail, Some(addr)) if !addr.is_empty() => {
+            pick_outlook_display_name(identities, addr, identity_id_override)
+        }
+        _ => None,
+    }
+}
+
 /// Pick the display name to set on Graph's `from.emailAddress.name`.
 ///
 /// Pure — caller fetches identities once and passes them in. Returns the
 /// display name to attach to From, or `None` to leave it unset (Graph
 /// then renders the authenticated user's default).
 ///
-/// Discipline (Milestone D.1, mirrors `gmail::pick_identity_display_name`
-/// line 1744): if `identity_id_override` is `Some(id)` but doesn't match
-/// any known identity, return `None` and emit a `tracing::warn!` —
-/// refuses to silently fall back to a different identity, because
-/// attaching the wrong name to the From line is a worse failure than
-/// having no name at all.
+/// Discipline (mirrors `gmail::pick_identity_display_name`): if
+/// `identity_id_override` is `Some(id)` but doesn't match any known
+/// identity, return `None` and emit a `tracing::warn!` — refuses to
+/// silently fall back to a different identity, because attaching the
+/// wrong name to the From line is a worse failure than having no name
+/// at all.
 ///
 /// Outlook's identity list is single-element today (just `/me`), so the
 /// no-override / no-match path also returns `None`: with only one
@@ -1582,18 +1645,33 @@ fn pick_outlook_display_name(
     identity_id_override: Option<&str>,
 ) -> Option<String> {
     let chosen = match identity_id_override {
-        Some(id) => {
-            let matched = identities.iter().find(|i| i.id == id);
-            if matched.is_none() {
+        Some(id) => match identities.iter().find(|i| i.id == id) {
+            None => {
                 tracing::warn!(
                     identity_id_override = %id,
                     "Outlook send: identity_id_override does not match any \
                      identity; sending without display name to avoid \
                      mislabeling From"
                 );
+                None
             }
-            matched
-        }
+            Some(ident) if ident.email.eq_ignore_ascii_case(from_addr) => Some(ident),
+            // Roborev 183 #1 defense-in-depth: the override id is real
+            // but its email doesn't match from_addr — attaching that
+            // identity's name to a different From address would
+            // mislabel just as badly as the unknown-id case.
+            Some(ident) => {
+                tracing::warn!(
+                    identity_id_override = %id,
+                    identity_email = %ident.email,
+                    from_addr,
+                    "Outlook send: identity_id_override id matches but its \
+                     email does not match from_addr; sending without \
+                     display name to avoid mislabeling From"
+                );
+                None
+            }
+        },
         None => identities
             .iter()
             .find(|i| i.email.eq_ignore_ascii_case(from_addr)),
@@ -1892,16 +1970,54 @@ pub async fn send_email(
             )
         })
     };
-    // Milestone D.1: resolve display name once. Only NewMail accepts a
-    // `from` field on the Graph Message — the reply paths inherit
-    // recipients (and From) from the parent message Graph-side, so the
-    // picker output is irrelevant there.
-    let from_name = if matches!(path, SendPath::NewMail) && from_addr.is_some() {
-        let identities = get_identities(session).await.unwrap_or_default();
-        pick_outlook_display_name(&identities, from_addr.unwrap_or(""), identity_id_override)
+    // Roborev 183 #2: warn when the user picked a non-default identity
+    // on a path that can't honor it. Two such cases: replies (Graph
+    // inherits From from the parent message), and NewMail with no
+    // from_addr (nothing to label). Silently dropping disagrees with
+    // the user — at minimum let the operator see the mismatch.
+    if identity_id_override.is_some() && !matches!(path, SendPath::NewMail) {
+        tracing::warn!(
+            ?identity_id_override,
+            "Outlook send: identity_id_override ignored on reply paths — \
+             Graph inherits From from the parent message server-side"
+        );
+    } else if identity_id_override.is_some()
+        && matches!(path, SendPath::NewMail)
+        && from_addr.is_none()
+    {
+        tracing::warn!(
+            ?identity_id_override,
+            "Outlook send: identity_id_override set but from_addr is empty — \
+             frontend should send both; ignoring override"
+        );
+    }
+    // Resolve display name. Only NewMail with from_addr ever invokes
+    // the picker (see pick_from_name_for_send_path). Roborev 183 #3:
+    // identities come from the 60s-TTL cache to avoid an extra
+    // /me RTT on every send. Roborev 183 #4: if the load fails and we
+    // had an override to honor, emit a tracing::error so the operator
+    // sees the real cause rather than the misleading "override unknown"
+    // warn the picker would emit on an empty identity list.
+    let identities = if matches!(path, SendPath::NewMail) && from_addr.is_some() {
+        match get_identities(session).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                if identity_id_override.is_some() {
+                    tracing::error!(
+                        error = %e,
+                        ?identity_id_override,
+                        "Outlook send: failed to load identities; cannot \
+                         honor identity_id_override on this send"
+                    );
+                }
+                Vec::new()
+            }
+        }
     } else {
-        None
+        Vec::new()
     };
+    let from_name =
+        pick_from_name_for_send_path(path, from_addr, identity_id_override, &identities);
     let new_id = match path {
         SendPath::NewMail => {
             send_new_mail(session, sub, &resolved, from_addr, from_name.as_deref()).await?
@@ -2622,6 +2738,7 @@ mod tests {
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+            identity_cache: tokio::sync::Mutex::new(None),
         };
 
         save_tokens(&session).unwrap();
@@ -2924,6 +3041,7 @@ mod tests {
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+            identity_cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -4282,6 +4400,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn picker_returns_none_when_override_id_matches_but_from_addr_differs() {
+        // Roborev 183 #1 defense-in-depth: if the frontend hands us a
+        // valid override id whose identity email *differs* from
+        // from_addr, attaching the identity's name to from_addr would
+        // mislabel From — the same failure mode the unknown-id branch
+        // already guards against. Refuse the match.
+        let ids = vec![
+            id("id-1", "u@example.com", "Ursula Example"),
+            id("id-2", "alias@example.com", "Ursula Alias"),
+        ];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "u@example.com", Some("id-2")),
+            None,
+            "must not attach Ursula Alias's name to u@example.com — that would mislabel From"
+        );
+    }
+
+    #[test]
+    fn picker_override_email_match_is_case_insensitive() {
+        // Parallel to the no-override case_insensitive test above —
+        // a stored identity email of "u@example.com" should match a
+        // from_addr of "U@EXAMPLE.COM" when override is in play too.
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_outlook_display_name(&ids, "U@EXAMPLE.COM", Some("id-1")),
+            Some("Ursula Example".into())
+        );
+    }
+
+    // ---- Roborev 183 #5: pick_from_name_for_send_path ----
+    //
+    // Pure wiring helper that decides whether send_email should invoke
+    // the picker for a given (path, from_addr, override) tuple. Lets us
+    // pin the "reply paths skip picker", "empty from skips picker",
+    // "NewMail+from_addr calls picker" branches without HTTP mocking
+    // (which the codebase deliberately doesn't have).
+
+    #[test]
+    fn pick_from_name_skips_picker_on_reply_one_shot() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_from_name_for_send_path(SendPath::ReplyOneShot, Some("u@example.com"), None, &ids),
+            None,
+            "reply paths inherit From from parent message Graph-side; picker output is irrelevant"
+        );
+    }
+
+    #[test]
+    fn pick_from_name_skips_picker_on_reply_with_attachments() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_from_name_for_send_path(
+                SendPath::ReplyWithAttachments,
+                Some("u@example.com"),
+                None,
+                &ids
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_from_name_skips_picker_when_from_addr_is_none() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_from_name_for_send_path(SendPath::NewMail, None, None, &ids),
+            None,
+            "no from_addr → Graph defaults to authenticated user; picker has nothing to label"
+        );
+    }
+
+    #[test]
+    fn pick_from_name_invokes_picker_on_new_mail_with_from_addr() {
+        let ids = vec![id("id-1", "u@example.com", "Ursula Example")];
+        assert_eq!(
+            pick_from_name_for_send_path(SendPath::NewMail, Some("u@example.com"), None, &ids),
+            Some("Ursula Example".into())
+        );
+    }
+
+    #[test]
+    fn pick_from_name_honors_override_on_new_mail() {
+        let ids = vec![
+            id("id-1", "u@example.com", "Ursula Example"),
+            id("id-2", "alias@example.com", "Ursula Alias"),
+        ];
+        assert_eq!(
+            pick_from_name_for_send_path(
+                SendPath::NewMail,
+                Some("alias@example.com"),
+                Some("id-2"),
+                &ids
+            ),
+            Some("Ursula Alias".into())
+        );
+    }
+
     // ---- Roborev 181 #3: format_send_failure_with_cleanup ----
     //
     // Pure helper that maps (send_err, cleanup_outcome, draft_id) to the
@@ -4368,6 +4584,7 @@ mod tests {
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+            identity_cache: tokio::sync::Mutex::new(None),
         }
     }
 

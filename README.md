@@ -19,7 +19,7 @@
 
 ---
 
-Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook, Gmail REST + Google Calendar. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
+Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook, Gmail REST + Google Calendar v3 for Gmail. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
 
 ## Features
 

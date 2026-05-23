@@ -10,12 +10,12 @@ use crate::{calendar, gmail, jmap, outlook};
 // =============================================================================
 
 pub enum ProviderSession {
-    Fastmail(JmapSession),
-    Outlook(OutlookSession),
-    /// Boxed because GmailSession is larger than the other variants
-    /// (label_cache + page_cache + upload_cache + parent_message_id_cache).
-    /// Without the box, every ProviderSession instance pays the size cost
-    /// even for Fastmail/Outlook accounts.
+    /// All variants are boxed so `ProviderSession` itself stays small
+    /// (one tag + one pointer). Without the boxes the enum's size is
+    /// the size of the largest variant, which clippy flags as
+    /// `large-enum-variant` once any provider gains another cache.
+    Fastmail(Box<JmapSession>),
+    Outlook(Box<OutlookSession>),
     Gmail(Box<GmailSession>),
 }
 
@@ -409,11 +409,11 @@ mod tests {
     use std::sync::Arc;
 
     fn make_fastmail_session() -> ProviderSession {
-        ProviderSession::Fastmail(JmapSession::new("user@fastmail.com", "Bearer token"))
+        ProviderSession::Fastmail(Box::new(JmapSession::new("user@fastmail.com", "Bearer token")))
     }
 
     fn make_outlook_session() -> ProviderSession {
-        ProviderSession::Outlook(OutlookSession {
+        ProviderSession::Outlook(Box::new(OutlookSession {
             client: reqwest::Client::new(),
             token: tokio::sync::Mutex::new(crate::outlook::OutlookToken {
                 access_token: "test".into(),
@@ -426,7 +426,8 @@ mod tests {
             folder_cache: tokio::sync::Mutex::new(None),
             page_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        })
+            identity_cache: tokio::sync::Mutex::new(None),
+        }))
     }
 
     fn make_gmail_session() -> ProviderSession {

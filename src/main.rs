@@ -105,7 +105,7 @@ async fn main() {
 
                 sessions.insert(
                     name.clone(),
-                    tokio::sync::RwLock::new(ProviderSession::Fastmail(session)),
+                    tokio::sync::RwLock::new(ProviderSession::Fastmail(Box::new(session))),
                 );
             }
 
@@ -141,7 +141,7 @@ async fn main() {
 
                 sessions.insert(
                     name.clone(),
-                    tokio::sync::RwLock::new(ProviderSession::Outlook(session)),
+                    tokio::sync::RwLock::new(ProviderSession::Outlook(Box::new(session))),
                 );
             }
 
