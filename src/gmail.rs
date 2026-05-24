@@ -1231,12 +1231,39 @@ pub(crate) fn classify_gmail_error(
     status: reqwest::StatusCode,
     body: &str,
 ) -> Error {
+    if is_rate_limited(status, body) {
+        return Error::BadRequest(format!(
+            "Gmail rate limit hit on {operation} — wait a moment and try again."
+        ));
+    }
     let msg = format!("Gmail {operation} failed ({status}): {body}");
     if status.is_client_error() {
         Error::BadRequest(msg)
     } else {
         Error::Internal(msg)
     }
+}
+
+/// True when the response is Gmail's per-user/per-project rate-limit signal.
+/// Two shapes in the wild:
+///   - HTTP 429 (Too Many Requests) — concurrent-request cap.
+///   - HTTP 403 with body mentioning `rateLimitExceeded`,
+///     `userRateLimitExceeded`, `quotaExceeded`, or `RESOURCE_EXHAUSTED` —
+///     per-minute quota cap. Google chose 403 here because the gRPC
+///     `PERMISSION_DENIED` status maps to HTTP 403, even though the cause is
+///     quota, not permissions.
+pub(crate) fn is_rate_limited(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return body.contains("rateLimitExceeded")
+            || body.contains("userRateLimitExceeded")
+            || body.contains("quotaExceeded")
+            || body.contains("RATE_LIMIT_EXCEEDED")
+            || body.contains("RESOURCE_EXHAUSTED");
+    }
+    false
 }
 
 // =============================================================================
@@ -1270,24 +1297,37 @@ async fn modify_labels(
 ) -> Result<bool, Error> {
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/{msg_id}/modify");
-    let resp = session
-        .client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&modify_body(add, remove))
-        .send()
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
+    let body = modify_body(add, remove);
+    // Single retry on rate limit. Most quota bursts here are transient
+    // (rapid archive + prefetch + split-count fan-out); a 750ms pause is
+    // usually enough to ride them out. If we're genuinely over the per-minute
+    // quota, the retry also fails and the friendly message from
+    // classify_gmail_error reaches the user.
+    for attempt in 0..2 {
+        let resp = session
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            invalidate_label_cache(session).await;
+            return Ok(true);
+        }
         let text = resp.text().await.unwrap_or_default();
+        if attempt == 0 && is_rate_limited(status, &text) {
+            tokio::time::sleep(Duration::from_millis(750)).await;
+            continue;
+        }
         return Err(classify_gmail_error(
             &format!("messages.modify {msg_id}"),
             status,
             &text,
         ));
     }
-    invalidate_label_cache(session).await;
-    Ok(true)
+    unreachable!("loop returns or continues on every branch");
 }
 
 pub async fn mark_read(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
@@ -3451,6 +3491,54 @@ mod tests {
         assert!(msg.contains("messages.batchModify"));
         assert!(msg.contains("400"));
         assert!(msg.contains("Invalid ID"));
+    }
+
+    // ---- is_rate_limited + friendly rate-limit message ----
+
+    #[test]
+    fn rate_limited_detects_429() {
+        assert!(is_rate_limited(reqwest::StatusCode::TOO_MANY_REQUESTS, "",));
+    }
+
+    #[test]
+    fn rate_limited_detects_403_quota_body() {
+        // The shape Gmail actually returns for per-minute quota exhaustion
+        // is 403 with `rateLimitExceeded` / `RATE_LIMIT_EXCEEDED` in the body.
+        let body = r#"{"error":{"code":403,"errors":[{"reason":"rateLimitExceeded"}],"status":"PERMISSION_DENIED","details":[{"reason":"RATE_LIMIT_EXCEEDED"}]}}"#;
+        assert!(is_rate_limited(reqwest::StatusCode::FORBIDDEN, body));
+    }
+
+    #[test]
+    fn rate_limited_ignores_plain_403() {
+        // Scope/permission denials must NOT be misread as rate limits — that
+        // would trigger a retry and bury the real "user needs to re-consent"
+        // signal.
+        assert!(!is_rate_limited(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"error":{"code":403,"message":"Insufficient scope"}}"#,
+        ));
+    }
+
+    #[test]
+    fn rate_limited_ignores_other_4xx() {
+        assert!(!is_rate_limited(reqwest::StatusCode::NOT_FOUND, ""));
+        assert!(!is_rate_limited(reqwest::StatusCode::BAD_REQUEST, ""));
+    }
+
+    #[test]
+    fn classify_rate_limit_returns_friendly_message() {
+        // The raw Gmail body is a ~30-line JSON blob — useless to a user.
+        // classify_gmail_error must collapse it to a short, actionable note.
+        let body = r#"{"error":{"code":403,"errors":[{"reason":"rateLimitExceeded"}]}}"#;
+        let err = classify_gmail_error("messages.modify abc", reqwest::StatusCode::FORBIDDEN, body);
+        let msg = match err {
+            Error::BadRequest(m) => m,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        assert!(msg.contains("rate limit"));
+        assert!(msg.contains("messages.modify abc"));
+        assert!(!msg.contains("PERMISSION_DENIED"));
+        assert!(!msg.contains('{'));
     }
 
     // ---- Milestone B: download_blob synthetic-blob rejection ----
