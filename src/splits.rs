@@ -1,3 +1,18 @@
+//! Split inbox filters.
+//!
+//! `splits.json` is a single global config. By construction — no
+//! `account_id` field on `SplitInbox` (see `crate::types`) — splits cannot
+//! be scoped per-account. Filters run against parsed `Email` objects after
+//! fetch, so the same definition works identically on Fastmail, Outlook,
+//! and Gmail. When the user switches accounts, the tab list stays the
+//! same; each tab matches that account's mail and shows zero if nothing
+//! hits.
+//!
+//! Auto-seeding (see [`seed_from_identities`]) runs ONCE at startup against
+//! the **default account's** identities, only when `splits.json` is empty.
+//! It deliberately does not re-run when accounts are added later: doing so
+//! would silently clobber the user's edits.
+
 use crate::error::Error;
 use crate::glob::glob_match;
 use crate::types::*;

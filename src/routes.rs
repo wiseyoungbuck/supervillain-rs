@@ -821,6 +821,13 @@ async fn unsubscribe_and_archive(
 
 // =============================================================================
 // Splits CRUD
+//
+// These four handlers (list/create/update/delete) are GLOBAL: they always
+// read and write the single ~/.config/supervillain/splits.json regardless
+// of any ?account= query param. The frontend's ACCOUNT_SCOPED_API regex
+// appends ?account= here too, but it's harmless and dropped.
+// `/api/split-counts` (below) and `/api/emails?split_id=` (in list_emails)
+// DO use the account session — counts are per-account, definitions are global.
 // =============================================================================
 
 #[derive(Deserialize)]

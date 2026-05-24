@@ -269,15 +269,15 @@ First run opens a browser for OAuth2 authorization. Tokens are saved to `~/.conf
 - *"Refresh token expired or revoked"* — your OAuth app is in **Testing** state and you're not listed as a Test User, or you've been listed for more than 7 days. Add yourself as a Test User and re-authenticate (delete the tokens file to force OAuth).
 - *"Google did not return a refresh_token on initial consent"* — your client was created without `access_type=offline` semantics, or Google de-duplicated the consent. Revoke the app in [Google Account permissions](https://myaccount.google.com/permissions) and re-authenticate.
 
-### Multiple identities
+### Multiple identities and accounts
 
-If you have multiple addresses in Fastmail (e.g. you@company.com, you@gmail.com, you@personal.dev), Supervillain handles this automatically:
+Supervillain supports any combination of Fastmail, Outlook, and Gmail accounts side by side.
 
-- **Receiving** — Forward Gmail/Outlook/etc. to Fastmail. All mail lands in one inbox.
-- **Sending** — All Fastmail identities appear in the From dropdown. Replies auto-select the matching address.
-- **Splits** — On first run, auto-creates one tab per domain from your identities.
+- **Receiving** — Each account has its own inbox. Switch with `1`-`9` (or the account picker in the sidebar). You can also forward mail from one provider into another and treat it as one stream.
+- **Sending** — All identities of the active account appear in the From dropdown. Replies auto-select the matching address.
+- **Splits** — Splits are global (one `splits.json`) and apply to whichever account is currently selected. See [Splits](#splits-inbox-tabs) below.
 
-No multi-account configuration needed.
+No multi-account configuration is needed beyond adding each account in Settings.
 
 ### Timezones (calendar invites)
 
@@ -293,7 +293,9 @@ Outgoing invites and RSVPs are generated with `DTSTART;TZID=<primary>` and a syn
 
 Splits filter your inbox into tabs. Stored at `~/.config/supervillain/splits.json`.
 
-On first run with no splits configured, Supervillain auto-generates one tab per email domain from your identities.
+**Scope.** `splits.json` is global — one file shared across every connected account. Filters run against the unified `Email` model (from/to/cc/subject/has_calendar) after the message is fetched and parsed, not against provider queries, so the same split definition works identically on Fastmail, Outlook, and Gmail. When you switch accounts, the tabs stay the same; each one matches against the current account's mail. A tab whose pattern doesn't match anything on the current account simply shows zero.
+
+**Auto-seeding.** On first run (and only when `splits.json` is empty) Supervillain inspects the **default account's** identities and creates one tab per email domain. It does not re-seed when you add a second account later, because that would silently overwrite any splits you've edited — create those tabs manually in `Ctrl+K > New Split` or edit `splits.json` directly.
 
 **Managing splits:**
 
@@ -437,7 +439,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 
 ## API
 
-All endpoints live under `/api/`. The frontend communicates exclusively through these. Account-scoped endpoints (`/emails/*`, `/mailboxes`, `/identities`, `/splits`, `/upload`, `/split-counts`) accept `?account={id}`; settings endpoints (`/accounts/*`, `/theme`, `/timezone/*`, `/calendar/invite`) are global.
+All endpoints live under `/api/`. The frontend communicates exclusively through these. Account-scoped endpoints (`/emails/*`, `/mailboxes`, `/identities`, `/upload`, `/split-counts`) accept `?account={id}`. Splits CRUD (`/splits`) is **global** — it reads and writes the single shared `splits.json` regardless of any `?account=` parameter. Settings endpoints (`/accounts/*`, `/theme`, `/timezone/*`, `/calendar/invite`) are also global.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -461,7 +463,7 @@ All endpoints live under `/api/`. The frontend communicates exclusively through 
 | POST | `/api/emails/{id}/add-to-calendar` | Add invite to calendar |
 | POST | `/api/emails/{id}/unsubscribe-and-archive-all` | Unsubscribe + archive all from sender |
 | GET | `/api/emails/{id}/attachments/{blob_id}/{filename}` | Download attachment |
-| GET | `/api/splits` | List splits |
+| GET | `/api/splits` | List splits (global; same result on every account) |
 | POST | `/api/splits` | Create split |
 | PUT | `/api/splits/{id}` | Update split |
 | DELETE | `/api/splits/{id}` | Delete split |
