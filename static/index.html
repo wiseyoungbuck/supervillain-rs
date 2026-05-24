@@ -106,6 +106,146 @@
                     </div>
                     <div class="account-detail">
                         <div id="account-empty" class="account-empty"></div>
+
+                        <!-- Add-account wizard (4 steps) — shown when creating a new account. -->
+                        <div id="wiz" class="wiz hidden" role="region" aria-label="Add account">
+                            <div class="wiz-header">
+                                <span class="wiz-cmd"><span class="wiz-colon">:</span>add-account</span>
+                                <span class="wiz-crumb" id="wiz-crumb">&rsaquo; choose provider</span>
+                                <span class="wiz-step">[<span id="wiz-step-now">1</span>/4]</span>
+                            </div>
+                            <div class="wiz-body">
+                                <!-- Step 1: provider picker -->
+                                <section class="wiz-screen visible" data-wiz-step="1">
+                                    <div class="wiz-title">Connect a mailbox</div>
+                                    <div class="wiz-blurb">
+                                        Pick the service that hosts your email. Supervillain opens your browser to sign you in &mdash; your password never touches this app.
+                                    </div>
+                                    <div class="wiz-picker" id="wiz-picker" role="listbox" aria-label="Provider">
+                                        <button type="button" class="wiz-row focused" data-wiz-provider="gmail" data-wiz-idx="0" role="option">
+                                            <span class="wiz-kbd">1</span>
+                                            <span class="wiz-gly">G</span>
+                                            <span class="wiz-name">Gmail</span>
+                                            <span class="wiz-desc">Google &mdash; Workspace or personal</span>
+                                            <span class="wiz-badge">OAuth</span>
+                                        </button>
+                                        <button type="button" class="wiz-row" data-wiz-provider="outlook" data-wiz-idx="1" role="option">
+                                            <span class="wiz-kbd">2</span>
+                                            <span class="wiz-gly">O</span>
+                                            <span class="wiz-name">Outlook</span>
+                                            <span class="wiz-desc">Microsoft 365 &mdash; work or personal</span>
+                                            <span class="wiz-badge">OAuth</span>
+                                        </button>
+                                        <button type="button" class="wiz-row" data-wiz-provider="fastmail" data-wiz-idx="2" role="option">
+                                            <span class="wiz-kbd">3</span>
+                                            <span class="wiz-gly">F</span>
+                                            <span class="wiz-name">Fastmail</span>
+                                            <span class="wiz-desc">JMAP &mdash; fast, privacy-focused</span>
+                                            <span class="wiz-badge">API token</span>
+                                        </button>
+                                    </div>
+                                </section>
+
+                                <!-- Step 2: credentials -->
+                                <section class="wiz-screen" data-wiz-step="2">
+                                    <div class="wiz-title" id="wiz-creds-title">Bring your own keys</div>
+                                    <div class="wiz-blurb" id="wiz-creds-blurb">
+                                        Supervillain talks to <em>Google</em> through an OAuth app <strong>you</strong> register &mdash; your inbox flows through your credentials, not ours. One-time, ~3-minute setup.
+                                    </div>
+                                    <div class="wiz-why" id="wiz-creds-why">
+                                        <div class="wiz-why-head">&#9656; Why am I being asked for this?</div>
+                                        Most mail clients proxy your inbox through their servers. Supervillain runs entirely on your machine, so it needs an OAuth client you own.
+                                        <a href="#" id="wiz-creds-guide" target="_blank" rel="noopener">Open the setup guide &#8599;</a>
+                                    </div>
+                                    <form id="wiz-form" class="wiz-form" autocomplete="off" onsubmit="event.preventDefault(); wizContinueFromCreds();">
+                                        <div class="wiz-field">
+                                            <label for="wiz-name">Account name</label>
+                                            <input type="text" id="wiz-name" autocomplete="off" placeholder="gmail" required>
+                                        </div>
+                                        <div class="wiz-field" data-wiz-field="username">
+                                            <label for="wiz-username">Email</label>
+                                            <input type="email" id="wiz-username" autocomplete="off" placeholder="you@fastmail.com">
+                                        </div>
+                                        <div class="wiz-field" data-wiz-field="client-id">
+                                            <label for="wiz-client-id" id="wiz-client-id-label">Client ID</label>
+                                            <input type="text" id="wiz-client-id" autocomplete="off">
+                                        </div>
+                                        <div class="wiz-field" data-wiz-field="client-secret">
+                                            <label for="wiz-client-secret" id="wiz-client-secret-label">Client secret</label>
+                                            <div class="wiz-secret">
+                                                <input type="password" id="wiz-client-secret" autocomplete="new-password">
+                                                <button type="button" class="wiz-reveal" data-wiz-reveal="wiz-client-secret">show</button>
+                                            </div>
+                                        </div>
+                                        <div class="wiz-field" data-wiz-field="api-token">
+                                            <label for="wiz-api-token">API token</label>
+                                            <div class="wiz-secret">
+                                                <input type="password" id="wiz-api-token" autocomplete="new-password" placeholder="fmu1-...">
+                                                <button type="button" class="wiz-reveal" data-wiz-reveal="wiz-api-token">show</button>
+                                            </div>
+                                        </div>
+                                        <div class="wiz-error hidden" id="wiz-error"></div>
+                                        <div class="wiz-actions">
+                                            <button type="button" class="wiz-btn" onclick="wizGoTo(1)">&larr; Back</button>
+                                            <button type="submit" class="wiz-btn primary wiz-actions-right" id="wiz-continue-btn">
+                                                Continue with <span id="wiz-continue-provider">Google</span> &rarr;
+                                            </button>
+                                        </div>
+                                    </form>
+                                </section>
+
+                                <!-- Step 3: connecting -->
+                                <section class="wiz-screen" data-wiz-step="3">
+                                    <div class="wiz-title">Opening your browser&hellip;</div>
+                                    <div class="wiz-blurb">
+                                        A sign-in tab is opening now. Choose the account you want to connect, approve the requested scopes, and come back here &mdash; we&rsquo;ll do the rest.
+                                    </div>
+                                    <div class="wiz-pulse">
+                                        <span class="wiz-pulse-dot"></span>
+                                        <span id="wiz-pulse-text">Awaiting consent on accounts.google.com</span>
+                                    </div>
+                                    <div class="wiz-log" id="wiz-log" role="log" aria-live="polite"></div>
+                                    <div class="wiz-actions">
+                                        <button type="button" class="wiz-btn" onclick="wizCancelConnecting()">&times; Cancel</button>
+                                    </div>
+                                </section>
+
+                                <!-- Step 4: success -->
+                                <section class="wiz-screen" data-wiz-step="4">
+                                    <div class="wiz-title"><span class="wiz-check">&#10003;</span>Mailbox connected</div>
+                                    <div class="wiz-blurb">
+                                        Your mailbox is connected and syncing in the background.
+                                    </div>
+                                    <div class="wiz-summary">
+                                        <div class="wiz-summary-row">
+                                            <span class="wiz-summary-lbl">Authorized as</span>
+                                            <span class="wiz-summary-val" id="wiz-success-email">&mdash;</span>
+                                        </div>
+                                        <div class="wiz-summary-row">
+                                            <span class="wiz-summary-lbl">Provider</span>
+                                            <span class="wiz-summary-val" id="wiz-success-provider">&mdash;</span>
+                                        </div>
+                                        <div class="wiz-summary-row">
+                                            <span class="wiz-summary-lbl">Saved as</span>
+                                            <span class="wiz-summary-val" id="wiz-success-name">&mdash;</span>
+                                        </div>
+                                        <div class="wiz-default-row">
+                                            <input type="checkbox" id="wiz-set-default">
+                                            <label for="wiz-set-default">Set as default account for compose</label>
+                                        </div>
+                                    </div>
+                                    <div class="wiz-actions">
+                                        <button type="button" class="wiz-btn" onclick="wizGoTo(1)">+ Add another</button>
+                                        <button type="button" class="wiz-btn primary wiz-actions-right" id="wiz-done-btn" onclick="wizFinish()">Done &rarr;</button>
+                                    </div>
+                                </section>
+                            </div>
+                            <div class="wiz-statusline" id="wiz-statusline">
+                                <span class="wiz-mode" id="wiz-mode">NORMAL</span>
+                                <span id="wiz-hints"></span>
+                            </div>
+                        </div>
+
                         <form id="account-form" class="account-form hidden" autocomplete="off">
                             <div class="modal-field">
                                 <label>Provider:</label>
@@ -125,7 +265,7 @@
                             </div>
                             <div class="modal-field" data-provider="outlook,gmail">
                                 <label>Email:</label>
-                                <input type="email" id="acct-email" readonly placeholder="(populated after authorize)">
+                                <input type="email" id="acct-email" readonly placeholder="filled in automatically after you authorize">
                             </div>
                             <div class="modal-field" data-provider="fastmail">
                                 <label>API Token:</label>

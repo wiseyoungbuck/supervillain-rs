@@ -27,6 +27,12 @@ const state = {
     selectedAccountId: null,  // which account is focused in settings
     settingsMode: 'view',     // 'view' | 'edit' | 'awaiting'
     authController: null,     // AbortController for the in-flight authorize fetch
+    // Add-account wizard (4-step). Active only while adding a new account;
+    // existing-account edits keep using the dense form.
+    wizardActive: false,
+    wizardStep: 1,
+    wizardProviderIdx: 0,     // 0=gmail, 1=outlook, 2=fastmail
+    wizardSavedId: null,      // id of the account being created (set after step 2 save)
     timezone: null,           // { primary, display, system, system_changed, use_system, ... }
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
 };
@@ -245,8 +251,12 @@ function init() {
         e.preventDefault();
         saveAccount();
     });
-    els.acctAuthorizeBtn.addEventListener('click', () => {
-        if (state.selectedAccountId) authorize(state.selectedAccountId);
+    els.acctAuthorizeBtn.addEventListener('click', async () => {
+        if (!state.selectedAccountId) {
+            await saveAccount();
+            if (!state.selectedAccountId) return;
+        }
+        authorize(state.selectedAccountId);
     });
     els.acctSetDefault.addEventListener('click', () => {
         if (state.selectedAccountId) setDefaultAccount(state.selectedAccountId);
@@ -277,6 +287,28 @@ function init() {
     });
     document.querySelector('#settings-view .add-row').addEventListener('click', () => {
         beginAddAccount();
+    });
+
+    // Wizard event listeners
+    document.querySelectorAll('#wiz-picker .wiz-row').forEach((row, i) => {
+        row.addEventListener('mouseenter', () => { if (state.wizardStep === 1) focusWizProvider(i); });
+        row.addEventListener('click', () => {
+            focusWizProvider(i);
+            wizGoTo(2);
+        });
+    });
+    document.querySelectorAll('#wiz input, #wiz select').forEach(el => {
+        el.addEventListener('focus', () => { if (state.wizardActive) setMode('insert'); });
+        el.addEventListener('blur', () => { if (state.wizardActive) setMode('normal'); });
+    });
+    document.querySelectorAll('#wiz .wiz-reveal').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const target = document.getElementById(btn.dataset.wizReveal);
+            if (!target) return;
+            const showing = target.type === 'text';
+            target.type = showing ? 'password' : 'text';
+            btn.textContent = showing ? 'show' : 'hide';
+        });
     });
     // Reload theme on window focus (pick up theme changes after alt-tabbing back)
     window.addEventListener('focus', loadTheme);
@@ -1315,9 +1347,11 @@ function openSettings({ firstRun = false } = {}) {
     }
     showView('settings');
     renderSettings();
+    if (firstRun) openWizard();
 }
 
 function closeSettings() {
+    if (state.wizardActive) closeWizard();
     if (state.authController) {
         state.authController.abort();
         state.authController = null;
@@ -1342,6 +1376,16 @@ function renderSettings() {
                 <span class="account-row-provider">${escapeHtml(a.provider)}</span>
             </div>`;
     }).join('');
+
+    // Wizard takes precedence over the form/empty state for new accounts.
+    const wiz = document.getElementById('wiz');
+    if (state.wizardActive) {
+        els.accountForm.classList.add('hidden');
+        els.accountEmpty.classList.add('hidden');
+        if (wiz) wiz.classList.remove('hidden');
+        return;
+    }
+    if (wiz) wiz.classList.add('hidden');
 
     // Detail pane: empty/firstrun shell vs. edit form
     if (state.settingsMode === 'view' && !state.selectedAccountId) {
@@ -1426,11 +1470,9 @@ function updateProviderFields() {
 }
 
 function beginAddAccount() {
-    state.selectedAccountId = null;
-    state.settingsMode = 'edit';
-    renderSettings();
-    setMode('insert');
-    els.acctName.focus();
+    // New accounts go through the 4-step wizard. Existing-account edits
+    // continue to use the dense form.
+    openWizard();
 }
 
 async function saveAccount() {
@@ -1537,6 +1579,328 @@ async function authorize(id) {
     }
 }
 
+// ============================================================================
+// Add-account wizard (4 steps: pick provider → keys → connecting → done)
+// ============================================================================
+
+const WIZ_PROVIDERS = ['gmail', 'outlook', 'fastmail'];
+const WIZ_CRUMBS = {
+    1: '› choose provider',
+    2: '› authorize',
+    3: '› connecting',
+    4: '› done',
+};
+const WIZ_HINTS = {
+    1: '<kbd>1 2 3</kbd>pick &middot; <kbd>j k</kbd>move &middot; <kbd>enter</kbd>select &middot; <kbd>esc</kbd>cancel',
+    2: '<kbd>tab</kbd>next field &middot; <kbd>S-tab</kbd>prev &middot; <kbd>enter</kbd>continue &middot; <kbd>esc</kbd>back',
+    3: '<kbd>esc</kbd>cancel',
+    4: '<kbd>enter</kbd>done &middot; <kbd>a</kbd>add another &middot; <kbd>esc</kbd>close',
+};
+
+function openWizard() {
+    state.wizardActive = true;
+    state.wizardStep = 1;
+    state.wizardProviderIdx = 0;
+    state.wizardSavedId = null;
+    state.selectedAccountId = null;
+    state.settingsMode = 'edit';
+    renderSettings();
+    renderWizardStep();
+}
+
+function closeWizard() {
+    if (state.authController) {
+        state.authController.abort();
+        state.authController = null;
+    }
+    state.wizardActive = false;
+    state.wizardSavedId = null;
+    setMode('normal');
+    renderSettings();
+}
+
+function wizGoTo(step) {
+    state.wizardStep = step;
+    renderWizardStep();
+}
+
+function renderWizardStep() {
+    const n = state.wizardStep;
+    document.querySelectorAll('.wiz-screen').forEach(s => {
+        s.classList.toggle('visible', Number(s.dataset.wizStep) === n);
+    });
+    document.getElementById('wiz-step-now').textContent = String(n);
+    document.getElementById('wiz-crumb').textContent = WIZ_CRUMBS[n];
+    document.getElementById('wiz-hints').innerHTML = WIZ_HINTS[n];
+    const modeEl = document.getElementById('wiz-mode');
+    modeEl.textContent = n === 3 ? 'AWAITING' : 'NORMAL';
+    modeEl.className = 'wiz-mode' + (n === 3 ? ' awaiting' : '');
+
+    if (n === 1) {
+        focusWizProvider(state.wizardProviderIdx);
+        setMode('normal');
+    } else if (n === 2) {
+        tailorWizCreds();
+    } else if (n === 4) {
+        renderWizSuccess();
+        setMode('normal');
+        setTimeout(() => {
+            const done = document.getElementById('wiz-done-btn');
+            if (done) done.focus();
+        }, 30);
+    }
+}
+
+function focusWizProvider(idx) {
+    state.wizardProviderIdx = ((idx % 3) + 3) % 3;
+    document.querySelectorAll('.wiz-row').forEach((r, i) => {
+        r.classList.toggle('focused', i === state.wizardProviderIdx);
+    });
+}
+
+function wizSuggestName(provider) {
+    const taken = new Set(state.accounts.map(a => a.id));
+    if (!taken.has(provider)) return provider;
+    for (let n = 2; n < 1000; n++) {
+        const cand = `${provider}-${n}`;
+        if (!taken.has(cand)) return cand;
+    }
+    return `${provider}-${Date.now()}`;
+}
+
+function tailorWizCreds() {
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const title = document.getElementById('wiz-creds-title');
+    const blurb = document.getElementById('wiz-creds-blurb');
+    const why = document.getElementById('wiz-creds-why');
+    const guide = document.getElementById('wiz-creds-guide');
+    const continueLabel = document.getElementById('wiz-continue-provider');
+    const nameInput = document.getElementById('wiz-name');
+    const clientIdInput = document.getElementById('wiz-client-id');
+    const clientSecretInput = document.getElementById('wiz-client-secret');
+    const usernameInput = document.getElementById('wiz-username');
+    const apiTokenInput = document.getElementById('wiz-api-token');
+
+    document.querySelectorAll('.wiz-field[data-wiz-field]').forEach(f => f.classList.add('hidden'));
+    document.getElementById('wiz-error').classList.add('hidden');
+
+    nameInput.value = wizSuggestName(provider);
+
+    const show = (field) => {
+        const el = document.querySelector(`.wiz-field[data-wiz-field="${field}"]`);
+        if (el) el.classList.remove('hidden');
+    };
+
+    if (provider === 'fastmail') {
+        title.textContent = 'Paste your Fastmail API token';
+        blurb.innerHTML = `Fastmail doesn&rsquo;t use OAuth &mdash; generate a scoped <em>JMAP + CalDAV</em> token in Fastmail settings and paste it below.`;
+        why.style.display = 'none';
+        continueLabel.textContent = 'Fastmail';
+        show('username');
+        show('api-token');
+    } else if (provider === 'outlook') {
+        title.textContent = 'Bring your own keys';
+        blurb.innerHTML = `Supervillain talks to <em>Microsoft 365</em> through an OAuth app <strong>you</strong> register in Azure &mdash; one-time, ~4-minute setup.`;
+        why.style.display = '';
+        guide.textContent = 'Open the Azure app-registration guide ↗';
+        guide.href = 'https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app';
+        continueLabel.textContent = 'Microsoft';
+        show('client-id');
+        clientIdInput.placeholder = 'a1b2c3d4-...';
+    } else {
+        title.textContent = 'Bring your own keys';
+        blurb.innerHTML = `Supervillain talks to <em>Google</em> through an OAuth app <strong>you</strong> register &mdash; your inbox flows through your credentials, not ours. One-time, ~3-minute setup.`;
+        why.style.display = '';
+        guide.textContent = 'Open the Google Cloud setup guide ↗';
+        guide.href = 'https://developers.google.com/identity/protocols/oauth2/native-app';
+        continueLabel.textContent = 'Google';
+        show('client-id');
+        show('client-secret');
+        clientIdInput.placeholder = '123…-abc.apps.googleusercontent.com';
+        clientSecretInput.placeholder = 'GOCSPX-…';
+    }
+    usernameInput.value = '';
+    apiTokenInput.value = '';
+    clientIdInput.value = '';
+    clientSecretInput.value = '';
+
+    setTimeout(() => {
+        const first = document.querySelector('.wiz-screen.visible .wiz-field:not(.hidden) input');
+        if (first) first.focus();
+    }, 30);
+}
+
+function wizShowError(msg) {
+    const el = document.getElementById('wiz-error');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+}
+
+async function wizContinueFromCreds() {
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const name = document.getElementById('wiz-name').value.trim();
+    if (!name) return wizShowError('Account name is required');
+
+    let payload;
+    if (provider === 'fastmail') {
+        const username = document.getElementById('wiz-username').value.trim();
+        const token = document.getElementById('wiz-api-token').value;
+        if (!username) return wizShowError('Email is required');
+        if (!token) return wizShowError('API token is required');
+        payload = { provider, username, 'api-token': token };
+    } else if (provider === 'outlook') {
+        const cid = document.getElementById('wiz-client-id').value.trim();
+        if (!cid) return wizShowError('Client ID is required');
+        payload = { provider, 'client-id': cid };
+    } else {
+        const cid = document.getElementById('wiz-client-id').value.trim();
+        const cs = document.getElementById('wiz-client-secret').value;
+        if (!cid) return wizShowError('Client ID is required');
+        if (!cs) return wizShowError('Client secret is required');
+        payload = { provider, 'client-id': cid, 'client-secret': cs };
+    }
+
+    document.getElementById('wiz-error').classList.add('hidden');
+    try {
+        const resp = await api('POST', `/accounts/${encodeURIComponent(name)}`, payload);
+        state.wizardSavedId = name;
+        state.selectedAccountId = name;
+        await loadAccounts();
+        if (resp && resp.authStatus === 'pending') {
+            wizGoTo(3);
+            wizStartConnecting();
+        } else {
+            wizGoTo(4);
+        }
+    } catch (err) {
+        wizShowError(err.message);
+    }
+}
+
+function wizAppendLog(html) {
+    const box = document.getElementById('wiz-log');
+    if (!box) return;
+    const line = document.createElement('div');
+    line.className = 'wiz-log-line';
+    line.innerHTML = html;
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+}
+
+async function wizStartConnecting() {
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const host = provider === 'gmail' ? 'accounts.google.com' : 'login.microsoftonline.com';
+    document.getElementById('wiz-pulse-text').textContent = `Awaiting consent on ${host}`;
+    const box = document.getElementById('wiz-log');
+    box.innerHTML = '';
+
+    // Best-effort visualisation of what the backend is doing during the
+    // long-poll. These are scripted (no event stream from the server yet),
+    // but they reflect the real sequence in src/platform/desktop.rs.
+    const lines = [
+        { d: 0,    h: `<span class="p">$</span> Generating PKCE challenge &hellip;  <span class="ok">ok</span>` },
+        { d: 250,  h: `<span class="p">$</span> Binding loopback callback  <span class="ok">ok</span>` },
+        { d: 500,  h: `<span class="p">$</span> Opening browser &hellip;` },
+        { d: 900,  h: `<span class="p">&rarr;</span> <span class="url">https://${host}/&hellip;/auth?&hellip;</span>` },
+        { d: 1400, h: `<span class="p">$</span> Awaiting redirect to <span class="in">/callback</span> &hellip; (5 min timeout)` },
+    ];
+    lines.forEach(e => setTimeout(() => {
+        if (state.wizardStep === 3) wizAppendLog(e.h);
+    }, e.d));
+
+    try {
+        if (state.authController) state.authController.abort();
+        state.authController = new AbortController();
+        await api('POST', `/accounts/${encodeURIComponent(state.wizardSavedId)}/authorize`,
+            null, state.authController.signal);
+        wizAppendLog(`<span class="p">&larr;</span> <span class="ok">code received</span> &middot; tokens exchanged`);
+        wizAppendLog(`<span class="p">$</span> Writing config &hellip;  <span class="ok">ok</span>`);
+        await loadAccounts();
+        setTimeout(() => { if (state.wizardStep === 3) wizGoTo(4); }, 500);
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        wizAppendLog(`<span class="p">&times;</span> <span class="er">${escapeHtml(err.message)}</span>`);
+        wizAppendLog(`<span class="p">$</span> <span class="wn">Press esc to go back and retry.</span>`);
+    } finally {
+        state.authController = null;
+    }
+}
+
+function wizCancelConnecting() {
+    if (state.authController) {
+        state.authController.abort();
+        state.authController = null;
+    }
+    wizGoTo(2);
+}
+
+function renderWizSuccess() {
+    const id = state.wizardSavedId;
+    const acct = state.accounts.find(a => a.id === id);
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const providerLabel = provider === 'gmail'   ? 'Gmail (Google)'
+                        : provider === 'outlook' ? 'Outlook (Microsoft 365)'
+                        :                          'Fastmail';
+    document.getElementById('wiz-success-email').textContent = (acct && acct.email) || '(syncing…)';
+    document.getElementById('wiz-success-provider').textContent = providerLabel;
+    document.getElementById('wiz-success-name').textContent = id || '';
+    document.getElementById('wiz-set-default').checked = !!(acct && acct.isDefault);
+}
+
+async function wizFinish() {
+    const id = state.wizardSavedId;
+    const wantDefault = document.getElementById('wiz-set-default').checked;
+    const acct = state.accounts.find(a => a.id === id);
+    if (wantDefault && acct && !acct.isDefault) {
+        try { await setDefaultAccount(id); } catch (_) { /* swallowed; setDefault shows its own error */ }
+    }
+    closeWizard();
+}
+
+function handleWizardKey(e) {
+    const step = state.wizardStep;
+    const inField = !!e.target.closest && e.target.matches('input, select, textarea');
+
+    if (step === 1) {
+        if (e.key === 'Escape')                           { closeWizard(); e.preventDefault(); }
+        else if (e.key === 'j' || e.key === 'ArrowDown')  { focusWizProvider(state.wizardProviderIdx + 1); e.preventDefault(); }
+        else if (e.key === 'k' || e.key === 'ArrowUp')    { focusWizProvider(state.wizardProviderIdx - 1); e.preventDefault(); }
+        else if (e.key === '1' || e.key === '2' || e.key === '3') {
+            focusWizProvider(Number(e.key) - 1); wizGoTo(2); e.preventDefault();
+        }
+        else if (e.key === 'Enter')                       { wizGoTo(2); e.preventDefault(); }
+        return;
+    }
+
+    if (step === 2) {
+        if (e.key === 'Escape') {
+            if (inField) e.target.blur();
+            wizGoTo(1);
+            e.preventDefault();
+        } else if (e.key === 'Enter' && inField && !e.shiftKey) {
+            // Plain Enter inside a wizard field submits — the form's native
+            // submit handler will fire and call wizContinueFromCreds().
+            // No preventDefault: let the submit happen.
+        } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            wizContinueFromCreds();
+            e.preventDefault();
+        }
+        return;
+    }
+
+    if (step === 3) {
+        if (e.key === 'Escape') { wizCancelConnecting(); e.preventDefault(); }
+        return;
+    }
+
+    if (step === 4) {
+        if (inField) return;
+        if (e.key === 'Enter')                           { wizFinish(); e.preventDefault(); }
+        else if (e.key === 'a' || e.key === 'A')         { wizGoTo(1); e.preventDefault(); }
+        else if (e.key === 'Escape')                     { closeWizard(); e.preventDefault(); }
+    }
+}
+
 function showStatus(message, type = 'info') {
     els.statusMessage.textContent = message;
     els.statusMessage.style.color = type === 'error' ? 'var(--danger)' :
@@ -1578,6 +1942,12 @@ function handleKeyDown(e) {
             saveSplit();
             e.preventDefault();
         }
+        return;
+    }
+
+    // Settings: wizard owns its own key logic across steps and modes.
+    if (state.view === 'settings' && state.wizardActive) {
+        handleWizardKey(e);
         return;
     }
 
