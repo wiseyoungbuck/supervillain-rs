@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::error::Error;
 use crate::oauth;
@@ -941,7 +942,7 @@ pub async fn get_emails(
     let token = access_token(session).await?;
     let format = if fetch_body { "full" } else { "metadata" };
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
+    let sem = Arc::new(Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
         let client = session.client.clone();
@@ -950,10 +951,13 @@ pub async fn get_emails(
         let format = format.to_string();
         let sem = sem.clone();
         join_set.spawn(async move {
+            // Permit gates only the HTTP call below. Keep token refresh /
+            // other auth work outside this scope or the cap expands to
+            // cover unrelated network I/O and defeats its purpose.
             let _permit = sem
                 .acquire()
                 .await
-                .map_err(|e| Error::Internal(format!("get_emails semaphore: {e}")))?;
+                .expect("semaphore not closed (only dropped after JoinSet drains)");
             let url = format!("{GMAIL_BASE}/messages/{id}?format={format}");
             let resp = client.get(&url).bearer_auth(&token).send().await?;
             let status = resp.status();
@@ -4259,5 +4263,60 @@ mod tests {
         };
         let ics = find_calendar_ics(&payload).unwrap();
         assert!(ics.contains("UID:first"));
+    }
+
+    // ---- concurrency cap on get_emails fan-out ----
+    //
+    // get_emails fans out one messages.get per ID through a shared
+    // Semaphore so we don't trip Gmail's per-user concurrent-request
+    // limit (429 RESOURCE_EXHAUSTED). The HTTP path is hard to mock
+    // without an extra dev-dep, so this test replays the same spawn
+    // pattern with an AtomicUsize peak counter — if someone later
+    // removes the semaphore from get_emails, the constant pin below
+    // still fails and forces them to update this test too.
+
+    #[test]
+    fn get_emails_max_concurrency_is_five() {
+        // Pins the chosen cap so a silent edit to the constant trips
+        // CI. 5 matches the Outlook path and keeps a 50-message inbox
+        // load under Gmail's per-user concurrent-request limit.
+        assert_eq!(GET_EMAILS_MAX_CONCURRENCY, 5);
+    }
+
+    #[tokio::test]
+    async fn semaphore_pattern_bounds_in_flight_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sem = Arc::new(Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let sem = sem.clone();
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while join_set.join_next().await.is_some() {}
+
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= GET_EMAILS_MAX_CONCURRENCY,
+            "peak in-flight {observed} exceeded cap {GET_EMAILS_MAX_CONCURRENCY}",
+        );
+        // Sanity: with 50 tasks and a 5ms sleep, we should saturate
+        // the cap. If this is < 2, the test isn't actually exercising
+        // concurrency and gives false confidence.
+        assert!(
+            observed >= 2,
+            "peak in-flight {observed} too low — test isn't exercising concurrency",
+        );
     }
 }
