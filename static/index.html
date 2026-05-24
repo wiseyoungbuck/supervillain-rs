@@ -162,6 +162,7 @@
                                             <label for="wiz-name">Account name</label>
                                             <input type="text" id="wiz-name" autocomplete="off" placeholder="gmail" required>
                                         </div>
+                                        <div class="wiz-overwrite hidden" id="wiz-overwrite" role="alert" aria-live="polite"></div>
                                         <div class="wiz-field" data-wiz-field="username">
                                             <label for="wiz-username">Email</label>
                                             <input type="email" id="wiz-username" autocomplete="off" placeholder="you@fastmail.com">
@@ -176,6 +177,7 @@
                                                 <input type="password" id="wiz-client-secret" autocomplete="new-password">
                                                 <button type="button" class="wiz-reveal" data-wiz-reveal="wiz-client-secret">show</button>
                                             </div>
+                                            <div class="wiz-cached-hint hidden" id="wiz-client-secret-hint"></div>
                                         </div>
                                         <div class="wiz-field" data-wiz-field="api-token">
                                             <label for="wiz-api-token">API token</label>
@@ -183,8 +185,9 @@
                                                 <input type="password" id="wiz-api-token" autocomplete="new-password" placeholder="fmu1-...">
                                                 <button type="button" class="wiz-reveal" data-wiz-reveal="wiz-api-token">show</button>
                                             </div>
+                                            <div class="wiz-cached-hint hidden" id="wiz-api-token-hint"></div>
                                         </div>
-                                        <div class="wiz-error hidden" id="wiz-error"></div>
+                                        <div class="wiz-error hidden" id="wiz-error" role="alert" aria-live="polite"></div>
                                         <div class="wiz-actions">
                                             <button type="button" class="wiz-btn" data-wiz-action="back-to-1">&larr; Back</button>
                                             <button type="submit" class="wiz-btn primary wiz-actions-right" id="wiz-continue-btn">

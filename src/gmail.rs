@@ -37,7 +37,11 @@ const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars/primary";
-const REDIRECT_URI: &str = "http://localhost:8401/callback";
+// Google's OAuth server auto-allows http://127.0.0.1:<port>/* for Desktop app
+// clients (no URI registration needed). http://localhost:* is "supported but
+// discouraged" per Google's native-app docs and is rejected as
+// redirect_uri_mismatch by Desktop app clients in practice.
+const REDIRECT_URI: &str = "http://127.0.0.1:8401/callback";
 const CALLBACK_PORT: u16 = 8401;
 
 const LABEL_CACHE_TTL: Duration = Duration::from_secs(60);

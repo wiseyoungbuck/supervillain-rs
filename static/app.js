@@ -33,6 +33,12 @@ const state = {
     wizardStep: 1,
     wizardProviderIdx: 0,     // 0=gmail, 1=outlook, 2=fastmail
     wizardSavedId: null,      // id of the account being created (set after step 2 save)
+    // In-memory cache of typed wizard fields, keyed by provider. Survives
+    // step transitions and wizard reopen within a page session so the user
+    // doesn't re-type after esc-back or cancelled OAuth. Cleared on page
+    // reload and on wizFinish for the provider just completed. Uniform
+    // shape across providers (see freshWizCache).
+    wizardCache: null,  // populated at init() once freshWizCache is defined
     timezone: null,           // { primary, display, system, system_changed, use_system, ... }
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
 };
@@ -74,6 +80,11 @@ const SEARCH_OPERATORS = [
 const els = {};
 
 function init() {
+    // Wizard cache — uniform shape per provider; reset to fresh on finish.
+    state.wizardCache = Object.fromEntries(
+        WIZ_PROVIDERS.map(p => [p, freshWizCache()])
+    );
+
     // Cache DOM elements
     els.modeIndicator = document.getElementById('mode-indicator');
     els.mailboxName = document.getElementById('mailbox-name');
@@ -315,6 +326,28 @@ function init() {
     document.getElementById('wiz-form').addEventListener('submit', (e) => {
         e.preventDefault();
         wizContinueFromCreds();
+    });
+    // Cache typed values per provider so esc-back/reopen preserves them.
+    const wizFieldMap = {
+        'wiz-name':          'name',
+        'wiz-client-id':     'client-id',
+        'wiz-client-secret': 'client-secret',
+        'wiz-username':      'username',
+        'wiz-api-token':     'api-token',
+    };
+    Object.keys(wizFieldMap).forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', () => {
+            if (!state.wizardActive) return;
+            const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+            state.wizardCache[provider][wizFieldMap[id]] = el.value;
+            if (id === 'wiz-name') {
+                state.wizardCache[provider].nameTouched = true;
+                checkWizOverwrite();
+            }
+            if (id === 'wiz-client-secret' || id === 'wiz-api-token') updateWizCachedHints();
+        });
     });
     document.querySelectorAll('#wiz [data-wiz-action]').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -627,12 +660,38 @@ async function loadAccounts() {
 
 function showAccountErrors(errors) {
     const count = errors.length;
-    const list = errors.map(e =>
-        `<li><strong>${escapeHtml(e.account)}</strong> (${escapeHtml(e.provider)}): ${escapeHtml(e.error)}</li>`
-    ).join('');
+    const list = errors.map(e => {
+        const acct = escapeHtml(e.account);
+        const prov = escapeHtml(e.provider);
+        let body = escapeHtml(e.error);
+        // Gate the Authorize affordance on a structural signal — the account's
+        // authStatus — not on a regex against the error string. The backend
+        // could reword the error tomorrow and this still works.
+        const acctRec = state.accounts.find(a => a.id === e.account);
+        const needsAuth = acctRec && acctRec.authStatus === 'pending';
+        if (needsAuth && body.includes('Authorize')) {
+            body = body.replace(
+                /Authorize/,
+                `<button type="button" class="banner-authorize-link" data-account-id="${acct}">Authorize</button>`
+            );
+        }
+        return `<li><strong>${acct}</strong> (${prov}): ${body}</li>`;
+    }).join('');
     els.accountErrorDetails.innerHTML =
         `<strong>${count} account${count > 1 ? 's' : ''} failed to connect:</strong><ul>${list}</ul>`;
     els.accountErrorBanner.classList.remove('hidden');
+    els.accountErrorDetails.querySelectorAll('.banner-authorize-link').forEach(btn => {
+        btn.addEventListener('click', () => authorizeAccountFromBanner(btn.dataset.accountId));
+    });
+}
+
+function authorizeAccountFromBanner(id) {
+    state.selectedAccountId = id;
+    state.settingsMode = 'edit';
+    showView('settings');
+    renderSettings();
+    showStatus(`Authorizing ${id}…`, 'info');
+    authorize(id);
 }
 
 function renderAccounts() {
@@ -1685,61 +1744,167 @@ function wizSuggestName(provider) {
     return `${provider}-${Date.now()}`;
 }
 
+// Provider descriptor table — single source of truth for everything that
+// changes between providers. Adding a new provider is one entry here, plus
+// the API-side support.
+const WIZ_ALL_FIELDS = ['client-id', 'client-secret', 'username', 'api-token'];
+const WIZ_FIELD_LABELS = {
+    'client-id':     'Client ID',
+    'client-secret': 'Client secret',
+    'username':      'Email',
+    'api-token':     'API token',
+};
+const WIZ_DESCRIPTORS = {
+    gmail: {
+        label: 'Google',
+        title: 'Bring your own keys',
+        blurb: `Supervillain talks to <em>Google</em> through an OAuth app <strong>you</strong> register &mdash; your inbox flows through your credentials, not ours.`,
+        host: 'accounts.google.com',
+        fields: ['client-id', 'client-secret'],
+        placeholders: {
+            'client-id':     '123…-abc.apps.googleusercontent.com',
+            'client-secret': 'GOCSPX-…',
+        },
+        instructionsHtml: `
+            <div class="wiz-why-head">Set up your Google OAuth client (~3&nbsp;min)</div>
+            <ol class="wiz-steps">
+                <li>Open <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud &rarr; Credentials</a>. Create a project if you don&rsquo;t have one.</li>
+                <li>Configure the <strong>OAuth consent screen</strong>: user type <strong>External</strong>; add yourself as a <strong>Test user</strong> under Audience (required while the app is in Testing mode &mdash; refresh tokens otherwise expire weekly).</li>
+                <li>Enable APIs: <strong>Gmail API</strong> and <strong>Google Calendar API</strong> under Enabled APIs &amp; services.</li>
+                <li><strong>+ Create Credentials &rarr; OAuth client ID</strong>. Application type: <strong>Desktop app</strong> (recommended &mdash; auto-allows loopback) or <strong>Web application</strong> with <code>http://127.0.0.1:8401/callback</code> registered as an authorized redirect URI.</li>
+                <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong> and paste them below.</li>
+            </ol>`,
+    },
+    outlook: {
+        label: 'Microsoft',
+        title: 'Bring your own keys',
+        blurb: `Supervillain talks to <em>Microsoft 365</em> through an OAuth app <strong>you</strong> register in Azure.`,
+        host: 'login.microsoftonline.com',
+        fields: ['client-id'],
+        placeholders: { 'client-id': 'a1b2c3d4-...' },
+        instructionsHtml: `
+            <div class="wiz-why-head">Set up your Microsoft Entra app (~4&nbsp;min)</div>
+            <ol class="wiz-steps">
+                <li>Open <a href="https://entra.microsoft.com/" target="_blank" rel="noopener">Microsoft Entra &rarr; App registrations</a> and click <strong>New registration</strong>.</li>
+                <li>Supported account types: <strong>Any organizational directory and personal Microsoft accounts</strong>.</li>
+                <li>Redirect URI: <strong>Web</strong> &rarr; <code>http://localhost:8400/callback</code>.</li>
+                <li>Under <strong>API permissions</strong>, add delegated: <strong>Mail.ReadWrite</strong>, <strong>Mail.Send</strong>, <strong>Calendars.ReadWrite</strong>.</li>
+                <li>Copy the <strong>Application (client) ID</strong> and paste it below. No client secret needed &mdash; supervillain uses PKCE.</li>
+            </ol>`,
+    },
+    fastmail: {
+        label: 'Fastmail',
+        title: 'Paste your Fastmail API token',
+        blurb: `Fastmail doesn&rsquo;t use OAuth &mdash; you generate a scoped <em>JMAP + CalDAV</em> token in your Fastmail account settings.`,
+        host: null,           // no browser/loopback step
+        fields: ['username', 'api-token'],
+        placeholders: { username: 'you@fastmail.com', 'api-token': 'fmu1-...' },
+        instructionsHtml: `
+            <div class="wiz-why-head">Get your Fastmail API token (~1&nbsp;min)</div>
+            <ol class="wiz-steps">
+                <li>Open <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; API tokens</a>.</li>
+                <li>Click <strong>New API token</strong>. Required scopes: <strong>JMAP</strong> and <strong>CalDAV</strong>.</li>
+                <li>Copy the token (Fastmail only shows it once) and paste it below along with your email.</li>
+            </ol>`,
+    },
+};
+
+// Uniform cache shape across every provider — same keys, always present.
+// The reset on wizFinish is then one assignment, no per-provider shapes.
+function freshWizCache() {
+    const c = { name: '', nameTouched: false };
+    WIZ_ALL_FIELDS.forEach(f => { c[f] = ''; });
+    return c;
+}
+
+function maskedHint(value) {
+    if (!value || !value.length) return '';
+    const last = value.length >= 4 ? value.slice(-4) : value;
+    return `<code>****${escapeHtml(last)}</code>`;
+}
+
+function updateWizCachedHints() {
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const cache = state.wizardCache[provider] || {};
+    const setHint = (id, value) => {
+        const hint = document.getElementById(id);
+        if (!hint) return;
+        if (value) {
+            hint.innerHTML = `Saved value: ${maskedHint(value)} &middot; type to replace`;
+            hint.classList.remove('hidden');
+        } else {
+            hint.innerHTML = '';
+            hint.classList.add('hidden');
+        }
+    };
+    setHint('wiz-client-secret-hint', cache['client-secret']);
+    setHint('wiz-api-token-hint',    cache['api-token']);
+}
+
+function checkWizOverwrite() {
+    const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const nameInput = document.getElementById('wiz-name');
+    const warn = document.getElementById('wiz-overwrite');
+    const continueBtn = document.getElementById('wiz-continue-btn');
+    const name = (nameInput?.value || '').trim();
+    const existing = name ? state.accounts.find(a => a.id === name) : null;
+
+    if (!existing || existing.id === state.wizardSavedId) {
+        warn.classList.add('hidden');
+        warn.classList.remove('error');
+        if (continueBtn) continueBtn.disabled = false;
+        return;
+    }
+    const label = escapeHtml(existing.email || existing.id);
+    if (existing.provider !== provider) {
+        // Provider mismatch — block continue. Forcing a save would clobber a
+        // different-provider account; user must rename or remove the old one.
+        warn.classList.add('error');
+        warn.classList.remove('hidden');
+        warn.innerHTML = `&#9888; The name <strong>${escapeHtml(name)}</strong> is already a <strong>${escapeHtml(existing.provider)}</strong> account (<strong>${label}</strong>). Pick a different name, or remove the existing account first.`;
+        if (continueBtn) continueBtn.disabled = true;
+    } else {
+        warn.classList.remove('error');
+        warn.classList.remove('hidden');
+        warn.innerHTML = `&#9888; This will overwrite the existing <strong>${escapeHtml(existing.provider)}</strong> account <strong>${label}</strong> and replace its credentials &amp; tokens.`;
+        if (continueBtn) continueBtn.disabled = false;
+    }
+}
+
 function tailorWizCreds() {
     const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
-    const title = document.getElementById('wiz-creds-title');
-    const blurb = document.getElementById('wiz-creds-blurb');
-    const why = document.getElementById('wiz-creds-why');
-    const guide = document.getElementById('wiz-creds-guide');
-    const continueLabel = document.getElementById('wiz-continue-provider');
-    const nameInput = document.getElementById('wiz-name');
-    const clientIdInput = document.getElementById('wiz-client-id');
-    const clientSecretInput = document.getElementById('wiz-client-secret');
-    const usernameInput = document.getElementById('wiz-username');
-    const apiTokenInput = document.getElementById('wiz-api-token');
+    const d = WIZ_DESCRIPTORS[provider];
+    const cache = state.wizardCache[provider] || freshWizCache();
 
+    // Apply provider copy (title, blurb, continueLabel, instructions).
+    document.getElementById('wiz-creds-title').textContent = d.title;
+    document.getElementById('wiz-creds-blurb').innerHTML = d.blurb;
+    const why = document.getElementById('wiz-creds-why');
+    why.innerHTML = d.instructionsHtml;
+    why.style.display = '';
+    document.getElementById('wiz-continue-provider').textContent = d.label;
+
+    // Show only the fields this provider needs; reset their placeholders.
     document.querySelectorAll('.wiz-field[data-wiz-field]').forEach(f => f.classList.add('hidden'));
     document.getElementById('wiz-error').classList.add('hidden');
+    d.fields.forEach(f => {
+        const fieldEl = document.querySelector(`.wiz-field[data-wiz-field="${f}"]`);
+        if (fieldEl) fieldEl.classList.remove('hidden');
+        const inp = document.getElementById(`wiz-${f}`);
+        if (inp && d.placeholders[f]) inp.placeholder = d.placeholders[f];
+    });
 
-    nameInput.value = wizSuggestName(provider);
+    // Restore from cache. The name field falls back to a suggested-unique
+    // default only when the user hasn't touched it (nameTouched flag —
+    // explicit beats null-vs-empty-string sentinel).
+    document.getElementById('wiz-name').value = cache.nameTouched ? cache.name : wizSuggestName(provider);
+    WIZ_ALL_FIELDS.forEach(f => {
+        const inp = document.getElementById(`wiz-${f}`);
+        if (inp) inp.value = cache[f] || '';
+    });
 
-    const show = (field) => {
-        const el = document.querySelector(`.wiz-field[data-wiz-field="${field}"]`);
-        if (el) el.classList.remove('hidden');
-    };
-
-    if (provider === 'fastmail') {
-        title.textContent = 'Paste your Fastmail API token';
-        blurb.innerHTML = `Fastmail doesn&rsquo;t use OAuth &mdash; generate a scoped <em>JMAP + CalDAV</em> token in Fastmail settings and paste it below.`;
-        why.style.display = 'none';
-        continueLabel.textContent = 'Fastmail';
-        show('username');
-        show('api-token');
-    } else if (provider === 'outlook') {
-        title.textContent = 'Bring your own keys';
-        blurb.innerHTML = `Supervillain talks to <em>Microsoft 365</em> through an OAuth app <strong>you</strong> register in Azure &mdash; one-time, ~4-minute setup.`;
-        why.style.display = '';
-        guide.textContent = 'Open the Azure app-registration guide ↗';
-        guide.href = 'https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app';
-        continueLabel.textContent = 'Microsoft';
-        show('client-id');
-        clientIdInput.placeholder = 'a1b2c3d4-...';
-    } else {
-        title.textContent = 'Bring your own keys';
-        blurb.innerHTML = `Supervillain talks to <em>Google</em> through an OAuth app <strong>you</strong> register &mdash; your inbox flows through your credentials, not ours. One-time, ~3-minute setup.`;
-        why.style.display = '';
-        guide.textContent = 'Open the Google Cloud setup guide ↗';
-        guide.href = 'https://developers.google.com/identity/protocols/oauth2/native-app';
-        continueLabel.textContent = 'Google';
-        show('client-id');
-        show('client-secret');
-        clientIdInput.placeholder = '123…-abc.apps.googleusercontent.com';
-        clientSecretInput.placeholder = 'GOCSPX-…';
-    }
-    usernameInput.value = '';
-    apiTokenInput.value = '';
-    clientIdInput.value = '';
-    clientSecretInput.value = '';
+    updateWizCachedHints();
+    checkWizOverwrite();
 
     setTimeout(() => {
         const first = document.querySelector('.wiz-screen.visible .wiz-field:not(.hidden) input');
@@ -1755,26 +1920,28 @@ function wizShowError(msg) {
 
 async function wizContinueFromCreds() {
     const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
+    const d = WIZ_DESCRIPTORS[provider];
     const name = document.getElementById('wiz-name').value.trim();
     if (!name) return wizShowError('Account name is required');
 
-    let payload;
-    if (provider === 'fastmail') {
-        const username = document.getElementById('wiz-username').value.trim();
-        const token = document.getElementById('wiz-api-token').value;
-        if (!username) return wizShowError('Email is required');
-        if (!token) return wizShowError('API token is required');
-        payload = { provider, username, 'api-token': token };
-    } else if (provider === 'outlook') {
-        const cid = document.getElementById('wiz-client-id').value.trim();
-        if (!cid) return wizShowError('Client ID is required');
-        payload = { provider, 'client-id': cid };
-    } else {
-        const cid = document.getElementById('wiz-client-id').value.trim();
-        const cs = document.getElementById('wiz-client-secret').value;
-        if (!cid) return wizShowError('Client ID is required');
-        if (!cs) return wizShowError('Client secret is required');
-        payload = { provider, 'client-id': cid, 'client-secret': cs };
+    // Hard re-validate cross-provider clobber even if the UI's disabled-button
+    // hint was bypassed (Ctrl+Enter still fires the form submit in some
+    // browsers). The user's mental model is "this will not let me clobber a
+    // different-provider account" — honour it here too.
+    const existing = state.accounts.find(a => a.id === name);
+    if (existing && existing.provider !== provider && existing.id !== state.wizardSavedId) {
+        return wizShowError(`'${name}' is already a ${existing.provider} account. Remove it first or pick a different name.`);
+    }
+
+    // Build payload from the descriptor's field list — adding a new provider
+    // means adding a descriptor entry, not editing this function.
+    const payload = { provider };
+    for (const f of d.fields) {
+        const inp = document.getElementById(`wiz-${f}`);
+        const raw = inp ? inp.value : '';
+        const val = (inp && inp.type === 'password') ? raw : raw.trim();
+        if (!val) return wizShowError(`${WIZ_FIELD_LABELS[f] || f} is required`);
+        payload[f] = val;
     }
 
     document.getElementById('wiz-error').classList.add('hidden');
@@ -1825,7 +1992,7 @@ function wizAppendLog(html) {
 
 async function wizStartConnecting() {
     const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
-    const host = provider === 'gmail' ? 'accounts.google.com' : 'login.microsoftonline.com';
+    const host = WIZ_DESCRIPTORS[provider].host || provider;
     document.getElementById('wiz-pulse-text').textContent = `Awaiting consent on ${host}`;
     const box = document.getElementById('wiz-log');
     box.innerHTML = '';
@@ -1893,6 +2060,11 @@ async function wizFinish() {
     if (wantDefault && acct && !acct.isDefault) {
         try { await setDefaultAccount(id); } catch (_) { /* swallowed; setDefault shows its own error */ }
     }
+    // Clear the just-finished provider's cache so the next wizard run starts
+    // fresh (otherwise "+ Add another" same provider would prefill the
+    // previous account's keys). Uniform shape → one assignment.
+    const provider = acct?.provider || WIZ_PROVIDERS[state.wizardProviderIdx];
+    if (state.wizardCache[provider]) state.wizardCache[provider] = freshWizCache();
     closeWizard();
 }
 
@@ -2857,6 +3029,7 @@ function getCommands() {
         { name: 'Go to Archive', desc: 'Switch to archive', shortcut: '', action: 'go-archive' },
         { name: 'Go to Trash', desc: 'Switch to trash', shortcut: '', action: 'go-trash' },
         { name: 'New Split', desc: 'Create split inbox', shortcut: '', action: 'new-split' },
+        { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
         { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
     ];
 
@@ -2867,6 +3040,17 @@ function getCommands() {
             desc: `Remove the "${split.name}" split`,
             shortcut: '',
             action: `delete-split:${split.id}`,
+        });
+    });
+
+    // Add remove commands for each existing account
+    state.accounts.forEach(acct => {
+        const label = acct.email || acct.id;
+        commands.push({
+            name: `Remove Account: ${label}`,
+            desc: `Disconnect and delete cached tokens for ${label}`,
+            shortcut: '',
+            action: `remove-account:${acct.id}`,
         });
     });
 
@@ -2905,13 +3089,42 @@ function executeCommand(action) {
         case 'new-split':
             openSplitModal();
             break;
+        case 'add-account':
+            openSettings();
+            openWizard();
+            break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {
                 const splitId = action.replace('delete-split:', '');
                 deleteSplit(splitId);
+            } else if (action.startsWith('remove-account:')) {
+                const id = action.slice('remove-account:'.length);
+                removeAccountById(id);
             }
             break;
+    }
+}
+
+async function removeAccountById(id) {
+    const acct = state.accounts.find(a => a.id === id);
+    const label = (acct && acct.email) || id;
+    if (!window.confirm(`Remove account "${label}"? This deletes cached tokens.`)) return;
+    try {
+        await api('DELETE', `/accounts/${encodeURIComponent(id)}`);
+        showStatus(`Deleted ${id}`, 'success');
+        if (state.selectedAccountId === id) {
+            state.selectedAccountId = null;
+            state.settingsMode = 'view';
+        }
+        if (state.currentAccount === id) {
+            state.currentAccount = null;
+            state.currentEmail = null;
+            state.emails = [];
+        }
+        await loadAccounts();
+    } catch (err) {
+        showStatus(`Failed to delete ${id}: ${err.message}`, 'error');
     }
 }
 
