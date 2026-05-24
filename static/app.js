@@ -661,21 +661,19 @@ async function loadAccounts() {
 function showAccountErrors(errors) {
     const count = errors.length;
     const list = errors.map(e => {
-        const acct = escapeHtml(e.account);
+        const acctText = escapeHtml(e.account);
+        const acctAttr = escapeAttr(e.account);
         const prov = escapeHtml(e.provider);
-        let body = escapeHtml(e.error);
-        // Gate the Authorize affordance on a structural signal — the account's
-        // authStatus — not on a regex against the error string. The backend
-        // could reword the error tomorrow and this still works.
+        const body = escapeHtml(e.error);
+        // The Authorize button is purely structural — gated on authStatus,
+        // independent of error text. The backend can reword "Not authorized
+        // — click Authorize" however it wants and the button still appears.
         const acctRec = state.accounts.find(a => a.id === e.account);
         const needsAuth = acctRec && acctRec.authStatus === 'pending';
-        if (needsAuth && body.includes('Authorize')) {
-            body = body.replace(
-                /Authorize/,
-                `<button type="button" class="banner-authorize-link" data-account-id="${acct}">Authorize</button>`
-            );
-        }
-        return `<li><strong>${acct}</strong> (${prov}): ${body}</li>`;
+        const action = needsAuth
+            ? ` <button type="button" class="banner-authorize-link" data-account-id="${acctAttr}">[ Authorize ]</button>`
+            : '';
+        return `<li><strong>${acctText}</strong> (${prov}): ${body}${action}</li>`;
     }).join('');
     els.accountErrorDetails.innerHTML =
         `<strong>${count} account${count > 1 ? 's' : ''} failed to connect:</strong><ul>${list}</ul>`;
@@ -685,7 +683,19 @@ function showAccountErrors(errors) {
     });
 }
 
-function authorizeAccountFromBanner(id) {
+async function authorizeAccountFromBanner(id) {
+    // Banner state can be stale (account removed, or it just succeeded
+    // somewhere else). Refresh and re-check before kicking off the flow.
+    await loadAccounts();
+    const acct = state.accounts.find(a => a.id === id);
+    if (!acct) {
+        showStatus(`Account ${id} no longer exists`, 'error');
+        return;
+    }
+    if (acct.authStatus !== 'pending') {
+        showStatus(`${id} is already authorized`, 'info');
+        return;
+    }
     state.selectedAccountId = id;
     state.settingsMode = 'edit';
     showView('settings');
@@ -1688,6 +1698,16 @@ function closeWizard() {
         state.authController.abort();
         state.authController = null;
     }
+    // Scrub cached secrets from JS memory on any wizard close (Esc, cancel
+    // button, finish). Non-secret fields (name, client-id, username) stay so
+    // a re-open after accidental close doesn't lose typed work; secrets are
+    // cheap to re-paste and shouldn't linger keyed by provider.
+    if (state.wizardCache) {
+        Object.values(state.wizardCache).forEach(c => {
+            c['client-secret'] = '';
+            c['api-token']    = '';
+        });
+    }
     state.wizardActive = false;
     state.wizardSavedId = null;
     setMode('normal');
@@ -1819,8 +1839,11 @@ function freshWizCache() {
 
 function maskedHint(value) {
     if (!value || !value.length) return '';
-    const last = value.length >= 4 ? value.slice(-4) : value;
-    return `<code>****${escapeHtml(last)}</code>`;
+    // Floor at 8 chars before exposing any tail — a short value (<8 chars) is
+    // already mostly the secret if we slice 4 off the end, so just mask it
+    // entirely.
+    if (value.length < 8) return `<code>****</code>`;
+    return `<code>****${escapeHtml(value.slice(-4))}</code>`;
 }
 
 function updateWizCachedHints() {
@@ -3450,6 +3473,13 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// escapeHtml is safe for text content but textContent's serializer doesn't
+// encode `"` or `'`, so a value with quotes can break out of an attribute.
+// Use escapeAttr inside attribute strings like data-foo="${...}".
+function escapeAttr(text) {
+    return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // Strip color-related CSS properties from inline styles.
