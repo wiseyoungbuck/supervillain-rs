@@ -923,6 +923,13 @@ pub struct GmailBody {
     pub attachment_id: Option<String>,
 }
 
+/// Cap on concurrent in-flight Gmail requests from a single `get_emails`
+/// call. Gmail returns HTTP 429 "Too many concurrent requests for user"
+/// when too many `messages.get` calls are in flight at once, even within
+/// daily quota. 5 matches the Outlook path and keeps inbox loads (~50
+/// messages) under the per-user concurrent limit.
+const GET_EMAILS_MAX_CONCURRENCY: usize = 5;
+
 pub async fn get_emails(
     session: &GmailSession,
     ids: &[String],
@@ -934,13 +941,19 @@ pub async fn get_emails(
     let token = access_token(session).await?;
     let format = if fetch_body { "full" } else { "metadata" };
 
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
         let client = session.client.clone();
         let token = token.clone();
         let id = id.clone();
         let format = format.to_string();
+        let sem = sem.clone();
         join_set.spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| Error::Internal(format!("get_emails semaphore: {e}")))?;
             let url = format!("{GMAIL_BASE}/messages/{id}?format={format}");
             let resp = client.get(&url).bearer_auth(&token).send().await?;
             let status = resp.status();
