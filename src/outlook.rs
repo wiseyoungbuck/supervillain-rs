@@ -99,18 +99,21 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-// Microsoft OAuth2 endpoints
-const AUTH_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
-const TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+// Microsoft OAuth2 endpoints. We target `/consumers` (personal MSA tenant)
+// rather than `/common`. Microsoft now blocks end-user consent to newly
+// registered multitenant apps that have no verified publisher (MPN ID), so
+// the multitenant audience is unusable for self-hosted single-user installs.
+// The matching app registration must use "Personal Microsoft accounts only"
+// (see README → Azure AD App Registration).
+const AUTH_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
+const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const REDIRECT_URI: &str = "http://localhost:8400/callback";
 
-// Phase 1: calendar only. Phase 2 adds Mail.ReadWrite Mail.Send
-// Outlook OAuth scopes. Phase 4 adds Mail.ReadWrite + Mail.Send alongside
-// the existing Calendars scope. Existing users with stored tokens will hit
-// "insufficient_scope" on first email call — README upgrade notes spell
-// out the recovery (delete the token file, restart, re-authorize).
-const SCOPES: &str = "Calendars.ReadWrite Mail.ReadWrite Mail.Send offline_access";
+// User.Read is required for Graph /me to reliably return mail / userPrincipalName;
+// without it, consent grants that carry only Mail/Calendar scopes can 403 on /me,
+// which surfaces to the user as "Could not determine Outlook email address".
+const SCOPES: &str = "User.Read Calendars.ReadWrite Mail.ReadWrite Mail.Send offline_access";
 
 use crate::oauth;
 
@@ -293,21 +296,46 @@ pub async fn oauth_flow(
     Ok(session)
 }
 
-/// Fetch the authenticated user's email from Microsoft Graph
-async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Result<String, Error> {
-    let resp: serde_json::Value = client
-        .get(format!("{GRAPH_BASE}/me"))
-        .bearer_auth(access_token)
-        .send()
-        .await?
-        .json()
-        .await?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeResponse {
+    #[serde(default)]
+    mail: Option<String>,
+    #[serde(default)]
+    user_principal_name: Option<String>,
+    #[serde(default)]
+    other_mails: Vec<String>,
+}
 
-    resp["mail"]
-        .as_str()
-        .or_else(|| resp["userPrincipalName"].as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| Error::Internal("Could not determine Outlook email address".into()))
+/// Fetch the authenticated user's email from Microsoft Graph.
+///
+/// Personal MSA accounts (outlook.com, hotmail.com, live.com) frequently return
+/// `mail: null` and put the actual address in `otherMails[0]`, so we $select all
+/// three candidate fields and fall through them in order. Without the HTTP status
+/// check below, a 403 from Graph (e.g. missing User.Read consent) would parse
+/// successfully as JSON and surface as the opaque "Could not determine Outlook
+/// email address" — masking the real consent error from the user.
+async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Result<String, Error> {
+    let url = format!("{GRAPH_BASE}/me?$select=mail,userPrincipalName,otherMails");
+    let resp = client.get(&url).bearer_auth(access_token).send().await?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| Error::Internal(format!("Reading Graph /me response body failed: {e}")))?;
+    if !status.is_success() {
+        return Err(classify_outlook_error("me.get", status, &text));
+    }
+    let me: MeResponse = serde_json::from_str(&text)
+        .map_err(|e| Error::Internal(format!("Graph /me returned non-JSON: {e}: {text}")))?;
+    me.mail
+        .or(me.user_principal_name)
+        .or_else(|| me.other_mails.into_iter().next())
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "Could not determine Outlook email address from Graph /me response: {text}"
+            ))
+        })
 }
 
 // =============================================================================

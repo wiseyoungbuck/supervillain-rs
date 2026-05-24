@@ -214,15 +214,21 @@ Account names (the `[section]` value) become the filename stem for token storage
 
 ### Azure AD App Registration
 
-To use Outlook (email + calendar), register an app in Azure AD:
+To use Outlook (email + calendar), register an app in Azure AD / Microsoft Entra:
 
 1. Go to [Azure Portal > App registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
 2. Click **New registration**
 3. Name: "Supervillain" (or whatever you like)
-4. Supported account types: "Accounts in any organizational directory and personal Microsoft accounts"
+4. Supported account types: **"Personal Microsoft accounts only"**.
+   _Do not pick a multitenant option._ Microsoft blocks end-user consent
+   to newly registered multitenant apps until the publisher is verified
+   (requires an MPN ID), which is impractical for self-hosted single-user
+   installs. The matching OAuth endpoint Supervillain targets is `/consumers`.
 5. Redirect URI: **Web** → `http://localhost:8400/callback`
 6. After creation, copy the **Application (client) ID** — this is your `client-id`
-7. Under **API permissions**, add (all delegated): `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`
+7. Under **API permissions**, add (all delegated): `User.Read`, `Mail.ReadWrite`,
+   `Mail.Send`, `Calendars.ReadWrite`. `User.Read` is required so Microsoft
+   Graph `/me` returns the address used to label the account.
 8. No client secret needed — Supervillain uses PKCE (public client)
 
 Put the client ID in your config:

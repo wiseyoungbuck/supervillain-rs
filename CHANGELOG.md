@@ -4,6 +4,22 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Outlook OAuth — switch to `/consumers` audience
+
+Outlook sign-in now targets the `/consumers` OAuth endpoint instead of
+`/common`. Microsoft blocks end-user consent to newly registered multitenant
+apps until the publisher is verified (MPN ID), which is impractical for
+self-hosted single-user installs. The matching app registration must use
+"Personal Microsoft accounts only" — see README → Azure AD App Registration.
+
+`User.Read` is now requested alongside the existing Mail/Calendar scopes so
+Graph `/me` reliably returns the user's email; `fetch_user_email` also
+checks the HTTP status before parsing and falls back to `otherMails[0]` for
+personal accounts where `mail`/`userPrincipalName` can be null. Existing
+Outlook users must delete `~/.config/supervillain/tokens/<account>.json` and
+re-authorize, since the prior token grant lacks `User.Read` and was issued
+against the wrong tenant.
+
 ## Phase 6 — Startup config error surfacing
 
 Account config (`~/.config/supervillain/config`) parse errors are now
