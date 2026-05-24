@@ -1,5 +1,68 @@
 # Supervillain TODO
 
+## Completed in Phase 5 (in-app account management + timezone-aware invites)
+
+- **Accounts refactor** — `src/accounts.rs` extracted from `main.rs`. Typed
+  `AccountConfig` enum (Fastmail / Outlook / Gmail), pure INI parse/serialize
+  (round-trip safe), `atomic_write_config` → `atomic_write_bytes(path, data,
+  secret)` helper (tmpfile → fsync → rename → fsync parent dir; PID + monotonic
+  counter on tmp name to avoid intra-process collision; mode 0600 for secrets
+  and 0644 for non-sensitive config). In-app account management routes
+  (`POST/PUT/DELETE /api/accounts/{id}`, `POST /api/accounts/{id}/authorize`)
+  so users add/edit/delete accounts and re-authorize OAuth from the UI;
+  first run lands on the settings screen. `AccountRegistry` mirrors the
+  on-disk config in memory under `tokio::sync::RwLock` so handlers don't
+  re-read the file under lock. `Error::Conflict` variant for duplicate-name
+  responses.
+- **OAuth single-flight** — `AuthorizingGuard` RAII type around `AuthorizingSlot`
+  (`std::sync::Mutex<Option<String>>`) so a panic in the OAuth callback flow
+  releases the slot on Drop instead of leaking it (roborev 186 #4). Adjacent
+  fix: `validate_section_name` rejects `/`, `\`, `.`, `..`, leading dot, NUL,
+  control chars, brackets, newlines — section names are joined with
+  `tokens_dir` as filenames, so path-safety matters. Defense in depth:
+  `parse_config_str` also validates section headers at parse time (a
+  hand-edited config can't smuggle a traversal id through startup);
+  `token_file_path` has a `debug_assert` tripwire.
+- **Timezone-aware calendar invites** — `src/timezone.rs` with
+  `TimezoneConfig` persisted to `~/.config/supervillain/timezone.json`
+  (atomic write via the shared helper, mode 0644). IANA validation via
+  `chrono-tz`; system-TZ detection via `iana-time-zone`. Routes:
+  `GET/PUT /api/timezone`, `POST /api/timezone/accept-system`,
+  `POST /api/timezone/dismiss-change` (body `{ seen_system }` returns 409
+  on TOCTOU mismatch so the user can't dismiss a change they never saw),
+  `GET /api/timezone/zones`, `POST /api/calendar/invite`. `AppState`
+  gained `timezone_write_lock: tokio::sync::Mutex<()>` to serialize the
+  three timezone mutation handlers' load → mutate → save windows.
+- **Calendar parser upgrade** — `parse_ics_datetime_property` tries
+  `chrono_tz::Tz::from_str(tzid)` first (correct DST resolution at the
+  event's instant); falls back to the existing VTIMEZONE-offset table for
+  non-IANA TZIDs (e.g. Outlook's "Pacific Standard Time"). Fixes the
+  documented single-offset DST limitation. Regression tests for
+  summer/winter on `America/Los_Angeles`.
+- **Invite + RSVP generation** — `calendar::generate_invite` (iTIP REQUEST,
+  TZID-qualified DTSTART/DTEND, synthesized minimal VTIMEZONE scoped to
+  the event instant — correct for one-shot events; we don't emit RRULE)
+  and `calendar::generate_rsvp_with_tz` (iTIP REPLY with the responder's
+  primary TZ rather than UTC-Z, so organizers see the reply in your
+  locale). All text/atom fields routed through `escape_text` (handles
+  `\r`, `\n`, `,`, `;`, `\\`) and `sanitize_token` / `sanitize_address` so
+  an attacker-controlled summary or organizer name can't inject iCal
+  properties on round-trip (roborev 188 #1B and carryover #2).
+  `provider::rsvp` threads `reply_tz` through; Outlook/Gmail arms
+  document why they don't use it (their Graph/Calendar APIs send RSVPs
+  automatically, not via iTIP REPLY emails).
+- **Frontend** — Timezone settings panel in the Settings view (system vs
+  manual primary radio, IANA datalist from `GET /api/timezone/zones`,
+  chip-style additional-TZ editor). `formatEventTimeMultiTz` renders one
+  line per configured display TZ on every event card (primary bold,
+  secondaries dimmed) using `Intl.DateTimeFormat` with `timeZone` +
+  `timeZoneName: 'short'`. TZ-change banner above the email list when the
+  OS TZ moves; dismiss posts the seen value back so the server can refuse
+  stale dismissals. Compose modal "Attach calendar invite" toggle reveals
+  summary / location / start / end / TZ fields and posts to
+  `/api/calendar/invite`; attachments and `end > start` validation are
+  threaded through.
+
 ## Completed in Phase 3 (Gmail provider)
 
 - **Milestone A** — Gmail OAuth + read-only inbox. PKCE flow via shared
