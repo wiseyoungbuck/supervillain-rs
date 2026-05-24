@@ -240,16 +240,14 @@ client-id = your-application-client-id
 > search, mark read/unread, star, archive, trash, move, batch-archive, attachment download,
 > compose + reply + send with attachments, Google Calendar add/remove, RSVP via Calendar PATCH.
 
-To use Gmail with Supervillain you'll create your own OAuth client in a Google Cloud project (one-time, ~5 minutes):
+Setup is recorded in [`infra/SETUP.md`](infra/SETUP.md) and partly automated by [`infra/bootstrap.sh`](infra/bootstrap.sh). Google exposes no public API for OAuth client/consent-screen creation, so the script handles project + API enablement and SETUP.md is a deep-linked checklist for the rest.
 
-1. Go to [Google Cloud Console > APIs & Services](https://console.cloud.google.com/apis/dashboard). Create a new project if you don't have one.
-2. Enable APIs: under **Enabled APIs & services**, enable **Gmail API** and **Google Calendar API**.
-3. Configure the OAuth consent screen: **APIs & Services > OAuth consent screen** → User type: **External** → fill in app name, your email, etc.
-4. **Add yourself as a Test User** under **Audience > Test users**. This is critical: unverified apps only work for listed test users, and refresh tokens for non-test users expire after 7 days.
-5. Create credentials: **APIs & Services > Credentials** → **Create Credentials** → **OAuth client ID** → Application type: **Desktop app** (recommended) or **Web application**. Desktop app clients automatically allow loopback redirects (`http://127.0.0.1:*`), so no URI registration is needed. If you choose **Web application** instead, add `http://127.0.0.1:8401/callback` as an authorized redirect URI — that's the exact URL supervillain sends. (Google's OAuth server rejects `http://localhost:*` for these flows with `Error 400: redirect_uri_mismatch`, so don't use `localhost` here even though it sometimes works elsewhere.)
-6. Copy both the **Client ID** and **Client Secret**. Yes, both — Google's OAuth token endpoint requires `client_secret` even for "Desktop" / PKCE flows. It's not really secret, but the API rejects requests without it.
+```sh
+./infra/bootstrap.sh   # creates project, enables Gmail + Calendar APIs
+# then follow infra/SETUP.md for the OAuth consent screen + Desktop client
+```
 
-Put both in your config:
+Put the resulting credentials in your config:
 
 ```ini
 [gmail]
