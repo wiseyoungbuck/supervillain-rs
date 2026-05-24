@@ -1,25 +1,53 @@
-<p align="center">
-  <img src="static/icon-512.png" width="200" alt="Supervillain">
-</p>
+# Supervillain
 
-<h1 align="center">Supervillain</h1>
+<img src="static/icon-512.png" width="120" alt="Supervillain" align="right">
 
-<p align="center">
-  Email for people who'd rather be typing.<br>
-  Vim-native, zero-Electron, talks to Fastmail, Gmail, and Outlook.
-</p>
+Email for people who'd rather be typing. Vim-native, zero-Electron, talks to
+Fastmail, Gmail, and Outlook. Single Rust binary, no build step, no framework.
 
+[JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook,
+Gmail REST + Google Calendar v3 for Gmail. `cargo install` and go.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust" alt="Rust 1.85+">
-  <img src="https://img.shields.io/badge/edition-2024-blue" alt="Rust Edition 2024">
-  <img src="https://img.shields.io/badge/protocol-JMAP-green" alt="JMAP">
-  <img src="https://img.shields.io/badge/version-0.2.0-purple" alt="v0.2.0">
-</p>
+## Quick start
 
----
+```sh
+git clone https://github.com/AristoiAI/supervillain.git
+cd supervillain
+cargo install --path .
+supervillain
+```
 
-Supervillain is a keyboard-first email client built in Rust. It runs as a local web server, serves a zero-dependency vanilla JS frontend, and talks to your email provider's native API — [JMAP](https://jmap.io/) for Fastmail, Microsoft Graph for Outlook, Gmail REST + Google Calendar v3 for Gmail. No Electron, no Node.js, no build step, no framework. Just `cargo install` and go.
+First run opens `http://127.0.0.1:8000` and lands on the settings screen. Press
+`a` to add an account; `Ctrl+Enter` to save; click `[Authorize]` for Gmail or
+Outlook (browser opens for OAuth). For Fastmail you'll need an API token from
+*Settings > Privacy & Security > Integrations*; for Gmail/Outlook see
+[Azure AD setup](#azure-ad-app-registration) / [Google Cloud setup](#google-cloud-app-registration)
+to create the OAuth client first.
+
+## Project facts
+
+```yaml
+name: supervillain
+binary: supervillain                       # at ~/.cargo/bin/ after `cargo install`
+language: Rust 1.85+ (edition 2024)
+server: 127.0.0.1:8000                     # local-only; see TODO.md for LAN/iOS
+config_dir: ~/.config/supervillain/        # or $XDG_CONFIG_HOME/supervillain/
+config_files:
+  config: accounts (INI, mode 0600); managed by settings UI
+  timezone.json: primary + additional display zones (JSON, mode 0644)
+  splits.json: inbox tab filters (JSON)
+  tokens/<account>.json: OAuth tokens (mode 0600)
+providers: [fastmail, outlook, gmail]
+protocols: [JMAP, Microsoft Graph, Gmail REST, Google Calendar v3, iCalendar/iTIP]
+auth: [bearer-token (fastmail), oauth2-pkce (outlook, gmail)]
+key_source_files:
+  src/accounts.rs: AccountConfig, INI parse, atomic_write_bytes, OAuth single-flight
+  src/timezone.rs: TimezoneConfig, system-TZ detection, IANA validation
+  src/calendar.rs: ICS parse + invite/RSVP generation (TZID-qualified)
+  src/provider.rs: ProviderSession enum + per-provider dispatch
+  src/routes.rs:   All HTTP handlers
+oauth_callback_ports: [8400 (outlook), 8401 (gmail)]
+```
 
 ## Features
 
@@ -94,68 +122,6 @@ Supervillain is a keyboard-first email client built in Rust. It runs as a local 
 | `Ctrl+Enter` | Save |
 | `Esc` | Back to inbox |
 
-## Requirements
-
-- [Rust](https://www.rust-lang.org/) 1.85+ (edition 2024)
-- A [Fastmail](https://www.fastmail.com/) account with an API token, and/or:
-- Microsoft app registration (for Outlook email + calendar via Microsoft Graph), and/or:
-- Google Cloud project with OAuth credentials (full Gmail + Google Calendar today)
-
-## Quick start
-
-**1. Create credentials for your provider:**
-
-- **Fastmail** — Settings > Privacy & Security > Integrations > API tokens. The token needs `Mail` and `Calendars` scopes.
-- **Outlook** — Register an app in Azure AD with `Mail.ReadWrite`, `Mail.Send`, and `Calendars.ReadWrite` permissions (see [Azure AD setup](#azure-ad-app-registration) below).
-- **Gmail** — Create OAuth credentials in Google Cloud Console (see [Google Cloud setup](#google-cloud-app-registration) below). Both `client-id` and `client-secret` are required — unlike Outlook, Google's OAuth needs a client_secret even on Desktop / PKCE flows.
-
-**2. Configure your first account — two options:**
-
-- **Option A (recommended):** Skip this step. Run `supervillain` and add accounts from the in-app settings screen (`g s`). First run lands directly in settings; the server writes `~/.config/supervillain/config` for you with mode `0600`.
-- **Option B:** Hand-edit `~/.config/supervillain/config` before first run:
-
-```sh
-mkdir -p ~/.config/supervillain
-```
-
-```ini
-# ~/.config/supervillain/config — managed by the in-app settings UI.
-# Hand-edited comments are not preserved on UI save.
-
-default-account = fastmail
-
-[fastmail]
-provider = fastmail
-username = you@fastmail.com
-api-token = fmu1-xxxxxxxxxxxxxxxx
-
-[outlook]
-provider = outlook
-client-id = xxxx-xxxx-xxxx
-# OAuth completes on first [Authorize] click in settings.
-
-[gmail]
-provider = gmail
-client-id = xxxx.apps.googleusercontent.com
-client-secret = GOCSPX-xxxxxxxxxxxx
-# Gmail also requires client-secret (Google quirk for PKCE).
-```
-
-`chmod 600 ~/.config/supervillain/config` is recommended — the file holds API tokens and OAuth secrets.
-
-**3. Build and run:**
-
-```sh
-git clone https://github.com/AristoiAI/supervillain.git
-cd supervillain
-cargo install --path .
-supervillain
-```
-
-This installs the `supervillain` binary to `~/.cargo/bin/` (on your PATH) and opens `http://127.0.0.1:8000` in your browser.
-
-If no accounts are configured, the UI opens straight into the settings screen — add an account there (`a` to add, `Ctrl+Enter` to save). For OAuth providers, click `[Authorize]` in the settings form to complete the flow in a browser; tokens are saved to `~/.config/supervillain/tokens/{account_id}.json` and auto-refresh before expiry. To remove an account, select it in settings and press `d` then confirm.
-
 ## Installation
 
 ### macOS
@@ -227,7 +193,7 @@ client-secret = GOCSPX-xxxxxxxxxxxx
 email = you@gmail.com
 ```
 
-Account names (the `[section]` value) become the filename stem for token storage and are validated against path-traversal: no `/`, `\`, `.`, `..`, leading dot, brackets, `=`, `#`, control characters, or newlines (`validate_section_name`). Sections that violate these rules are skipped at startup with a warning.
+Account names (the `[section]` value) become the filename stem for token storage and are validated against path-traversal. The canonical rule list lives on the doc-comment of `validate_section_name` in `src/accounts.rs`; sections that violate the rules are skipped at startup with a warning.
 
 ### Azure AD App Registration
 
@@ -247,8 +213,8 @@ Put the client ID in your config:
 ```ini
 [outlook]
 provider = outlook
-username = you@company.com
 client-id = your-application-client-id
+# `email = ...` is populated automatically after the [Authorize] click.
 ```
 
 ### Google Cloud App Registration
@@ -488,6 +454,63 @@ All endpoints live under `/api/`. The frontend communicates exclusively through 
 | GET | `/api/theme` | Get theme configuration |
 | POST | `/api/upload` | Upload attachment for compose |
 
+### API examples
+
+The frontend is the canonical client; these examples come from real traffic.
+All bodies are JSON; the server replies with JSON.
+
+**Resolved timezone view** (`GET /api/timezone`):
+
+```http
+GET /api/timezone HTTP/1.1
+```
+```json
+{
+  "primary": "America/Chicago",
+  "display": ["America/Chicago", "Europe/London"],
+  "system": "America/Chicago",
+  "system_changed": false,
+  "use_system": true
+}
+```
+
+**Send a calendar invite** (`POST /api/calendar/invite?account=fastmail`):
+
+```json
+{
+  "to": ["bob@example.com"],
+  "cc": [],
+  "subject": "Sync",
+  "body": "See you then.",
+  "summary": "Quarterly sync",
+  "location": "Coffee shop",
+  "start": "2026-06-01T10:00:00",
+  "end":   "2026-06-01T11:00:00",
+  "tz": "America/Los_Angeles",
+  "attendees": [{ "email": "bob@example.com", "name": "Bob" }]
+}
+```
+```json
+{ "success": true, "emailId": "M1234abcdef" }
+```
+
+400 if `end <= start` or `tz` is unknown; 409 from `/api/timezone/dismiss-change`
+when `seen_system` doesn't match the current OS TZ.
+
+**Upsert an account** (`POST /api/accounts/{id}` — new id creates, existing updates):
+
+```json
+{ "provider": "fastmail", "username": "you@fastmail.com", "api-token": "fmu1-..." }
+```
+```json
+{ "id": "fastmail", "provider": "fastmail", "email": "you@fastmail.com",
+  "isDefault": true, "authStatus": "authorized" }
+```
+
+For OAuth providers (`outlook`, `gmail`) the upsert returns 201 with
+`authStatus: "pending"`; the client then calls `POST /api/accounts/{id}/authorize`
+to long-poll the browser-OAuth callback.
+
 ## Project structure
 
 ```
@@ -565,4 +588,6 @@ Tests cover JMAP types, glob matching, split filtering, identity-based split see
 - Email signatures
 - Offline mode
 
-See [TODO.md](TODO.md) for the per-phase change log (Phase 3 Gmail, Phase 4 Outlook, Phase 5 in-app account management + timezone-aware invites).
+See [CHANGELOG.md](CHANGELOG.md) for the per-phase record of shipped work
+(Phase 3 Gmail, Phase 4 Outlook, Phase 5 in-app account management +
+timezone-aware invites), and [TODO.md](TODO.md) for forward-looking items.

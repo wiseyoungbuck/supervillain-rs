@@ -317,11 +317,27 @@ impl FieldError {
     }
 }
 
+/// Canonical rule list for account ids. Referenced from README + CHANGELOG;
+/// keep this doc-comment as the single source of truth so the rules don't
+/// drift across documents.
+///
 /// Section names appear inside `[brackets]` in the config file AND are used
 /// as the filename stem for token storage (`{tokens_dir}/{name}.json`). The
 /// rules below serve both: round-trip safety in the INI file AND path-safety
 /// when joined with `tokens_dir`. Without this, a name of `..%2Fconfig`
 /// would let `POST/DELETE /api/accounts/{id}` escape the tokens directory.
+///
+/// Rules (rejected if violated):
+/// - empty or longer than 64 characters
+/// - `.` or `..` (current/parent directory)
+/// - starts with `.` (hidden file)
+/// - contains `/`, `\`, or NUL (path separators)
+/// - contains `[`, `]`, `=`, `#`, `\n`, or `\r` (INI structural characters)
+/// - any other control character (`is_control()`)
+///
+/// Defense in depth: `parse_config_str` also runs this on every section header
+/// at parse time so a hand-edited config can't smuggle a traversal name
+/// through startup. `token_file_path` carries a `debug_assert!` tripwire.
 pub fn validate_section_name(s: &str) -> Result<(), &'static str> {
     if s.is_empty() {
         return Err("name must not be empty");
