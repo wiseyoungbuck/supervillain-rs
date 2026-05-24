@@ -157,7 +157,7 @@
                                         Most mail clients proxy your inbox through their servers. Supervillain runs entirely on your machine, so it needs an OAuth client you own.
                                         <a href="#" id="wiz-creds-guide" target="_blank" rel="noopener">Open the setup guide &#8599;</a>
                                     </div>
-                                    <form id="wiz-form" class="wiz-form" autocomplete="off" onsubmit="event.preventDefault(); wizContinueFromCreds();">
+                                    <form id="wiz-form" class="wiz-form" autocomplete="off">
                                         <div class="wiz-field">
                                             <label for="wiz-name">Account name</label>
                                             <input type="text" id="wiz-name" autocomplete="off" placeholder="gmail" required>
@@ -186,7 +186,7 @@
                                         </div>
                                         <div class="wiz-error hidden" id="wiz-error"></div>
                                         <div class="wiz-actions">
-                                            <button type="button" class="wiz-btn" onclick="wizGoTo(1)">&larr; Back</button>
+                                            <button type="button" class="wiz-btn" data-wiz-action="back-to-1">&larr; Back</button>
                                             <button type="submit" class="wiz-btn primary wiz-actions-right" id="wiz-continue-btn">
                                                 Continue with <span id="wiz-continue-provider">Google</span> &rarr;
                                             </button>
@@ -206,7 +206,7 @@
                                     </div>
                                     <div class="wiz-log" id="wiz-log" role="log" aria-live="polite"></div>
                                     <div class="wiz-actions">
-                                        <button type="button" class="wiz-btn" onclick="wizCancelConnecting()">&times; Cancel</button>
+                                        <button type="button" class="wiz-btn" data-wiz-action="cancel-connecting">&times; Cancel</button>
                                     </div>
                                 </section>
 
@@ -235,8 +235,8 @@
                                         </div>
                                     </div>
                                     <div class="wiz-actions">
-                                        <button type="button" class="wiz-btn" onclick="wizGoTo(1)">+ Add another</button>
-                                        <button type="button" class="wiz-btn primary wiz-actions-right" id="wiz-done-btn" onclick="wizFinish()">Done &rarr;</button>
+                                        <button type="button" class="wiz-btn" data-wiz-action="add-another">+ Add another</button>
+                                        <button type="button" class="wiz-btn primary wiz-actions-right" id="wiz-done-btn" data-wiz-action="finish">Done &rarr;</button>
                                     </div>
                                 </section>
                             </div>

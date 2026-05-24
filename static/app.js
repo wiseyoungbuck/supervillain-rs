@@ -251,12 +251,11 @@ function init() {
         e.preventDefault();
         saveAccount();
     });
-    els.acctAuthorizeBtn.addEventListener('click', async () => {
-        if (!state.selectedAccountId) {
-            await saveAccount();
-            if (!state.selectedAccountId) return;
-        }
-        authorize(state.selectedAccountId);
+    els.acctAuthorizeBtn.addEventListener('click', () => {
+        // The dense form is only reachable for existing accounts now —
+        // new accounts go through the wizard, which owns its own
+        // save→authorize flow. selectedAccountId is always set here.
+        if (state.selectedAccountId) authorize(state.selectedAccountId);
     });
     els.acctSetDefault.addEventListener('click', () => {
         if (state.selectedAccountId) setDefaultAccount(state.selectedAccountId);
@@ -297,7 +296,10 @@ function init() {
             wizGoTo(2);
         });
     });
-    document.querySelectorAll('#wiz input, #wiz select').forEach(el => {
+    // Only text-like inputs should flip global mode to insert — the step-4
+    // "Set as default" checkbox stays in normal mode so the wizard's NORMAL
+    // pill remains accurate.
+    document.querySelectorAll('#wiz input[type=text], #wiz input[type=email], #wiz input[type=password], #wiz select').forEach(el => {
         el.addEventListener('focus', () => { if (state.wizardActive) setMode('insert'); });
         el.addEventListener('blur', () => { if (state.wizardActive) setMode('normal'); });
     });
@@ -308,6 +310,20 @@ function init() {
             const showing = target.type === 'text';
             target.type = showing ? 'password' : 'text';
             btn.textContent = showing ? 'show' : 'hide';
+        });
+    });
+    document.getElementById('wiz-form').addEventListener('submit', (e) => {
+        e.preventDefault();
+        wizContinueFromCreds();
+    });
+    document.querySelectorAll('#wiz [data-wiz-action]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            switch (btn.dataset.wizAction) {
+                case 'back-to-1':         wizGoTo(1); break;
+                case 'cancel-connecting': wizCancelConnecting(); break;
+                case 'add-another':       wizGoTo(1); break;
+                case 'finish':            wizFinish(); break;
+            }
         });
     });
     // Reload theme on window focus (pick up theme changes after alt-tabbing back)
@@ -1652,7 +1668,8 @@ function renderWizardStep() {
 }
 
 function focusWizProvider(idx) {
-    state.wizardProviderIdx = ((idx % 3) + 3) % 3;
+    const n = WIZ_PROVIDERS.length;
+    state.wizardProviderIdx = ((idx % n) + n) % n;
     document.querySelectorAll('.wiz-row').forEach((r, i) => {
         r.classList.toggle('focused', i === state.wizardProviderIdx);
     });
@@ -1762,10 +1779,29 @@ async function wizContinueFromCreds() {
 
     document.getElementById('wiz-error').classList.add('hidden');
     try {
-        const resp = await api('POST', `/accounts/${encodeURIComponent(name)}`, payload);
-        state.wizardSavedId = name;
-        state.selectedAccountId = name;
-        await loadAccounts();
+        // Retry after Esc-back: if the account was already saved under this
+        // exact name (same wizard session), skip the POST (would 409) and
+        // go straight to re-authorizing. If the user renamed, delete the
+        // prior id first so we don't orphan a half-set-up account.
+        const sameId = state.wizardSavedId === name;
+        if (state.wizardSavedId && !sameId) {
+            try {
+                await api('DELETE', `/accounts/${encodeURIComponent(state.wizardSavedId)}`);
+            } catch (_) { /* tolerate: account may already be gone */ }
+            state.wizardSavedId = null;
+        }
+        let resp;
+        if (sameId) {
+            // Re-fetch the existing record to decide if authorize is needed.
+            await loadAccounts();
+            const acct = state.accounts.find(a => a.id === name);
+            resp = acct ? { authStatus: acct.authStatus } : { authStatus: 'pending' };
+        } else {
+            resp = await api('POST', `/accounts/${encodeURIComponent(name)}`, payload);
+            state.wizardSavedId = name;
+            state.selectedAccountId = name;
+            await loadAccounts();
+        }
         if (resp && resp.authStatus === 'pending') {
             wizGoTo(3);
             wizStartConnecting();
@@ -1808,11 +1844,12 @@ async function wizStartConnecting() {
         if (state.wizardStep === 3) wizAppendLog(e.h);
     }, e.d));
 
+    if (state.authController) state.authController.abort();
+    const ctrl = new AbortController();
+    state.authController = ctrl;
     try {
-        if (state.authController) state.authController.abort();
-        state.authController = new AbortController();
         await api('POST', `/accounts/${encodeURIComponent(state.wizardSavedId)}/authorize`,
-            null, state.authController.signal);
+            null, ctrl.signal);
         wizAppendLog(`<span class="p">&larr;</span> <span class="ok">code received</span> &middot; tokens exchanged`);
         wizAppendLog(`<span class="p">$</span> Writing config &hellip;  <span class="ok">ok</span>`);
         await loadAccounts();
@@ -1822,7 +1859,9 @@ async function wizStartConnecting() {
         wizAppendLog(`<span class="p">&times;</span> <span class="er">${escapeHtml(err.message)}</span>`);
         wizAppendLog(`<span class="p">$</span> <span class="wn">Press esc to go back and retry.</span>`);
     } finally {
-        state.authController = null;
+        // Only clear the slot if a newer call hasn't already replaced us —
+        // otherwise our late-arriving finally would clobber a fresh controller.
+        if (state.authController === ctrl) state.authController = null;
     }
 }
 
@@ -1877,11 +1916,10 @@ function handleWizardKey(e) {
             if (inField) e.target.blur();
             wizGoTo(1);
             e.preventDefault();
-        } else if (e.key === 'Enter' && inField && !e.shiftKey) {
-            // Plain Enter inside a wizard field submits — the form's native
-            // submit handler will fire and call wizContinueFromCreds().
-            // No preventDefault: let the submit happen.
         } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            // Ctrl/Cmd+Enter submits from anywhere in step 2 (incl. when
+            // the focus is on a button). Plain Enter inside a field falls
+            // through to native form submit which calls wizContinueFromCreds.
             wizContinueFromCreds();
             e.preventDefault();
         }
