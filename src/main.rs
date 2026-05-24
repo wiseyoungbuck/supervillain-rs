@@ -25,36 +25,18 @@ async fn main() {
     let token_store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(tokens_dir.clone()));
 
     let mut sessions: HashMap<String, SessionLock> = HashMap::new();
-    let mut account_errors: Vec<AccountError> = parse_errors
-        .into_iter()
-        .map(|e| AccountError {
-            account: e.section,
-            provider: e.provider,
-            error: format!(
-                "Config error: {} — edit ~/.config/supervillain/config",
-                e.reason
-            ),
-        })
-        .collect();
-
     // Validate sibling config files at startup. Route handlers tolerate parse
     // failures by falling back to defaults (a transient FS error shouldn't
     // 500 a request); startup is the one place we can loudly tell the user
     // their hand-edited file is broken before defaults silently kick in.
-    if let Err(reason) = splits::try_load_splits(&splits_config_path) {
-        account_errors.push(AccountError {
-            account: "splits.json".into(),
-            provider: "config".into(),
-            error: format!("Config error: {reason} — using defaults until fixed"),
-        });
-    }
-    if let Err(reason) = timezone::try_load_config(&timezone_config_path) {
-        account_errors.push(AccountError {
-            account: "timezone.json".into(),
-            provider: "config".into(),
-            error: format!("Config error: {reason} — using defaults until fixed"),
-        });
-    }
+    let mut account_errors: Vec<AccountError> = accounts::startup_config_errors(
+        &config_path,
+        parse_errors,
+        &splits_config_path,
+        splits::try_load_splits(&splits_config_path),
+        &timezone_config_path,
+        timezone::try_load_config(&timezone_config_path),
+    );
 
     for (name, account) in &cfg.accounts {
         match load_session(name, account, &tokens_dir, &token_store).await {

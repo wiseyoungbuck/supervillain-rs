@@ -84,9 +84,79 @@ pub fn parse_config(path: &Path) -> (ConfigFile, Vec<ConfigParseError>) {
 /// vanish into a log line. One per malformed section.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigParseError {
+    /// Section name as it appeared in the config, sanitized when the original
+    /// header was rejected by `validate_section_name` (path traversal,
+    /// embedded `[`/`]`/`=`/newlines, etc.) so it's safe to drop into a UI
+    /// string without re-introducing the validation-bypass payload.
     pub section: String,
+    /// Provider key from the section, or empty when none was supplied or the
+    /// section header itself was invalid. UI code must treat empty as "no
+    /// provider claimed" and not as a real provider value.
     pub provider: String,
     pub reason: String,
+}
+
+/// Substituted for a hostile section name in `ConfigParseError.section` so
+/// nothing the validator already rejected (path separators, embedded
+/// brackets, newlines, quotes) reaches the UI banner.
+const MALFORMED_SECTION_PLACEHOLDER: &str = "<malformed section>";
+
+// =============================================================================
+// Startup config validation → UI-visible errors
+// =============================================================================
+
+/// Build the list of startup-time config errors that the UI banner displays.
+///
+/// Three sources, each routed to the same `AccountError` shape so the
+/// existing red-banner code in `static/app.js` renders them without changes:
+///
+///   * Account INI (`config_path`) — one `AccountError` per malformed section.
+///   * `splits.json` — one entry on parse/IO failure (missing file is fine).
+///   * `timezone.json` — same pattern.
+///
+/// Pure: takes pre-computed values, no `tracing` side effects of its own.
+/// Tests can call this directly without spinning up a tokio runtime.
+pub fn startup_config_errors(
+    config_path: &Path,
+    parse_errors: Vec<ConfigParseError>,
+    splits_path: &Path,
+    splits_result: Result<Option<crate::types::SplitsConfig>, String>,
+    timezone_path: &Path,
+    timezone_result: Result<Option<crate::timezone::TimezoneConfig>, String>,
+) -> Vec<crate::types::AccountError> {
+    let mut errors: Vec<crate::types::AccountError> = parse_errors
+        .into_iter()
+        .map(|e| crate::types::AccountError {
+            account: e.section,
+            provider: e.provider,
+            error: format!(
+                "Config error: {} — edit {}",
+                e.reason,
+                config_path.display()
+            ),
+        })
+        .collect();
+
+    if let Err(reason) = splits_result {
+        errors.push(crate::types::AccountError {
+            account: splits_path.display().to_string(),
+            // Empty provider matches the convention used by section-level
+            // parse errors that have no provider claim; UI must not treat
+            // it as a real provider key.
+            provider: String::new(),
+            error: format!("Config error: {reason} — using defaults until fixed"),
+        });
+    }
+
+    if let Err(reason) = timezone_result {
+        errors.push(crate::types::AccountError {
+            account: timezone_path.display().to_string(),
+            provider: String::new(),
+            error: format!("Config error: {reason} — using defaults until fixed"),
+        });
+    }
+
+    errors
 }
 
 /// Pure parser; tested without filesystem.
@@ -109,8 +179,11 @@ pub fn parse_config_str(content: &str) -> (ConfigFile, Vec<ConfigParseError>) {
             // same rules for newly-added accounts).
             if let Err(e) = validate_section_name(&name) {
                 tracing::warn!("[{name}] skipping malformed section header: {e}");
+                // `name` was rejected because it contains hostile characters;
+                // don't echo it back into the UI banner. The log line above
+                // still preserves the original for operator debugging.
                 errors.push(ConfigParseError {
-                    section: name.clone(),
+                    section: MALFORMED_SECTION_PLACEHOLDER.into(),
                     provider: String::new(),
                     reason: format!("Invalid section name: {e}"),
                 });
@@ -143,10 +216,19 @@ pub fn parse_config_str(content: &str) -> (ConfigFile, Vec<ConfigParseError>) {
 
     let mut accounts = BTreeMap::new();
     for (name, props) in sections {
-        let provider = props
-            .get("provider")
-            .cloned()
-            .unwrap_or_else(|| "fastmail".to_string());
+        let Some(provider) = props.get("provider").cloned() else {
+            // Previously defaulted to "fastmail", which produced a misleading
+            // "missing username" error for sections that omitted `provider`
+            // but were obviously a different provider (e.g. a Gmail section
+            // with client-id / client-secret but no provider line).
+            tracing::warn!("[{name}] skipping account: missing required field `provider`");
+            errors.push(ConfigParseError {
+                section: name,
+                provider: String::new(),
+                reason: "missing required field `provider`".into(),
+            });
+            continue;
+        };
         match account_from_props(&provider, &props) {
             Ok(acct) => {
                 accounts.insert(name, acct);
@@ -1289,6 +1371,10 @@ api-token = tok
     #[test]
     fn parse_rejects_path_traversal_section_names() {
         // A hand-edited config can't smuggle a traversal name through startup.
+        // The hostile name is replaced with a placeholder in the surfaced
+        // error so the UI banner never echoes back the validator-rejected
+        // string (which by definition contains characters the validator
+        // banned, including ones escapeHtml does not encode).
         let bad = "\
 [../escape]
 provider = fastmail
@@ -1303,7 +1389,10 @@ api-token = tok
         let (cfg, errors) = parse_config_str(bad);
         assert!(!cfg.accounts.contains_key("../escape"));
         assert!(cfg.accounts.contains_key("ok"));
-        assert!(errors.iter().any(|e| e.section == "../escape"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].section, MALFORMED_SECTION_PLACEHOLDER);
+        assert!(errors[0].provider.is_empty());
+        assert!(errors[0].reason.starts_with("Invalid section name:"));
     }
 
     #[test]
@@ -1314,6 +1403,21 @@ api-token = tok
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].provider, "yahoo");
         assert!(errors[0].reason.contains("unknown provider"));
+    }
+
+    #[test]
+    fn parse_missing_provider_key_is_reported_distinctly() {
+        // Regression: a section without a `provider` line used to default to
+        // "fastmail" and then emit a misleading "missing username" error
+        // even if the keys were obviously Gmail-shaped. Surface the actual
+        // missing field so the user knows what to add.
+        let s = "[acct]\nclient-id = cid\nclient-secret = cs\n";
+        let (cfg, errors) = parse_config_str(s);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].section, "acct");
+        assert!(errors[0].provider.is_empty());
+        assert!(errors[0].reason.contains("`provider`"));
     }
 
     // ---- Validators ----
@@ -1553,6 +1657,71 @@ api-token = tok
             account_configs: BTreeMap::new(),
             default_account: String::new(),
         }
+    }
+
+    // ---- startup_config_errors (the seam main.rs uses) ----
+
+    #[test]
+    fn startup_errors_combine_all_three_sources_with_resolved_paths() {
+        // Parse error from the INI file, parse error from splits.json, parse
+        // error from timezone.json. Each must surface with the actual file
+        // path that was checked (not a hardcoded ~/.config/... string), so
+        // users with XDG_CONFIG_HOME set or custom paths see something
+        // actionable.
+        let cfg_path = Path::new("/custom/xdg/config");
+        let splits_path = Path::new("/custom/xdg/splits.json");
+        let tz_path = Path::new("/custom/xdg/timezone.json");
+
+        let parse_errors = vec![ConfigParseError {
+            section: "gmail".into(),
+            provider: "gmail".into(),
+            reason: "missing required field `client-id`".into(),
+        }];
+        let splits_err = Err("JSON parse failed: line 1".to_string());
+        let tz_err = Err("JSON parse failed: line 2".to_string());
+
+        let errors = startup_config_errors(
+            cfg_path,
+            parse_errors,
+            splits_path,
+            splits_err,
+            tz_path,
+            tz_err,
+        );
+
+        assert_eq!(errors.len(), 3);
+
+        // Account INI parse error keeps section+provider, references the
+        // actual config path.
+        assert_eq!(errors[0].account, "gmail");
+        assert_eq!(errors[0].provider, "gmail");
+        assert!(errors[0].error.contains("/custom/xdg/config"));
+        assert!(errors[0].error.contains("client-id"));
+
+        // splits.json: account = real path, provider empty (not "config").
+        assert_eq!(errors[1].account, "/custom/xdg/splits.json");
+        assert!(errors[1].provider.is_empty());
+        assert!(errors[1].error.contains("using defaults until fixed"));
+
+        // timezone.json: same shape.
+        assert_eq!(errors[2].account, "/custom/xdg/timezone.json");
+        assert!(errors[2].provider.is_empty());
+        assert!(errors[2].error.contains("using defaults until fixed"));
+    }
+
+    #[test]
+    fn startup_errors_empty_when_everything_is_clean() {
+        // No parse errors, splits/timezone both Ok (whether the file was
+        // present or not) → empty error list. Banner stays hidden.
+        let errors = startup_config_errors(
+            Path::new("/x/config"),
+            Vec::new(),
+            Path::new("/x/splits.json"),
+            Ok(None),
+            Path::new("/x/timezone.json"),
+            Ok(None),
+        );
+        assert!(errors.is_empty());
     }
 
     #[test]
