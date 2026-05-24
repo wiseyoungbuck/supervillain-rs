@@ -26,6 +26,21 @@ pub fn load_splits(config_path: &Path, env_override: Option<&str>) -> SplitsConf
     SplitsConfig::default()
 }
 
+/// Strict variant for startup validation: reports parse/IO errors instead of
+/// silently falling back to default. Returns `Ok(None)` when the file is
+/// missing (a missing file is normal on first run, not an error). The
+/// route-handler path keeps using `load_splits` so a transient read failure
+/// never 500s a live request.
+pub fn try_load_splits(config_path: &Path) -> Result<Option<SplitsConfig>, String> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(config_path).map_err(|e| format!("read failed: {e}"))?;
+    serde_json::from_str::<SplitsConfig>(&content)
+        .map(Some)
+        .map_err(|e| format!("JSON parse failed: {e}"))
+}
+
 pub fn save_splits(config: &SplitsConfig, config_path: &Path) -> Result<(), Error> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -514,6 +529,35 @@ mod tests {
     fn load_nonexistent_returns_empty() {
         let config = load_splits(Path::new("/nonexistent/path/splits.json"), None);
         assert!(config.splits.is_empty());
+    }
+
+    #[test]
+    fn try_load_missing_file_is_ok_none() {
+        let result = try_load_splits(Path::new("/nonexistent/path/splits.json"));
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn try_load_invalid_json_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splits.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+        let result = try_load_splits(&path);
+        let err = result.expect_err("should reject invalid JSON");
+        assert!(err.contains("JSON parse failed"));
+    }
+
+    #[test]
+    fn try_load_valid_file_returns_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splits.json");
+        std::fs::write(
+            &path,
+            r#"{"splits": [{"id": "x", "name": "X", "filters": [], "match_mode": "any"}]}"#,
+        )
+        .unwrap();
+        let cfg = try_load_splits(&path).unwrap().expect("should parse");
+        assert_eq!(cfg.splits.len(), 1);
     }
 
     #[test]

@@ -51,6 +51,21 @@ pub fn load_config(config_path: &Path, env_override: Option<&str>) -> TimezoneCo
     }
 }
 
+/// Strict variant for startup validation: reports parse/IO errors instead of
+/// silently falling back to default. Returns `Ok(None)` when the file is
+/// missing (a missing file is normal on first run, not an error). The
+/// route-handler path keeps using `load_config` so a transient read failure
+/// never 500s a live request.
+pub fn try_load_config(config_path: &Path) -> Result<Option<TimezoneConfig>, String> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(config_path).map_err(|e| format!("read failed: {e}"))?;
+    serde_json::from_str::<TimezoneConfig>(&content)
+        .map(Some)
+        .map_err(|e| format!("JSON parse failed: {e}"))
+}
+
 pub fn save_config(config: &TimezoneConfig, config_path: &Path) -> Result<(), Error> {
     let json = serde_json::to_string_pretty(config)?;
     crate::accounts::atomic_write_bytes(config_path, json.as_bytes(), /* secret */ false)?;
@@ -272,5 +287,35 @@ mod tests {
         let loaded = load_config(&path, Some(override_json));
         assert!(loaded.use_system);
         assert!(loaded.manual_primary.is_none());
+    }
+
+    #[test]
+    fn try_load_missing_file_is_ok_none() {
+        let result = try_load_config(Path::new("/nonexistent/path/tz.json"));
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn try_load_invalid_json_returns_err() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tz.json");
+        std::fs::write(&path, "not json at all").unwrap();
+        let err = try_load_config(&path).expect_err("should reject invalid JSON");
+        assert!(err.contains("JSON parse failed"));
+    }
+
+    #[test]
+    fn try_load_valid_file_returns_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tz.json");
+        let cfg = TimezoneConfig {
+            use_system: false,
+            manual_primary: Some("Europe/London".into()),
+            ..Default::default()
+        };
+        save_config(&cfg, &path).unwrap();
+        let loaded = try_load_config(&path).unwrap().expect("should parse");
+        assert!(!loaded.use_system);
+        assert_eq!(loaded.manual_primary.as_deref(), Some("Europe/London"));
     }
 }

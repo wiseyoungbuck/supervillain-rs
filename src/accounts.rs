@@ -72,19 +72,29 @@ pub struct ConfigFile {
 
 /// Read a config file from disk. Returns an empty `ConfigFile` if the file
 /// is missing or unreadable — startup is non-fatal on first run.
-pub fn parse_config(path: &Path) -> ConfigFile {
+pub fn parse_config(path: &Path) -> (ConfigFile, Vec<ConfigParseError>) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return ConfigFile::default(),
+        Err(_) => return (ConfigFile::default(), Vec::new()),
     };
     parse_config_str(&content)
 }
 
+/// Surfaced to the UI so a hand-edited config that fails to parse doesn't
+/// vanish into a log line. One per malformed section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigParseError {
+    pub section: String,
+    pub provider: String,
+    pub reason: String,
+}
+
 /// Pure parser; tested without filesystem.
-pub fn parse_config_str(content: &str) -> ConfigFile {
+pub fn parse_config_str(content: &str) -> (ConfigFile, Vec<ConfigParseError>) {
     let mut default_account: Option<String> = None;
     let mut current_section: Option<String> = None;
     let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut errors: Vec<ConfigParseError> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -99,6 +109,11 @@ pub fn parse_config_str(content: &str) -> ConfigFile {
             // same rules for newly-added accounts).
             if let Err(e) = validate_section_name(&name) {
                 tracing::warn!("[{name}] skipping malformed section header: {e}");
+                errors.push(ConfigParseError {
+                    section: name.clone(),
+                    provider: String::new(),
+                    reason: format!("Invalid section name: {e}"),
+                });
                 current_section = None;
                 continue;
             }
@@ -132,29 +147,47 @@ pub fn parse_config_str(content: &str) -> ConfigFile {
             .get("provider")
             .cloned()
             .unwrap_or_else(|| "fastmail".to_string());
-        if let Some(acct) = account_from_props(&provider, &props) {
-            accounts.insert(name, acct);
-        } else {
-            tracing::warn!(
-                "[{name}] skipping account: provider '{provider}' missing required fields"
-            );
+        match account_from_props(&provider, &props) {
+            Ok(acct) => {
+                accounts.insert(name, acct);
+            }
+            Err(reason) => {
+                tracing::warn!("[{name}] skipping account ({provider}): {reason}");
+                errors.push(ConfigParseError {
+                    section: name,
+                    provider,
+                    reason,
+                });
+            }
         }
     }
 
-    ConfigFile {
-        default_account,
-        accounts,
-    }
+    (
+        ConfigFile {
+            default_account,
+            accounts,
+        },
+        errors,
+    )
 }
 
-fn account_from_props(provider: &str, props: &BTreeMap<String, String>) -> Option<AccountConfig> {
+fn account_from_props(
+    provider: &str,
+    props: &BTreeMap<String, String>,
+) -> Result<AccountConfig, String> {
+    let require = |key: &str| -> Result<String, String> {
+        props
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("missing required field `{key}`"))
+    };
     match provider {
-        "fastmail" => Some(AccountConfig::Fastmail {
-            username: props.get("username")?.clone(),
-            api_token: props.get("api-token")?.clone(),
+        "fastmail" => Ok(AccountConfig::Fastmail {
+            username: require("username")?,
+            api_token: require("api-token")?,
         }),
-        "outlook" => Some(AccountConfig::Outlook {
-            client_id: props.get("client-id")?.clone(),
+        "outlook" => Ok(AccountConfig::Outlook {
+            client_id: require("client-id")?,
             // Accept `username` as a synonym for `email` so configs predating
             // the typed enum still parse — Outlook's OAuth populates email
             // from Graph; user-facing label was historically `username`.
@@ -163,12 +196,12 @@ fn account_from_props(provider: &str, props: &BTreeMap<String, String>) -> Optio
                 .or_else(|| props.get("username"))
                 .cloned(),
         }),
-        "gmail" => Some(AccountConfig::Gmail {
-            client_id: props.get("client-id")?.clone(),
-            client_secret: props.get("client-secret")?.clone(),
+        "gmail" => Ok(AccountConfig::Gmail {
+            client_id: require("client-id")?,
+            client_secret: require("client-secret")?,
             email: props.get("email").cloned(),
         }),
-        _ => None,
+        other => Err(format!("unknown provider `{other}`")),
     }
 }
 
@@ -1070,7 +1103,8 @@ mod tests {
             accounts,
         };
         let s = serialize_config(&cfg);
-        let parsed = parse_config_str(&s);
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty());
         assert_eq!(parsed.default_account.as_deref(), Some("fm"));
         assert_eq!(parsed.accounts.len(), 3);
         match parsed.accounts.get("fm").unwrap() {
@@ -1151,9 +1185,9 @@ provider = fastmail
 username = u@fm.com
 api-token = tok
 ";
-        let parsed = parse_config_str(original);
+        let (parsed, _) = parse_config_str(original);
         let reserialized = serialize_config(&parsed);
-        let reparsed = parse_config_str(&reserialized);
+        let (reparsed, _) = parse_config_str(&reserialized);
         assert_eq!(reparsed.default_account, parsed.default_account);
         assert_eq!(reparsed.accounts.len(), parsed.accounts.len());
         assert_eq!(reserialized, serialize_config(&reparsed));
@@ -1227,11 +1261,29 @@ api-token = tok
 
     #[test]
     fn parse_skips_account_with_missing_required_fields() {
-        // Outlook needs client-id; without it the section is skipped.
+        // Outlook needs client-id; without it the section is skipped and
+        // the parser emits a structured error so the UI can surface it.
         let s = "[broken]\nprovider = outlook\n\n[ok]\nprovider = fastmail\nusername = u@fm.com\napi-token = t\n";
-        let cfg = parse_config_str(s);
+        let (cfg, errors) = parse_config_str(s);
         assert!(cfg.accounts.contains_key("ok"));
         assert!(!cfg.accounts.contains_key("broken"));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].section, "broken");
+        assert_eq!(errors[0].provider, "outlook");
+        assert!(errors[0].reason.contains("client-id"));
+    }
+
+    #[test]
+    fn parse_reports_typoed_key_as_missing_field() {
+        // Regression: a config with `client = ...` instead of `client-id = ...`
+        // used to be silently dropped. It must now surface as a parse error.
+        let s = "[gmail]\nprovider = gmail\nclient = abc.apps.googleusercontent.com\nclient-secret = secret\n";
+        let (cfg, errors) = parse_config_str(s);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].section, "gmail");
+        assert_eq!(errors[0].provider, "gmail");
+        assert!(errors[0].reason.contains("client-id"));
     }
 
     #[test]
@@ -1248,16 +1300,20 @@ provider = fastmail
 username = ok@fm.com
 api-token = tok
 ";
-        let cfg = parse_config_str(bad);
+        let (cfg, errors) = parse_config_str(bad);
         assert!(!cfg.accounts.contains_key("../escape"));
         assert!(cfg.accounts.contains_key("ok"));
+        assert!(errors.iter().any(|e| e.section == "../escape"));
     }
 
     #[test]
-    fn parse_unknown_provider_is_skipped() {
+    fn parse_unknown_provider_is_reported() {
         let s = "[bad]\nprovider = yahoo\nusername = u@y.com\n";
-        let cfg = parse_config_str(s);
+        let (cfg, errors) = parse_config_str(s);
         assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].provider, "yahoo");
+        assert!(errors[0].reason.contains("unknown provider"));
     }
 
     // ---- Validators ----
@@ -1510,7 +1566,7 @@ api-token = tok
         reg.default_account = "fm".into();
 
         atomic_write_config(&path, &reg.snapshot()).unwrap();
-        let parsed = parse_config(&path);
+        let (parsed, _) = parse_config(&path);
         assert_eq!(parsed.default_account.as_deref(), Some("fm"));
         assert_eq!(parsed.accounts.len(), 1);
     }
@@ -1538,7 +1594,7 @@ api-token = tok
             .unwrap_or_default();
         atomic_write_config(&path, &reg.snapshot()).unwrap();
 
-        let parsed = parse_config(&path);
+        let (parsed, _) = parse_config(&path);
         assert_eq!(parsed.accounts.len(), 1);
         assert_eq!(parsed.default_account.as_deref(), Some("beta"));
     }
