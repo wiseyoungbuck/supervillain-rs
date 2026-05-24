@@ -101,6 +101,16 @@ pub struct ConfigParseError {
 /// brackets, newlines, quotes) reaches the UI banner.
 const MALFORMED_SECTION_PLACEHOLDER: &str = "<malformed section>";
 
+/// Substituted into `ConfigParseError.provider` when the provider string is
+/// not one of the recognized providers (`fastmail`, `outlook`, `gmail`).
+/// Unknown providers — including hostile strings from a tampered config —
+/// would otherwise echo into the UI banner where `escapeHtml` doesn't
+/// encode `"` / `'` (attribute-context render). Known provider names are
+/// short safe-by-construction tokens.
+const MALFORMED_PROVIDER_PLACEHOLDER: &str = "<unknown provider>";
+
+const KNOWN_PROVIDERS: &[&str] = &["fastmail", "outlook", "gmail"];
+
 // =============================================================================
 // Startup config validation → UI-visible errors
 // =============================================================================
@@ -114,8 +124,11 @@ const MALFORMED_SECTION_PLACEHOLDER: &str = "<malformed section>";
 ///   * `splits.json` — one entry on parse/IO failure (missing file is fine).
 ///   * `timezone.json` — same pattern.
 ///
-/// Pure: takes pre-computed values, no `tracing` side effects of its own.
-/// Tests can call this directly without spinning up a tokio runtime.
+/// The helper itself emits no `tracing` side effects. (Upstream callers —
+/// `parse_config_str`, `splits::load`, `timezone::load` — may emit `warn!`
+/// when they produce the inputs to this function; that logging is their
+/// concern, not the helper's.) Tests can call this directly without
+/// spinning up a tokio runtime.
 pub fn startup_config_errors(
     config_path: &Path,
     parse_errors: Vec<ConfigParseError>,
@@ -235,9 +248,19 @@ pub fn parse_config_str(content: &str) -> (ConfigFile, Vec<ConfigParseError>) {
             }
             Err(reason) => {
                 tracing::warn!("[{name}] skipping account ({provider}): {reason}");
+                // Only echo the provider into the UI banner if it's one of
+                // the known providers (safe-by-construction tokens). Unknown
+                // / tampered values get a placeholder so a quote or `>` in
+                // the bad string can't escape the UI's attribute-context
+                // render.
+                let safe_provider = if KNOWN_PROVIDERS.contains(&provider.as_str()) {
+                    provider
+                } else {
+                    MALFORMED_PROVIDER_PLACEHOLDER.into()
+                };
                 errors.push(ConfigParseError {
                     section: name,
-                    provider,
+                    provider: safe_provider,
                     reason,
                 });
             }
@@ -1396,13 +1419,37 @@ api-token = tok
     }
 
     #[test]
-    fn parse_unknown_provider_is_reported() {
+    fn parse_unknown_provider_is_reported_with_placeholder() {
+        // Unknown provider names are NOT echoed into ConfigParseError.provider
+        // — they get the placeholder, so a tampered config with a hostile
+        // string (quotes, `>`, etc.) can't escape attribute-context HTML
+        // in the UI banner. The reason text still says "unknown provider"
+        // and the tracing::warn line preserves the original for debugging.
         let s = "[bad]\nprovider = yahoo\nusername = u@y.com\n";
         let (cfg, errors) = parse_config_str(s);
         assert!(cfg.accounts.is_empty());
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].provider, "yahoo");
+        assert_eq!(errors[0].provider, MALFORMED_PROVIDER_PLACEHOLDER);
         assert!(errors[0].reason.contains("unknown provider"));
+    }
+
+    #[test]
+    fn parse_hostile_provider_string_does_not_reach_ui() {
+        // The XSS shape the previous review flagged: a tampered config with
+        // a provider value containing `"` or `>` would land verbatim in
+        // ConfigParseError.provider and then (combined with the UI's
+        // attribute-context escapeHtml gap) escape its render context.
+        // Sanitization on the parser side closes the vector at the source.
+        let hostile = "\"><script>alert(1)</script>";
+        let s = format!("[bad]\nprovider = {hostile}\n");
+        let (cfg, errors) = parse_config_str(&s);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        // The hostile bytes must not appear in the field that the UI banner
+        // renders; only the fixed-shape placeholder constant does.
+        assert_eq!(errors[0].provider, MALFORMED_PROVIDER_PLACEHOLDER);
+        assert!(!errors[0].provider.contains("script"));
+        assert!(!errors[0].provider.contains("alert"));
     }
 
     #[test]
@@ -1707,6 +1754,38 @@ api-token = tok
         assert_eq!(errors[2].account, "/custom/xdg/timezone.json");
         assert!(errors[2].provider.is_empty());
         assert!(errors[2].error.contains("using defaults until fixed"));
+    }
+
+    #[test]
+    fn startup_errors_mixed_sources_preserve_order() {
+        // Mixed case — parse_errors present, splits Ok, timezone Err — pins
+        // the ordering contract that the UI banner relies on:
+        // parse errors first, then splits (if any), then timezone (if any).
+        // A reordering or accidental dedup would slip past the all-Ok and
+        // all-Err endpoint tests; this one wouldn't.
+        let errors = startup_config_errors(
+            Path::new("/x/config"),
+            vec![ConfigParseError {
+                section: "fastmail".into(),
+                provider: "fastmail".into(),
+                reason: "missing required field `api-token`".into(),
+            }],
+            Path::new("/x/splits.json"),
+            Ok(None),
+            Path::new("/x/timezone.json"),
+            Err("EOF while parsing".into()),
+        );
+
+        assert_eq!(errors.len(), 2);
+        // Index 0 must be the parse error (config path interpolated, real
+        // provider preserved because it's a known token).
+        assert_eq!(errors[0].account, "fastmail");
+        assert_eq!(errors[0].provider, "fastmail");
+        assert!(errors[0].error.contains("/x/config"));
+        // Index 1 must be timezone (splits was Ok so it didn't push).
+        assert_eq!(errors[1].account, "/x/timezone.json");
+        assert!(errors[1].provider.is_empty());
+        assert!(errors[1].error.contains("EOF while parsing"));
     }
 
     #[test]

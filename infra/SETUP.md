@@ -13,7 +13,7 @@ Two parts:
 
 ## Recorded state
 
-Update these after your first successful setup so future-you knows what's deployed.
+This block records the **maintainer's** deployed project — it's what `bootstrap.sh` defaults to. If you're forking or running your own copy, override `PROJECT_ID` (see Part 1 below) and keep your own record in your local copy; you don't need to PR a change here.
 
 - **Project ID:** `supervillain-mail-prod`
 - **Created:** _YYYY-MM-DD_ with gcloud version _X.Y.Z_
@@ -39,9 +39,21 @@ The script:
 - Enables Gmail API + Google Calendar API
 - Prints the two URLs you need for Part 2
 
-If the project ID is globally taken (Google project IDs are unique across all of GCP), edit `PROJECT_ID` at the top of `bootstrap.sh` to something else and re-run. Don't forget to update the "Recorded state" section above.
+If the project ID is globally taken (Google project IDs are unique across all of GCP), override via env var — no need to edit the committed script:
 
-**Optional:** to link a billing account, set `BILLING_ACCOUNT` at the top of the script to your billing account ID and re-run. You only need this if you exceed the free Gmail/Calendar API quotas, which a personal mailbox won't.
+```sh
+PROJECT_ID=my-supervillain ./infra/bootstrap.sh
+```
+
+Don't forget to update the "Recorded state" section in *your* copy of this file.
+
+**Optional billing:** to link a billing account, set `BILLING_ACCOUNT` the same way:
+
+```sh
+BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX ./infra/bootstrap.sh
+```
+
+You only need this if you exceed the free Gmail/Calendar API quotas, which a personal mailbox won't.
 
 ## Part 2 — OAuth consent screen (in browser)
 
@@ -101,10 +113,10 @@ Edit the "Recorded state" section at the top of this file with your project ID (
 
 ## Scopes and redirect URI live in code
 
-These are runtime-authoritative — don't duplicate them here:
+These are runtime-authoritative — don't duplicate them here. Symbol names (stable across refactors), not line numbers:
 
-- Scopes: `src/gmail.rs:52-56` (`gmail.modify`, `gmail.send`, `calendar`)
-- Redirect URI: `src/gmail.rs:44` (`http://127.0.0.1:8401/callback`)
+- Scopes: `SCOPES` const in `src/gmail.rs` — currently `gmail.modify`, `gmail.send`, `calendar`. Grep: `rg 'const SCOPES' src/gmail.rs`
+- Redirect URI: `REDIRECT_URI` const in `src/gmail.rs` — currently `http://127.0.0.1:8401/callback`. Grep: `rg 'const REDIRECT_URI' src/gmail.rs`
 
 If you change them in code, no GCP-side change is needed: Desktop OAuth clients auto-allow `127.0.0.1` loopback redirects on any port, and Supervillain requests scopes dynamically at consent time.
 

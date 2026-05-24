@@ -4,6 +4,29 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Phase 6 — Startup config error surfacing
+
+Account config (`~/.config/supervillain/config`) parse errors are now
+surfaced in a UI banner at startup instead of silently dropping malformed
+sections. Same shape for `splits.json` and `timezone.json` parse failures
+(missing files are still fine; only malformed content reports).
+
+Behavior change worth noting for hand-edited configs: a section that omits
+the `provider = ...` line is now reported as `missing required field
+provider` and skipped, where it previously defaulted to `fastmail` and
+emitted a misleading `missing required field username` instead. The
+serializer always writes `provider =`, so any UI-created config is
+unaffected — this only matters if you wrote the file by hand and omitted
+the line.
+
+XSS hardening on the parse-error UI surface: section names rejected by
+`validate_section_name` are replaced with `<malformed section>` in the
+banner (the original is kept in the `tracing::warn!` line for operator
+debugging); unknown / hostile provider strings are replaced with
+`<unknown provider>` for the same reason. Both close attribute-context
+escape vectors against the UI's `escapeHtml` (which does not encode
+`"` / `'`).
+
 ## Phase 5 — In-app account management + timezone-aware invites
 
 Two largely orthogonal features that shipped together in commits `d00dd60` and
