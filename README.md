@@ -17,12 +17,19 @@ cargo install --path .
 supervillain
 ```
 
-First run opens `http://127.0.0.1:8000` and lands on the settings screen. Press
-`a` to add an account; `Ctrl+Enter` to save; click `[Authorize]` for Gmail or
-Outlook (browser opens for OAuth). For Fastmail you'll need an API token from
-*Settings > Privacy & Security > Integrations*; for Gmail/Outlook see
-[Azure AD setup](#azure-ad-app-registration) / [Google Cloud setup](#google-cloud-app-registration)
-to create the OAuth client first.
+First run opens `http://127.0.0.1:8000` and launches the **add-account wizard**:
+
+1. **Pick a provider** — Gmail, Outlook, or Fastmail (`1`/`2`/`3` or click).
+2. **Paste your keys** — Fastmail needs an API token from *Settings > Privacy &
+   Security > Integrations*; Gmail and Outlook need an OAuth Client ID (and
+   Client Secret for Gmail) — see
+   [Google Cloud setup](#google-cloud-app-registration) or
+   [Azure AD setup](#azure-ad-app-registration).
+3. **Authorize in your browser** — supervillain opens a sign-in tab; approve
+   the requested scopes and return to the app.
+4. **Done** — your mailbox is connected and syncing.
+
+Add more mailboxes any time via `g s` → `a`, or `Ctrl+K` → `Add Account`.
 
 ## Project facts
 
@@ -53,7 +60,7 @@ oauth_callback_ports: [8400 (outlook), 8401 (gmail)]
 
 - **Multi-provider** — Fastmail (JMAP + CalDAV), Outlook (full email + calendar via Microsoft Graph), Gmail (full email + Google Calendar)
 - **Multi-account** — Switch between accounts with `1`-`9` keys
-- **In-app account management** — Add, edit, delete, and re-authorize accounts from the UI (`g s` or `Ctrl+K → settings`); no editing the config file or restarting the server. First run lands directly in the settings screen.
+- **In-app account management** — A 4-step wizard (provider picker → paste keys → browser sign-in → done) for adding mailboxes; edit, re-authorize, set default, or remove from the settings pane. Open via `g s`; first run lands directly in the wizard. The command palette (`Ctrl+K`) exposes `Add Account` and a `Remove Account: <email>` entry per connected mailbox.
 - **Calendar sync per provider** — CalDAV (Fastmail), Outlook Calendar API, Google Calendar
 - **Timezone-aware calendar invites** — View, RSVP, and compose new invites with proper RFC 5545 VTIMEZONE/TZID. Multi-timezone display on every event card (great for travel); a banner catches when your OS timezone changes and lets you accept or keep the previous setting. Configurable per-user via Settings; persisted at `~/.config/supervillain/timezone.json`
 - **Vim keybindings** — `j`/`k` navigation, `gg`/`G`, modal editing in compose, `/` search
@@ -108,19 +115,29 @@ oauth_callback_ports: [8400 (outlook), 8401 (gmail)]
 | `Ctrl+Enter` | Send |
 | `Esc` | Cancel |
 
-### Account settings
+### Settings pane
 
 | Key | Action |
 |-----|--------|
 | `g s` | Open settings (from any view) |
-| `Ctrl+K` → `settings` | Open settings via command palette |
 | `j` / `k` | Navigate account list |
 | `Enter` | Edit selected account |
-| `a` | Add a new account |
+| `a` | Add a new account (opens the wizard) |
 | `d` | Delete (then confirm) |
 | `Shift+D` | Set selected account as default |
-| `Ctrl+Enter` | Save |
+| `Ctrl+Enter` | Save edits to an existing account |
 | `Esc` | Back to inbox |
+| `Ctrl+K` → `Add Account` | Launch the wizard from any view |
+| `Ctrl+K` → `Remove Account: <email>` | Disconnect a mailbox |
+
+### Add-account wizard
+
+| Step | Keys |
+|------|------|
+| 1 · Pick provider | `1` / `2` / `3`, or `j`/`k` + `Enter`; `Esc` cancels |
+| 2 · Paste keys | `Tab` next field · `Enter` or `Ctrl+Enter` continue · `Esc` back |
+| 3 · Connecting | `Esc` cancels in-flight OAuth |
+| 4 · Done | `Enter` finish · `a` add another · `Esc` close |
 
 ## Installation
 
@@ -229,7 +246,7 @@ To use Gmail with Supervillain you'll create your own OAuth client in a Google C
 2. Enable APIs: under **Enabled APIs & services**, enable **Gmail API** and **Google Calendar API**.
 3. Configure the OAuth consent screen: **APIs & Services > OAuth consent screen** → User type: **External** → fill in app name, your email, etc.
 4. **Add yourself as a Test User** under **Audience > Test users**. This is critical: unverified apps only work for listed test users, and refresh tokens for non-test users expire after 7 days.
-5. Create credentials: **APIs & Services > Credentials** → **Create Credentials** → **OAuth client ID** → Application type: **Web application**. Add `http://localhost:8401/callback` as an authorized redirect URI.
+5. Create credentials: **APIs & Services > Credentials** → **Create Credentials** → **OAuth client ID** → Application type: **Desktop app** (recommended) or **Web application**. Desktop app clients automatically allow loopback redirects, so no URI registration is needed. If you choose **Web application** instead, add `http://localhost:8401/callback` as an authorized redirect URI — supervillain sends that exact URL to Google.
 6. Copy both the **Client ID** and **Client Secret**. Yes, both — Google's OAuth token endpoint requires `client_secret` even for "Desktop" / PKCE flows. It's not really secret, but the API rejects requests without it.
 
 Put both in your config:
