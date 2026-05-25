@@ -9,6 +9,7 @@ pub mod outlook;
 pub mod platform;
 pub mod provider;
 pub mod provider_utils;
+pub mod rate_limit;
 pub mod routes;
 pub mod search;
 pub mod splits;

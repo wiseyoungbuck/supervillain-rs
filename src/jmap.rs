@@ -1,5 +1,6 @@
 use crate::calendar;
 use crate::error::Error;
+use crate::rate_limit::RateLimiter;
 use crate::types::ParsedQuery;
 use crate::types::*;
 use serde::{Deserialize, Deserializer};
@@ -120,6 +121,12 @@ pub struct JmapSession {
     pub mailbox_cache: HashMap<String, Mailbox>,
     pub identity_id: Option<String>,
     pub identities: Option<Vec<Identity>>,
+    /// Provider-wide rate limiter combining concurrency cap, steady-state
+    /// spacing, and Retry-After-aware retry. Fastmail doesn't publish
+    /// hard limits — 4 concurrent at 100ms spacing (≈ 10 RPS) is a
+    /// conservative starting point. JMAP method-batching (used in
+    /// `send_email`, `archive_batch`) further reduces request count.
+    pub limiter: std::sync::Arc<RateLimiter>,
 }
 
 impl JmapSession {
@@ -138,6 +145,12 @@ impl JmapSession {
             mailbox_cache: HashMap::new(),
             identity_id: None,
             identities: None,
+            limiter: std::sync::Arc::new(RateLimiter::new(
+                "jmap",
+                4,
+                std::time::Duration::from_millis(100),
+                3,
+            )),
         }
     }
 }
@@ -194,12 +207,19 @@ async fn jmap_call(
         "methodCalls": method_calls
     });
 
+    // Route every JMAP request through the session limiter: one wrap
+    // covers ~12 call sites since nearly all JMAP operations bottleneck
+    // here.
     let resp = s
-        .client
-        .post(api_url)
-        .header("Authorization", &s.auth_header)
-        .json(&payload)
-        .send()
+        .limiter
+        .execute("jmap_call", || async {
+            s.client
+                .post(api_url)
+                .header("Authorization", &s.auth_header)
+                .json(&payload)
+                .send()
+                .await
+        })
         .await?;
 
     if !resp.status().is_success() {
@@ -210,6 +230,13 @@ async fn jmap_call(
     }
 
     let body: serde_json::Value = resp.json().await?;
+    // JMAP can return HTTP 200 with `urn:ietf:params:jmap:error:limit`
+    // inside individual method responses. Surface that as a typed
+    // rate-limit error so upstream layers (and the user) see 429-shaped
+    // behavior rather than a confusing success-with-empty-response.
+    if crate::rate_limit::is_jmap_rate_limit_response(&body) {
+        return Err(Error::RateLimited { retry_after: None });
+    }
     Ok(body)
 }
 
@@ -681,13 +708,20 @@ pub async fn upload_blob(
     let upload_url = s.upload_url.as_ref().ok_or(Error::NotConnected)?;
     let url = upload_url.replace("{accountId}", account_id);
 
+    // Closure-based limiter: body bytes are cloned per attempt so
+    // streaming-body retries actually work (the limiter is documented
+    // to require a closure precisely for this case).
     let resp = s
-        .client
-        .post(&url)
-        .header("Authorization", &s.auth_header)
-        .header("Content-Type", content_type)
-        .body(reqwest::Body::from(body.to_vec()))
-        .send()
+        .limiter
+        .execute("blob.upload", || async {
+            s.client
+                .post(&url)
+                .header("Authorization", &s.auth_header)
+                .header("Content-Type", content_type)
+                .body(reqwest::Body::from(body.to_vec()))
+                .send()
+                .await
+        })
         .await?;
 
     if !resp.status().is_success() {
@@ -720,10 +754,14 @@ pub async fn download_blob(
         .replace("{type}", "application/octet-stream");
 
     let resp = s
-        .client
-        .get(&url)
-        .header("Authorization", &s.auth_header)
-        .send()
+        .limiter
+        .execute("blob.download", || async {
+            s.client
+                .get(&url)
+                .header("Authorization", &s.auth_header)
+                .send()
+                .await
+        })
         .await?;
 
     if !resp.status().is_success() {

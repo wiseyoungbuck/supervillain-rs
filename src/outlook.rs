@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::provider_utils::{MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP};
+use crate::rate_limit::RateLimiter;
 use crate::types::{CalendarEvent, Mailbox};
 
 // =============================================================================
@@ -37,6 +38,23 @@ pub struct OutlookSession {
     /// 183 #3: avoids an extra Graph RTT on every send-with-from_addr,
     /// since `/me` fields are essentially session-immutable.
     pub identity_cache: tokio::sync::Mutex<Option<IdentityCacheEntry>>,
+    /// Provider-wide rate limiter combining concurrency cap, steady-state
+    /// spacing, and Retry-After-aware retry. Microsoft Graph throttles
+    /// aggressively per-app/per-mailbox; this is the single place that
+    /// intent lives (see [`build_outlook_limiter`]).
+    pub limiter: std::sync::Arc<RateLimiter>,
+}
+
+/// Outlook rate-limit tuning. 4 concurrent × 125ms spacing ≈ 8 RPS
+/// steady-state — conservative for Graph's per-mailbox throttling.
+/// Graph mandates honoring `Retry-After`; the limiter does.
+pub(crate) fn build_outlook_limiter() -> std::sync::Arc<RateLimiter> {
+    std::sync::Arc::new(RateLimiter::new(
+        "outlook",
+        4,
+        std::time::Duration::from_millis(125),
+        3,
+    ))
 }
 
 /// A snapshot of the folder list, anchored at a fetch time for TTL math.
@@ -99,14 +117,15 @@ struct TokenResponse {
     expires_in: i64,
 }
 
-// Microsoft OAuth2 endpoints. We target `/consumers` (personal MSA tenant)
-// rather than `/common`. Microsoft now blocks end-user consent to newly
-// registered multitenant apps that have no verified publisher (MPN ID), so
-// the multitenant audience is unusable for self-hosted single-user installs.
-// The matching app registration must use "Personal Microsoft accounts only"
-// (see README → Azure AD App Registration).
-const AUTH_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
-const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+// Microsoft OAuth2 endpoints. We target `/common` so both personal MSAs and
+// work / school (Azure AD tenant) accounts can sign in with the same app
+// registration. Microsoft warns about end-user consent for unverified
+// multitenant apps, but: (a) the app owner can always consent to their own
+// registration, and (b) work/school tenant admins can grant admin consent
+// for their tenants. For self-hosted single-user installs neither path
+// requires publisher verification (MPN ID).
+const AUTH_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
+const TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const REDIRECT_URI: &str = "http://localhost:8400/callback";
 
@@ -250,6 +269,7 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         identity_cache: tokio::sync::Mutex::new(None),
+        limiter: build_outlook_limiter(),
     })
 }
 
@@ -289,9 +309,15 @@ pub async fn oauth_flow(
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         identity_cache: tokio::sync::Mutex::new(None),
+        limiter: build_outlook_limiter(),
     };
 
-    save_tokens(&session)?;
+    // `save_tokens` uses `blocking_lock`, which panics inside a tokio runtime.
+    // Acquire async here and call the inner helper directly.
+    {
+        let token = session.token.lock().await;
+        save_tokens_inner(&session.token_path, &token, &session.email)?;
+    }
     tracing::info!("Outlook OAuth completed for {}", session.email);
     Ok(session)
 }
@@ -305,6 +331,38 @@ struct MeResponse {
     user_principal_name: Option<String>,
     #[serde(default)]
     other_mails: Vec<String>,
+}
+
+impl MeResponse {
+    /// Pick the first non-empty address in fallback order: mail → UPN → otherMails[0].
+    /// Empty-string filtering matters because Graph sometimes returns `"mail": ""` on
+    /// MSA edge cases — `Option::or` would short-circuit on `Some("")` and we'd persist
+    /// an empty account label (which becomes the token-file stem).
+    fn primary_address(self) -> Option<String> {
+        fn nonempty(s: Option<String>) -> Option<String> {
+            s.filter(|v| !v.is_empty())
+        }
+        nonempty(self.mail)
+            .or_else(|| nonempty(self.user_principal_name))
+            .or_else(|| self.other_mails.into_iter().find(|s| !s.is_empty()))
+    }
+}
+
+/// Truncate a Graph response body for inclusion in user-visible error messages.
+/// Full body goes to `tracing::debug!` separately; this is the short form so we
+/// don't paste multi-kilobyte error payloads into log/UI surfaces.
+fn truncate_error_body(body: &str) -> String {
+    const MAX_BYTES: usize = 500;
+    if body.len() <= MAX_BYTES {
+        body.to_string()
+    } else {
+        let cut = body
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_BYTES)
+            .last();
+        let end = cut.map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+        format!("{}… [truncated, {} bytes total]", &body[..end], body.len())
+    }
 }
 
 /// Fetch the authenticated user's email from Microsoft Graph.
@@ -324,18 +382,27 @@ async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Resul
         .await
         .map_err(|e| Error::Internal(format!("Reading Graph /me response body failed: {e}")))?;
     if !status.is_success() {
-        return Err(classify_outlook_error("me.get", status, &text));
+        tracing::debug!(graph_response = %text, "Graph /me non-success body");
+        return Err(classify_outlook_error(
+            "me.get",
+            status,
+            &truncate_error_body(&text),
+        ));
     }
-    let me: MeResponse = serde_json::from_str(&text)
-        .map_err(|e| Error::Internal(format!("Graph /me returned non-JSON: {e}: {text}")))?;
-    me.mail
-        .or(me.user_principal_name)
-        .or_else(|| me.other_mails.into_iter().next())
-        .ok_or_else(|| {
-            Error::Internal(format!(
-                "Could not determine Outlook email address from Graph /me response: {text}"
-            ))
-        })
+    let me: MeResponse = serde_json::from_str(&text).map_err(|e| {
+        tracing::debug!(graph_response = %text, "Graph /me parse failure body");
+        Error::Internal(format!(
+            "Graph /me returned non-JSON: {e}: {}",
+            truncate_error_body(&text)
+        ))
+    })?;
+    me.primary_address().ok_or_else(|| {
+        tracing::debug!(graph_response = %text, "Graph /me missing-address body");
+        Error::Internal(format!(
+            "Could not determine Outlook email address from Graph /me response: {}",
+            truncate_error_body(&text)
+        ))
+    })
 }
 
 // =============================================================================
@@ -842,6 +909,19 @@ pub(crate) fn classify_outlook_error(
     status: reqwest::StatusCode,
     body: &str,
 ) -> Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        // The limiter normally absorbs 429/503 with Retry-After honored
+        // before reaching here. This is the fallthrough for any call
+        // site not yet routed through the limiter.
+        tracing::warn!(
+            operation,
+            status = status.as_u16(),
+            "Graph throttle surfaced past limiter — classifying as RateLimited"
+        );
+        return Error::RateLimited { retry_after: None };
+    }
     let msg = format!("Outlook {operation} failed ({status}): {body}");
     if status.is_client_error() {
         Error::BadRequest(msg)
@@ -1125,15 +1205,10 @@ fn build_outlook_query_url(
 }
 
 /// Fetch full message data for each ID in parallel. Uses `$expand=attachments`
-/// so attachment metadata comes back in the same response.
-/// Cap on concurrent in-flight Graph requests from a single `get_emails`
-/// call. Graph throttles aggressively (HTTP 429 with `Retry-After`);
-/// fanning out 200 requests at once is a recipe for a 429 storm.
-/// 5 is conservative — matches what Gmail's get_emails effectively
-/// achieves via tokio's natural connection-pool serialization.
-/// Roborev 179 #5.
-const GET_EMAILS_MAX_CONCURRENCY: usize = 5;
-
+/// so attachment metadata comes back in the same response. Concurrency,
+/// spacing, and 429 retry are all enforced by `session.limiter` — see
+/// `build_outlook_limiter`. Graph mandates honoring `Retry-After`; the
+/// limiter does.
 pub async fn get_emails(
     session: &OutlookSession,
     ids: &[String],
@@ -1143,22 +1218,20 @@ pub async fn get_emails(
         return Ok(Vec::new());
     }
     let token = access_token(session).await?;
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
         let client = session.client.clone();
         let token = token.clone();
         let id = id.clone();
-        let sem = sem.clone();
+        let limiter = session.limiter.clone();
         join_set.spawn(async move {
-            // Acquire holds the permit for the duration of the request.
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|e| Error::Internal(format!("get_emails semaphore: {e}")))?;
             let encoded = crate::provider_utils::encode_path_segment(&id);
             let url = format!("{GRAPH_BASE}/me/messages/{encoded}?$expand=attachments");
-            let resp = client.get(&url).bearer_auth(&token).send().await?;
+            let resp = limiter
+                .execute("messages.get", || async {
+                    client.get(&url).bearer_auth(&token).send().await
+                })
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
@@ -1446,11 +1519,16 @@ pub async fn archive_batch(session: &OutlookSession, msg_ids: &[String]) -> Resu
     for chunk in chunks {
         let body = build_batch_archive_body(&chunk);
         let resp = session
-            .client
-            .post(format!("{GRAPH_BASE}/$batch"))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
+            .limiter
+            .execute("$batch.archive", || async {
+                session
+                    .client
+                    .post(format!("{GRAPH_BASE}/$batch"))
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await
+            })
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -2625,6 +2703,84 @@ mod tests {
         assert!(url.contains("state=test-state"));
     }
 
+    // ---- MeResponse parse + fallback (roborev 200 #1/#2) ----
+
+    fn parse_me(json: &str) -> MeResponse {
+        serde_json::from_str(json).expect("MeResponse parse")
+    }
+
+    #[test]
+    fn me_response_prefers_mail_when_populated() {
+        let me = parse_me(
+            r#"{"mail":"user@example.com","userPrincipalName":"upn@example.com","otherMails":["other@example.com"]}"#,
+        );
+        assert_eq!(me.primary_address(), Some("user@example.com".into()));
+    }
+
+    #[test]
+    fn me_response_falls_back_to_upn_when_mail_null() {
+        let me = parse_me(r#"{"mail":null,"userPrincipalName":"upn@example.com","otherMails":[]}"#);
+        assert_eq!(me.primary_address(), Some("upn@example.com".into()));
+    }
+
+    #[test]
+    fn me_response_falls_back_to_other_mails_when_mail_and_upn_null() {
+        let me = parse_me(
+            r#"{"mail":null,"userPrincipalName":null,"otherMails":["other@example.com"]}"#,
+        );
+        assert_eq!(me.primary_address(), Some("other@example.com".into()));
+    }
+
+    #[test]
+    fn me_response_returns_none_when_all_absent() {
+        let me = parse_me(r#"{}"#);
+        assert_eq!(me.primary_address(), None);
+    }
+
+    #[test]
+    fn me_response_skips_empty_string_mail() {
+        // Graph occasionally returns "" instead of null on MSA edge cases.
+        // Option::or would short-circuit on Some(""); primary_address must
+        // treat empty as absent and fall through.
+        let me = parse_me(r#"{"mail":"","userPrincipalName":"upn@example.com","otherMails":[]}"#);
+        assert_eq!(me.primary_address(), Some("upn@example.com".into()));
+    }
+
+    #[test]
+    fn me_response_skips_empty_other_mails_entries() {
+        let me = parse_me(
+            r#"{"mail":null,"userPrincipalName":null,"otherMails":["","real@example.com"]}"#,
+        );
+        assert_eq!(me.primary_address(), Some("real@example.com".into()));
+    }
+
+    // ---- truncate_error_body (roborev 200 #3) ----
+
+    #[test]
+    fn truncate_error_body_passthrough_when_small() {
+        let s = "short body";
+        assert_eq!(truncate_error_body(s), "short body");
+    }
+
+    #[test]
+    fn truncate_error_body_truncates_long_input() {
+        let s = "x".repeat(1000);
+        let out = truncate_error_body(&s);
+        assert!(out.contains("truncated"));
+        assert!(out.contains("1000 bytes total"));
+        // Truncated payload + suffix should be well under the original.
+        assert!(out.len() < 600);
+    }
+
+    #[test]
+    fn truncate_error_body_respects_utf8_char_boundaries() {
+        // 4-byte chars at the 500-byte boundary must not split.
+        let s = "🦀".repeat(200); // 800 bytes
+        let out = truncate_error_body(&s);
+        // No panic on indexing; output ends with the truncated marker.
+        assert!(out.contains("truncated"));
+    }
+
     #[test]
     fn build_graph_event_basic() {
         let event = CalendarEvent {
@@ -2767,6 +2923,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            limiter: build_outlook_limiter(),
         };
 
         save_tokens(&session).unwrap();
@@ -3070,6 +3227,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            limiter: build_outlook_limiter(),
         }
     }
 
@@ -3707,15 +3865,31 @@ mod tests {
     }
 
     #[test]
-    fn classify_outlook_429_returns_bad_request() {
-        // Graph's throttling — 4xx, surfaces to caller. Future work could
-        // expose Retry-After but it's still BadRequest-shaped today.
+    fn classify_outlook_429_returns_rate_limited() {
+        // Graph throttling now surfaces as the typed RateLimited variant
+        // (→ HTTP 429 in IntoResponse). The limiter normally absorbs
+        // this before classify is reached; this test pins the
+        // fallthrough behavior for call sites not yet routed through
+        // the limiter.
         let err = classify_outlook_error(
             "messages.list",
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             "throttled",
         );
-        assert!(matches!(err, Error::BadRequest(_)));
+        assert!(matches!(err, Error::RateLimited { .. }));
+    }
+
+    #[test]
+    fn classify_outlook_503_returns_rate_limited() {
+        // Graph emits 503 under sustained throttling; same treatment as
+        // 429 — the limiter retries with backoff, fallthrough surfaces
+        // RateLimited so the caller gets a 429 to the user.
+        let err = classify_outlook_error(
+            "messages.list",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "throttled",
+        );
+        assert!(matches!(err, Error::RateLimited { .. }));
     }
 
     #[test]
@@ -4613,6 +4787,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            limiter: build_outlook_limiter(),
         }
     }
 

@@ -1,6 +1,8 @@
 use axum::http::StatusCode;
+use axum::http::header::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum Error {
@@ -11,6 +13,7 @@ pub enum Error {
     BadRequest(String),
     Conflict(String),
     Internal(String),
+    RateLimited { retry_after: Option<Duration> },
 }
 
 impl fmt::Display for Error {
@@ -23,6 +26,10 @@ impl fmt::Display for Error {
             Error::BadRequest(msg) => write!(f, "bad request: {msg}"),
             Error::Conflict(msg) => write!(f, "conflict: {msg}"),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
+            Error::RateLimited { retry_after } => match retry_after {
+                Some(d) => write!(f, "rate limited — retry after {}s", d.as_secs()),
+                None => write!(f, "rate limited"),
+            },
         }
     }
 }
@@ -49,6 +56,7 @@ impl From<serde_json::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        let mut retry_after_header: Option<HeaderValue> = None;
         let (status, client_message) = match &self {
             Error::Auth(_) => (StatusCode::UNAUTHORIZED, "authentication failed".into()),
             Error::NotFound(msg) => (StatusCode::NOT_FOUND, format!("not found: {msg}")),
@@ -72,9 +80,20 @@ impl IntoResponse for Error {
                     "internal error".to_string(),
                 )
             }
+            Error::RateLimited { retry_after } => {
+                if let Some(d) = retry_after {
+                    retry_after_header = HeaderValue::from_str(&d.as_secs().to_string()).ok();
+                }
+                (StatusCode::TOO_MANY_REQUESTS, "rate limited".to_string())
+            }
         };
         let body = serde_json::json!({ "error": client_message });
-        (status, axum::Json(body)).into_response()
+        let mut resp = (status, axum::Json(body)).into_response();
+        if let Some(v) = retry_after_header {
+            resp.headers_mut()
+                .insert(HeaderName::from_static("retry-after"), v);
+        }
+        resp
     }
 }
 
@@ -151,5 +170,36 @@ mod tests {
         let (_, body) = response_status_and_body(Error::Auth("token fmu1-abc123xyz".into())).await;
         assert!(!body.contains("fmu1-abc123xyz"));
         assert!(body.contains("authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_returns_429() {
+        let (status, body) =
+            response_status_and_body(Error::RateLimited { retry_after: None }).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(body.contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_echoes_retry_after_header() {
+        let err = Error::RateLimited {
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = resp
+            .headers()
+            .get("retry-after")
+            .expect("retry-after header present")
+            .to_str()
+            .unwrap();
+        assert_eq!(header, "7");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_no_retry_after_omits_header() {
+        let err = Error::RateLimited { retry_after: None };
+        let resp = err.into_response();
+        assert!(resp.headers().get("retry-after").is_none());
     }
 }

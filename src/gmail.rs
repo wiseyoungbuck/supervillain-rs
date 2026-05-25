@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tokio::sync::Semaphore;
 
 use crate::error::Error;
 use crate::oauth;
@@ -28,6 +27,7 @@ use crate::provider_utils::{
     MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP, encode_path_segment,
     mime_type_from_filename, should_clear_tokens_on_refresh_failure,
 };
+use crate::rate_limit::RateLimiter;
 use crate::types::{CalendarEvent, Email, EmailAddress, Identity, Mailbox, ParsedQuery};
 
 // =============================================================================
@@ -85,11 +85,24 @@ pub struct GmailSession {
     /// message ID as `in_reply_to`, but RFC822 needs the actual `<…@…>`
     /// header value. Capped at `PARENT_MID_CACHE_CAP`; oldest entries evicted.
     pub parent_message_id_cache: tokio::sync::Mutex<Vec<(String, String)>>,
+    /// Provider-wide rate limiter combining concurrency cap, steady-state
+    /// spacing, and Retry-After-aware retry. Every Gmail HTTP request
+    /// should be routed through `limiter.execute(...)` so the throttling
+    /// intent is expressed in one place (see [`build_gmail_limiter`]).
+    pub limiter: Arc<RateLimiter>,
 }
 
 // UPLOAD_CACHE_CAP, MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES → see
 // crate::provider_utils (single tuning point shared with Outlook).
 const PARENT_MID_CACHE_CAP: usize = 16;
+
+/// Gmail rate-limit tuning. 5 concurrent × 80ms spacing ≈ 12 RPS
+/// steady-state — well under Gmail's per-user 250 quota-units/sec
+/// budget, and matches the proven `get_emails` cap that prevents the
+/// "Too many concurrent requests for user" 429.
+fn build_gmail_limiter() -> Arc<RateLimiter> {
+    Arc::new(RateLimiter::new("gmail", 5, Duration::from_millis(80), 3))
+}
 
 /// What's needed to fetch a given page from Gmail's cursor-paginated
 /// `messages.list`. The three states are deliberately distinguishable so the
@@ -313,6 +326,7 @@ pub fn load_session(
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
+        limiter: build_gmail_limiter(),
     })
 }
 
@@ -364,6 +378,7 @@ pub async fn oauth_flow(
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
+        limiter: build_gmail_limiter(),
     };
 
     let token = session.token.lock().await;
@@ -487,10 +502,15 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
 
     let stubs: LabelsListResp = {
         let resp = session
-            .client
-            .get(format!("{GMAIL_BASE}/labels"))
-            .bearer_auth(&token)
-            .send()
+            .limiter
+            .execute("labels.list", || async {
+                session
+                    .client
+                    .get(format!("{GMAIL_BASE}/labels"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+            })
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -500,7 +520,10 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
         resp.json().await?
     };
 
-    // Concurrent fan-out for per-label details (counts come from labels.get only).
+    // Per-label `labels.get` fan-out. Previously uncapped — a mailbox
+    // with many labels would issue N concurrent requests and hit the
+    // per-user concurrent-request 429. Routes through the same limiter
+    // as `get_emails` so concurrency + spacing apply uniformly.
     let mut join_set = tokio::task::JoinSet::new();
     for stub in stubs.labels {
         let label_type = stub.label_type.as_deref().unwrap_or("user");
@@ -510,11 +533,13 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
         let client = session.client.clone();
         let token = token.clone();
         let id = stub.id.clone();
+        let limiter = session.limiter.clone();
         join_set.spawn(async move {
-            let resp = client
-                .get(format!("{GMAIL_BASE}/labels/{id}"))
-                .bearer_auth(&token)
-                .send()
+            let url = format!("{GMAIL_BASE}/labels/{id}");
+            let resp = limiter
+                .execute("labels.get", || async {
+                    client.get(&url).bearer_auth(&token).send().await
+                })
                 .await?;
             let status = resp.status();
             if !status.is_success() {
@@ -924,13 +949,6 @@ pub struct GmailBody {
     pub attachment_id: Option<String>,
 }
 
-/// Cap on concurrent in-flight Gmail requests from a single `get_emails`
-/// call. Gmail returns HTTP 429 "Too many concurrent requests for user"
-/// when too many `messages.get` calls are in flight at once, even within
-/// daily quota. 5 matches the Outlook path and keeps inbox loads (~50
-/// messages) under the per-user concurrent limit.
-const GET_EMAILS_MAX_CONCURRENCY: usize = 5;
-
 pub async fn get_emails(
     session: &GmailSession,
     ids: &[String],
@@ -942,24 +960,20 @@ pub async fn get_emails(
     let token = access_token(session).await?;
     let format = if fetch_body { "full" } else { "metadata" };
 
-    let sem = Arc::new(Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
         let client = session.client.clone();
         let token = token.clone();
         let id = id.clone();
         let format = format.to_string();
-        let sem = sem.clone();
+        let limiter = session.limiter.clone();
         join_set.spawn(async move {
-            // Permit gates only the HTTP call below. Keep token refresh /
-            // other auth work outside this scope or the cap expands to
-            // cover unrelated network I/O and defeats its purpose.
-            let _permit = sem
-                .acquire()
-                .await
-                .expect("semaphore not closed (only dropped after JoinSet drains)");
             let url = format!("{GMAIL_BASE}/messages/{id}?format={format}");
-            let resp = client.get(&url).bearer_auth(&token).send().await?;
+            let resp = limiter
+                .execute("messages.get", || async {
+                    client.get(&url).bearer_auth(&token).send().await
+                })
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
@@ -1232,9 +1246,16 @@ pub(crate) fn classify_gmail_error(
     body: &str,
 ) -> Error {
     if is_rate_limited(status, body) {
-        return Error::BadRequest(format!(
-            "Gmail rate limit hit on {operation} — wait a moment and try again."
-        ));
+        // The limiter normally absorbs 429s before reaching here; this
+        // path catches Gmail's quirky HTTP-403-with-quota-body shape and
+        // any call site not yet routed through the limiter. No
+        // `Retry-After` is available at this layer.
+        tracing::warn!(
+            operation,
+            status = status.as_u16(),
+            "Gmail rate limit surfaced past limiter — classifying as RateLimited"
+        );
+        return Error::RateLimited { retry_after: None };
     }
     let msg = format!("Gmail {operation} failed ({status}): {body}");
     if status.is_client_error() {
@@ -1298,36 +1319,33 @@ async fn modify_labels(
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/{msg_id}/modify");
     let body = modify_body(add, remove);
-    // Single retry on rate limit. Most quota bursts here are transient
-    // (rapid archive + prefetch + split-count fan-out); a 750ms pause is
-    // usually enough to ride them out. If we're genuinely over the per-minute
-    // quota, the retry also fails and the friendly message from
-    // classify_gmail_error reaches the user.
-    for attempt in 0..2 {
-        let resp = session
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        if status.is_success() {
-            invalidate_label_cache(session).await;
-            return Ok(true);
-        }
-        let text = resp.text().await.unwrap_or_default();
-        if attempt == 0 && is_rate_limited(status, &text) {
-            tokio::time::sleep(Duration::from_millis(750)).await;
-            continue;
-        }
-        return Err(classify_gmail_error(
-            &format!("messages.modify {msg_id}"),
-            status,
-            &text,
-        ));
+    // Retry/backoff (including for the rapid archive + prefetch +
+    // split-count fan-out bursts that used to need a bespoke 750ms
+    // retry-once) is handled by the session limiter — see
+    // `build_gmail_limiter`.
+    let resp = session
+        .limiter
+        .execute("messages.modify", || async {
+            session
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        invalidate_label_cache(session).await;
+        return Ok(true);
     }
-    unreachable!("loop returns or continues on every branch");
+    let text = resp.text().await.unwrap_or_default();
+    Err(classify_gmail_error(
+        &format!("messages.modify {msg_id}"),
+        status,
+        &text,
+    ))
 }
 
 pub async fn mark_read(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
@@ -3526,19 +3544,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_rate_limit_returns_friendly_message() {
-        // The raw Gmail body is a ~30-line JSON blob — useless to a user.
-        // classify_gmail_error must collapse it to a short, actionable note.
+    fn classify_rate_limit_returns_rate_limited_variant() {
+        // Both shapes of Gmail rate-limit (HTTP 429 and the quirky
+        // HTTP-403-with-quota-body) collapse to the typed RateLimited
+        // variant so IntoResponse can emit a real HTTP 429.
         let body = r#"{"error":{"code":403,"errors":[{"reason":"rateLimitExceeded"}]}}"#;
         let err = classify_gmail_error("messages.modify abc", reqwest::StatusCode::FORBIDDEN, body);
-        let msg = match err {
-            Error::BadRequest(m) => m,
-            other => panic!("expected BadRequest, got {other:?}"),
-        };
-        assert!(msg.contains("rate limit"));
-        assert!(msg.contains("messages.modify abc"));
-        assert!(!msg.contains("PERMISSION_DENIED"));
-        assert!(!msg.contains('{'));
+        assert!(matches!(err, Error::RateLimited { .. }));
+
+        let err429 = classify_gmail_error(
+            "messages.get xyz",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+        );
+        assert!(matches!(err429, Error::RateLimited { .. }));
     }
 
     // ---- Milestone B: download_blob synthetic-blob rejection ----
@@ -4364,47 +4383,16 @@ mod tests {
     // still fails and forces them to update this test too.
 
     #[test]
-    fn get_emails_max_concurrency_is_five() {
-        // Pins the chosen cap so a silent edit to the constant trips
-        // CI. 5 matches the Outlook path and keeps a 50-message inbox
-        // load under Gmail's per-user concurrent-request limit.
-        assert_eq!(GET_EMAILS_MAX_CONCURRENCY, 5);
-    }
-
-    #[tokio::test]
-    async fn semaphore_pattern_bounds_in_flight_tasks() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let sem = Arc::new(Semaphore::new(GET_EMAILS_MAX_CONCURRENCY));
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let mut join_set = tokio::task::JoinSet::new();
-        for _ in 0..50 {
-            let sem = sem.clone();
-            let in_flight = in_flight.clone();
-            let peak = peak.clone();
-            join_set.spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
-        while join_set.join_next().await.is_some() {}
-
-        let observed = peak.load(Ordering::SeqCst);
-        assert!(
-            observed <= GET_EMAILS_MAX_CONCURRENCY,
-            "peak in-flight {observed} exceeded cap {GET_EMAILS_MAX_CONCURRENCY}",
-        );
-        // Sanity: with 50 tasks and a 5ms sleep, we should saturate
-        // the cap. If this is < 2, the test isn't actually exercising
-        // concurrency and gives false confidence.
-        assert!(
-            observed >= 2,
-            "peak in-flight {observed} too low — test isn't exercising concurrency",
-        );
+    fn gmail_limiter_is_configured_for_per_user_throttling() {
+        // Pin the limiter tuning so a silent edit to the configuration
+        // trips CI. 5 concurrent × 80ms spacing ≈ 12 RPS — under Gmail's
+        // documented per-user 250 quota-units/sec budget and proven to
+        // avoid "Too many concurrent requests for user" 429s. The general
+        // semaphore/spacer correctness is covered by tests in
+        // crate::rate_limit; this only pins the per-provider knobs.
+        let session = test_session();
+        assert_eq!(session.limiter.name(), "gmail");
+        assert_eq!(session.limiter.concurrency(), 5);
+        assert_eq!(session.limiter.spacing(), Duration::from_millis(80));
     }
 }
