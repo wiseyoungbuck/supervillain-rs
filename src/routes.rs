@@ -481,11 +481,18 @@ async fn get_email(
     let session_lock = resolve_session(&state, Some(&account_key)).await?;
     let session = session_lock.read().await;
 
-    let emails =
-        provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
-    let email = emails
-        .first()
-        .ok_or_else(|| Error::NotFound("Email not found".into()))?;
+    let email = state
+        .prefetch
+        .body_or_fetch(&account_key, &email_id, || async {
+            let emails =
+                provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
+            emails
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::NotFound("Email not found".into()))
+        })
+        .await?;
+    let email = &email;
 
     // Auto mark-read
     if email.is_unread() {

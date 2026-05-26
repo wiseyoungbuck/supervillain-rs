@@ -22,19 +22,19 @@ pub struct InboxKey {
     pub limit: usize,
 }
 
-/// One slot per (mailbox, limit) pair and one slot per mailbox for split
-/// counts — **not** a multi-mailbox LRU. The optimization target is the
-/// "switch accounts → land on inbox" flow; cross-mailbox navigation
-/// within an account (Inbox → Archive → Inbox) evicts the previous entry
-/// and pays a full provider round-trip on each switch. If folder-hopping
-/// turns out to be common in real usage, swap `inbox_list` and
-/// `split_counts` for small LRU maps keyed by `(mailbox_id, limit)`.
+/// Per-account cache. `inbox_lists` is a map (one entry per (mailbox, limit))
+/// so the warmer can warm Inbox / Archive / Sent / labels in parallel without
+/// evicting each other. `body_cache` is a flat-by-id store for individual
+/// email bodies — fed both by the warmer's top-N prefetch and by `get_email`
+/// route hits, keyed by provider message id (unique within an account, so no
+/// account-id prefix needed).
 #[derive(Default)]
 struct AccountEntry {
     mailboxes: Option<Vec<Mailbox>>,
     identities: Option<Vec<Identity>>,
-    inbox_list: Option<(InboxKey, Vec<Email>)>,
+    inbox_lists: HashMap<InboxKey, Vec<Email>>,
     split_counts: Option<(String, HashMap<String, u32>)>,
+    body_cache: HashMap<String, Email>,
     /// Monotonic version bumped on every `invalidate`. The warmer snapshots
     /// this before each provider call and discards its result if the version
     /// changed mid-flight — otherwise a slow in-flight refresh could
@@ -89,15 +89,22 @@ impl PrefetchCache {
     pub async fn get_inbox_list(&self, account: &str, key: &InboxKey) -> Option<Vec<Email>> {
         let entry = self.entry(account).await;
         let guard = entry.lock().await;
-        match &guard.inbox_list {
-            Some((k, v)) if k == key => Some(v.clone()),
-            _ => None,
-        }
+        guard.inbox_lists.get(key).cloned()
     }
 
     pub async fn set_inbox_list(&self, account: &str, key: InboxKey, emails: Vec<Email>) {
         let entry = self.entry(account).await;
-        entry.lock().await.inbox_list = Some((key, emails));
+        entry.lock().await.inbox_lists.insert(key, emails);
+    }
+
+    pub async fn get_body(&self, account: &str, email_id: &str) -> Option<Email> {
+        let entry = self.entry(account).await;
+        entry.lock().await.body_cache.get(email_id).cloned()
+    }
+
+    pub async fn set_body(&self, account: &str, email_id: String, email: Email) {
+        let entry = self.entry(account).await;
+        entry.lock().await.body_cache.insert(email_id, email);
     }
 
     pub async fn get_split_counts(
@@ -140,8 +147,30 @@ impl PrefetchCache {
         let mut e = entry.lock().await;
         e.mailboxes = None;
         e.identities = None;
-        e.inbox_list = None;
+        e.inbox_lists.clear();
         e.split_counts = None;
+        // body_cache deliberately survives: per-mutation invalidates fire
+        // on every mark-read / archive / flag-toggle, but the email's
+        // text/html content doesn't change with those operations. The
+        // frontend's emailCache (a50f1f8) carries the optimistically-
+        // updated metadata for any email the user has touched, so stale
+        // keywords in body_cache don't reach the UI. Wholesale-wiping
+        // bodies on every read action would turn the cache into a one-
+        // shot buffer that the next mutation always drains.
+        e.version = e.version.wrapping_add(1);
+    }
+
+    /// Wholesale-clear, including body_cache. Use only for "the account
+    /// was removed / tokens were revoked" type events, where keeping any
+    /// previous content would be a leak rather than a freshness issue.
+    pub async fn invalidate_full(&self, account: &str) {
+        let entry = self.entry(account).await;
+        let mut e = entry.lock().await;
+        e.mailboxes = None;
+        e.identities = None;
+        e.inbox_lists.clear();
+        e.split_counts = None;
+        e.body_cache.clear();
         e.version = e.version.wrapping_add(1);
     }
 
@@ -205,7 +234,23 @@ impl PrefetchCache {
         if e.version != expected_version {
             return false;
         }
-        e.inbox_list = Some((key, emails));
+        e.inbox_lists.insert(key, emails);
+        true
+    }
+
+    pub async fn try_set_body(
+        &self,
+        account: &str,
+        expected_version: u64,
+        email_id: String,
+        email: Email,
+    ) -> bool {
+        let entry = self.entry(account).await;
+        let mut e = entry.lock().await;
+        if e.version != expected_version {
+            return false;
+        }
+        e.body_cache.insert(email_id, email);
         true
     }
 
@@ -284,6 +329,25 @@ impl PrefetchCache {
         Ok(live)
     }
 
+    pub async fn body_or_fetch<F, Fut>(
+        &self,
+        account: &str,
+        email_id: &str,
+        fetch: F,
+    ) -> Result<Email, Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Email, Error>>,
+    {
+        if let Some(c) = self.get_body(account, email_id).await {
+            return Ok(c);
+        }
+        let live = fetch().await?;
+        self.set_body(account, email_id.to_string(), live.clone())
+            .await;
+        Ok(live)
+    }
+
     pub async fn split_counts_or_fetch<F, Fut>(
         &self,
         account: &str,
@@ -321,7 +385,7 @@ impl Default for PrefetchCache {
 /// the entry version before each fetch and discard the write if the version
 /// changed mid-flight, so a user-triggered mutation that runs in parallel
 /// always wins (see [`PrefetchCache::invalidate`]).
-pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) {
+pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &str) {
     let started = std::time::Instant::now();
     let cache = state.prefetch.clone();
 
@@ -335,7 +399,7 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
     let v = cache.version(account_id).await;
 
     // --- mailboxes ---
-    let mailboxes = match fetch_mailboxes(state, account_id).await {
+    let mailboxes = match fetch_mailboxes(&state, account_id).await {
         Ok(m) => {
             if cache.try_set_mailboxes(account_id, v, m.clone()).await {
                 Some(m)
@@ -358,7 +422,7 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
     };
 
     // --- identities ---
-    match fetch_identities(state, account_id).await {
+    match fetch_identities(&state, account_id).await {
         Ok(ids) => {
             if !cache.try_set_identities(account_id, v, ids).await {
                 tracing::debug!(
@@ -371,27 +435,81 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
         Err(e) => tracing::warn!(account = %account_id, "prefetch: identities failed: {e}"),
     }
 
-    // --- inbox + split counts (only if we have mailboxes to find the inbox role) ---
+    // --- per-mailbox lists + bodies + split counts ---
     if let Some(mailboxes) = mailboxes {
-        let Some(inbox) = mailboxes
-            .iter()
-            .find(|m| m.role.as_deref() == Some("inbox"))
-        else {
-            tracing::warn!(
-                account = %account_id,
-                "prefetch: no mailbox with role=inbox; skipping inbox/split-counts warm"
-            );
-            return;
+        warm_all_mailboxes(state, account_id, v, &mailboxes).await;
+    }
+
+    tracing::info!(
+        account = %account_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "prefetch: account warmed"
+    );
+}
+
+/// Top-N latest bodies to prefetch per mailbox per warm cycle. Sized to match
+/// a typical preview window — opening any recent message in any mailbox is a
+/// cache hit. If a user runs into Gmail quota issues, lower this first; if
+/// memory pressure is the problem, lower this *and* introduce per-cache
+/// eviction. Default 25 = ~22 MB resident per warm cycle for a 3-account
+/// 6-mailbox-per-account setup (see plan cost-analysis).
+pub(crate) const BODY_PREFETCH_PER_MAILBOX: usize = 25;
+
+/// Fan out list + body warming across every mailbox in parallel. The
+/// provider's `RateLimiter` already enforces concurrency caps (5 concurrent
+/// × 80 ms spacing on Gmail), so we don't need our own throttle — issuing
+/// every request at once just queues them at the limiter and they drain
+/// in-order. Sequential iteration here would multiply warm latency by the
+/// mailbox count without any quota benefit.
+async fn warm_all_mailboxes(
+    state: Arc<crate::types::AppState>,
+    account_id: &str,
+    v: u64,
+    mailboxes: &[Mailbox],
+) {
+    let cache = state.prefetch.clone();
+
+    // ---- Phase 1: per-mailbox list + split-counts fan-out ----
+    let mut list_set = tokio::task::JoinSet::new();
+    for mb in mailboxes {
+        let state = state.clone();
+        let account = account_id.to_string();
+        let mailbox_id = mb.id.clone();
+        let mailbox_role = mb.role.clone();
+        list_set.spawn(async move {
+            let list = fetch_inbox(&state, &account, &mailbox_id).await;
+            // Only warm split-counts for the inbox role — that's the only
+            // mailbox where the sidebar split tabs render.
+            let counts = if mailbox_role.as_deref() == Some("inbox") {
+                Some(fetch_split_counts(&state, &account, &mailbox_id).await)
+            } else {
+                None
+            };
+            (mailbox_id, list, counts)
+        });
+    }
+
+    let mut warmed_ids: Vec<(String, Vec<String>)> = Vec::new();
+    while let Some(joined) = list_set.join_next().await {
+        let (mailbox_id, list_res, counts_res) = match joined {
+            Ok(t) => t,
+            Err(je) => {
+                tracing::warn!(
+                    account = %account_id,
+                    "mailbox warm task panicked: {je}"
+                );
+                continue;
+            }
         };
-        let inbox_id = inbox.id.clone();
-        match fetch_inbox(state, account_id, &inbox_id).await {
+        match list_res {
             Ok(emails) => {
+                let ids = emails.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
                 if !cache
                     .try_set_inbox_list(
                         account_id,
                         v,
                         InboxKey {
-                            mailbox_id: inbox_id.clone(),
+                            mailbox_id: mailbox_id.clone(),
                             limit: crate::routes::DEFAULT_INBOX_LIMIT,
                         },
                         emails,
@@ -400,37 +518,116 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
                 {
                     tracing::debug!(
                         account = %account_id,
+                        mailbox = %mailbox_id,
                         "prefetch: inbox list discarded — version changed mid-fetch"
                     );
                     return;
                 }
+                tracing::debug!(
+                    account = %account_id,
+                    mailbox = %mailbox_id,
+                    list_n = ids.len(),
+                    "warmed mailbox list"
+                );
+                warmed_ids.push((mailbox_id.clone(), ids));
             }
-            Err(e) => tracing::warn!(account = %account_id, "prefetch: inbox list failed: {e}"),
+            Err(e) => tracing::warn!(
+                account = %account_id,
+                mailbox = %mailbox_id,
+                "mailbox warm failed: {e}"
+            ),
         }
-
-        match fetch_split_counts(state, account_id, &inbox_id).await {
-            Ok(counts) => {
-                if !cache
-                    .try_set_split_counts(account_id, v, inbox_id, counts)
-                    .await
-                {
-                    tracing::debug!(
-                        account = %account_id,
-                        "prefetch: split-counts discarded — version changed mid-fetch"
-                    );
+        if let Some(counts_res) = counts_res {
+            match counts_res {
+                Ok(counts) => {
+                    if !cache
+                        .try_set_split_counts(account_id, v, mailbox_id, counts)
+                        .await
+                    {
+                        tracing::debug!(
+                            account = %account_id,
+                            "prefetch: split-counts discarded — version changed mid-fetch"
+                        );
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(account = %account_id, "prefetch: split-counts failed: {e}")
+                Err(e) => {
+                    tracing::warn!(account = %account_id, "prefetch: split-counts failed: {e}")
+                }
             }
         }
     }
 
-    tracing::debug!(
+    // ---- Phase 2: top-N body fan-out across all warmed mailboxes ----
+    let mut body_set = tokio::task::JoinSet::new();
+    let mut total_bodies = 0usize;
+    for (mailbox_id, ids) in warmed_ids {
+        let prefix: Vec<String> = ids.into_iter().take(BODY_PREFETCH_PER_MAILBOX).collect();
+        if prefix.is_empty() {
+            continue;
+        }
+        total_bodies += prefix.len();
+        let state = state.clone();
+        let account = account_id.to_string();
+        body_set.spawn(async move {
+            let res = fetch_bodies(&state, &account, &prefix).await;
+            (mailbox_id, res)
+        });
+    }
+
+    while let Some(joined) = body_set.join_next().await {
+        let (mailbox_id, res) = match joined {
+            Ok(t) => t,
+            Err(je) => {
+                tracing::warn!(
+                    account = %account_id,
+                    "body warm task panicked: {je}"
+                );
+                continue;
+            }
+        };
+        match res {
+            Ok(emails) => {
+                let count = emails.len();
+                for email in emails {
+                    let id = email.id.clone();
+                    if !cache.try_set_body(account_id, v, id, email).await {
+                        tracing::debug!(
+                            account = %account_id,
+                            "prefetch: body discarded — version changed mid-fetch"
+                        );
+                        return;
+                    }
+                }
+                tracing::debug!(
+                    account = %account_id,
+                    mailbox = %mailbox_id,
+                    bodies_n = count,
+                    "warmed mailbox bodies"
+                );
+            }
+            Err(e) => tracing::warn!(
+                account = %account_id,
+                mailbox = %mailbox_id,
+                "body warm failed: {e}"
+            ),
+        }
+    }
+
+    tracing::info!(
         account = %account_id,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "prefetch: account warmed"
+        bodies = total_bodies,
+        "warmed account bodies across all mailboxes"
     );
+}
+
+async fn fetch_bodies(
+    state: &crate::types::AppState,
+    account_id: &str,
+    ids: &[String],
+) -> Result<Vec<Email>, Error> {
+    let session_lock = session_for(state, account_id).await?;
+    let session = session_lock.read().await;
+    crate::provider::get_emails(&session, ids, true, None).await
 }
 
 async fn fetch_mailboxes(
@@ -556,7 +753,7 @@ pub fn spawn_warmer(
             move |account| {
                 let s = state_for_warm.clone();
                 async move {
-                    prefetch_account(&s, &account).await;
+                    prefetch_account(s, &account).await;
                 }
             },
         )
@@ -1063,6 +1260,150 @@ mod tests {
             limit: 150,
         };
         assert!(cache.get_inbox_list("acc-1", &k_other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_lists_holds_two_mailbox_entries_simultaneously() {
+        // The warmer warms a list per *every* mailbox, not just inbox. So
+        // the cache must keep both entries — storing Archive must not
+        // evict Inbox.
+        let cache = PrefetchCache::new();
+        let inbox_key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+        };
+        let archive_key = InboxKey {
+            mailbox_id: "archive".into(),
+            limit: 150,
+        };
+        cache
+            .set_inbox_list("acc-1", inbox_key.clone(), vec![email("a")])
+            .await;
+        cache
+            .set_inbox_list("acc-1", archive_key.clone(), vec![email("b")])
+            .await;
+
+        assert!(
+            cache.get_inbox_list("acc-1", &inbox_key).await.is_some(),
+            "Inbox entry must survive a subsequent Archive store"
+        );
+        assert!(
+            cache.get_inbox_list("acc-1", &archive_key).await.is_some(),
+            "Archive entry must coexist with Inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_cache_roundtrip() {
+        let cache = PrefetchCache::new();
+        assert!(cache.get_body("acc-1", "missing").await.is_none());
+        cache
+            .set_body("acc-1", "msg-1".into(), email("msg-1"))
+            .await;
+        let got = cache.get_body("acc-1", "msg-1").await.unwrap();
+        assert_eq!(got.id, "msg-1");
+    }
+
+    #[tokio::test]
+    async fn body_or_fetch_skips_fallback_on_hit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = PrefetchCache::new();
+        cache
+            .set_body("acc-1", "msg-1".into(), email("msg-1"))
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let got = cache
+            .body_or_fetch("acc-1", "msg-1", move || {
+                let c = calls_for_closure.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(email("should-not-fire"))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got.id, "msg-1");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "fallback must not run on cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_or_fetch_populates_on_miss() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = PrefetchCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let got = cache
+            .body_or_fetch("acc-1", "msg-1", move || {
+                let c = calls_for_closure.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(email("msg-1"))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got.id, "msg-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Subsequent call: cached, fallback doesn't fire
+        let _ = cache
+            .body_or_fetch("acc-1", "msg-1", || async {
+                panic!("must not run after first miss populates")
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_lists_and_counts_but_not_bodies() {
+        // Per-mutation invalidate must NOT drain body_cache — bodies are
+        // content-only (text/html), unaffected by mark-read/archive/move.
+        // Wiping them on every mutation defeats the prefetch entirely.
+        let cache = PrefetchCache::new();
+        cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+        };
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
+            .await;
+        cache
+            .set_body("acc-1", "msg-1".into(), email("msg-1"))
+            .await;
+
+        cache.invalidate("acc-1").await;
+
+        assert!(cache.get_mailboxes("acc-1").await.is_none());
+        assert!(cache.get_inbox_list("acc-1", &key).await.is_none());
+        assert!(
+            cache.get_body("acc-1", "msg-1").await.is_some(),
+            "body_cache must survive a per-mutation invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_full_clears_everything_including_bodies() {
+        let cache = PrefetchCache::new();
+        cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
+        cache
+            .set_body("acc-1", "msg-1".into(), email("msg-1"))
+            .await;
+        let v0 = cache.version("acc-1").await;
+
+        cache.invalidate_full("acc-1").await;
+
+        assert!(cache.get_mailboxes("acc-1").await.is_none());
+        assert!(
+            cache.get_body("acc-1", "msg-1").await.is_none(),
+            "invalidate_full must drain body_cache"
+        );
+        assert_eq!(cache.version("acc-1").await, v0 + 1);
     }
 
     #[tokio::test]
