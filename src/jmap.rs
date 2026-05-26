@@ -75,7 +75,12 @@ struct BodyValue {
 #[serde(rename_all = "camelCase")]
 struct JmapEmailRaw {
     pub id: String,
+    // blobId/threadId are optional in the wire format because `properties_override`
+    // (see `get_emails`) lets callers fetch a subset — e.g. split-counts asks for
+    // only id/from/to/cc/subject. Without `default` the route 500s for Fastmail.
+    #[serde(default)]
     pub blob_id: String,
+    #[serde(default)]
     pub thread_id: String,
     #[serde(default)]
     pub mailbox_ids: HashMap<String, bool>,
@@ -3070,6 +3075,27 @@ END:VCALENDAR";
         assert_eq!(raw.subject, "");
         assert_eq!(raw.preview, "");
         assert_eq!(raw.size, 0);
+    }
+
+    #[test]
+    fn jmap_email_raw_deserializes_with_only_split_count_properties() {
+        // Mirrors what split_counts (src/routes.rs) sends via properties_override:
+        // ["id", "from", "to", "cc", "subject"]. JMAP responds with only those
+        // keys, so JmapEmailRaw must tolerate missing blobId/threadId or the
+        // route 500s for every Fastmail account.
+        let json = serde_json::json!({
+            "id": "e1",
+            "from": [{"email": "a@example.com"}],
+            "to": [],
+            "cc": [],
+            "subject": "Hi"
+        });
+        let raw: JmapEmailRaw = serde_json::from_value(json)
+            .expect("partial Email/get response (id/from/to/cc/subject only) must deserialize");
+        assert_eq!(raw.id, "e1");
+        assert_eq!(raw.blob_id, "");
+        assert_eq!(raw.thread_id, "");
+        assert_eq!(raw.subject, "Hi");
     }
 
     #[test]
