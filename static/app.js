@@ -733,9 +733,16 @@ function selectAccount(account) {
     state.mailboxes = [];
     state.emails = [];
     state.currentMailbox = null;
+    state.currentEmail = null;
     state.selectedIndex = 0;
     state.currentSplit = 'all';
     clearSplitListCache();
+    // emailCache and scrollPositions are keyed by previous-account email ids;
+    // leaving them populated lets prefetch/RSVP/keyboard-nav fire a stale id
+    // against the new account's backend and surface as a 400 from the wrong
+    // provider. const-bound, so wipe in place.
+    for (const k in emailCache) delete emailCache[k];
+    for (const k in scrollPositions) delete scrollPositions[k];
     renderAccounts();
     loadMailboxes();
     loadIdentities();

@@ -1549,6 +1549,28 @@ mod tests {
     }
 
     #[test]
+    fn select_account_clears_cross_account_caches() {
+        // selectAccount must wipe state held under the previous account's
+        // namespace (emailCache, scrollPositions, state.currentEmail) so
+        // post-switch prefetch / keyboard-nav / RSVP writes can't fire a
+        // stale id at the new provider's backend (manifests as 400 from
+        // the wrong provider). Pins the contract in the served JS bundle
+        // — same approach as the other app_js_contains tests above.
+        assert!(
+            APP_JS.contains("state.currentEmail = null"),
+            "selectAccount must null out state.currentEmail"
+        );
+        assert!(
+            APP_JS.contains("for (const k in emailCache) delete emailCache[k]"),
+            "selectAccount must wipe emailCache in place (const-bound)"
+        );
+        assert!(
+            APP_JS.contains("for (const k in scrollPositions) delete scrollPositions[k]"),
+            "selectAccount must wipe scrollPositions in place"
+        );
+    }
+
+    #[test]
     fn api_helper_excludes_settings_from_account_param() {
         // The api() helper allowlists which paths receive ?account=.
         // Settings paths (`/accounts/...`) must NOT be auto-tagged.
