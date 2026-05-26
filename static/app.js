@@ -736,11 +736,11 @@ function selectAccount(account) {
     state.currentEmail = null;
     state.selectedIndex = 0;
     state.currentSplit = 'all';
-    clearSplitListCache();
-    // emailCache and scrollPositions are account-scoped (cacheKey() prefixes
-    // every key with the active account id) — switching accounts can't
-    // surface previous-account state, and returning to an account finds
-    // its earlier cache entries intact.
+    // splitListCache, emailCache, and scrollPositions are all account-scoped
+    // (their keys include state.currentAccount.id). Switching accounts can't
+    // surface previous-account state, and returning to an account finds its
+    // cache entries intact — no cold reloads for previously-viewed mailboxes
+    // or emails.
     renderAccounts();
     loadMailboxes();
     loadIdentities();
@@ -859,10 +859,6 @@ function splitCacheKey() {
     return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${state.starredOnly ? 'S' : ''}:${getSearchQuery()}`;
 }
 
-function clearSplitListCache() {
-    Object.keys(splitListCache).forEach(k => delete splitListCache[k]);
-}
-
 function invalidateSplitListCache() {
     delete splitListCache[splitCacheKey()];
 }
@@ -870,15 +866,8 @@ function invalidateSplitListCache() {
 function selectSplit(splitId) {
     state.currentSplit = splitId;
     renderSplitTabs();
-
-    // Show cached split data instantly — no network wait
-    const key = splitCacheKey();
-    if (splitListCache[key]) {
-        state.emails = [...splitListCache[key]];
-        state.selectedIndex = 0;
-        renderEmailList();
-    }
-
+    // loadEmails now renders from splitListCache instantly when a hit exists,
+    // then refreshes in the background.
     loadEmails();
 }
 
@@ -935,8 +924,16 @@ async function loadEmails() {
     // Snapshot context at request time for stale detection
     const context = splitCacheKey();
 
-    // Show loading only if we have no data (cache miss)
-    if (state.emails.length === 0) {
+    // Superhuman-style: render the cached list immediately so the
+    // mailbox/split/account switch feels instant. The network refresh
+    // below races in the background and replaces the list when it
+    // arrives. Only show the "Loading" placeholder on a true cold miss
+    // (no cached entry and no in-memory emails).
+    if (splitListCache[context]) {
+        state.emails = [...splitListCache[context]];
+        state.selectedIndex = 0;
+        renderEmailList();
+    } else if (state.emails.length === 0) {
         els.emailList.innerHTML = '<div class="loading">Loading</div>';
     }
 
@@ -1262,7 +1259,8 @@ function renderStarredItem() {
 function toggleStarredOnly() {
     if (!state.currentMailbox) return;
     state.starredOnly = !state.starredOnly;
-    clearSplitListCache();
+    // Cache key already encodes the starred flag, so toggling switches to
+    // a different cached slot rather than throwing both away.
     renderStarredItem();
     updateMailboxNameDisplay();
     loadEmails();
@@ -1422,7 +1420,10 @@ function selectMailbox(mailbox) {
     state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
-    clearSplitListCache();
+    // No cache wipe: splitListCache keys include (account, mailbox, split,
+    // starred, search), so switching mailbox simply changes which entry
+    // loadEmails looks up. The cached snapshot for the new mailbox (if any)
+    // renders instantly while the network refresh runs in the background.
     updateMailboxNameDisplay();
     renderMailboxes();
     renderSplitTabs();

@@ -1604,6 +1604,25 @@ mod tests {
     }
 
     #[test]
+    fn loadEmails_renders_cached_snapshot_before_network_refresh() {
+        // The Superhuman-style "instant switch" contract: when loadEmails is
+        // called for a mailbox/split/account with a cached entry, the cached
+        // list renders immediately (no awaiting the network). The fresh fetch
+        // races in the background and replaces the snapshot on arrival. Pins
+        // both halves: (1) the cache-hit branch exists, (2) no caller wipes
+        // the cache wholesale — that would force a cold reload on every
+        // switch and defeat the optimization.
+        assert!(
+            APP_JS.contains("if (splitListCache[context]) {"),
+            "loadEmails must render the cached snapshot before awaiting the network"
+        );
+        assert!(
+            !APP_JS.contains("clearSplitListCache()"),
+            "no caller should wipe splitListCache wholesale — keys are already (account, mailbox, split, starred, search)-scoped"
+        );
+    }
+
+    #[test]
     fn email_caches_are_account_scoped() {
         // Cross-account isolation is enforced by prefixing every cache key
         // with the active account id (`cacheKey(emailId)`), not by wiping
@@ -2892,8 +2911,8 @@ white   = '#fdf6e3'
         let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
         let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
         assert!(
-            rsvp_fn.contains("emailCache[state.currentEmail.id] = state.currentEmail"),
-            "should update emailCache after RSVP"
+            rsvp_fn.contains("emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail"),
+            "should update emailCache after RSVP (account-scoped key via cacheKey)"
         );
     }
 
