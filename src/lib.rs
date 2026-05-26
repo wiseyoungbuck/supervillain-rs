@@ -7,6 +7,7 @@ pub mod jmap;
 pub mod oauth;
 pub mod outlook;
 pub mod platform;
+pub mod prefetch;
 pub mod provider;
 pub mod provider_utils;
 pub mod rate_limit;
