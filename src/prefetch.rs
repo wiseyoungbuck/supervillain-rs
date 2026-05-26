@@ -22,6 +22,13 @@ pub struct InboxKey {
     pub limit: usize,
 }
 
+/// One slot per (mailbox, limit) pair and one slot per mailbox for split
+/// counts — **not** a multi-mailbox LRU. The optimization target is the
+/// "switch accounts → land on inbox" flow; cross-mailbox navigation
+/// within an account (Inbox → Archive → Inbox) evicts the previous entry
+/// and pays a full provider round-trip on each switch. If folder-hopping
+/// turns out to be common in real usage, swap `inbox_list` and
+/// `split_counts` for small LRU maps keyed by `(mailbox_id, limit)`.
 #[derive(Default)]
 struct AccountEntry {
     mailboxes: Option<Vec<Mailbox>>,
@@ -120,6 +127,14 @@ impl PrefetchCache {
     /// from mutation routes (archive / mark-read / delete / move / star) so
     /// the next read repopulates from the live provider instead of serving
     /// pre-mutation data.
+    ///
+    /// **Inbound-change staleness window:** the cache is *only* invalidated
+    /// on user-initiated mutations. Mail arriving server-side (or flag
+    /// changes from another client) doesn't trigger an invalidate, so it
+    /// stays invisible until either the user themselves mutates something
+    /// or the 5-minute warmer cycle re-fetches. If/when a push channel
+    /// (JMAP push, Graph webhooks, IMAP IDLE) is wired up, that handler
+    /// MUST call `invalidate(account_id)` to close this window.
     pub async fn invalidate(&self, account: &str) {
         let entry = self.entry(account).await;
         let mut e = entry.lock().await;
@@ -310,10 +325,13 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
     let started = std::time::Instant::now();
     let cache = state.prefetch.clone();
 
-    // Snapshot the version once and reuse it for every try_set; if any
-    // invalidation fires during this pass, every subsequent write is
-    // discarded atomically. The cost of a missed warm pass is just one
-    // extra live fetch on the next user request.
+    // Snapshot the version once at the start of the pass: any mutation
+    // during the pass discards every subsequent write. At the current
+    // 5-minute interval the cost of a cancelled pass is one extra live
+    // fetch on the next user click, which is fine. **Revisit if the
+    // interval shrinks** — at e.g. 30 s the "cancel the whole pass on
+    // any click" bias becomes wasteful and we'd want to re-snapshot
+    // between phases so an un-invalidated phase can still land.
     let v = cache.version(account_id).await;
 
     // --- mailboxes ---
@@ -326,7 +344,11 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
                     account = %account_id,
                     "prefetch: mailboxes discarded — version changed mid-fetch"
                 );
-                Some(m) // still return mailboxes so we can find the inbox below
+                // Version already changed; the inbox + split-counts
+                // writes below would also be rejected. Bail rather
+                // than burn ~22 s of Gmail RTT on results we'll throw
+                // away.
+                return;
             }
         }
         Err(e) => {
@@ -338,40 +360,65 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
     // --- identities ---
     match fetch_identities(state, account_id).await {
         Ok(ids) => {
-            let _ = cache.try_set_identities(account_id, v, ids).await;
+            if !cache.try_set_identities(account_id, v, ids).await {
+                tracing::debug!(
+                    account = %account_id,
+                    "prefetch: identities discarded — version changed mid-fetch"
+                );
+                return;
+            }
         }
         Err(e) => tracing::warn!(account = %account_id, "prefetch: identities failed: {e}"),
     }
 
     // --- inbox + split counts (only if we have mailboxes to find the inbox role) ---
-    if let Some(mailboxes) = mailboxes
-        && let Some(inbox) = mailboxes
+    if let Some(mailboxes) = mailboxes {
+        let Some(inbox) = mailboxes
             .iter()
             .find(|m| m.role.as_deref() == Some("inbox"))
-    {
+        else {
+            tracing::warn!(
+                account = %account_id,
+                "prefetch: no mailbox with role=inbox; skipping inbox/split-counts warm"
+            );
+            return;
+        };
         let inbox_id = inbox.id.clone();
         match fetch_inbox(state, account_id, &inbox_id).await {
             Ok(emails) => {
-                let _ = cache
+                if !cache
                     .try_set_inbox_list(
                         account_id,
                         v,
                         InboxKey {
                             mailbox_id: inbox_id.clone(),
-                            limit: 150,
+                            limit: crate::routes::DEFAULT_INBOX_LIMIT,
                         },
                         emails,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::debug!(
+                        account = %account_id,
+                        "prefetch: inbox list discarded — version changed mid-fetch"
+                    );
+                    return;
+                }
             }
             Err(e) => tracing::warn!(account = %account_id, "prefetch: inbox list failed: {e}"),
         }
 
         match fetch_split_counts(state, account_id, &inbox_id).await {
             Ok(counts) => {
-                let _ = cache
+                if !cache
                     .try_set_split_counts(account_id, v, inbox_id, counts)
-                    .await;
+                    .await
+                {
+                    tracing::debug!(
+                        account = %account_id,
+                        "prefetch: split-counts discarded — version changed mid-fetch"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(account = %account_id, "prefetch: split-counts failed: {e}")
@@ -379,7 +426,7 @@ pub async fn prefetch_account(state: &crate::types::AppState, account_id: &str) 
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         account = %account_id,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "prefetch: account warmed"
@@ -411,7 +458,14 @@ async fn fetch_inbox(
 ) -> Result<Vec<Email>, Error> {
     let session_lock = session_for(state, account_id).await?;
     let session = session_lock.read().await;
-    let ids = crate::provider::query_emails(&session, Some(mailbox_id), 150, 0, None).await?;
+    let ids = crate::provider::query_emails(
+        &session,
+        Some(mailbox_id),
+        crate::routes::DEFAULT_INBOX_LIMIT,
+        0,
+        None,
+    )
+    .await?;
     crate::provider::get_emails(&session, &ids, false, None).await
 }
 
@@ -427,26 +481,11 @@ async fn fetch_split_counts(
     if config.splits.is_empty() {
         return Ok(HashMap::new());
     }
-    let session_lock = session_for(state, account_id).await?;
-    let session = session_lock.read().await;
-    let fetch_limit = 150 * 10;
-    let ids =
-        crate::provider::query_emails(&session, Some(mailbox_id), fetch_limit, 0, None).await?;
-    let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
-    let mut all = Vec::new();
-    for batch in ids.chunks(500) {
-        let part = crate::provider::get_emails(&session, batch, false, Some(minimal_props)).await?;
-        all.extend(part);
-    }
-    let mut counts = HashMap::new();
-    for split in &config.splits {
-        let n = all
-            .iter()
-            .filter(|e| crate::splits::matches_split(e, split))
-            .count();
-        counts.insert(split.id.clone(), n as u32);
-    }
-    Ok(counts)
+    // Delegate to the same function the `/api/split-counts` handler
+    // calls — drift between warmer and route would mean the cached
+    // value disagrees with what the route would have produced on a
+    // miss, which then flips visibly to the user every invalidate.
+    crate::routes::compute_split_counts(state, Some(account_id), mailbox_id, &config, None).await
 }
 
 async fn session_for(
@@ -482,11 +521,16 @@ pub async fn warm_loop<L, LFut, W, WFut>(
     loop {
         let accounts = list_accounts().await;
         let n = accounts.len();
+        let started = std::time::Instant::now();
         tracing::info!(count = n, "prefetch: warming pass starting");
         for account in accounts {
             warm_account(account).await;
         }
-        tracing::info!(count = n, "prefetch: warming pass complete");
+        tracing::info!(
+            count = n,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "prefetch: warming pass complete"
+        );
         tokio::time::sleep(interval).await;
     }
 }
@@ -810,12 +854,99 @@ mod tests {
         assert!(cache.get_inbox_list("acc-1", &key).await.is_none());
     }
 
+    #[tokio::test]
+    async fn warmer_inbox_key_matches_route_handler_key() {
+        // Regression test for the `is_cacheable` predicate in
+        // list_emails: if the route uses one limit while the warmer
+        // stores under another, every default account-switch fetch
+        // silently bypasses the cache. Today both reference
+        // `routes::DEFAULT_INBOX_LIMIT`. This test pins that contract:
+        // an inbox_list stored at the constant's value is hit by a
+        // lookup that also uses the constant.
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "INBOX".into(),
+            limit: crate::routes::DEFAULT_INBOX_LIMIT,
+        };
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
+            .await;
+
+        // A second lookup using the same constant should hit, not miss.
+        let lookup = InboxKey {
+            mailbox_id: "INBOX".into(),
+            limit: crate::routes::DEFAULT_INBOX_LIMIT,
+        };
+        assert!(
+            cache.get_inbox_list("acc-1", &lookup).await.is_some(),
+            "warmer InboxKey and route InboxKey must share DEFAULT_INBOX_LIMIT"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_forces_next_or_fetch_call_to_refetch() {
+        // Locks in the route-level contract that mutation handlers
+        // currently satisfy by calling state.prefetch.invalidate(&id):
+        // once invalidated, the *next* *_or_fetch call must invoke the
+        // live closure (i.e. re-hit the provider), not return cached
+        // pre-mutation data. If anyone drops one of the invalidate()
+        // lines from a mutation handler this test still passes — but
+        // if the cache itself ever grows a "soft invalidation" mode
+        // that retains stale data past invalidate(), this test fails.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let cache = PrefetchCache::new();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        // Populate
+        let c2 = calls.clone();
+        let _ = cache
+            .mailboxes_or_fetch("acc-1", move || {
+                let c2 = c2.clone();
+                async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![mb("inbox")])
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Simulate a mutation handler firing.
+        cache.invalidate("acc-1").await;
+
+        // Next read must hit the provider, not return the cached vec.
+        let c3 = calls.clone();
+        let got = cache
+            .mailboxes_or_fetch("acc-1", move || {
+                let c3 = c3.clone();
+                async move {
+                    c3.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![mb("inbox-fresh")])
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "post-invalidate read must call the live closure"
+        );
+        assert_eq!(got[0].id, "inbox-fresh");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn warm_loop_runs_initial_pass_then_repeats_each_interval() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let calls = Arc::new(AtomicU32::new(0));
         let interval = std::time::Duration::from_secs(300);
 
+        // Channel-based barrier: the warm closure signals on every
+        // invocation, so the test never has to guess about yield
+        // ordering — it just `recv().await`s the next signal. Beats
+        // the previous "sleep(1ms) to nudge the runtime" pattern,
+        // which silently broke whenever the inner loop's await
+        // ordering shifted.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let cls = calls.clone();
         let handle = tokio::spawn(async move {
             warm_loop(
@@ -823,31 +954,25 @@ mod tests {
                 interval,
                 move |_acc| {
                     let c = cls.clone();
+                    let tx = tx.clone();
                     async move {
                         c.fetch_add(1, Ordering::SeqCst);
+                        let _ = tx.send(());
                     }
                 },
             )
             .await;
         });
 
-        // Move past startup delay + the initial pass.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "initial pass should have completed"
-        );
+        // Initial pass fires ~200 ms after spawn.
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        rx.recv().await.expect("initial pass should have fired");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Skip one interval — the second pass should run.
-        tokio::time::sleep(interval).await;
-        // The next sleep call inside the loop yields; advance past it.
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "second pass should run after one interval"
-        );
+        // Subsequent pass after one interval.
+        tokio::time::advance(interval + std::time::Duration::from_millis(1)).await;
+        rx.recv().await.expect("second pass should have fired");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         handle.abort();
     }

@@ -14,7 +14,16 @@ use crate::error::Error;
 use crate::types::*;
 use crate::{accounts, calendar, provider, search, splits, theme, timezone};
 
-const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
+pub(crate) const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
+
+/// Inbox list size used by the UI's default account-switch fetch.
+///
+/// Kept `pub(crate)` so the prefetch warmer and the `is_cacheable` gate
+/// in `list_emails` reference the same value — if these drift, the
+/// warmer caches a 150-row list that the route handler then rejects
+/// because `params.limit.unwrap_or(N) != N`, and every account switch
+/// silently bypasses the cache.
+pub(crate) const DEFAULT_INBOX_LIMIT: usize = 150;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
@@ -332,7 +341,7 @@ async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
 ) -> Result<impl IntoResponse, Error> {
-    let limit = params.limit.unwrap_or(150);
+    let limit = params.limit.unwrap_or(DEFAULT_INBOX_LIMIT);
     let offset = params.offset.unwrap_or(0);
 
     let mut query = params.search.as_deref().map(search::parse_query);
@@ -359,7 +368,7 @@ async fn list_emails(
         && params.search.is_none()
         && params.starred != Some(true)
         && offset == 0
-        && params.limit.unwrap_or(150) == 150;
+        && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT;
 
     let mut emails = if is_cacheable {
         let id = resolve_account_id(&state, params.account.as_deref()).await?;
@@ -983,7 +992,13 @@ async fn split_counts(
     Ok(Json(serde_json::json!(counts)))
 }
 
-async fn compute_split_counts(
+/// Shared splits-counting implementation used by the `/api/split-counts`
+/// handler *and* the prefetch warmer. Drift between the two would mean
+/// the cached value the warmer wrote was computed from a different
+/// sample size than the route would have produced on a miss, so the
+/// user-facing count would flip every time the cache invalidated. One
+/// function, one constant.
+pub(crate) async fn compute_split_counts(
     state: &AppState,
     account: Option<&str>,
     mailbox_id: &str,
@@ -993,7 +1008,7 @@ async fn compute_split_counts(
     let session_lock = resolve_session(state, account).await?;
     let session = session_lock.read().await;
 
-    let fetch_limit = 150 * SPLIT_OVERFETCH_MULTIPLIER;
+    let fetch_limit = DEFAULT_INBOX_LIMIT * SPLIT_OVERFETCH_MULTIPLIER;
     let email_ids =
         provider::query_emails(&session, Some(mailbox_id), fetch_limit, 0, query.as_ref()).await?;
 
