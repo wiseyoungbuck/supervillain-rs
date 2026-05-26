@@ -16,7 +16,12 @@ pub struct EmailAddress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Email {
     pub id: String,
+    /// May be empty when sourced via JMAP `properties_override` that omits
+    /// `blobId` (e.g. `src/routes.rs` `split_counts`). Don't use this to
+    /// build download URLs without first checking it's non-empty.
     pub blob_id: String,
+    /// May be empty when sourced via JMAP `properties_override` that omits
+    /// `threadId`. Threaded-view code paths should treat empty as "unknown."
     pub thread_id: String,
     pub mailbox_ids: HashMap<String, bool>,
     pub keywords: HashMap<String, bool>,
@@ -415,6 +420,11 @@ pub struct AppState {
     pub tokens_dir: PathBuf,
     pub token_store: std::sync::Arc<dyn crate::platform::TokenStore>,
     pub authorizing: crate::accounts::AuthorizingSlot,
+    /// Cross-account background cache of mailboxes / identities / inbox-list
+    /// / split-counts. Populated by `prefetch::spawn_warmer` at startup and
+    /// every 5 min thereafter; consulted by the four hot routes (`list_*`,
+    /// `split_counts`) before falling through to a live provider call.
+    pub prefetch: std::sync::Arc<crate::prefetch::PrefetchCache>,
 }
 
 // =============================================================================

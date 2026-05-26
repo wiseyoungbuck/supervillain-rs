@@ -1069,15 +1069,15 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
     let has_attachment = !attachments.is_empty();
 
     // Diagnostic: when the caller asked for body content but we extracted
-    // neither plain nor HTML, log the structure so we can tell whether
-    // walk_payload missed a part type or Gmail returned an unexpected shape.
-    if fetch_body && text_body.is_none() && html_body.is_none() {
-        let mut mime_tree = Vec::new();
-        collect_mime_tree(&msg.payload, &mut mime_tree);
+    // neither plain nor HTML AND the message isn't an attachment-only
+    // forward or calendar-only invite (those legitimately have no body),
+    // log the mime tree so we can tell whether walk_payload missed a part
+    // type or Gmail returned an unexpected shape.
+    if fetch_body && text_body.is_none() && html_body.is_none() && !has_attachment && !has_calendar
+    {
         tracing::warn!(
             msg_id = %msg.id,
-            top_mime = %msg.payload.mime_type,
-            parts = ?mime_tree,
+            parts = %mime_path(&msg.payload),
             "Gmail message parsed with empty text/html body — UI will show '(no content)'"
         );
     }
@@ -1189,30 +1189,24 @@ fn walk_payload(
     let is_body_html = mime_type == "text/html" && !is_attachment_disposition;
 
     if is_body_text && text_body.is_none() {
-        if fetch_body {
-            match decode_part_body(part) {
-                BodyDecode::Ok(s) => *text_body = Some(s),
-                BodyDecode::Skipped(reason) => tracing::warn!(
-                    msg_id,
-                    mime_type = %part.mime_type,
-                    reason,
-                    "Gmail text/plain part could not be decoded — body will appear empty"
-                ),
-            }
+        if fetch_body
+            && let Some(body) = &part.body
+            && let Some(data) = &body.data
+            && let Ok(bytes) = base64url_decode(data)
+            && let Ok(s) = String::from_utf8(bytes)
+        {
+            *text_body = Some(s);
         }
         return;
     }
     if is_body_html && html_body.is_none() {
-        if fetch_body {
-            match decode_part_body(part) {
-                BodyDecode::Ok(s) => *html_body = Some(s),
-                BodyDecode::Skipped(reason) => tracing::warn!(
-                    msg_id,
-                    mime_type = %part.mime_type,
-                    reason,
-                    "Gmail text/html part could not be decoded — body will appear empty"
-                ),
-            }
+        if fetch_body
+            && let Some(body) = &part.body
+            && let Some(data) = &body.data
+            && let Ok(bytes) = base64url_decode(data)
+            && let Ok(s) = String::from_utf8(bytes)
+        {
+            *html_body = Some(s);
         }
         return;
     }
@@ -1247,35 +1241,26 @@ fn walk_payload(
     }
 }
 
-fn collect_mime_tree(part: &GmailPayload, out: &mut Vec<String>) {
-    out.push(part.mime_type.clone());
-    if let Some(parts) = &part.parts {
-        for child in parts {
-            collect_mime_tree(child, out);
+/// Render a Gmail payload tree as a single line: `multipart/mixed > [text/plain, text/html]`.
+/// Used only by the empty-body diagnostic in `parse_message_to_email`, so structure
+/// (nesting + siblings) matters more than allocation count — without it the report
+/// can't tell "text/plain was hiding inside multipart/related" from "text/plain
+/// was a top-level sibling."
+fn mime_path(part: &GmailPayload) -> String {
+    let mut buf = part.mime_type.clone();
+    if let Some(parts) = &part.parts
+        && !parts.is_empty()
+    {
+        buf.push_str(" > [");
+        for (i, child) in parts.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            buf.push_str(&mime_path(child));
         }
+        buf.push(']');
     }
-}
-
-enum BodyDecode {
-    Ok(String),
-    Skipped(&'static str),
-}
-
-fn decode_part_body(part: &GmailPayload) -> BodyDecode {
-    let Some(body) = &part.body else {
-        return BodyDecode::Skipped("no body field on part");
-    };
-    let Some(data) = &body.data else {
-        return BodyDecode::Skipped("body.data is null (large payload may be in attachmentId)");
-    };
-    let bytes = match base64url_decode(data) {
-        Ok(b) => b,
-        Err(_) => return BodyDecode::Skipped("base64url decode failed"),
-    };
-    match String::from_utf8(bytes) {
-        Ok(s) => BodyDecode::Ok(s),
-        Err(_) => BodyDecode::Skipped("body bytes are not valid UTF-8"),
-    }
+    buf
 }
 
 fn base64url_decode(s: &str) -> Result<Vec<u8>, Error> {
@@ -2857,6 +2842,68 @@ mod tests {
         assert_eq!(addrs[0].email, "a@x.com");
         assert_eq!(addrs[1].email, "b@y.com");
         assert_eq!(addrs[1].name.as_deref(), Some("Bob"));
+    }
+
+    // ---- mime_path ----
+
+    #[test]
+    fn mime_path_renders_flat_leaf() {
+        let p = GmailPayload {
+            mime_type: "text/plain".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: None,
+            parts: None,
+        };
+        assert_eq!(mime_path(&p), "text/plain");
+    }
+
+    #[test]
+    fn mime_path_renders_nested_tree_with_siblings() {
+        // The whole point of this helper is to keep nesting visible in the
+        // empty-body diagnostic: a flat list would lose "was text/plain under
+        // multipart/related?" which is exactly the forensics we need.
+        let p = GmailPayload {
+            mime_type: "multipart/mixed".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: None,
+            parts: Some(vec![
+                GmailPayload {
+                    mime_type: "multipart/alternative".into(),
+                    filename: String::new(),
+                    headers: vec![],
+                    body: None,
+                    parts: Some(vec![
+                        GmailPayload {
+                            mime_type: "text/plain".into(),
+                            filename: String::new(),
+                            headers: vec![],
+                            body: None,
+                            parts: None,
+                        },
+                        GmailPayload {
+                            mime_type: "text/html".into(),
+                            filename: String::new(),
+                            headers: vec![],
+                            body: None,
+                            parts: None,
+                        },
+                    ]),
+                },
+                GmailPayload {
+                    mime_type: "application/pdf".into(),
+                    filename: "doc.pdf".into(),
+                    headers: vec![],
+                    body: None,
+                    parts: None,
+                },
+            ]),
+        };
+        assert_eq!(
+            mime_path(&p),
+            "multipart/mixed > [multipart/alternative > [text/plain, text/html], application/pdf]"
+        );
     }
 
     // ---- parse_message_to_email ----
