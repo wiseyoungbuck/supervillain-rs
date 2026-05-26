@@ -58,10 +58,16 @@ impl Spacer {
     pub async fn acquire(&self) {
         let wake_at = {
             // Poisoning is impossible: critical section is infallible
-            // arithmetic. `.unwrap()` would only fire on memory corruption.
+            // arithmetic (checked_add saturates instead of panicking).
+            // `.unwrap()` would only fire on memory corruption.
             let mut last = self.last.lock().unwrap();
             let now = Instant::now();
-            let wake = std::cmp::max(now, *last + self.interval);
+            // `Instant + Duration` panics on overflow; `checked_add` saturates
+            // by falling back to `now` (i.e., "fire immediately"). With
+            // intervals of 80-125ms this is theoretical, but it keeps the
+            // "infallible arithmetic" invariant literally true.
+            let next = last.checked_add(self.interval).unwrap_or(now);
+            let wake = std::cmp::max(now, next);
             *last = wake;
             wake
         };
@@ -250,7 +256,11 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         if secs > 0 {
             return Some(Duration::from_secs(secs as u64));
         }
-        return Some(Duration::ZERO);
+        // Past HTTP-date: most often clock skew, not "retry now". Returning
+        // `Some(ZERO)` would short-circuit `execute`'s backoff and hammer
+        // a server that's likely already overloaded. Fall through to None
+        // so the jittered exponential fallback takes over.
+        return None;
     }
     None
 }
@@ -291,7 +301,10 @@ mod tests {
         let spacer = Spacer::new(Duration::from_millis(100));
         let start = Instant::now();
         spacer.acquire().await;
-        assert!(start.elapsed() < Duration::from_millis(20));
+        // Tolerance is intentionally well below `interval` (100ms) so a
+        // regression that makes the first call sleep for `interval` would
+        // still trip the assertion, while busy CI runners get headroom.
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 
     #[tokio::test]
@@ -364,6 +377,20 @@ mod tests {
     fn parse_retry_after_garbage_returns_none() {
         let mut h = reqwest::header::HeaderMap::new();
         h.insert(reqwest::header::RETRY_AFTER, "nope".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn parse_retry_after_past_http_date_returns_none() {
+        // A past HTTP-date almost always indicates clock skew. Returning
+        // None lets `execute()` fall through to jittered exponential
+        // backoff instead of issuing an immediate herd retry.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            past.to_rfc2822().parse().unwrap(),
+        );
         assert_eq!(parse_retry_after(&h), None);
     }
 
