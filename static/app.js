@@ -737,15 +737,22 @@ function selectAccount(account) {
     state.selectedIndex = 0;
     state.currentSplit = 'all';
     clearSplitListCache();
-    // emailCache and scrollPositions are keyed by previous-account email ids;
-    // leaving them populated lets prefetch/RSVP/keyboard-nav fire a stale id
-    // against the new account's backend and surface as a 400 from the wrong
-    // provider. const-bound, so wipe in place.
-    for (const k in emailCache) delete emailCache[k];
-    for (const k in scrollPositions) delete scrollPositions[k];
+    // emailCache and scrollPositions are account-scoped (cacheKey() prefixes
+    // every key with the active account id) — switching accounts can't
+    // surface previous-account state, and returning to an account finds
+    // its earlier cache entries intact.
     renderAccounts();
     loadMailboxes();
     loadIdentities();
+}
+
+// Account-scoped cache key. Prefixing every read/write with the active
+// account's id keeps emailCache and scrollPositions safe across switches:
+// a Gmail id under account "gmail" can't collide with the same string
+// under account "outlook-aristotle", and re-selecting an account finds
+// its previous cache entries instead of a cold fetch.
+function cacheKey(emailId) {
+    return (state.currentAccount?.id ?? '') + ':' + emailId;
 }
 
 async function loadSplits() {
@@ -984,10 +991,11 @@ async function loadEmailDetail(emailId) {
     saveScrollPosition();
 
     // Use cache if available — render immediately, no await
-    if (emailCache[emailId]) {
-        state.currentEmail = emailCache[emailId];
+    const key = cacheKey(emailId);
+    if (emailCache[key]) {
+        state.currentEmail = emailCache[key];
         renderEmailDetail();
-        els.emailBody.scrollTop = scrollPositions[emailId] || 0;
+        els.emailBody.scrollTop = scrollPositions[key] || 0;
         showView('detail');
         prefetchAdjacentEmails();
         return;
@@ -1006,7 +1014,7 @@ async function loadEmailDetail(emailId) {
 
     try {
         const email = await api('GET', `/emails/${emailId}`);
-        emailCache[emailId] = email;
+        emailCache[cacheKey(emailId)] = email;
         // Only render if we're still looking at this email (user may have navigated away)
         if (state.currentEmail?.id === emailId) {
             state.currentEmail = email;
@@ -1049,9 +1057,10 @@ function prefetchAdjacentEmails() {
     // Prefetch next 3 emails (the ones you'll hit when archiving repeatedly)
     for (let i = 1; i <= 3; i++) {
         const target = state.emails[idx + i];
-        if (target && !emailCache[target.id]) {
+        if (target && !emailCache[cacheKey(target.id)]) {
+            const key = cacheKey(target.id);
             api('GET', `/emails/${target.id}`)
-                .then(email => { emailCache[target.id] = email; })
+                .then(email => { emailCache[key] = email; })
                 .catch(() => {}); // Swallow — prefetch is best-effort
         }
     }
@@ -1389,7 +1398,7 @@ function renderCommandPalette() {
 
 function saveScrollPosition() {
     if (state.view === 'detail' && state.currentEmail) {
-        scrollPositions[state.currentEmail.id] = els.emailBody.scrollTop;
+        scrollPositions[cacheKey(state.currentEmail.id)] = els.emailBody.scrollTop;
     }
 }
 
@@ -3849,14 +3858,14 @@ async function rsvpToEvent(status) {
         const result = await api('POST', `/emails/${state.currentEmail.id}/rsvp`, { status });
         if (result.calendarEvent) {
             state.currentEmail.calendarEvent = result.calendarEvent;
-            emailCache[state.currentEmail.id] = state.currentEmail;
+            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
             renderCalendarCard(result.calendarEvent);
         }
     } catch (err) {
         // Revert optimistic update if we had one
         if (prevEvent) {
             state.currentEmail.calendarEvent = prevEvent;
-            emailCache[state.currentEmail.id] = state.currentEmail;
+            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
             renderCalendarCard(prevEvent);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');

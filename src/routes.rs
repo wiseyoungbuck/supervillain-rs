@@ -1604,24 +1604,29 @@ mod tests {
     }
 
     #[test]
-    fn select_account_clears_cross_account_caches() {
-        // selectAccount must wipe state held under the previous account's
-        // namespace (emailCache, scrollPositions, state.currentEmail) so
-        // post-switch prefetch / keyboard-nav / RSVP writes can't fire a
-        // stale id at the new provider's backend (manifests as 400 from
-        // the wrong provider). Pins the contract in the served JS bundle
-        // — same approach as the other app_js_contains tests above.
+    fn email_caches_are_account_scoped() {
+        // Cross-account isolation is enforced by prefixing every cache key
+        // with the active account id (`cacheKey(emailId)`), not by wiping
+        // caches on account switch. Wiping forced every revisit to refetch
+        // from the provider, which was unusably slow (Gmail in particular
+        // takes seconds per body). The scoped-key approach is both safer
+        // (no leak window between wipe and refill) and preserves state
+        // across switches — returning to an email finds its cached body.
+        assert!(
+            APP_JS.contains("function cacheKey(emailId)"),
+            "static/app.js must define cacheKey() so emailCache/scrollPositions are account-scoped"
+        );
         assert!(
             APP_JS.contains("state.currentEmail = null"),
-            "selectAccount must null out state.currentEmail"
+            "selectAccount must null out state.currentEmail (no cross-account detail residue)"
         );
         assert!(
-            APP_JS.contains("for (const k in emailCache) delete emailCache[k]"),
-            "selectAccount must wipe emailCache in place (const-bound)"
+            !APP_JS.contains("for (const k in emailCache) delete emailCache[k]"),
+            "selectAccount must NOT wipe emailCache — cacheKey() scoping makes the wipe both unnecessary and a performance regression"
         );
         assert!(
-            APP_JS.contains("for (const k in scrollPositions) delete scrollPositions[k]"),
-            "selectAccount must wipe scrollPositions in place"
+            !APP_JS.contains("for (const k in scrollPositions) delete scrollPositions[k]"),
+            "selectAccount must NOT wipe scrollPositions — cacheKey() scoping handles isolation"
         );
     }
 
