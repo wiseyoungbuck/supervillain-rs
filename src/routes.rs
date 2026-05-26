@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post, put},
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -230,6 +231,21 @@ async fn resolve_session(state: &AppState, account: Option<&str>) -> Result<Sess
         .ok_or_else(|| Error::BadRequest(format!("Unknown account: {key}")))
 }
 
+/// Resolve just the account ID (default if None), without requiring the
+/// session to exist. Used by cache-aware handlers so a cached response can
+/// be served before doing any session lookup.
+async fn resolve_account_id(state: &AppState, account: Option<&str>) -> Result<String, Error> {
+    let reg = state.accounts.read().await;
+    let id = match account {
+        Some(a) => a.to_string(),
+        None => reg.default_account.clone(),
+    };
+    if id.is_empty() {
+        return Err(Error::BadRequest("No account specified".into()));
+    }
+    Ok(id)
+}
+
 // =============================================================================
 // Handlers
 // =============================================================================
@@ -257,9 +273,15 @@ async fn list_identities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
-    let mut session = session_lock.write().await;
-    let identities = provider::get_identities(&mut session).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let identities = state
+        .prefetch
+        .identities_or_fetch(&id, || async {
+            let session_lock = resolve_session(&state, Some(&id)).await?;
+            let mut session = session_lock.write().await;
+            provider::get_identities(&mut session).await
+        })
+        .await?;
     Ok(Json(serde_json::json!(identities)))
 }
 
@@ -294,9 +316,15 @@ async fn list_mailboxes(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
-    let session = session_lock.read().await;
-    let mailboxes = provider::get_mailboxes(&session).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let mailboxes = state
+        .prefetch
+        .mailboxes_or_fetch(&id, || async {
+            let session_lock = resolve_session(&state, Some(&id)).await?;
+            let session = session_lock.read().await;
+            provider::get_mailboxes(&session).await
+        })
+        .await?;
     Ok(Json(serde_json::json!(mailboxes)))
 }
 
@@ -304,8 +332,6 @@ async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
-    let session = session_lock.read().await;
     let limit = params.limit.unwrap_or(150);
     let offset = params.offset.unwrap_or(0);
 
@@ -324,16 +350,52 @@ async fn list_emails(
         limit
     };
 
-    let email_ids = provider::query_emails(
-        &session,
-        params.mailbox_id.as_deref(),
-        fetch_limit,
-        offset,
-        query_ref,
-    )
-    .await?;
+    // Default-inbox shape (mailbox_id set, no split, no search, no
+    // starred, default offset/limit) goes through the prefetch cache.
+    // Anything else bypasses it: cache key would explode and the data
+    // is per-query anyway.
+    let is_cacheable = params.mailbox_id.is_some()
+        && params.split_id.is_none()
+        && params.search.is_none()
+        && params.starred != Some(true)
+        && offset == 0
+        && params.limit.unwrap_or(150) == 150;
 
-    let mut emails = provider::get_emails(&session, &email_ids, false, None).await?;
+    let mut emails = if is_cacheable {
+        let id = resolve_account_id(&state, params.account.as_deref()).await?;
+        let key = crate::prefetch::InboxKey {
+            mailbox_id: params.mailbox_id.clone().unwrap(),
+            limit,
+        };
+        state
+            .prefetch
+            .inbox_list_or_fetch(&id, key, || async {
+                let session_lock = resolve_session(&state, Some(&id)).await?;
+                let session = session_lock.read().await;
+                let email_ids = provider::query_emails(
+                    &session,
+                    params.mailbox_id.as_deref(),
+                    fetch_limit,
+                    offset,
+                    query_ref,
+                )
+                .await?;
+                provider::get_emails(&session, &email_ids, false, None).await
+            })
+            .await?
+    } else {
+        let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+        let session = session_lock.read().await;
+        let email_ids = provider::query_emails(
+            &session,
+            params.mailbox_id.as_deref(),
+            fetch_limit,
+            offset,
+            query_ref,
+        )
+        .await?;
+        provider::get_emails(&session, &email_ids, false, None).await?
+    };
 
     // Apply split filtering
     if let Some(ref split_id) = params.split_id {
@@ -538,9 +600,12 @@ async fn archive_email(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::archive(&session, &email_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -549,9 +614,12 @@ async fn trash_email(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::trash(&session, &email_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -560,9 +628,12 @@ async fn mark_read(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::mark_read(&session, &email_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -571,9 +642,12 @@ async fn mark_unread(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::mark_unread(&session, &email_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -582,9 +656,12 @@ async fn toggle_flag(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::toggle_flag(&session, &email_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -594,9 +671,12 @@ async fn move_email(
     Query(params): Query<AccountParam>,
     Json(body): Json<MoveBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::move_to_mailbox(&session, &email_id, &body.mailbox_id).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
 }
 
@@ -782,7 +862,8 @@ async fn unsubscribe_and_archive(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
 
     // Get the email to find the sender
@@ -811,6 +892,8 @@ async fn unsubscribe_and_archive(
 
     // Archive all
     let archived = provider::archive_batch(&session, &all_ids).await?;
+    drop(session);
+    state.prefetch.invalidate(&id).await;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -851,28 +934,68 @@ async fn split_counts(
         return Ok(Json(serde_json::json!({})));
     }
 
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
-    let session = session_lock.read().await;
+    // Default-view counts (no starred filter) go through the prefetch
+    // cache; the starred-filter variant is per-session ephemeral and
+    // bypasses the cache so it doesn't pollute the steady-state entry.
+    let is_cacheable = params.starred != Some(true);
 
-    // When the sidebar Starred filter is active, restrict the count query to
-    // flagged emails so tab counts match the rows the user sees in the list.
-    let query = if params.starred == Some(true) {
-        Some(crate::types::ParsedQuery {
+    let counts: HashMap<String, u32> = if is_cacheable {
+        let id = resolve_account_id(&state, params.account.as_deref()).await?;
+        let mbox_for_key = params.mailbox_id.clone();
+        let mbox_for_fetch = params.mailbox_id.clone();
+        let cfg = config.clone();
+        let state_for_fetch = state.clone();
+        let acct_for_fetch = params.account.clone();
+        state
+            .prefetch
+            .split_counts_or_fetch(&id, &mbox_for_key, || async move {
+                compute_split_counts(
+                    &state_for_fetch,
+                    acct_for_fetch.as_deref(),
+                    &mbox_for_fetch,
+                    &cfg,
+                    None,
+                )
+                .await
+            })
+            .await?
+    } else {
+        let query = crate::types::ParsedQuery {
             is_flagged: Some(true),
             ..Default::default()
-        })
-    } else {
-        None
+        };
+        compute_split_counts(
+            &state,
+            params.account.as_deref(),
+            &params.mailbox_id,
+            &config,
+            Some(query),
+        )
+        .await?
     };
+
+    tracing::debug!(
+        "split-counts: {} splits, {:.0}ms",
+        counts.len(),
+        start.elapsed().as_millis()
+    );
+
+    Ok(Json(serde_json::json!(counts)))
+}
+
+async fn compute_split_counts(
+    state: &AppState,
+    account: Option<&str>,
+    mailbox_id: &str,
+    config: &SplitsConfig,
+    query: Option<crate::types::ParsedQuery>,
+) -> Result<HashMap<String, u32>, Error> {
+    let session_lock = resolve_session(state, account).await?;
+    let session = session_lock.read().await;
+
     let fetch_limit = 150 * SPLIT_OVERFETCH_MULTIPLIER;
-    let email_ids = provider::query_emails(
-        &session,
-        Some(&params.mailbox_id),
-        fetch_limit,
-        0,
-        query.as_ref(),
-    )
-    .await?;
+    let email_ids =
+        provider::query_emails(&session, Some(mailbox_id), fetch_limit, 0, query.as_ref()).await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
     let mut all_emails = Vec::new();
@@ -881,23 +1004,15 @@ async fn split_counts(
         all_emails.extend(emails);
     }
 
-    let mut counts = serde_json::Map::new();
+    let mut counts = HashMap::new();
     for split in &config.splits {
         let count = all_emails
             .iter()
             .filter(|e| splits::matches_split(e, split))
             .count();
-        counts.insert(split.id.clone(), serde_json::json!(count));
+        counts.insert(split.id.clone(), count as u32);
     }
-
-    tracing::debug!(
-        "split-counts: {} emails, {} splits, {:.0}ms",
-        all_emails.len(),
-        config.splits.len(),
-        start.elapsed().as_millis()
-    );
-
-    Ok(Json(serde_json::Value::Object(counts)))
+    Ok(counts)
 }
 
 async fn list_splits(State(state): State<Arc<AppState>>) -> impl IntoResponse {

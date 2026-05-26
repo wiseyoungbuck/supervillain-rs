@@ -5,7 +5,7 @@ use vimmail::{
     accounts::{self, AccountConfig},
     gmail, jmap, outlook, platform,
     platform::{FsTokenStore, TokenStore},
-    provider,
+    prefetch, provider,
     provider::ProviderSession,
     routes, splits, timezone,
     types::{AccountError, AccountRegistry, AppState, SessionLock},
@@ -100,7 +100,16 @@ async fn main() {
         tokens_dir,
         token_store,
         authorizing: accounts::AuthorizingSlot::default(),
+        prefetch: std::sync::Arc::new(prefetch::PrefetchCache::new()),
     });
+
+    // Kick off the background prefetch warmer. The first pass starts
+    // ~200 ms after spawn (let the HTTP server bind first) and re-runs
+    // every 5 minutes for every connected account, keeping the
+    // mailbox / identity / inbox / split-count caches warm so account
+    // switches return from cache instead of waiting on ~24 s of Gmail
+    // split-count requests.
+    prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
 
     let app = routes::router(state);
 

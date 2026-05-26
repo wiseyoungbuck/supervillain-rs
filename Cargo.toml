@@ -33,3 +33,5 @@ percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables tokio::time::pause for deterministic interval testing.
+tokio = { version = "1", features = ["test-util"] }
