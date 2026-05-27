@@ -76,120 +76,44 @@ function escapeHtml(text) {
 }
 
 // ============================================================================
-// HTML sanitization — ported from static/app.js
+// Email-body rendering — sandboxed iframe
 // ============================================================================
+// Attacker-controlled email HTML goes into a sandboxed iframe with neither
+// allow-scripts nor allow-same-origin: scripts in the iframe never run, so
+// the entire class of HTML-sanitizer bypasses (mXSS, scheme tricks,
+// namespace confusion) cannot reach the app origin. allow-popups +
+// allow-popups-to-escape-sandbox lets recipient links open new tabs as a
+// normal browsing context; <base target=_blank> in the srcdoc makes that
+// the default.
 
-function sanitizeStyleContent(css) {
-    css = css.replace(/@import\b[^;]*;?/gi, '');
-    css = css.replace(/@font-face\s*\{[^}]*\}/gi, '');
-    css = css.replace(/url\s*\([^)]*\)/gi, '');
-    css = css.replace(/expression\s*\([^)]*\)/gi, '');
-    css = css.replace(/-moz-binding\s*:[^;]+;?/gi, '');
-    css = css.replace(/behavior\s*:[^;]+;?/gi, '');
-    return css;
+function renderHtmlBodyIframe(container, html) {
+    container.replaceChildren();
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
+    iframe.className = 'email-iframe';
+    iframe.setAttribute('srcdoc', wrapEmailHtml(html));
+    container.appendChild(iframe);
 }
 
-function scopeStyleToEmailBody(css) {
-    return css.replace(
-        /([^{}@]+)\{/g,
-        (match, selectors) => {
-            if (selectors.trim().startsWith('@')) return match;
-            const scoped = selectors.split(',')
-                .map(s => s.trim())
-                .filter(s => s.length > 0)
-                .map(s => `#email-body ${s}`)
-                .join(', ');
-            return scoped + ' {';
-        }
-    );
-}
-
-const SAFE_DATA_IMAGE_PREFIXES = [
-    'data:image/png', 'data:image/jpeg', 'data:image/gif', 'data:image/webp',
-];
-
-function sanitizeHtml(html) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-
-    // Remove dangerous elements
-    const dangerousTags = [
-        'script', 'iframe', 'object', 'embed', 'form', 'input',
-        'button', 'meta', 'base', 'link', 'svg', 'math',
-    ];
-    for (const tag of dangerousTags) {
-        for (const el of doc.querySelectorAll(tag)) el.remove();
-    }
-
-    // Sanitize and scope style elements
-    for (const el of doc.querySelectorAll('style')) {
-        el.textContent = scopeStyleToEmailBody(sanitizeStyleContent(el.textContent));
-    }
-
-    // Sanitize all elements
-    for (const el of doc.querySelectorAll('*')) {
-        const attrs = [...el.attributes];
-        for (const attr of attrs) {
-            const name = attr.name.toLowerCase();
-            const value = attr.value.toLowerCase().trim();
-
-            // Remove event handlers
-            if (name.startsWith('on')) {
-                el.removeAttribute(attr.name);
-                continue;
-            }
-
-            // Remove dangerous URL schemes
-            if (['href', 'src', 'action', 'xlink:href', 'formaction'].includes(name)) {
-                if (value.startsWith('javascript:') || value.startsWith('vbscript:')) {
-                    el.removeAttribute(attr.name);
-                }
-                // Block data: URLs except safe image formats (SVG excluded — can contain script)
-                if (value.startsWith('data:') &&
-                    !SAFE_DATA_IMAGE_PREFIXES.some(p => value.startsWith(p))) {
-                    el.removeAttribute(attr.name);
-                }
-            }
-
-            // Remove dangerous style expressions
-            if (name === 'style') {
-                if (value.includes('expression') || value.includes('javascript')) {
-                    el.removeAttribute(attr.name);
-                }
-            }
-        }
-    }
-
-    // Linkify bare URLs in text nodes
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
-    const textNodes = [];
-    while (walker.nextNode()) textNodes.push(walker.currentNode);
-    for (const node of textNodes) {
-        if (node.parentElement && node.parentElement.closest('a')) continue;
-        const segments = segmentUrls(node.textContent);
-        if (segments.length <= 1 && !segments[0]?.url) continue;
-        const frag = doc.createDocumentFragment();
-        for (const seg of segments) {
-            if (seg.url) {
-                const a = doc.createElement('a');
-                a.href = seg.url;
-                a.textContent = seg.url;
-                a.setAttribute('target', '_blank');
-                a.setAttribute('rel', 'noopener noreferrer');
-                frag.appendChild(a);
-            } else {
-                frag.appendChild(doc.createTextNode(seg.text));
-            }
-        }
-        node.parentNode.replaceChild(frag, node);
-    }
-
-    // Make all links open in a new tab
-    for (const el of doc.querySelectorAll('a[href]')) {
-        el.setAttribute('target', '_blank');
-        el.setAttribute('rel', 'noopener noreferrer');
-    }
-
-    return doc.body.innerHTML;
+function wrapEmailHtml(html) {
+    return '<!doctype html><html><head>'
+        + '<meta charset="utf-8">'
+        + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        + '<base target="_blank">'
+        + '<meta name="color-scheme" content="light dark">'
+        + '<style>'
+        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
+        + 'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;'
+        + 'font-size:15px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
+        + 'img{max-width:100%;height:auto;}'
+        + 'table{max-width:100%;overflow-x:auto;display:block;}'
+        + 'pre{white-space:pre-wrap;overflow-x:auto;}'
+        + 'a{color:#e94560;}'
+        + 'blockquote{border-left:3px solid #ddd;margin:8px 0;padding:4px 12px;color:#666;}'
+        + '</style>'
+        + '</head><body>'
+        + html
+        + '</body></html>';
 }
 
 function segmentUrls(text) {
@@ -473,14 +397,16 @@ function renderEmailDetail(email) {
     }
 
     // Body
+    const bodyEl = document.getElementById('email-body');
     if (email.htmlBody) {
-        document.getElementById('email-body').innerHTML = sanitizeHtml(email.htmlBody);
+        bodyEl.classList.add('html-content');
+        renderHtmlBodyIframe(bodyEl, email.htmlBody);
     } else if (email.textBody) {
-        document.getElementById('email-body').innerHTML =
-            '<div class="plain-text-body">' + linkifyText(email.textBody) + '</div>';
+        bodyEl.classList.remove('html-content');
+        bodyEl.innerHTML = '<div class="plain-text-body">' + linkifyText(email.textBody) + '</div>';
     } else {
-        document.getElementById('email-body').innerHTML =
-            '<div style="padding:16px;color:var(--text-muted)">No content</div>';
+        bodyEl.classList.remove('html-content');
+        bodyEl.innerHTML = '<div style="padding:16px;color:var(--text-muted)">No content</div>';
     }
 }
 

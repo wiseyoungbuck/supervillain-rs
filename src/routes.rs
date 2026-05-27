@@ -111,8 +111,35 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/icon-512.png", get(icon_512))
 }
 
+// Restrictive CSP for the app shell: defense-in-depth so that any future
+// innerHTML sink cannot evaluate inline script. Email HTML is rendered inside
+// a sandboxed iframe (see static/app.js `renderHtmlBodyIframe`) which kills
+// the only attacker-controlled-HTML path that could try to reach this origin.
+//
+// `style-src 'unsafe-inline'` is required because the codebase emits some
+// inline style="..." attributes via innerHTML (status messages, etc); the
+// security-critical directive is `script-src 'self'`. `frame-src 'self' data:`
+// covers iframes whose `srcdoc` parents treat as a `data:`-like origin.
+const APP_CSP: &str = "default-src 'self'; \
+    script-src 'self'; \
+    style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data: https: http:; \
+    font-src 'self' data:; \
+    connect-src 'self'; \
+    frame-src 'self' data:; \
+    object-src 'none'; \
+    base-uri 'none'; \
+    form-action 'self'";
+
+fn html_headers() -> [(&'static str, &'static str); 2] {
+    [
+        ("content-type", "text/html; charset=utf-8"),
+        ("content-security-policy", APP_CSP),
+    ]
+}
+
 async fn index_html() -> impl IntoResponse {
-    ([("content-type", "text/html; charset=utf-8")], INDEX_HTML)
+    (html_headers(), INDEX_HTML)
 }
 
 async fn app_js() -> impl IntoResponse {
@@ -127,7 +154,7 @@ async fn style_css() -> impl IntoResponse {
 }
 
 async fn mobile_html() -> impl IntoResponse {
-    ([("content-type", "text/html; charset=utf-8")], MOBILE_HTML)
+    (html_headers(), MOBILE_HTML)
 }
 
 async fn mobile_app_js() -> impl IntoResponse {
@@ -2323,50 +2350,98 @@ white   = '#fdf6e3'
         );
     }
 
+    // Email HTML is rendered inside a sandboxed iframe (see
+    // `renderHtmlBodyIframe` in static/app.js and static/mobile/app.js)
+    // instead of being passed through a JS sanitizer. The iframe's sandbox
+    // omits `allow-scripts` and `allow-same-origin`, so any script in the
+    // email cannot execute in the app origin — closing the whole class of
+    // HTML-sanitizer-bypass vulnerabilities.
+
     #[test]
-    fn app_js_sanitize_html_linkifies_bare_urls() {
+    fn app_js_renders_email_body_in_sandboxed_iframe() {
         assert!(
-            APP_JS.contains("createTreeWalker"),
-            "sanitizeHtml should walk text nodes to linkify bare URLs"
+            APP_JS.contains("renderHtmlBodyIframe"),
+            "desktop app.js must render HTML email bodies via the sandboxed iframe helper"
         );
         assert!(
-            APP_JS.contains("NodeFilter.SHOW_TEXT"),
-            "sanitizeHtml should filter for text nodes only"
+            !APP_JS.contains("function sanitizeHtml"),
+            "desktop app.js must NOT keep a client-side HTML sanitizer (replaced by iframe sandbox)"
         );
     }
 
     #[test]
-    fn app_js_sanitize_html_skips_existing_links() {
+    fn app_js_iframe_sandbox_blocks_scripts_and_same_origin() {
+        let pos = APP_JS
+            .find("function renderHtmlBodyIframe")
+            .expect("function renderHtmlBodyIframe must exist");
+        let region = &APP_JS[pos..APP_JS.len().min(pos + 2000)];
         assert!(
-            APP_JS.contains("closest('a')"),
-            "sanitizeHtml should not double-linkify URLs already inside <a> tags"
+            region.contains("'allow-popups allow-popups-to-escape-sandbox'"),
+            "iframe sandbox must allow popups only — never allow-scripts or allow-same-origin"
+        );
+        assert!(
+            !region.contains("allow-scripts"),
+            "iframe sandbox must NOT include allow-scripts (would re-enable XSS in the iframe)"
+        );
+        assert!(
+            !region.contains("allow-same-origin"),
+            "iframe sandbox must NOT include allow-same-origin (would let iframe reach /api/*)"
         );
     }
 
     #[test]
-    fn app_js_sanitize_html_sets_link_security_attrs() {
-        // The TreeWalker block sets target and rel on created <a> elements
-        let tree_walker_section = APP_JS
-            .find("createTreeWalker")
-            .expect("should have TreeWalker");
-        let after_walker = &APP_JS[tree_walker_section..];
+    fn mobile_app_js_renders_email_body_in_sandboxed_iframe() {
         assert!(
-            after_walker.contains("noopener noreferrer"),
-            "linkified URLs in sanitizeHtml should have rel=noopener noreferrer"
+            MOBILE_APP_JS.contains("renderHtmlBodyIframe"),
+            "mobile app.js must render HTML email bodies via the sandboxed iframe helper"
+        );
+        assert!(
+            !MOBILE_APP_JS.contains("function sanitizeHtml"),
+            "mobile app.js must NOT keep a client-side HTML sanitizer"
+        );
+        let pos = MOBILE_APP_JS
+            .find("function renderHtmlBodyIframe")
+            .expect("function renderHtmlBodyIframe must exist");
+        let region = &MOBILE_APP_JS[pos..MOBILE_APP_JS.len().min(pos + 2000)];
+        assert!(
+            !region.contains("allow-scripts") && !region.contains("allow-same-origin"),
+            "mobile iframe sandbox must omit allow-scripts and allow-same-origin"
         );
     }
 
-    #[test]
-    fn app_js_segment_urls_raw_mode_allows_ampersand() {
+    #[tokio::test]
+    async fn index_html_sets_restrictive_csp() {
+        let resp = index_html().await.into_response();
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("index.html must set Content-Security-Policy")
+            .to_str()
+            .unwrap();
         assert!(
-            APP_JS.contains("segmentUrls(node.textContent, true)"),
-            "sanitizeHtml should pass raw=true to segmentUrls for unescaped text nodes"
+            csp.contains("script-src 'self'"),
+            "CSP must restrict script-src to 'self' so an innerHTML XSS cannot eval inline script"
         );
-        // The raw regex should not exclude &
         assert!(
-            APP_JS.contains(r#"? /https?:\/\/[^\s<>"')\]]+/g"#),
-            "raw mode regex should allow & in URLs for query strings"
+            csp.contains("object-src 'none'"),
+            "CSP must block <object>/<embed> plugins"
         );
+        assert!(
+            csp.contains("base-uri 'none'"),
+            "CSP must lock down <base> so an attacker cannot rewrite relative URLs"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_html_sets_restrictive_csp() {
+        let resp = mobile_html().await.into_response();
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("mobile index.html must set Content-Security-Policy")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"));
     }
 
     #[test]

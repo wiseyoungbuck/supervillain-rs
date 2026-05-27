@@ -441,16 +441,25 @@
             overflow-wrap: break-word;
         }
 
-        #email-body img { max-width: 100%; height: auto; }
-        #email-body table { max-width: 100%; overflow-x: auto; display: block; }
-        #email-body pre { white-space: pre-wrap; overflow-x: auto; }
-        #email-body a { color: var(--accent); }
-        #email-body blockquote {
-            border-left: 3px solid var(--border);
-            margin: 8px 0;
-            padding: 4px 12px;
-            color: var(--text-muted);
+        /* HTML emails render inside a sandboxed iframe (.email-iframe); the
+           iframe owns its own scrolling and styling, so the parent suppresses
+           padding/scroll for that case. */
+        #email-body.html-content {
+            padding: 0;
+            overflow: hidden;
+            display: flex;
         }
+
+        .email-iframe {
+            flex: 1;
+            width: 100%;
+            border: 0;
+            display: block;
+            background: #fff;
+        }
+
+        #email-body img { max-width: 100%; height: auto; }
+        #email-body a { color: var(--accent); }
 
         .plain-text-body { white-space: pre-wrap; }
     </style>

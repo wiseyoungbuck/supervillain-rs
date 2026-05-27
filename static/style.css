@@ -594,6 +594,12 @@ body {
 
 #email-body.html-content {
     white-space: normal;
+    /* HTML email is rendered inside a sandboxed iframe (.email-iframe); the
+       iframe handles its own scrolling and styling. The parent suppresses its
+       own scroll/padding so the iframe fills the pane. */
+    padding: 0;
+    overflow: hidden;
+    display: flex;
 }
 
 #email-body a {
@@ -605,42 +611,12 @@ body {
     text-decoration: underline;
 }
 
-/* Force dark theme on HTML emails - override sender's colors */
-body:not(.light-theme) #email-body.html-content,
-body:not(.light-theme) #email-body.html-content * {
-    color: var(--fg) !important;
-    background-color: transparent !important;
-    border-color: var(--border) !important;
-}
-
-/* Links stay cyan */
-#email-body.html-content a,
-#email-body.html-content a * {
-    color: var(--accent) !important;
-}
-
-/* Quoted text (replies) - dimmer */
-#email-body.html-content blockquote,
-#email-body.html-content .gmail_quote {
-    border-left: 2px solid var(--fg-dim) !important;
-    padding-left: 12px;
-    color: var(--fg-muted) !important;
-}
-
-/* Email tables: collapse for sender-styled borders */
-#email-body.html-content table {
-    border-collapse: collapse;
-}
-
-#email-body.html-content td,
-#email-body.html-content th {
-    padding: 4px 8px;
-}
-
-/* Code blocks */
-#email-body.html-content pre,
-#email-body.html-content code {
-    background-color: var(--bg-secondary) !important;
+.email-iframe {
+    flex: 1;
+    width: 100%;
+    border: 0;
+    display: block;
+    background: #fff;
 }
 
 /* Compose view */
@@ -697,6 +673,15 @@ body:not(.light-theme) #email-body.html-content * {
     color: var(--fg-muted);
     font-size: 13px;
     line-height: 1.4;
+}
+
+.compose-quote-body {
+    display: flex;
+    min-height: 200px;
+}
+
+.compose-quote-body .email-iframe {
+    min-height: 200px;
 }
 
 .compose-quote.hidden {

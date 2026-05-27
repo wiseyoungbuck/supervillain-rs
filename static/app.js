@@ -1353,7 +1353,7 @@ function renderEmailDetail() {
     }
 
     if (e.htmlBody) {
-        els.emailBody.innerHTML = sanitizeHtml(e.htmlBody);
+        renderHtmlBodyIframe(els.emailBody, e.htmlBody);
         els.emailBody.classList.add('html-content');
     } else {
         els.emailBody.innerHTML = linkifyText(e.textBody || '(no content)');
@@ -2761,7 +2761,7 @@ function startReply(replyAll) {
 
     els.composeSubject.value = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
 
-    const quotedHtml = email.htmlBody ? sanitizeHtml(email.htmlBody) : null;
+    const quotedHtml = email.htmlBody || null;
     const quotedText = email.htmlBody
         ? htmlToPlainText(email.htmlBody)
         : (email.textBody || '');
@@ -2775,12 +2775,7 @@ function startReply(replyAll) {
     autoSelectFromAddress(email);
 
     const header = `On ${formatDate(email.receivedAt)}, ${from?.name || from?.email} wrote:`;
-    if (quotedHtml) {
-        els.composeQuote.innerHTML = `<p><strong>${escapeHtml(header)}</strong></p>${quotedHtml}`;
-    } else {
-        els.composeQuote.innerHTML = `<p><strong>${escapeHtml(header)}</strong></p><pre>${escapeHtml(quotedText)}</pre>`;
-    }
-    els.composeQuote.classList.remove('hidden');
+    renderComposeQuote(header, quotedHtml, quotedText);
 
     showView('compose');
 }
@@ -2795,7 +2790,7 @@ function startForward() {
     els.composeSubject.value = email.subject.startsWith('Fwd:') ? email.subject : `Fwd: ${email.subject}`;
 
     const from = email.from[0];
-    const quotedHtml = email.htmlBody ? sanitizeHtml(email.htmlBody) : null;
+    const quotedHtml = email.htmlBody || null;
     const quotedText = email.htmlBody
         ? htmlToPlainText(email.htmlBody)
         : (email.textBody || '');
@@ -2803,12 +2798,7 @@ function startForward() {
     state.replyContext = { quotedHtml, quotedText };
 
     const headerLines = `---------- Forwarded message ---------<br>From: ${escapeHtml(from?.name || '')} &lt;${escapeHtml(from?.email)}&gt;<br>Subject: ${escapeHtml(email.subject)}`;
-    if (quotedHtml) {
-        els.composeQuote.innerHTML = `<p>${headerLines}</p>${quotedHtml}`;
-    } else {
-        els.composeQuote.innerHTML = `<p>${headerLines}</p><pre>${escapeHtml(quotedText)}</pre>`;
-    }
-    els.composeQuote.classList.remove('hidden');
+    renderComposeQuote(headerLines, quotedHtml, quotedText);
 
     showView('compose');
 }
@@ -3489,154 +3479,60 @@ function escapeAttr(text) {
     return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Strip color-related CSS properties from inline styles.
-// Preserves layout (margin, padding, display) while removing colors.
-function stripColorStyles(styleString) {
-    const colorProps = [
-        'color', 'background-color',
-        'outline-color', 'text-decoration-color', 'text-shadow', 'box-shadow'
-    ];
-    return styleString.split(';')
-        .map(d => d.trim())
-        .flatMap(d => {
-            if (!d) return [];
-            const propName = d.split(':')[0]?.trim().toLowerCase();
-            if (!propName) return [];
-            // Always preserve background-image (contains url())
-            if (propName === 'background-image') return [d];
-            // For background shorthand: extract url() as background-image, strip color parts
-            if (propName === 'background') {
-                const urlMatch = d.match(/url\s*\([^)]*\)/i);
-                return urlMatch ? ['background-image: ' + urlMatch[0]] : [];
-            }
-            if (colorProps.some(cp => propName === cp || propName.startsWith(cp + '-'))) return [];
-            return [d];
-        })
-        .join('; ');
-}
-
-function sanitizeStyleContent(css) {
-    // Remove @import rules (external resource loading / tracking)
-    css = css.replace(/@import\b[^;]*;?/gi, '');
-    // Remove @font-face rules (external resource loading)
-    css = css.replace(/@font-face\s*\{[^}]*\}/gi, '');
-    // Strip external url() references (tracking pixels) but preserve cid: URLs (inline images)
-    css = css.replace(/url\s*\(\s*(?!['"]?cid:)[^)]*\)/gi, '');
-    // Remove expression() (IE CSS expressions)
-    css = css.replace(/expression\s*\([^)]*\)/gi, '');
-    // Remove -moz-binding (Firefox XBL)
-    css = css.replace(/-moz-binding\s*:[^;]+;?/gi, '');
-    // Remove behavior (IE HTC)
-    css = css.replace(/behavior\s*:[^;]+;?/gi, '');
-    return css;
-}
-
-function scopeStyleToEmailBody(css) {
-    // Prefix all CSS selectors with #email-body to prevent leaking into app UI
-    return css.replace(
-        /([^{}@]+)\{/g,
-        (match, selectors) => {
-            // Don't modify @-rules (@media, @keyframes, etc.)
-            if (selectors.trim().startsWith('@')) return match;
-            const scoped = selectors.split(',')
-                .map(s => s.trim())
-                .filter(s => s.length > 0)
-                .map(s => `#email-body ${s}`)
-                .join(', ');
-            return scoped + ' {';
-        }
-    );
-}
-
-function sanitizeHtml(html) {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-
-    // Remove dangerous elements (style kept and sanitized separately)
-    const dangerousTags = ['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'meta', 'base', 'link', 'svg', 'math'];
-    dangerousTags.forEach(tag => {
-        doc.querySelectorAll(tag).forEach(el => el.remove());
-    });
-
-    // Sanitize and scope style elements
-    doc.querySelectorAll('style').forEach(el => {
-        el.textContent = scopeStyleToEmailBody(sanitizeStyleContent(el.textContent));
-    });
-
-    // Sanitize all elements
-    doc.querySelectorAll('*').forEach(el => {
-        // Remove legacy HTML color attributes
-        if (el.hasAttribute('bgcolor')) el.removeAttribute('bgcolor');
-        if (el.hasAttribute('color')) el.removeAttribute('color');
-
-        const attrs = [...el.attributes];
-        attrs.forEach(attr => {
-            const name = attr.name.toLowerCase();
-            const value = attr.value.toLowerCase();
-
-            // Remove event handlers
-            if (name.startsWith('on')) {
-                el.removeAttribute(attr.name);
-                return;
-            }
-
-            // Remove dangerous URL schemes in href/src/action
-            if (['href', 'src', 'action', 'xlink:href', 'formaction'].includes(name)) {
-                if (value.startsWith('javascript:') || value.startsWith('vbscript:')) {
-                    el.removeAttribute(attr.name);
-                }
-                // Block data: URLs except for images
-                if (value.startsWith('data:') && !value.startsWith('data:image/')) {
-                    el.removeAttribute(attr.name);
-                }
-            }
-
-            // Strip color styles, remove dangerous expressions
-            if (name === 'style') {
-                if (value.includes('expression') || value.includes('javascript')) {
-                    el.removeAttribute(attr.name);
-                    return;
-                }
-                const cleaned = stripColorStyles(attr.value);
-                if (cleaned) {
-                    el.setAttribute('style', cleaned);
-                } else {
-                    el.removeAttribute('style');
-                }
-            }
-        });
-    });
-
-    // Linkify bare URLs in text nodes
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
-    const textNodes = [];
-    while (walker.nextNode()) textNodes.push(walker.currentNode);
-    for (const node of textNodes) {
-        if (node.parentElement && node.parentElement.closest('a')) continue;
-        const segments = segmentUrls(node.textContent, true);
-        if (segments.length <= 1 && !segments[0]?.url) continue;
-        const frag = doc.createDocumentFragment();
-        for (const seg of segments) {
-            if (seg.url) {
-                const a = doc.createElement('a');
-                a.href = seg.url;
-                a.textContent = seg.url;
-                a.setAttribute('target', '_blank');
-                a.setAttribute('rel', 'noopener noreferrer');
-                frag.appendChild(a);
-            } else {
-                frag.appendChild(doc.createTextNode(seg.text));
-            }
-        }
-        node.parentNode.replaceChild(frag, node);
+// Render attacker-controlled email HTML in a sandboxed iframe. The sandbox
+// token list deliberately omits allow-scripts and allow-same-origin, so
+// scripts inside the iframe do not run at all — closing the entire class of
+// HTML-sanitizer bypasses (mXSS, scheme tricks, namespace confusion, future
+// parser quirks). allow-popups + allow-popups-to-escape-sandbox lets links
+// click through to new tabs as a normal browsing context. <base target=_blank>
+// in the srcdoc makes all links default to opening externally.
+// Header is trusted HTML (caller composed it from escapeHtml output); body is
+// attacker-controlled and goes into an iframe via renderHtmlBodyIframe.
+function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
+    const headerEl = document.createElement('p');
+    headerEl.innerHTML = headerHtml;
+    els.composeQuote.replaceChildren(headerEl);
+    if (quotedHtml) {
+        const bodyHost = document.createElement('div');
+        bodyHost.className = 'compose-quote-body';
+        els.composeQuote.appendChild(bodyHost);
+        renderHtmlBodyIframe(bodyHost, quotedHtml);
+    } else {
+        const pre = document.createElement('pre');
+        pre.textContent = quotedText;
+        els.composeQuote.appendChild(pre);
     }
+    els.composeQuote.classList.remove('hidden');
+}
 
-    // Make all links open in a new tab
-    doc.querySelectorAll('a[href]').forEach(el => {
-        el.setAttribute('target', '_blank');
-        el.setAttribute('rel', 'noopener noreferrer');
-    });
+function renderHtmlBodyIframe(container, html) {
+    container.replaceChildren();
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
+    iframe.className = 'email-iframe';
+    iframe.setAttribute('srcdoc', wrapEmailHtml(html));
+    container.appendChild(iframe);
+}
 
-    return doc.body.innerHTML;
+function wrapEmailHtml(html) {
+    return '<!doctype html><html><head>'
+        + '<meta charset="utf-8">'
+        + '<base target="_blank">'
+        + '<meta name="color-scheme" content="light dark">'
+        + '<style>'
+        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
+        + 'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
+        + 'font-size:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
+        + 'img{max-width:100%;height:auto;}'
+        + 'a{color:#0366d6;}'
+        + 'blockquote,.gmail_quote{border-left:2px solid #ccc;padding-left:12px;margin-left:0;color:#555;}'
+        + 'table{border-collapse:collapse;}'
+        + 'td,th{padding:4px 8px;}'
+        + 'pre,code{background:#f4f4f4;padding:2px 4px;border-radius:3px;}'
+        + '</style>'
+        + '</head><body>'
+        + html
+        + '</body></html>';
 }
 
 // Strips HTML tags and returns plain text. Uses innerText to preserve
