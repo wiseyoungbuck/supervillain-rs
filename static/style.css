@@ -676,12 +676,15 @@ body {
 }
 
 .compose-quote-body {
-    display: flex;
-    min-height: 200px;
+    display: block;
 }
 
+/* The compose-quote iframe is autosized at load time: parent reads
+   scrollHeight via the allow-same-origin sandbox and sets .style.height. */
 .compose-quote-body .email-iframe {
-    min-height: 200px;
+    width: 100%;
+    border: 0;
+    display: block;
 }
 
 .compose-quote.hidden {

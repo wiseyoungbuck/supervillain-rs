@@ -30,6 +30,11 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 mail-builder = "0.4"
 percent-encoding = "2"
+# Vetted HTML allowlist sanitizer. Used to strip script/event-handlers/dangerous
+# URL schemes from outgoing reply/forward html_body — the iframe sandbox handles
+# inbound display, but outgoing mail goes to recipients whose clients may render
+# unsafely (defense in depth for the people we send to).
+ammonia = "4"
 
 [dev-dependencies]
 tempfile = "3"

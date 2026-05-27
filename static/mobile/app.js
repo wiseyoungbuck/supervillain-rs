@@ -91,25 +91,66 @@ function renderHtmlBodyIframe(container, html) {
     const iframe = document.createElement('iframe');
     iframe.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
     iframe.className = 'email-iframe';
-    iframe.setAttribute('srcdoc', wrapEmailHtml(html));
+    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html), isDarkTheme()));
     container.appendChild(iframe);
 }
 
-function wrapEmailHtml(html) {
+// Mobile follows the OS color scheme (prefers-color-scheme media query in
+// the page <style>). matchMedia gives us the same signal to mirror inside
+// the iframe so the email doesn't render bright in a dark UI.
+function isDarkTheme() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
+// Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
+// cosmetic — the iframe sandbox is the security boundary, not this function.
+function linkifyHtml(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+    for (const node of textNodes) {
+        if (node.parentElement && node.parentElement.closest('a')) continue;
+        const segments = segmentUrls(node.textContent);
+        if (segments.length <= 1 && !segments[0]?.url) continue;
+        const frag = doc.createDocumentFragment();
+        for (const seg of segments) {
+            if (seg.url) {
+                const a = doc.createElement('a');
+                a.href = seg.url;
+                a.textContent = seg.url;
+                a.setAttribute('target', '_blank');
+                a.setAttribute('rel', 'noopener noreferrer');
+                frag.appendChild(a);
+            } else {
+                frag.appendChild(doc.createTextNode(seg.text));
+            }
+        }
+        node.parentNode.replaceChild(frag, node);
+    }
+    return doc.body.innerHTML;
+}
+
+function wrapEmailHtml(html, dark) {
+    const bg = dark ? '#1a1a2e' : '#fff';
+    const fg = dark ? '#e0e0e0' : '#222';
+    const linkColor = dark ? '#e94560' : '#e94560';
+    const quoteBorder = dark ? '#444' : '#ddd';
+    const quoteFg = dark ? '#999' : '#666';
     return '<!doctype html><html><head>'
         + '<meta charset="utf-8">'
         + '<meta name="viewport" content="width=device-width, initial-scale=1">'
         + '<base target="_blank">'
-        + '<meta name="color-scheme" content="light dark">'
+        + '<meta name="color-scheme" content="' + (dark ? 'dark' : 'light') + '">'
         + '<style>'
-        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
+        + 'html,body{margin:0;padding:12px;background:' + bg + ';color:' + fg + ';'
         + 'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;'
         + 'font-size:15px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
         + 'img{max-width:100%;height:auto;}'
         + 'table{max-width:100%;overflow-x:auto;display:block;}'
         + 'pre{white-space:pre-wrap;overflow-x:auto;}'
-        + 'a{color:#e94560;}'
-        + 'blockquote{border-left:3px solid #ddd;margin:8px 0;padding:4px 12px;color:#666;}'
+        + 'a{color:' + linkColor + ';}'
+        + 'blockquote{border-left:3px solid ' + quoteBorder + ';margin:8px 0;padding:4px 12px;color:' + quoteFg + ';}'
         + '</style>'
         + '</head><body>'
         + html

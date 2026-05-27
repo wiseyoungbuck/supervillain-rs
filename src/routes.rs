@@ -118,15 +118,17 @@ pub fn router(state: Arc<AppState>) -> Router {
 //
 // `style-src 'unsafe-inline'` is required because the codebase emits some
 // inline style="..." attributes via innerHTML (status messages, etc); the
-// security-critical directive is `script-src 'self'`. `frame-src 'self' data:`
-// covers iframes whose `srcdoc` parents treat as a `data:`-like origin.
+// security-critical directive is `script-src 'self'`. Per CSP3, srcdoc
+// iframes inherit this policy from the parent rather than being matched
+// against `frame-src` — `frame-src 'self'` is kept for any future non-srcdoc
+// embeds, not because srcdoc needs it.
 const APP_CSP: &str = "default-src 'self'; \
     script-src 'self'; \
     style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: https: http:; \
     font-src 'self' data:; \
     connect-src 'self'; \
-    frame-src 'self' data:; \
+    frame-src 'self'; \
     object-src 'none'; \
     base-uri 'none'; \
     form-action 'self'";
@@ -716,6 +718,17 @@ async fn move_email(
     Ok(Json(serde_json::json!({"success": success})))
 }
 
+// Defense in depth for outbound HTML: scrubs scripts, event handlers,
+// dangerous URL schemes (javascript:/vbscript:/non-image data:), and other
+// well-known XSS vectors before the message hits the wire. The iframe sandbox
+// protects *our* viewer, but reply/forward bodies carry the original sender's
+// HTML out to recipients whose clients may render it unsafely. Ammonia's
+// defaults are a vetted allowlist sanitizer; this prevents us from being a
+// laundering vector for an attacker's payload across the address book.
+fn sanitize_outgoing_html(html: &str) -> String {
+    ammonia::clean(html)
+}
+
 async fn send_email_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
@@ -739,7 +752,7 @@ async fn send_email_handler(
         } else {
             Some(body.bcc)
         },
-        html_body: body.html_body,
+        html_body: body.html_body.map(|h| sanitize_outgoing_html(&h)),
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: body.attachments,
@@ -2370,22 +2383,55 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn app_js_iframe_sandbox_blocks_scripts_and_same_origin() {
+    fn outgoing_html_strips_scripts_and_javascript_urls() {
+        // Reply/forward propagates the original sender's HTML out to
+        // recipients whose clients may render it unsafely. The iframe
+        // sandbox protects only us; outbound sanitization is defense in
+        // depth for the recipients.
+        let dirty = r#"<p>hi <script>alert(1)</script><a href="javascript:steal()">x</a></p>"#;
+        let cleaned = sanitize_outgoing_html(dirty);
+        assert!(
+            !cleaned.contains("<script"),
+            "outbound sanitizer must strip <script> tags"
+        );
+        assert!(
+            !cleaned.to_lowercase().contains("javascript:"),
+            "outbound sanitizer must strip javascript: URLs"
+        );
+        // Should preserve benign content.
+        assert!(cleaned.contains("hi"));
+    }
+
+    #[test]
+    fn outgoing_html_bypass_via_whitespace_prefix_is_blocked() {
+        // The very bypass that motivated this whole change (leading TAB
+        // before javascript: in href) must be neutralized server-side too.
+        let dirty = "<a href=\"\tjavascript:alert(1)\">x</a>";
+        let cleaned = sanitize_outgoing_html(dirty);
+        assert!(
+            !cleaned.to_lowercase().contains("javascript:"),
+            "outbound sanitizer must strip whitespace-prefixed javascript: URLs"
+        );
+    }
+
+    #[test]
+    fn app_js_iframe_sandbox_never_allows_scripts() {
+        // Strict invariant: `allow-scripts` must NEVER appear in any email-iframe
+        // sandbox token list — that is what closes the entire XSS class. Both the
+        // read-side iframe and the compose-quote autosize iframe must respect
+        // this. (Compose-quote uses `allow-same-origin` for scrollHeight
+        // measurement, which is safe specifically because scripts are absent.)
         let pos = APP_JS
             .find("function renderHtmlBodyIframe")
             .expect("function renderHtmlBodyIframe must exist");
         let region = &APP_JS[pos..APP_JS.len().min(pos + 2000)];
         assert!(
             region.contains("'allow-popups allow-popups-to-escape-sandbox'"),
-            "iframe sandbox must allow popups only — never allow-scripts or allow-same-origin"
+            "read-side iframe sandbox token list must be allow-popups+allow-popups-to-escape-sandbox"
         );
         assert!(
             !region.contains("allow-scripts"),
-            "iframe sandbox must NOT include allow-scripts (would re-enable XSS in the iframe)"
-        );
-        assert!(
-            !region.contains("allow-same-origin"),
-            "iframe sandbox must NOT include allow-same-origin (would let iframe reach /api/*)"
+            "iframe sandbox must NOT include allow-scripts (would re-enable XSS)"
         );
     }
 

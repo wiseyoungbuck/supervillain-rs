@@ -3496,7 +3496,7 @@ function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
         const bodyHost = document.createElement('div');
         bodyHost.className = 'compose-quote-body';
         els.composeQuote.appendChild(bodyHost);
-        renderHtmlBodyIframe(bodyHost, quotedHtml);
+        renderHtmlBodyIframe(bodyHost, quotedHtml, { autosize: true });
     } else {
         const pre = document.createElement('pre');
         pre.textContent = quotedText;
@@ -3505,30 +3505,91 @@ function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
     els.composeQuote.classList.remove('hidden');
 }
 
-function renderHtmlBodyIframe(container, html) {
+// Read-side (default): sandbox omits allow-scripts AND allow-same-origin —
+// scripts in the iframe never run, closing the whole class of HTML-sanitizer
+// bypasses. allow-popups + allow-popups-to-escape-sandbox lets recipient
+// links click through to new tabs; <base target=_blank> makes that default.
+//
+// Compose-quote side (opts.autosize=true): swaps to sandbox="allow-same-origin"
+// (still no scripts/forms/popups) so the parent can read
+// contentDocument.body.scrollHeight and resize the iframe to fit. Same-origin
+// is safe *precisely because* allow-scripts is absent: no JS runs in the
+// iframe, so granting same-origin just lets the parent measure passive DOM.
+function renderHtmlBodyIframe(container, html, opts) {
+    const autosize = !!(opts && opts.autosize);
     container.replaceChildren();
     const iframe = document.createElement('iframe');
-    iframe.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
+    iframe.setAttribute(
+        'sandbox',
+        autosize ? 'allow-same-origin' : 'allow-popups allow-popups-to-escape-sandbox'
+    );
     iframe.className = 'email-iframe';
-    iframe.setAttribute('srcdoc', wrapEmailHtml(html));
+    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html), isDarkTheme()));
+    if (autosize) {
+        iframe.addEventListener('load', () => {
+            try {
+                const h = iframe.contentDocument?.body?.scrollHeight;
+                if (h) iframe.style.height = h + 'px';
+            } catch (_) { /* allow-same-origin should always succeed */ }
+        });
+    }
     container.appendChild(iframe);
 }
 
-function wrapEmailHtml(html) {
+function isDarkTheme() {
+    return !document.body.classList.contains('light-theme');
+}
+
+// Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
+// cosmetic — the iframe sandbox is the security boundary, not this function.
+function linkifyHtml(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode);
+    for (const node of textNodes) {
+        if (node.parentElement && node.parentElement.closest('a')) continue;
+        const segments = segmentUrls(node.textContent, true);
+        if (segments.length <= 1 && !segments[0]?.url) continue;
+        const frag = doc.createDocumentFragment();
+        for (const seg of segments) {
+            if (seg.url) {
+                const a = doc.createElement('a');
+                a.href = seg.url;
+                a.textContent = seg.url;
+                a.setAttribute('target', '_blank');
+                a.setAttribute('rel', 'noopener noreferrer');
+                frag.appendChild(a);
+            } else {
+                frag.appendChild(doc.createTextNode(seg.text));
+            }
+        }
+        node.parentNode.replaceChild(frag, node);
+    }
+    return doc.body.innerHTML;
+}
+
+function wrapEmailHtml(html, dark) {
+    const bg = dark ? '#1e1e1e' : '#fff';
+    const fg = dark ? '#ddd' : '#222';
+    const linkColor = dark ? '#58a6ff' : '#0366d6';
+    const quoteBorder = dark ? '#555' : '#ccc';
+    const quoteFg = dark ? '#aaa' : '#555';
+    const codeBg = dark ? '#2a2a2a' : '#f4f4f4';
     return '<!doctype html><html><head>'
         + '<meta charset="utf-8">'
         + '<base target="_blank">'
-        + '<meta name="color-scheme" content="light dark">'
+        + '<meta name="color-scheme" content="' + (dark ? 'dark' : 'light') + '">'
         + '<style>'
-        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
+        + 'html,body{margin:0;padding:12px;background:' + bg + ';color:' + fg + ';'
         + 'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
         + 'font-size:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
         + 'img{max-width:100%;height:auto;}'
-        + 'a{color:#0366d6;}'
-        + 'blockquote,.gmail_quote{border-left:2px solid #ccc;padding-left:12px;margin-left:0;color:#555;}'
+        + 'a{color:' + linkColor + ';}'
+        + 'blockquote,.gmail_quote{border-left:2px solid ' + quoteBorder + ';padding-left:12px;margin-left:0;color:' + quoteFg + ';}'
         + 'table{border-collapse:collapse;}'
         + 'td,th{padding:4px 8px;}'
-        + 'pre,code{background:#f4f4f4;padding:2px 4px;border-radius:3px;}'
+        + 'pre,code{background:' + codeBg + ';padding:2px 4px;border-radius:3px;}'
         + '</style>'
         + '</head><body>'
         + html
