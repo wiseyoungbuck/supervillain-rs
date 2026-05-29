@@ -1,67 +1,96 @@
 #!/usr/bin/env bash
+# Cross-platform launcher for Supervillain. Detects the host OS at runtime
+# and routes through `open` (macOS) or `omarchy-launch-or-focus-webapp` /
+# `xdg-open` (Linux). Used by the macOS .app bundle (install-macos-app.sh)
+# and the Linux .desktop entry (install-omarchy.sh).
 
-BINARY="${HOME}/.cargo/bin/supervillain"
+set -euo pipefail
+
 PORT=8000
 URL="http://127.0.0.1:${PORT}"
-LOG_FILE="${TMPDIR:-/tmp}/supervillain.log"
+LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 
 port_listening() {
-    /usr/sbin/lsof -i ":${PORT}" -sTCP:LISTEN &>/dev/null
+    if command -v ss &>/dev/null; then
+        ss -tln 2>/dev/null | grep -q ":${PORT} "
+    else
+        lsof -i ":${PORT}" -sTCP:LISTEN &>/dev/null
+    fi
 }
 
-# Hand the URL to the user's default browser. Plain `open URL` honors
-# the macOS LaunchServices default — respecting that is worth more than
-# the chromeless Chrome/Edge `--app=` window we used to force.
+# Hand the URL to the user's preferred webapp surface. On macOS that's the
+# LaunchServices default via `open`. On Omarchy we honor the
+# launch-or-focus wrapper so a second invocation focuses the existing
+# window instead of opening a duplicate. Elsewhere on Linux, xdg-open
+# consults the system default.
 open_webapp() {
-    open "$URL"
+    if [[ "$OSTYPE" == darwin* ]]; then
+        open "$URL"
+    elif command -v omarchy-launch-or-focus-webapp &>/dev/null; then
+        omarchy-launch-or-focus-webapp "127.0.0.1:${PORT}" "$URL"
+    else
+        xdg-open "$URL"
+    fi
 }
 
-# Tests source this file to exercise functions in isolation; skip the
-# main flow when that flag is set.
-[[ "${SUPERVILLAIN_LAUNCHER_SOURCE_ONLY:-0}" == "1" ]] && return 0
+# Surface a failure to the user via a native notification, falling back to
+# stderr when no GUI channel is available.
+notify_error() {
+    local msg="$1"
+    if [[ "$OSTYPE" == darwin* ]]; then
+        osascript -e "display alert \"Supervillain\" message \"${msg}\" as critical" &>/dev/null || true
+    elif command -v notify-send &>/dev/null; then
+        notify-send "Supervillain" "$msg" &>/dev/null || true
+    fi
+    echo "Supervillain: $msg" >&2
+}
 
-# Best-effort: pull latest source and rebuild the binary if the repo is
-# behind upstream. Failures are non-fatal — we still launch what we have.
+# Tests source this file to exercise functions in isolation; either flag
+# short-circuits before the main flow. Both names are kept for symmetry
+# with the historical macOS / Linux launcher pair.
+if [[ "${SUPERVILLAIN_LAUNCHER_SOURCE_ONLY:-0}" == "1" ]] || [[ "${SUPERVILLAIN_LAUNCHER_LINUX_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0
+fi
+
+# Best-effort: pull latest source and rebuild if behind upstream. The
+# installer writes a stamp file pointing at the repo; if it's absent we
+# skip the check.
 REPO_STAMP="${XDG_CONFIG_HOME:-$HOME/.config}/supervillain/repo"
 if [[ -f "$REPO_STAMP" ]]; then
-    REPO_DIR="$(cat "$REPO_STAMP")"
-    if [[ -f "$REPO_DIR/scripts/check-and-update.sh" ]]; then
+    REPO_DIR_FROM_STAMP="$(cat "$REPO_STAMP")"
+    if [[ -f "$REPO_DIR_FROM_STAMP/scripts/check-and-update.sh" ]]; then
         # shellcheck disable=SC1091
-        source "$REPO_DIR/scripts/check-and-update.sh"
-        check_and_update || true
+        SUPERVILLAIN_REPO_DIR="$REPO_DIR_FROM_STAMP" source "$REPO_DIR_FROM_STAMP/scripts/check-and-update.sh"
+        SUPERVILLAIN_REPO_DIR="$REPO_DIR_FROM_STAMP" check_and_update || true
     fi
 fi
 
-if [[ ! -x "$BINARY" ]]; then
-    osascript -e 'display alert "Supervillain not found" message "Run: cargo install --path /path/to/supervillain-rs" as critical'
+if ! BIN="$(command -v supervillain 2>/dev/null)"; then
+    notify_error "supervillain binary not found on PATH — run: cargo install --path ~/scripture/supervillain"
     exit 1
 fi
 
-# If already running, just open a webapp window
 if port_listening; then
     open_webapp
     exit 0
 fi
 
-# Start the server
-"$BINARY" --no-browser > "$LOG_FILE" 2>&1 &
+nohup "$BIN" --no-browser > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
-# Wait for server to be ready
 for _ in $(seq 1 30); do
-    # Check the process is still alive
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
-        osascript -e 'display alert "Supervillain crashed on startup" message "Check '"$LOG_FILE"' for details." as critical'
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        notify_error "supervillain crashed at startup — check $LOG_FILE"
         exit 1
     fi
     if port_listening; then
         open_webapp
-        wait $SERVER_PID
+        wait "$SERVER_PID"
         exit 0
     fi
     sleep 0.5
 done
 
-osascript -e 'display alert "Supervillain failed to start" message "Check '"$LOG_FILE"' for details." as critical'
-kill $SERVER_PID 2>/dev/null || true
+notify_error "supervillain failed to start within 15s — check $LOG_FILE"
+kill "$SERVER_PID" 2>/dev/null || true
 exit 1

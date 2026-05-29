@@ -5,3 +5,9 @@ static/Gemini_Generated_Image_*.png
 
 # Editor / CLI metadata (machine-specific, do not commit)
 .antigravitycli/
+.claude/scheduled_tasks.lock
+
+# Share Claude Code permission allowlist across collaborators; the user's
+# global gitignore excludes .claude/settings.local.json by default, so
+# this rule re-includes it for this repo.
+!.claude/settings.local.json
