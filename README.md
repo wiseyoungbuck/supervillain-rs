@@ -219,11 +219,13 @@ To use Outlook (email + calendar), register an app in Azure AD / Microsoft Entra
 1. Go to [Azure Portal > App registrations](https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
 2. Click **New registration**
 3. Name: "Supervillain" (or whatever you like)
-4. Supported account types: **"Personal Microsoft accounts only"**.
-   _Do not pick a multitenant option._ Microsoft blocks end-user consent
-   to newly registered multitenant apps until the publisher is verified
-   (requires an MPN ID), which is impractical for self-hosted single-user
-   installs. The matching OAuth endpoint Supervillain targets is `/consumers`.
+4. Supported account types: **"Accounts in any organizational directory
+   and personal Microsoft accounts"**. Required to cover both work/school
+   tenant accounts and personal MSAs. Microsoft will warn that end-user
+   consent for unverified multitenant apps is restricted; for a self-hosted
+   personal install you bypass this by either (a) signing in as the account
+   that owns the app registration, or (b) having a tenant admin grant admin
+   consent for work/school accounts.
 5. Redirect URI: **Web** → `http://localhost:8400/callback`
 6. After creation, copy the **Application (client) ID** — this is your `client-id`
 7. Under **API permissions**, add (all delegated): `User.Read`, `Mail.ReadWrite`,
