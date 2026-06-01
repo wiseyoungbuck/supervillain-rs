@@ -439,7 +439,7 @@ async fn list_emails(
     if let Some(ref split_id) = params.split_id {
         let config = splits::load_splits(
             &state.splits_config_path,
-            std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+            std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
         );
         emails = splits::filter_by_split(emails, split_id, &config);
         emails.truncate(limit);
@@ -984,7 +984,7 @@ async fn split_counts(
 
     let config = splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
     if config.splits.is_empty() {
         return Ok(Json(serde_json::json!({})));
@@ -1080,7 +1080,7 @@ pub(crate) async fn compute_split_counts(
 async fn list_splits(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
     Json(serde_json::json!(config.splits))
 }
@@ -1091,7 +1091,7 @@ async fn create_split(
 ) -> Result<impl IntoResponse, Error> {
     let mut config = splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
 
     // Check for duplicate ID
@@ -1115,7 +1115,7 @@ async fn update_split(
 ) -> Result<impl IntoResponse, Error> {
     let mut config = splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
 
     let existing = config
@@ -1136,7 +1136,7 @@ async fn delete_split(
 ) -> Result<impl IntoResponse, Error> {
     let mut config = splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
 
     let original_len = config.splits.len();
@@ -1170,7 +1170,7 @@ fn default_true_bool() -> bool {
 }
 
 fn timezone_env_override() -> Option<String> {
-    std::env::var("VIMMAIL_TIMEZONE").ok()
+    std::env::var("SUPERVILLAIN_TIMEZONE").ok()
 }
 
 async fn get_timezone(State(state): State<Arc<AppState>>) -> impl IntoResponse {

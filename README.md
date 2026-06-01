@@ -351,9 +351,9 @@ All optional when using the config file.
 |----------|-------------|
 | `FASTMAIL_USERNAME` | Fallback for `username` |
 | `FASTMAIL_API_TOKEN` | Fallback for `api-token` |
-| `VIMMAIL_SPLITS` | Inline JSON splits config (overrides file) |
+| `SUPERVILLAIN_SPLITS` | Inline JSON splits config (overrides file) |
 | `XDG_CONFIG_HOME` | Config directory (default: `~/.config`) |
-| `RUST_LOG` | Log level (`info`, `debug`, `vimmail=debug`) |
+| `RUST_LOG` | Log level (`info`, `debug`, `supervillain=debug`) |
 
 ## Search syntax
 

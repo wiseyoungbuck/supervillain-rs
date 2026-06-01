@@ -673,7 +673,7 @@ async fn fetch_split_counts(
 ) -> Result<HashMap<String, u32>, Error> {
     let config = crate::splits::load_splits(
         &state.splits_config_path,
-        std::env::var("VIMMAIL_SPLITS").ok().as_deref(),
+        std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
     if config.splits.is_empty() {
         return Ok(HashMap::new());

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vimmail::{
+use supervillain::{
     accounts::{self, AccountConfig},
     gmail, jmap, outlook, platform,
     platform::{FsTokenStore, TokenStore},
