@@ -40,7 +40,7 @@ stop_server() {
 
 install_binary() {
     echo "Building and installing from $REPO_DIR..."
-    run cargo install --path "$REPO_DIR"
+    run cargo install --path "$REPO_DIR" --force
 }
 
 start_server() {
