@@ -76,7 +76,8 @@ async fn main() {
         let mut session = session_lock.write().await;
         match provider::get_identities(&mut session).await {
             Ok(identities) => {
-                if let Some(config) = splits::seed_from_identities(&identities, &splits_config_path)
+                if let Some(config) =
+                    splits::seed_from_identities(&identities, &default_account, &splits_config_path)
                 {
                     let names: Vec<_> = config.splits.iter().map(|s| s.name.as_str()).collect();
                     tracing::info!("Auto-created split tabs: {}", names.join(", "));

@@ -101,6 +101,7 @@ impl SplitsConfig {
 /// Returns None if splits already exist (non-empty config file).
 pub fn seed_from_identities(
     identities: &[crate::types::Identity],
+    account: &str,
     config_path: &Path,
 ) -> Option<SplitsConfig> {
     // Don't overwrite existing splits
@@ -109,7 +110,7 @@ pub fn seed_from_identities(
         return None;
     }
 
-    let config = generate_splits_from_identities(identities);
+    let config = generate_splits_from_identities(identities, account);
     if config.splits.is_empty() {
         return None;
     }
@@ -123,7 +124,10 @@ pub fn seed_from_identities(
 
 /// Generate split tabs from identities, one per unique domain.
 /// Skips if there's only one domain (no point in splitting).
-pub fn generate_splits_from_identities(identities: &[crate::types::Identity]) -> SplitsConfig {
+pub fn generate_splits_from_identities(
+    identities: &[crate::types::Identity],
+    account: &str,
+) -> SplitsConfig {
     use std::collections::BTreeSet;
 
     // Collect unique domains
@@ -165,7 +169,7 @@ pub fn generate_splits_from_identities(identities: &[crate::types::Identity]) ->
                     name: None,
                 }],
                 match_mode: MatchMode::Any,
-                account: None,
+                account: Some(account.to_string()),
             }
         })
         .collect();
@@ -826,7 +830,7 @@ mod tests {
             make_identity("user@gmail.com"),
             make_identity("user@aristotle.ai"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 3);
 
         // BTreeMap sorts alphabetically by domain
@@ -847,13 +851,13 @@ mod tests {
             make_identity("user@fastmail.com"),
             make_identity("alias@fastmail.com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert!(config.splits.is_empty());
     }
 
     #[test]
     fn generate_splits_empty_identities_returns_empty() {
-        let config = generate_splits_from_identities(&[]);
+        let config = generate_splits_from_identities(&[], "acct");
         assert!(config.splits.is_empty());
     }
 
@@ -864,7 +868,7 @@ mod tests {
             make_identity("bob@aristoi.ai"),
             make_identity("user@gmail.com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 2);
         assert_eq!(config.splits[0].id, "aristoi");
         assert_eq!(config.splits[1].id, "gmail");
@@ -876,10 +880,26 @@ mod tests {
             make_identity("user@Aristoi.AI"),
             make_identity("user@Gmail.Com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 2);
         assert_eq!(config.splits[0].filters[0].pattern, "*@aristoi.ai");
         assert_eq!(config.splits[1].filters[0].pattern, "*@gmail.com");
+    }
+
+    #[test]
+    fn generated_splits_are_tagged_with_seeding_account() {
+        let identities = vec![
+            make_identity("user@aristoi.ai"),
+            make_identity("user@gmail.com"),
+        ];
+        let config = generate_splits_from_identities(&identities, "aristoi");
+        assert_eq!(config.splits.len(), 2);
+        assert!(
+            config
+                .splits
+                .iter()
+                .all(|s| s.account.as_deref() == Some("aristoi"))
+        );
     }
 
     #[test]
@@ -889,7 +909,7 @@ mod tests {
             make_identity("user@aristoi.com"),
             make_identity("user@gmail.com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 3);
         // All should use full domain since "aristoi" collides
         assert_eq!(config.splits[0].id, "aristoi-ai");
@@ -905,7 +925,7 @@ mod tests {
             make_identity("user@aristoi.ai"),
             make_identity("user@gmail.com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 2);
     }
 
@@ -919,7 +939,7 @@ mod tests {
             make_identity("user@aristoi.ai"),
             make_identity("user@gmail.com"),
         ];
-        let result = seed_from_identities(&identities, &path);
+        let result = seed_from_identities(&identities, "acct", &path);
         assert!(result.is_some());
         assert_eq!(result.unwrap().splits.len(), 2);
 
@@ -950,7 +970,7 @@ mod tests {
             make_identity("user@aristoi.ai"),
             make_identity("user@gmail.com"),
         ];
-        let result = seed_from_identities(&identities, &path);
+        let result = seed_from_identities(&identities, "acct", &path);
         assert!(result.is_none());
 
         // Original config should be preserved
@@ -964,7 +984,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("splits.json");
         let identities = vec![make_identity("user@fastmail.com")];
-        let result = seed_from_identities(&identities, &path);
+        let result = seed_from_identities(&identities, "acct", &path);
         assert!(result.is_none());
     }
 
@@ -976,7 +996,7 @@ mod tests {
             make_identity("matt@fastmail.com"),
             make_identity("matt@company.onmicrosoft.com"),
         ];
-        let config = generate_splits_from_identities(&identities);
+        let config = generate_splits_from_identities(&identities, "acct");
         assert_eq!(config.splits.len(), 2);
         let o365_split = config
             .splits
