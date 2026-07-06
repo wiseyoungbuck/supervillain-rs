@@ -783,6 +783,9 @@ function selectAccount(account) {
     renderAccounts();
     loadMailboxes();
     loadIdentities();
+    // Tab sets are per-account now; rebuild the split row (also refreshes
+    // counts via loadSplitCounts).
+    loadSplits();
 }
 
 // Account-scoped cache key. Prefixing every read/write with the active
@@ -796,7 +799,7 @@ function cacheKey(emailId) {
 
 async function loadSplits() {
     try {
-        state.splits = await fetch('/api/splits').then(r => r.json());
+        state.splits = await api('GET', '/splits');
         renderSplitTabs();
         loadSplitCounts();
     } catch (err) {
@@ -3389,6 +3392,9 @@ async function saveSplit() {
             name,
             filters: [filter],
             match_mode: 'any',
+            // New splits belong to the account being viewed; hand-edit
+            // splits.json to make one global.
+            account: state.currentAccount?.id,
         });
 
         showStatus(`Split "${name}" created`, 'success');

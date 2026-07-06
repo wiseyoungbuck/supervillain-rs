@@ -1732,6 +1732,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_splits_goes_through_account_scoped_api_helper() {
+        // A raw fetch skips ?account= and renders every account's tabs.
+        assert!(
+            APP_JS.contains("state.splits = await api('GET', '/splits')"),
+            "loadSplits must use the api() helper so ?account= is appended"
+        );
+        assert!(
+            !APP_JS.contains("fetch('/api/splits')"),
+            "loadSplits must not bypass api() with a raw fetch"
+        );
+    }
+
+    #[test]
+    fn select_account_reloads_splits() {
+        // Tab sets differ per account; switching must rebuild the row.
+        let start = APP_JS
+            .find("function selectAccount")
+            .expect("selectAccount must exist");
+        let body = &APP_JS[start..start + 1500];
+        assert!(
+            body.contains("loadSplits()"),
+            "selectAccount must call loadSplits()"
+        );
+    }
+
+    #[test]
+    fn save_split_tags_current_account() {
+        assert!(
+            APP_JS.contains("account: state.currentAccount?.id"),
+            "saveSplit must scope new splits to the active account"
+        );
+    }
+
     // =========================================================================
     // Mobile PWA tests
     // =========================================================================
