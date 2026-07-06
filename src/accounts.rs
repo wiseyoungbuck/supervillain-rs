@@ -1088,8 +1088,10 @@ async fn upsert_account(
         promote_default_if_empty(&mut reg, &id);
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        // Inside the write lock so no GET can observe the clean file against
+        // the stale baseline (sync lock, held for a clear() — never awaits).
+        state.reset_config_error_baseline();
     }
-    state.reset_config_error_baseline();
 
     clear_setup_sentinel(&state).await;
     if needs_auth {
@@ -1153,8 +1155,8 @@ async fn delete_account(
         }
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        state.reset_config_error_baseline();
     }
-    state.reset_config_error_baseline();
 
     if let Err(e) = std::fs::remove_file(token_file_path(&state.tokens_dir, &id))
         && e.kind() != std::io::ErrorKind::NotFound
@@ -1179,8 +1181,8 @@ async fn set_default_account(
         reg.default_account = id.clone();
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
+        state.reset_config_error_baseline();
     }
-    state.reset_config_error_baseline();
     Ok(StatusCode::OK)
 }
 
@@ -1255,9 +1257,9 @@ async fn run_and_install_authorize(
         promote_default_if_empty(&mut reg, id);
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| format!("failed to write config: {e}"))?;
+        state.reset_config_error_baseline();
         reg.default_account == id
     };
-    state.reset_config_error_baseline();
 
     Ok((updated_account, is_default))
 }
@@ -1957,6 +1959,58 @@ api-token = tok
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn reset_config_error_baseline_clears_seeded_errors() {
+        // The roborev-268 fix: after an app-made config write, the parse-
+        // error baseline must be empty so the clean rewrite doesn't read as
+        // a hand-edit forever.
+        let state = crate::types::AppState {
+            accounts: tokio::sync::RwLock::new(empty_registry()),
+            account_errors: tokio::sync::RwLock::new(Vec::new()),
+            splits_config_path: PathBuf::from("/x/splits.json"),
+            timezone_config_path: PathBuf::from("/x/timezone.json"),
+            timezone_write_lock: tokio::sync::Mutex::new(()),
+            config_path: PathBuf::from("/x/config"),
+            tokens_dir: PathBuf::from("/x/tokens"),
+            token_store: std::sync::Arc::new(crate::platform::FsTokenStore::new(PathBuf::from(
+                "/x/tokens",
+            ))),
+            authorizing: AuthorizingSlot::default(),
+            config_error_baseline: std::sync::RwLock::new(vec![ConfigParseError {
+                section: "broken".into(),
+                provider: String::new(),
+                reason: "missing required field `provider`".into(),
+            }]),
+            prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+        };
+        state.reset_config_error_baseline();
+        assert!(state.config_error_baseline.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_app_config_write_site_resets_the_baseline() {
+        // Source-level tripwire: each handler write of the config file must
+        // be followed by a baseline reset, or a broken-at-startup config
+        // plus that write path regresses to the permanent-banner bug
+        // (roborev 268 #1). Only handler code is scanned — the test module
+        // is sliced off so its own occurrences don't skew the counts.
+        let src = include_str!("accounts.rs");
+        let handler_src = &src[..src.find("mod tests").expect("tests module exists")];
+        let writes = handler_src
+            .matches("atomic_write_config(&state.config_path")
+            .count();
+        let resets = handler_src
+            .matches("state.reset_config_error_baseline()")
+            .count();
+        assert_eq!(
+            writes, resets,
+            "every atomic_write_config(&state.config_path, ..) handler site must be \
+             paired with state.reset_config_error_baseline() ({writes} writes vs \
+             {resets} resets)"
+        );
+        assert!(writes >= 4, "expected the four known handler write sites");
     }
 
     #[test]
