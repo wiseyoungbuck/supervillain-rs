@@ -346,6 +346,10 @@ pub struct SplitInbox {
     pub filters: Vec<SplitFilter>,
     #[serde(default)]
     pub match_mode: MatchMode,
+    /// Config-section account id this split belongs to.
+    /// `None` = visible on every account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -676,6 +680,7 @@ mod tests {
             icon: None,
             filters: vec![],
             match_mode: MatchMode::Any,
+            account: None,
         };
         let json = serde_json::to_string(&split).unwrap();
         assert!(!json.contains("icon"));
@@ -689,9 +694,48 @@ mod tests {
             icon: Some("https://example.com/icon.svg".into()),
             filters: vec![],
             match_mode: MatchMode::Any,
+            account: None,
         };
         let json = serde_json::to_string(&split).unwrap();
         assert!(json.contains(r#""icon":"https://example.com/icon.svg""#));
+    }
+
+    #[test]
+    fn split_inbox_account_roundtrip() {
+        let split = SplitInbox {
+            id: "work".into(),
+            name: "Work".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: MatchMode::Any,
+            account: Some("aristoi".into()),
+        };
+        let json = serde_json::to_string(&split).unwrap();
+        assert!(json.contains(r#""account":"aristoi""#));
+        let back: SplitInbox = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.account.as_deref(), Some("aristoi"));
+    }
+
+    #[test]
+    fn split_inbox_account_absent_parses_as_none() {
+        // Back-compat: every pre-existing splits.json lacks the field.
+        let json = r#"{"id": "x", "name": "X", "filters": [], "match_mode": "any"}"#;
+        let split: SplitInbox = serde_json::from_str(json).unwrap();
+        assert_eq!(split.account, None);
+    }
+
+    #[test]
+    fn split_inbox_account_none_omitted_from_json() {
+        let split = SplitInbox {
+            id: "test".into(),
+            name: "Test".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: MatchMode::Any,
+            account: None,
+        };
+        let json = serde_json::to_string(&split).unwrap();
+        assert!(!json.contains("account"));
     }
 
     // --- CalendarEvent tests ---
@@ -824,6 +868,7 @@ mod tests {
                         },
                     ],
                     match_mode: MatchMode::All,
+                    account: None,
                 },
                 SplitInbox {
                     id: "newsletters".into(),
@@ -835,6 +880,7 @@ mod tests {
                         name: None,
                     }],
                     match_mode: MatchMode::Any,
+                    account: None,
                 },
             ],
         };

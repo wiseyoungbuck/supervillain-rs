@@ -137,6 +137,7 @@ pub fn generate_splits_from_identities(identities: &[crate::types::Identity]) ->
                     name: None,
                 }],
                 match_mode: MatchMode::Any,
+                account: None,
             }
         })
         .collect();
@@ -452,6 +453,7 @@ mod tests {
                 subject_filter("nonexistent-pattern"),
             ],
             match_mode: MatchMode::Any,
+            account: None,
         };
         assert!(matches_split(&email, &split));
     }
@@ -468,6 +470,7 @@ mod tests {
                 subject_filter("nonexistent-pattern"),
             ],
             match_mode: MatchMode::All,
+            account: None,
         };
         assert!(!matches_split(&email, &split));
     }
@@ -487,6 +490,7 @@ mod tests {
                 icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         let result = filter_by_split(emails, "cal", &config);
@@ -507,6 +511,7 @@ mod tests {
                 icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         let result = filter_by_split(emails, "primary", &config);
@@ -526,6 +531,7 @@ mod tests {
                 icon: None,
                 filters: vec![from_filter("*@calendar.google.com")],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         assert!(matches_any_split(&email, &config));
@@ -637,6 +643,7 @@ mod tests {
                 icon: None,
                 filters: vec![],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         save_splits(&config, &path).unwrap();
@@ -659,6 +666,7 @@ mod tests {
                     name: Some("Content-Type".into()),
                 }],
                 match_mode: MatchMode::All,
+                account: None,
             }],
         };
         save_splits(&config, &path).unwrap();
@@ -683,6 +691,7 @@ mod tests {
                     icon: None,
                     filters: vec![from_filter("*@example.com")],
                     match_mode: MatchMode::Any,
+                    account: None,
                 },
                 SplitInbox {
                     id: "b".into(),
@@ -690,6 +699,7 @@ mod tests {
                     icon: None,
                     filters: vec![subject_filter("test")],
                     match_mode: MatchMode::All,
+                    account: None,
                 },
             ],
         };
@@ -832,6 +842,7 @@ mod tests {
                 icon: None,
                 filters: vec![from_filter("*@example.com")],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         save_splits(&existing, &path).unwrap();
@@ -885,6 +896,7 @@ mod tests {
             icon: None,
             filters: vec![to_filter("*@company.onmicrosoft.com")],
             match_mode: MatchMode::Any,
+            account: None,
         };
         assert!(matches_split(&email, &split));
     }
@@ -900,6 +912,7 @@ mod tests {
             icon: None,
             filters: vec![to_filter("*@company.onmicrosoft.com")],
             match_mode: MatchMode::Any,
+            account: None,
         };
         assert!(!matches_split(&email, &split));
     }
@@ -917,6 +930,7 @@ mod tests {
                 icon: None,
                 filters: vec![to_filter("*@company.onmicrosoft.com")],
                 match_mode: MatchMode::Any,
+                account: None,
             }],
         };
         let primary = filter_by_split(emails, "primary", &config);
