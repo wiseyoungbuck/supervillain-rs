@@ -1994,16 +1994,29 @@ api-token = tok
         // Source-level tripwire: each handler write of the config file must
         // be followed by a baseline reset, or a broken-at-startup config
         // plus that write path regresses to the permanent-banner bug
-        // (roborev 268 #1). Only handler code is scanned — the test module
-        // is sliced off so its own occurrences don't skew the counts.
-        let src = include_str!("accounts.rs");
-        let handler_src = &src[..src.find("mod tests").expect("tests module exists")];
-        let writes = handler_src
-            .matches("atomic_write_config(&state.config_path")
-            .count();
-        let resets = handler_src
-            .matches("state.reset_config_error_baseline()")
-            .count();
+        // (roborev 268 #1). Only handler code is scanned — each file's test
+        // module is sliced off so its own occurrences don't skew the counts.
+        //
+        // Scope (roborev 270): every module that could plausibly gain a
+        // config-write path is scanned; add new modules here if one does.
+        // The scan matches the literal `atomic_write_config(&state.config_path`
+        // form — aliasing the path through a local binding defeats it, so
+        // config writes must keep that form (or extend this test).
+        let sources = [
+            include_str!("accounts.rs"),
+            include_str!("routes.rs"),
+            include_str!("main.rs"),
+        ];
+        let (mut writes, mut resets) = (0usize, 0usize);
+        for src in sources {
+            let handler_src = src.split("mod tests").next().unwrap_or(src);
+            writes += handler_src
+                .matches("atomic_write_config(&state.config_path")
+                .count();
+            resets += handler_src
+                .matches("state.reset_config_error_baseline()")
+                .count();
+        }
         assert_eq!(
             writes, resets,
             "every atomic_write_config(&state.config_path, ..) handler site must be \
