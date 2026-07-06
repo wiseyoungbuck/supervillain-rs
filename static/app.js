@@ -781,6 +781,10 @@ function selectAccount(account) {
     // surface previous-account state, and returning to an account finds its
     // cache entries intact — no cold reloads for previously-viewed mailboxes
     // or emails.
+    // Clear the list pane NOW: if the new account's mailbox fetch is slow
+    // (or fails), the previous account's emails must not stay on screen
+    // looking like this account's inbox.
+    els.emailList.innerHTML = '<div class="loading">Loading</div>';
     renderAccounts();
     loadMailboxes();
     loadIdentities();

@@ -736,6 +736,29 @@ pub(crate) fn outlook_folder_role(folder_id: &str) -> Option<String> {
     }
 }
 
+/// The well-known aliases whose folder ids we resolve to assign roles.
+/// Must stay in sync with [`outlook_folder_role`]'s match arms.
+const WELL_KNOWN_ALIASES: [&str; 6] = [
+    "inbox",
+    "sentitems",
+    "drafts",
+    "deleteditems",
+    "junkemail",
+    "archive",
+];
+
+/// Build a folder-id → role map from resolved (alias, folder_id) pairs.
+/// Graph v1.0's `mailFolders` listing has no `wellKnownName` property
+/// (beta-only), so roles can't be read off the list response — the alias
+/// endpoints (`/me/mailFolders/inbox` → opaque id) are the only v1.0 way
+/// to identify system folders. Pure — testable without HTTP.
+pub(crate) fn roles_by_folder_id(alias_ids: &[(String, String)]) -> HashMap<String, String> {
+    alias_ids
+        .iter()
+        .filter_map(|(alias, id)| outlook_folder_role(alias).map(|role| (id.clone(), role)))
+        .collect()
+}
+
 // =============================================================================
 // Phase 4: Outlook email — mutation helpers (pure)
 // =============================================================================
@@ -945,8 +968,6 @@ struct FolderEntry {
     id: String,
     #[serde(default, rename = "displayName")]
     display_name: String,
-    #[serde(default, rename = "wellKnownName")]
-    well_known_name: Option<String>,
     #[serde(default, rename = "totalItemCount")]
     total_item_count: i64,
     #[serde(default, rename = "unreadItemCount")]
@@ -981,15 +1002,19 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
     }
     let parsed: FolderListResp = resp.json().await?;
 
+    // v1.0 has no `wellKnownName` on the list response (beta-only), so
+    // system-folder roles come from resolving each well-known alias to its
+    // opaque folder id and matching ids. Tolerates individual alias
+    // failures (e.g. `archive` 404s when In-Place Archive is disabled):
+    // a folder whose alias didn't resolve is listed role-less, same as a
+    // user folder.
+    let role_map = roles_by_folder_id(&resolve_well_known_aliases(session, &token).await);
+
     let folders: Vec<Mailbox> = parsed
         .value
         .into_iter()
         .map(|f| {
-            // Graph exposes wellKnownName for system folders; user folders
-            // get `None` here. Roborev 179 #9: dropped the `id` fallback —
-            // Graph returns opaque base64 IDs in `id`, never the well-known
-            // strings, so the fallback could never fire.
-            let role = f.well_known_name.as_deref().and_then(outlook_folder_role);
+            let role = role_map.get(&f.id).cloned();
             Mailbox {
                 id: f.id,
                 name: f.display_name,
@@ -1007,6 +1032,52 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
         folders: folders.clone(),
     });
     Ok(folders)
+}
+
+/// Resolve each well-known alias (`/me/mailFolders/inbox` etc.) to its
+/// opaque folder id. Lookups run concurrently; a failed lookup drops that
+/// alias rather than failing the whole mailboxes fetch, so total Graph
+/// throttling degrades to a role-less folder list instead of an error.
+async fn resolve_well_known_aliases(
+    session: &OutlookSession,
+    token: &str,
+) -> Vec<(String, String)> {
+    #[derive(Deserialize)]
+    struct FolderIdResp {
+        id: String,
+    }
+
+    async fn lookup(session: &OutlookSession, token: &str, alias: &str) -> Option<String> {
+        let url = format!("{GRAPH_BASE}/me/mailFolders/{alias}?$select=id");
+        let resp = session
+            .client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::debug!(
+                "well-known folder '{alias}' not resolved: {}",
+                resp.status()
+            );
+            return None;
+        }
+        resp.json::<FolderIdResp>().await.ok().map(|f| f.id)
+    }
+
+    let futures = WELL_KNOWN_ALIASES.map(|alias| lookup(session, token, alias));
+    let [inbox, sent, drafts, trash, junk, archive] = futures;
+    let results = tokio::join!(inbox, sent, drafts, trash, junk, archive);
+    let ids = [
+        results.0, results.1, results.2, results.3, results.4, results.5,
+    ];
+
+    WELL_KNOWN_ALIASES
+        .iter()
+        .zip(ids)
+        .filter_map(|(alias, id)| id.map(|id| (alias.to_string(), id)))
+        .collect()
 }
 
 /// Invalidate the folder cache. Called after any mutation that changes
@@ -3186,6 +3257,37 @@ mod tests {
     fn outlook_folder_role_archive() {
         // Outlook's "Archive" is a well-known folder once enabled.
         assert_eq!(outlook_folder_role("archive"), Some("archive".into()));
+    }
+
+    // ---- roles_by_folder_id ----
+
+    #[test]
+    fn roles_by_folder_id_maps_resolved_aliases() {
+        let alias_ids = vec![
+            ("inbox".to_string(), "AQMkInboxOpaque".to_string()),
+            ("sentitems".to_string(), "AQMkSentOpaque".to_string()),
+        ];
+        let map = roles_by_folder_id(&alias_ids);
+        assert_eq!(
+            map.get("AQMkInboxOpaque").map(String::as_str),
+            Some("inbox")
+        );
+        assert_eq!(map.get("AQMkSentOpaque").map(String::as_str), Some("sent"));
+    }
+
+    #[test]
+    fn roles_by_folder_id_skips_unknown_alias() {
+        // A future alias this build doesn't know about must not panic or
+        // produce a bogus role — it's simply dropped.
+        let alias_ids = vec![("scheduled".to_string(), "AQMkOpaque".to_string())];
+        assert!(roles_by_folder_id(&alias_ids).is_empty());
+    }
+
+    #[test]
+    fn roles_by_folder_id_empty_when_no_aliases_resolved() {
+        // Total alias-lookup failure (throttling, etc.) degrades to the
+        // pre-fix behavior: folders listed, no roles.
+        assert!(roles_by_folder_id(&[]).is_empty());
     }
 
     #[test]
