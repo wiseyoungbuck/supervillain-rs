@@ -4,6 +4,19 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Account-scoped split tabs
+
+Splits in `splits.json` may now carry an `account` tag (a config-section id
+like `aristoi`). Tagged splits render, count, and filter only on that
+account; untagged splits remain global, so pre-existing configs behave
+unchanged. The synthetic Primary tab is computed against only the active
+account's splits — previously a `*@gmail.com` split visible everywhere
+swallowed all mail on the gmail account and left its Primary nearly empty.
+`GET /api/splits` honors `?account=` (no param returns the full list for
+management), split creation/update rejects unknown account ids, auto-seeding
+tags generated splits with the seeding account, and the frontend reloads the
+tab row on account switch and tags new splits with the active account.
+
 ## Account visibility, credential-shape validation, stale-config detection
 
 `GET /api/accounts` now lists every configured account, not just the ones
