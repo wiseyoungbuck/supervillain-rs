@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn loadEmails_renders_cached_snapshot_before_network_refresh() {
+    fn load_emails_renders_cached_snapshot_before_network_refresh() {
         // The Superhuman-style "instant switch" contract: when loadEmails is
         // called for a mailbox/split/account with a cached entry, the cached
         // list renders immediately (no awaiting the network). The fresh fetch
