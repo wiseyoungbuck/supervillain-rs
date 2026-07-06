@@ -77,19 +77,15 @@ pub fn save_splits(config: &SplitsConfig, config_path: &Path) -> Result<(), Erro
 impl SplitsConfig {
     /// Splits visible to `account`: untagged splits (visible everywhere)
     /// plus splits tagged with exactly this account. `None` returns the
-    /// full config — the management view.
-    pub fn scoped_to(&self, account: Option<&str>) -> SplitsConfig {
-        let Some(account) = account else {
-            return self.clone();
-        };
-        SplitsConfig {
-            splits: self
-                .splits
-                .iter()
-                .filter(|s| s.account.as_deref().is_none_or(|a| a == account))
-                .cloned()
-                .collect(),
+    /// full config — the management view. Consumes `self`: every caller
+    /// already owns the config it's scoping (freshly loaded or cloned),
+    /// so there's no reason to force a second clone here.
+    pub fn scoped_to(mut self, account: Option<&str>) -> SplitsConfig {
+        if let Some(account) = account {
+            self.splits
+                .retain(|s| s.account.as_deref().is_none_or(|a| a == account));
         }
+        self
     }
 }
 

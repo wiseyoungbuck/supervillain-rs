@@ -174,6 +174,20 @@ impl PrefetchCache {
         e.version = e.version.wrapping_add(1);
     }
 
+    /// Clears only the cached split-counts, leaving mailboxes / identities /
+    /// inbox_lists / body_cache untouched. Splits CRUD writes touch exactly
+    /// this one derived field; a full `invalidate` would also discard
+    /// perfectly fresh mailbox/inbox data for no reason. Still bumps the
+    /// version counter so an in-flight warmer fetch computed against the
+    /// pre-write splits.json is discarded instead of overwriting the fresh
+    /// state with stale counts.
+    pub async fn invalidate_split_counts(&self, account: &str) {
+        let entry = self.entry(account).await;
+        let mut e = entry.lock().await;
+        e.split_counts = None;
+        e.version = e.version.wrapping_add(1);
+    }
+
     /// Current version of this account's entry. Used by the warmer to
     /// detect mid-flight invalidations.
     pub async fn version(&self, account: &str) -> u64 {
@@ -1430,6 +1444,44 @@ mod tests {
         assert!(cache.get_identities("acc-1").await.is_none());
         assert!(cache.get_inbox_list("acc-1", &key).await.is_none());
         assert!(cache.get_split_counts("acc-1", "inbox").await.is_none());
+        assert_eq!(cache.version("acc-1").await, v0 + 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_split_counts_clears_only_counts_and_bumps_version() {
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+        };
+        cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
+        cache.set_identities("acc-1", vec![ident("p")]).await;
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
+            .await;
+        cache
+            .set_split_counts("acc-1", "inbox".into(), HashMap::new())
+            .await;
+
+        let v0 = cache.version("acc-1").await;
+        cache.invalidate_split_counts("acc-1").await;
+
+        assert!(
+            cache.get_split_counts("acc-1", "inbox").await.is_none(),
+            "split-counts must be cleared"
+        );
+        assert!(
+            cache.get_mailboxes("acc-1").await.is_some(),
+            "mailboxes must survive a split-counts-only invalidate"
+        );
+        assert!(
+            cache.get_identities("acc-1").await.is_some(),
+            "identities must survive a split-counts-only invalidate"
+        );
+        assert!(
+            cache.get_inbox_list("acc-1", &key).await.is_some(),
+            "inbox_lists must survive a split-counts-only invalidate"
+        );
         assert_eq!(cache.version("acc-1").await, v0 + 1);
     }
 

@@ -775,6 +775,8 @@ function selectAccount(account) {
     state.currentEmail = null;
     state.selectedIndex = 0;
     state.currentSplit = 'all';
+    state.splits = [];
+    state.splitCounts = {};
     // splitListCache, emailCache, and scrollPositions are all account-scoped
     // (their keys include state.currentAccount.id). Switching accounts can't
     // surface previous-account state, and returning to an account finds its
@@ -3367,6 +3369,11 @@ async function saveSplit() {
     const filterType = els.splitFilterType.value;
     const pattern = els.splitPattern.value.trim();
     const isCalendar = filterType === 'calendar';
+
+    if (!state.currentAccount?.id) {
+        showStatus('Select an account before creating a split', 'error');
+        return;
+    }
 
     if (!name) {
         showStatus('Name is required', 'error');

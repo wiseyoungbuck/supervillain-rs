@@ -410,6 +410,32 @@ async fn list_emails(
     }
     let query_ref = query.as_ref();
 
+    // Resolved once and reused for both the fetch (cached or live) and the
+    // split-filter block below — a second resolve_account_id call can't
+    // disagree with this one since both apply the same default-account
+    // fallback, but there's no reason to pay for the lock twice.
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+
+    // Split-filtered requests need the scoped config before the fetch: an
+    // id that matches neither "primary" nor a split in scope (a deleted
+    // split, a stale client tab) can bail out here without spending a
+    // provider round-trip on mail we'd throw away below.
+    let split_config = params.split_id.is_some().then(|| {
+        splits::load_splits(
+            &state.splits_config_path,
+            std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
+        )
+        .scoped_to(Some(&account_id))
+    });
+
+    if let Some(split_id) = params.split_id.as_deref()
+        && split_id != "primary"
+        && let Some(config) = split_config.as_ref()
+        && !config.splits.iter().any(|s| s.id == split_id)
+    {
+        return Ok(Json(Vec::<serde_json::Value>::new()));
+    }
+
     let fetch_limit = if params.split_id.is_some() {
         limit * SPLIT_OVERFETCH_MULTIPLIER
     } else {
@@ -428,15 +454,14 @@ async fn list_emails(
         && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT;
 
     let mut emails = if is_cacheable {
-        let id = resolve_account_id(&state, params.account.as_deref()).await?;
         let key = crate::prefetch::InboxKey {
             mailbox_id: params.mailbox_id.clone().unwrap(),
             limit,
         };
         state
             .prefetch
-            .inbox_list_or_fetch(&id, key, || async {
-                let session_lock = resolve_session(&state, Some(&id)).await?;
+            .inbox_list_or_fetch(&account_id, key, || async {
+                let session_lock = resolve_session(&state, Some(&account_id)).await?;
                 let session = session_lock.read().await;
                 let email_ids = provider::query_emails(
                     &session,
@@ -450,7 +475,7 @@ async fn list_emails(
             })
             .await?
     } else {
-        let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+        let session_lock = resolve_session(&state, Some(&account_id)).await?;
         let session = session_lock.read().await;
         let email_ids = provider::query_emails(
             &session,
@@ -464,15 +489,10 @@ async fn list_emails(
     };
 
     // Apply split filtering, scoped to this account's splits so "primary"
-    // means "not matching any of *this account's* splits".
-    if let Some(ref split_id) = params.split_id {
-        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
-        let config = splits::load_splits(
-            &state.splits_config_path,
-            std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
-        )
-        .scoped_to(Some(&account_id));
-        emails = splits::filter_by_split(emails, split_id, &config);
+    // means "not matching any of *this account's* splits". Reuses the
+    // config loaded above the fetch — no second load/scope pass.
+    if let (Some(split_id), Some(config)) = (params.split_id.as_deref(), split_config.as_ref()) {
+        emails = splits::filter_by_split(emails, split_id, config);
         emails.truncate(limit);
     }
 
@@ -999,6 +1019,19 @@ async fn unsubscribe_and_archive(
 // account before counting/filtering.
 // =============================================================================
 
+/// splits.json is an input to the per-account split-counts cache; any
+/// write must leave no window where disk and cache disagree. Splits
+/// writes are rare, so invalidating every account's entry is fine.
+async fn invalidate_all_split_caches(state: &AppState) {
+    let ids: Vec<String> = {
+        let reg = state.accounts.read().await;
+        reg.account_configs.keys().cloned().collect()
+    };
+    for id in &ids {
+        state.prefetch.invalidate_split_counts(id).await;
+    }
+}
+
 #[derive(Deserialize)]
 struct SplitCountsParams {
     mailbox_id: String,
@@ -1157,6 +1190,7 @@ async fn create_split(
 
     config.splits.push(new_split);
     splits::save_splits(&config, &state.splits_config_path)?;
+    invalidate_all_split_caches(&state).await;
 
     Ok(Json(serde_json::json!(config.splits)))
 }
@@ -1180,14 +1214,24 @@ async fn update_split(
         }
     }
 
+    if updated.id != split_id {
+        return Err(Error::BadRequest(format!(
+            "Split id is immutable ('{split_id}' != '{}')",
+            updated.id
+        )));
+    }
+
     let existing = config
         .splits
         .iter_mut()
         .find(|s| s.id == split_id)
         .ok_or_else(|| Error::NotFound(format!("Split '{split_id}' not found")))?;
 
+    // PUT replaces the whole split: a body without `account` UNTAGS it
+    // (makes it global). Deliberate — the body is the full new state.
     *existing = updated;
     splits::save_splits(&config, &state.splits_config_path)?;
+    invalidate_all_split_caches(&state).await;
 
     Ok(Json(serde_json::json!(config.splits)))
 }
@@ -1209,6 +1253,7 @@ async fn delete_split(
     }
 
     splits::save_splits(&config, &state.splits_config_path)?;
+    invalidate_all_split_caches(&state).await;
 
     Ok(Json(serde_json::json!(config.splits)))
 }
@@ -1760,6 +1805,28 @@ mod tests {
         assert!(
             body.contains("loadSplits()"),
             "selectAccount must call loadSplits()"
+        );
+    }
+
+    #[test]
+    fn select_account_resets_stale_split_state() {
+        // Regression test: before loadSplits()'s async response lands, the
+        // previous account's tabs/counts must not linger — otherwise a fast
+        // click into the new account briefly renders the old account's
+        // split tabs and counts.
+        let start = APP_JS
+            .find("function selectAccount")
+            .expect("selectAccount must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("selectAccount must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.splits = []"),
+            "selectAccount must clear state.splits before the new account's loadSplits() resolves"
+        );
+        assert!(
+            body.contains("state.splitCounts = {}"),
+            "selectAccount must clear state.splitCounts before the new account's loadSplitCounts() resolves"
         );
     }
 
