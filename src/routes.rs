@@ -1751,7 +1751,12 @@ mod tests {
         let start = APP_JS
             .find("function selectAccount")
             .expect("selectAccount must exist");
-        let body = &APP_JS[start..start + 1500];
+        let rest = &APP_JS[start..];
+        // Slice to the function's own closing brace (first `}` at column
+        // 0) so a match can only come from selectAccount's body, not the
+        // loadSplits() declaration that follows it in the file.
+        let end = rest.find("\n}").expect("selectAccount must close");
+        let body = &rest[..end];
         assert!(
             body.contains("loadSplits()"),
             "selectAccount must call loadSplits()"
