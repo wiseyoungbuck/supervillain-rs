@@ -31,7 +31,7 @@ async fn main() {
     // their hand-edited file is broken before defaults silently kick in.
     let mut account_errors: Vec<AccountError> = accounts::startup_config_errors(
         &config_path,
-        parse_errors,
+        parse_errors.clone(),
         &splits_config_path,
         splits::try_load_splits(&splits_config_path),
         &timezone_config_path,
@@ -100,6 +100,7 @@ async fn main() {
         tokens_dir,
         token_store,
         authorizing: accounts::AuthorizingSlot::default(),
+        startup_parse_errors: parse_errors,
         prefetch: std::sync::Arc::new(prefetch::PrefetchCache::new()),
     });
 

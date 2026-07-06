@@ -289,6 +289,14 @@ async fn resolve_account_id(state: &AppState, account: Option<&str>) -> Result<S
 // =============================================================================
 
 async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Re-read the config from disk before taking the registry lock: the read
+    // is async (no blocking the runtime) and the lock isn't held across IO.
+    // Missing/unreadable file parses as empty, same as parse_config.
+    let disk_content = tokio::fs::read_to_string(&state.config_path)
+        .await
+        .unwrap_or_default();
+    let (disk, disk_parse_errors) = crate::accounts::parse_config_str(&disk_content);
+
     let reg = state.accounts.read().await;
     let mut live = std::collections::HashMap::new();
     for (name, session_lock) in &reg.sessions {
@@ -307,10 +315,13 @@ async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let mut errors = state.account_errors.read().await.clone();
     // Hand-edits made after startup never take effect (config is loaded once
     // in main); tell the user instead of letting the edit silently rot.
-    let (disk, _) = crate::accounts::parse_config(&state.config_path);
-    if let Some(banner) =
-        crate::accounts::stale_config_banner(&state.config_path, &disk, &reg.account_configs)
-    {
+    if let Some(banner) = crate::accounts::stale_config_banner(
+        &state.config_path,
+        &disk,
+        &disk_parse_errors,
+        &state.startup_parse_errors,
+        &reg.account_configs,
+    ) {
         errors.push(banner);
     }
     Json(serde_json::json!({
@@ -3022,6 +3033,31 @@ white   = '#fdf6e3'
         assert!(
             APP_JS.contains("account.authStatus === 'pending'"),
             "selectAccount should guard against pending accounts"
+        );
+    }
+
+    #[test]
+    fn app_js_never_fires_oauth_authorize_for_fastmail() {
+        // Roborev job 267 finding #1: a Fastmail account whose connect failed
+        // is listed as pending; routing it into POST /authorize can only 400.
+        // The authorize entry point must branch to the edit form instead.
+        assert!(
+            APP_JS.contains("acct.provider === 'fastmail'"),
+            "authorizeAccountFromBanner should route fastmail to the edit form, not OAuth"
+        );
+    }
+
+    #[test]
+    fn app_js_banner_heading_not_connection_specific_for_config_notices() {
+        // The stale-config banner (provider "config") must not render under
+        // a "failed to connect" heading with empty parentheses.
+        assert!(
+            APP_JS.contains("attention:"),
+            "banner should use a neutral heading when non-connection notices are present"
+        );
+        assert!(
+            APP_JS.contains("e.provider !== 'config'"),
+            "banner heading should branch on the config provider label"
         );
     }
 

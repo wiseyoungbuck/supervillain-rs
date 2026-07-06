@@ -683,13 +683,23 @@ function showAccountErrors(errors) {
         // — click Authorize" however it wants and the button still appears.
         const acctRec = state.accounts.find(a => a.id === e.account);
         const needsAuth = acctRec && acctRec.authStatus === 'pending';
+        // Fastmail has no OAuth flow — its button opens the edit form, so
+        // label it accordingly (authorizeAccountFromBanner branches the same
+        // way and never fires the doomed /authorize request).
+        const label = acctRec?.provider === 'fastmail' ? '[ Fix ]' : '[ Authorize ]';
         const action = needsAuth
-            ? ` <button type="button" class="banner-authorize-link" data-account-id="${acctAttr}">[ Authorize ]</button>`
+            ? ` <button type="button" class="banner-authorize-link" data-account-id="${acctAttr}">${label}</button>`
             : '';
-        return `<li><strong>${acctText}</strong> (${prov}): ${body}${action}</li>`;
+        return `<li><strong>${acctText}</strong>${prov ? ` (${prov})` : ''}: ${body}${action}</li>`;
     }).join('');
+    // "failed to connect" is wrong for non-connection notices like the
+    // stale-config banner (provider "config") — use a neutral heading then.
+    const allConnect = errors.every(e => e.provider && e.provider !== 'config');
+    const heading = allConnect
+        ? `${count} account${count > 1 ? 's' : ''} failed to connect:`
+        : `${count} item${count > 1 ? 's need' : ' needs'} attention:`;
     els.accountErrorDetails.innerHTML =
-        `<strong>${count} account${count > 1 ? 's' : ''} failed to connect:</strong><ul>${list}</ul>`;
+        `<strong>${heading}</strong><ul>${list}</ul>`;
     els.accountErrorBanner.classList.remove('hidden');
     els.accountErrorDetails.querySelectorAll('.banner-authorize-link').forEach(btn => {
         btn.addEventListener('click', () => authorizeAccountFromBanner(btn.dataset.accountId));
@@ -713,6 +723,13 @@ async function authorizeAccountFromBanner(id) {
     state.settingsMode = 'edit';
     showView('settings');
     renderSettings();
+    if (acct.provider === 'fastmail') {
+        // Fastmail doesn't use OAuth — a session-less Fastmail account means
+        // the connection failed (bad token, network). Land on the edit form;
+        // POSTing /authorize would only 400.
+        showStatus(`${id} failed to connect — check the username and API token`, 'error');
+        return;
+    }
     showStatus(`Authorizing ${id}…`, 'info');
     authorize(id);
 }
@@ -731,7 +748,7 @@ function renderAccounts() {
              data-id="${escapeAttr(acc.id)}">
             <span class="account-key">${idx + 1}</span>
             <span class="account-email">${escapeHtml(acc.email || acc.id)}</span>
-            <span class="account-provider">${escapeHtml(acc.provider)}${pending ? ' · needs auth' : ''}</span>
+            <span class="account-provider">${escapeHtml(acc.provider)}${pending ? (acc.provider === 'fastmail' ? ' · not connected' : ' · needs auth') : ''}</span>
         </div>
     `;
     }).join('');
@@ -1566,7 +1583,9 @@ function renderSettings() {
         els.acctDefaultMarker.textContent = existing.isDefault ? 'yes ★' : 'no';
         const pending = existing.authStatus === 'pending';
         els.acctAuthPill.className = 'auth-status-pill ' + (pending ? 'failed' : 'authorized');
-        els.acctAuthPill.textContent = pending ? 'NEEDS AUTH' : 'AUTHORIZED';
+        els.acctAuthPill.textContent = pending
+            ? (existing.provider === 'fastmail' ? 'NOT CONNECTED' : 'NEEDS AUTH')
+            : 'AUTHORIZED';
     } else {
         els.acctName.value = '';
         els.acctUsername.value = '';

@@ -420,6 +420,12 @@ pub struct AppState {
     pub tokens_dir: PathBuf,
     pub token_store: std::sync::Arc<dyn crate::platform::TokenStore>,
     pub authorizing: crate::accounts::AuthorizingSlot,
+    /// Parse errors from the config file as it was read at startup. The
+    /// stale-config check in `list_accounts` compares fresh re-parse errors
+    /// against this snapshot: unchanged errors mean the file hasn't been
+    /// edited (they were already surfaced at startup); new/removed errors
+    /// mean a post-startup hand-edit even when the parsed accounts match.
+    pub startup_parse_errors: Vec<crate::accounts::ConfigParseError>,
     /// Cross-account background cache of mailboxes / identities / inbox-list
     /// / split-counts. Populated by `prefetch::spawn_warmer` at startup and
     /// every 5 min thereafter; consulted by the four hot routes (`list_*`,

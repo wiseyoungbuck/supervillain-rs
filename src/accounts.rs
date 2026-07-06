@@ -852,20 +852,31 @@ pub fn wire_account_list(
 /// so a divergent file means the user is waiting on changes that will never
 /// arrive — return a banner telling them to restart.
 ///
+/// Parse errors are compared against the startup snapshot rather than
+/// requiring the parsed accounts to differ: a hand-edit that adds a
+/// *malformed* section is dropped by the parser (accounts stay equal), but
+/// the new parse error is still evidence the file changed. Conversely, a
+/// file whose parse errors are unchanged since startup hasn't been edited —
+/// those errors were already surfaced by `startup_config_errors`.
+///
 /// `default_account` is deliberately NOT compared: the registry's default may
 /// legitimately diverge from disk when the configured default failed to
 /// connect and `resolve_default_account` picked a fallback.
 pub fn stale_config_banner(
     config_path: &Path,
     disk: &ConfigFile,
+    disk_parse_errors: &[ConfigParseError],
+    startup_parse_errors: &[ConfigParseError],
     running: &BTreeMap<String, AccountConfig>,
 ) -> Option<crate::types::AccountError> {
-    if disk.accounts == *running {
+    if disk.accounts == *running && disk_parse_errors == startup_parse_errors {
         return None;
     }
     Some(crate::types::AccountError {
         account: config_path.display().to_string(),
-        provider: String::new(),
+        // Rendered by the UI banner as a parenthetical label; a real
+        // provider name would be wrong here and an empty one renders as "()".
+        provider: "config".into(),
         error: "Config file changed on disk after startup — restart supervillain to apply \
                 hand-edits (Settings changes apply immediately and would overwrite them)"
             .into(),
@@ -1841,7 +1852,7 @@ api-token = tok
             default_account: Some("fm".into()),
             accounts: accounts.clone(),
         };
-        assert!(stale_config_banner(Path::new("/x/config"), &disk, &accounts).is_none());
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &[], &[], &accounts).is_none());
     }
 
     #[test]
@@ -1855,14 +1866,17 @@ api-token = tok
             default_account: Some("fm".into()),
             accounts: edited,
         };
-        let banner =
-            stale_config_banner(Path::new("/x/config"), &disk, &running).expect("must fire");
+        let banner = stale_config_banner(Path::new("/x/config"), &disk, &[], &[], &running)
+            .expect("must fire");
         assert!(
             banner.error.contains("restart"),
             "tells the user the fix: {}",
             banner.error
         );
         assert_eq!(banner.account, "/x/config");
+        // Labeled "config" so the UI banner doesn't render an empty "()"
+        // or imply a provider connection failure.
+        assert_eq!(banner.provider, "config");
     }
 
     #[test]
@@ -1875,7 +1889,7 @@ api-token = tok
             default_account: Some("fm".into()),
             accounts: edited,
         };
-        assert!(stale_config_banner(Path::new("/x/config"), &disk, &running).is_some());
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &[], &[], &running).is_some());
     }
 
     #[test]
@@ -1889,7 +1903,78 @@ api-token = tok
             default_account: Some("something-else".into()),
             accounts: accounts.clone(),
         };
-        assert!(stale_config_banner(Path::new("/x/config"), &disk, &accounts).is_none());
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &[], &[], &accounts).is_none());
+    }
+
+    #[test]
+    fn stale_banner_fires_when_hand_edit_adds_malformed_section() {
+        // A malformed section is dropped by the parser, so the account maps
+        // stay equal — the fresh parse error is the only evidence the file
+        // changed. Roborev job 267 finding #2.
+        let mut running = BTreeMap::new();
+        running.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: running.clone(),
+        };
+        let new_err = vec![ConfigParseError {
+            section: "typo".into(),
+            provider: String::new(),
+            reason: "missing required field `provider`".into(),
+        }];
+        assert!(
+            stale_config_banner(Path::new("/x/config"), &disk, &new_err, &[], &running).is_some()
+        );
+    }
+
+    #[test]
+    fn stale_banner_quiet_when_parse_errors_unchanged_since_startup() {
+        // A config that was already broken at startup and untouched since
+        // must NOT read as "changed on disk" — startup_config_errors already
+        // surfaced those parse errors.
+        let mut running = BTreeMap::new();
+        running.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: running.clone(),
+        };
+        let startup_err = vec![ConfigParseError {
+            section: "broken".into(),
+            provider: "outlook".into(),
+            reason: "missing required field `client-id`".into(),
+        }];
+        assert!(
+            stale_config_banner(
+                Path::new("/x/config"),
+                &disk,
+                &startup_err,
+                &startup_err,
+                &running
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_banner_fires_when_startup_parse_error_fixed_on_disk() {
+        // The inverse: user fixed the broken section after startup. The
+        // parse errors went away, accounts differ or not — either way the
+        // file changed and a restart is needed to pick up the fix.
+        let mut running = BTreeMap::new();
+        running.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: running.clone(),
+        };
+        let startup_err = vec![ConfigParseError {
+            section: "broken".into(),
+            provider: "outlook".into(),
+            reason: "missing required field `client-id`".into(),
+        }];
+        assert!(
+            stale_config_banner(Path::new("/x/config"), &disk, &[], &startup_err, &running)
+                .is_some()
+        );
     }
 
     // ---- Authorize single-flight ----

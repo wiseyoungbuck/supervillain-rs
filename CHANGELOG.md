@@ -29,6 +29,15 @@ effect (config is loaded once in main), so a divergent file now surfaces a
 registry's fallback default-account is deliberately excluded from the
 comparison.
 
+Review follow-ups (roborev 267): parse errors from the re-read are compared
+against a startup snapshot so a hand-edit that adds a *malformed* section
+still fires the banner (and an untouched startup-broken config doesn't);
+the banner is labeled `config` and the UI uses a neutral "needs attention"
+heading for non-connection notices; a session-less Fastmail account (failed
+connect, not missing OAuth) routes to the settings edit form instead of a
+doomed `/authorize` POST, labeled "not connected"; the config re-read is
+async and happens before the registry lock is taken.
+
 ## Outlook OAuth — User.Read scope + Graph /me hardening
 
 Outlook stays on the `/common` endpoint (supports both personal MSAs and
