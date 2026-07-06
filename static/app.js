@@ -811,6 +811,9 @@ async function loadSplits() {
         renderSplitTabs();
         loadSplitCounts();
     } catch (err) {
+        // Stale failure guard: a request from the previous account erroring
+        // late must not wipe the new account's already-loaded splits.
+        if (state.currentAccount?.id !== accountId) return;
         console.warn('Failed to load splits:', err);
         state.splits = [];
     }

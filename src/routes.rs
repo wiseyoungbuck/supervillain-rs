@@ -260,13 +260,23 @@ struct AccountParam {
 // Account resolution
 // =============================================================================
 
+/// Uniform unknown-account rejection for every path that accepts a
+/// client-supplied account id. One message format, one place to change
+/// validation (e.g. future case normalization).
+fn ensure_known_account(reg: &AccountRegistry, id: &str) -> Result<(), Error> {
+    if !reg.account_configs.contains_key(id) {
+        return Err(Error::BadRequest(format!("Unknown account '{id}'")));
+    }
+    Ok(())
+}
+
 async fn resolve_session(state: &AppState, account: Option<&str>) -> Result<SessionLock, Error> {
     let reg = state.accounts.read().await;
     let key = account.unwrap_or(&reg.default_account);
     reg.sessions
         .get(key)
         .cloned()
-        .ok_or_else(|| Error::BadRequest(format!("Unknown account: {key}")))
+        .ok_or_else(|| Error::BadRequest(format!("Unknown account '{key}'")))
 }
 
 /// Resolve just the account ID (default if None), without requiring the
@@ -281,9 +291,7 @@ async fn resolve_account_id(state: &AppState, account: Option<&str>) -> Result<S
     if id.is_empty() {
         return Err(Error::BadRequest("No account specified".into()));
     }
-    if !reg.account_configs.contains_key(&id) {
-        return Err(Error::BadRequest(format!("Unknown account '{id}'")));
-    }
+    ensure_known_account(&reg, &id)?;
     Ok(id)
 }
 
@@ -1160,9 +1168,7 @@ async fn list_splits(
     // the untagged-only split list instead of 400ing.
     if let Some(ref acct) = params.account {
         let reg = state.accounts.read().await;
-        if !reg.account_configs.contains_key(acct) {
-            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
-        }
+        ensure_known_account(&reg, acct)?;
     }
 
     let config = splits::load_splits(
@@ -1195,9 +1201,7 @@ async fn create_split(
     // silently never render anywhere.
     if let Some(ref acct) = new_split.account {
         let reg = state.accounts.read().await;
-        if !reg.account_configs.contains_key(acct) {
-            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
-        }
+        ensure_known_account(&reg, acct)?;
     }
 
     config.splits.push(new_split);
@@ -1221,9 +1225,7 @@ async fn update_split(
     // silently never render anywhere.
     if let Some(ref acct) = updated.account {
         let reg = state.accounts.read().await;
-        if !reg.account_configs.contains_key(acct) {
-            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
-        }
+        ensure_known_account(&reg, acct)?;
     }
 
     if updated.id != split_id {
@@ -1813,8 +1815,12 @@ mod tests {
         let end = rest.find("\n}").expect("loadSplits must close");
         let body = &rest[..end];
         assert!(
-            body.contains("state.currentAccount?.id !== accountId"),
-            "loadSplits must discard a response that arrives after the account changed"
+            body.matches("state.currentAccount?.id !== accountId")
+                .count()
+                >= 2,
+            "loadSplits must discard BOTH a stale success and a stale failure — \
+             a failed request from the previous account must not wipe the new \
+             account's already-loaded splits in the catch branch"
         );
     }
 

@@ -38,6 +38,14 @@ pub struct OutlookSession {
     /// 183 #3: avoids an extra Graph RTT on every send-with-from_addr,
     /// since `/me` fields are essentially session-immutable.
     pub identity_cache: tokio::sync::Mutex<Option<IdentityCacheEntry>>,
+    /// Resolved folder-id → role map from the well-known alias lookups.
+    /// Alias→id assignments are stable for an account's lifetime, so this
+    /// resolves once per session rather than on every 60s folder-cache
+    /// refresh (6 Graph RTTs each — worsening the throttling it defends
+    /// against). An empty resolution is NOT cached: a throttled first
+    /// attempt retries on the next folder fetch instead of pinning a
+    /// role-less list.
+    pub folder_role_cache: tokio::sync::Mutex<Option<HashMap<String, String>>>,
     /// Provider-wide rate limiter combining concurrency cap, steady-state
     /// spacing, and Retry-After-aware retry. Microsoft Graph throttles
     /// aggressively per-app/per-mailbox; this is the single place that
@@ -269,6 +277,7 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         identity_cache: tokio::sync::Mutex::new(None),
+        folder_role_cache: tokio::sync::Mutex::new(None),
         limiter: build_outlook_limiter(),
     })
 }
@@ -309,6 +318,7 @@ pub async fn oauth_flow(
         page_cache: tokio::sync::Mutex::new(HashMap::new()),
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         identity_cache: tokio::sync::Mutex::new(None),
+        folder_role_cache: tokio::sync::Mutex::new(None),
         limiter: build_outlook_limiter(),
     };
 
@@ -1007,8 +1017,18 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
     // opaque folder id and matching ids. Tolerates individual alias
     // failures (e.g. `archive` 404s when In-Place Archive is disabled):
     // a folder whose alias didn't resolve is listed role-less, same as a
-    // user folder.
-    let role_map = roles_by_folder_id(&resolve_well_known_aliases(session, &token).await);
+    // user folder. Resolved once per session (see `folder_role_cache`).
+    let cached_roles = session.folder_role_cache.lock().await.clone();
+    let role_map = match cached_roles {
+        Some(map) => map,
+        None => {
+            let map = roles_by_folder_id(&resolve_well_known_aliases(session, &token).await);
+            if !map.is_empty() {
+                *session.folder_role_cache.lock().await = Some(map.clone());
+            }
+            map
+        }
+    };
 
     let folders: Vec<Mailbox> = parsed
         .value
@@ -2994,6 +3014,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
         };
 
@@ -3329,6 +3350,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
         }
     }
@@ -4889,6 +4911,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
         }
     }

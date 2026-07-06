@@ -448,6 +448,7 @@ mod tests {
             page_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             upload_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             identity_cache: tokio::sync::Mutex::new(None),
+            folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: crate::outlook::build_outlook_limiter(),
         }))
     }
