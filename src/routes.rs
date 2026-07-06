@@ -281,6 +281,9 @@ async fn resolve_account_id(state: &AppState, account: Option<&str>) -> Result<S
     if id.is_empty() {
         return Err(Error::BadRequest("No account specified".into()));
     }
+    if !reg.account_configs.contains_key(&id) {
+        return Err(Error::BadRequest(format!("Unknown account '{id}'")));
+    }
     Ok(id)
 }
 
@@ -1150,16 +1153,25 @@ struct ListSplitsParams {
 async fn list_splits(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListSplitsParams>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, Error> {
+    // No ?account= → full list (management/debugging view). The UI always
+    // sends the active account via the api() helper. When an account IS
+    // given, validate it — a typo would otherwise silently compute against
+    // the untagged-only split list instead of 400ing.
+    if let Some(ref acct) = params.account {
+        let reg = state.accounts.read().await;
+        if !reg.account_configs.contains_key(acct) {
+            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
+        }
+    }
+
     let config = splits::load_splits(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
-    // No ?account= → full list (management/debugging view). The UI always
-    // sends the active account via the api() helper.
-    Json(serde_json::json!(
+    Ok(Json(serde_json::json!(
         config.scoped_to(params.account.as_deref()).splits
-    ))
+    )))
 }
 
 async fn create_split(
@@ -1781,12 +1793,44 @@ mod tests {
     fn load_splits_goes_through_account_scoped_api_helper() {
         // A raw fetch skips ?account= and renders every account's tabs.
         assert!(
-            APP_JS.contains("state.splits = await api('GET', '/splits')"),
+            APP_JS.contains("const splits = await api('GET', '/splits')"),
             "loadSplits must use the api() helper so ?account= is appended"
         );
         assert!(
             !APP_JS.contains("fetch('/api/splits')"),
             "loadSplits must not bypass api() with a raw fetch"
+        );
+    }
+
+    #[test]
+    fn load_splits_guards_against_stale_account_switch() {
+        // On rapid account switches, account A's in-flight response can
+        // land after B's and overwrite state.splits while B is active.
+        let start = APP_JS
+            .find("async function loadSplits()")
+            .expect("loadSplits must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("loadSplits must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.currentAccount?.id !== accountId"),
+            "loadSplits must discard a response that arrives after the account changed"
+        );
+    }
+
+    #[test]
+    fn init_does_not_call_load_splits_directly() {
+        // init() runs before account selection, so state.currentAccount is
+        // still null — a direct call here fetches the unscoped split list,
+        // which can race and overwrite the account-scoped load triggered by
+        // selectAccount() (called from loadAccounts()).
+        let start = APP_JS.find("function init() {").expect("init must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("init must close");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("loadSplits()"),
+            "init must not call loadSplits() directly; selectAccount() loads it once an account is chosen"
         );
     }
 
@@ -1836,6 +1880,104 @@ mod tests {
             APP_JS.contains("account: state.currentAccount?.id"),
             "saveSplit must scope new splits to the active account"
         );
+    }
+
+    // =========================================================================
+    // resolve_account_id / list_splits — reject unknown account ids (roborev 271)
+    // =========================================================================
+
+    fn test_state(known: &[&str], default_account: &str) -> AppState {
+        let mut account_configs = std::collections::BTreeMap::new();
+        for id in known {
+            account_configs.insert(
+                id.to_string(),
+                accounts::AccountConfig::Fastmail {
+                    username: format!("{id}@example.com"),
+                    api_token: "tok".into(),
+                },
+            );
+        }
+        AppState {
+            accounts: tokio::sync::RwLock::new(AccountRegistry {
+                sessions: HashMap::new(),
+                account_configs,
+                default_account: default_account.to_string(),
+            }),
+            account_errors: tokio::sync::RwLock::new(Vec::new()),
+            splits_config_path: std::path::PathBuf::from("/tmp/nonexistent-splits.json"),
+            timezone_config_path: std::path::PathBuf::from("/tmp/nonexistent-timezone.json"),
+            timezone_write_lock: tokio::sync::Mutex::new(()),
+            config_path: std::path::PathBuf::from("/tmp/nonexistent-config"),
+            tokens_dir: std::path::PathBuf::from("/tmp/nonexistent-tokens"),
+            token_store: std::sync::Arc::new(crate::platform::FsTokenStore::new(
+                std::path::PathBuf::from("/tmp/nonexistent-tokens"),
+            )),
+            authorizing: accounts::AuthorizingSlot::default(),
+            config_error_baseline: std::sync::RwLock::new(Vec::new()),
+            prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_account_id_rejects_unknown_account() {
+        let state = test_state(&["known"], "known");
+        let err = resolve_account_id(&state, Some("typo"))
+            .await
+            .expect_err("an id absent from account_configs must be rejected");
+        assert!(
+            matches!(err, Error::BadRequest(ref msg) if msg.contains("Unknown account")),
+            "expected a BadRequest naming the unknown account, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_account_id_accepts_known_account() {
+        let state = test_state(&["known"], "known");
+        let id = resolve_account_id(&state, Some("known"))
+            .await
+            .expect("a configured account must resolve");
+        assert_eq!(id, "known");
+    }
+
+    #[tokio::test]
+    async fn resolve_account_id_default_none_still_works() {
+        // The None (default-account) path must keep working — default_account
+        // is always kept in sync with account_configs by the mutation
+        // handlers, so this can't regress into a false rejection.
+        let state = test_state(&["known"], "known");
+        let id = resolve_account_id(&state, None)
+            .await
+            .expect("omitting ?account= must fall back to the default account");
+        assert_eq!(id, "known");
+    }
+
+    #[tokio::test]
+    async fn list_splits_rejects_unknown_account_param() {
+        let state = Arc::new(test_state(&["known"], "known"));
+        let params = ListSplitsParams {
+            account: Some("typo".into()),
+        };
+        let err = list_splits(State(state), Query(params))
+            .await
+            .err()
+            .expect("an unknown ?account= must 400, not silently scope to untagged splits");
+        assert!(
+            matches!(err, Error::BadRequest(ref msg) if msg.contains("Unknown account")),
+            "expected a BadRequest naming the unknown account, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_splits_without_account_param_is_unaffected() {
+        // No ?account= → full list (management/debugging view); this must
+        // stay reachable even though it never hits the new validation gate.
+        let state = Arc::new(test_state(&["known"], "known"));
+        let params = ListSplitsParams { account: None };
+        let resp = list_splits(State(state), Query(params))
+            .await
+            .expect("omitting ?account= must not be rejected")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // =========================================================================

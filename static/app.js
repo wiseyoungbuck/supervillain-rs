@@ -385,7 +385,6 @@ function init() {
     // Load data
     loadTheme();
     loadAccounts();
-    loadSplits();
     loadTimezone();
     loadTzZones();
 }
@@ -800,8 +799,11 @@ function cacheKey(emailId) {
 }
 
 async function loadSplits() {
+    const accountId = state.currentAccount?.id;
     try {
-        state.splits = await api('GET', '/splits');
+        const splits = await api('GET', '/splits');
+        if (state.currentAccount?.id !== accountId) return; // stale response guard
+        state.splits = splits;
         renderSplitTabs();
         loadSplitCounts();
     } catch (err) {
