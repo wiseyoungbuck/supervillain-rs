@@ -1981,6 +1981,170 @@ mod tests {
     }
 
     // =========================================================================
+    // create_split / update_split validation tests (roborev 271)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn create_split_rejects_unknown_account() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let splits_path = temp_dir.path().join("splits.json");
+
+        let mut state = test_state(&["known"], "known");
+        state.splits_config_path = splits_path;
+
+        let new_split = SplitInbox {
+            id: "test-split".into(),
+            name: "Test".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: Some("typo".into()),
+        };
+
+        let err = create_split(State(Arc::new(state)), Json(new_split))
+            .await
+            .err()
+            .expect("create_split must reject a split tagged to an unknown account");
+
+        assert!(
+            matches!(err, Error::BadRequest(ref msg) if msg.contains("Unknown account")),
+            "expected a BadRequest containing 'Unknown account', got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_split_rejects_unknown_account() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let splits_path = temp_dir.path().join("splits.json");
+
+        let mut state = test_state(&["known"], "known");
+        state.splits_config_path = splits_path.clone();
+
+        // Seed a split with id "a" and no account tag
+        let existing_split = SplitInbox {
+            id: "a".into(),
+            name: "Original".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: None,
+        };
+        let config = SplitsConfig {
+            splits: vec![existing_split],
+        };
+        splits::save_splits(&config, &splits_path).expect("failed to save seed splits");
+
+        // Try to update it with account="typo"
+        let updated = SplitInbox {
+            id: "a".into(),
+            name: "Updated".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: Some("typo".into()),
+        };
+
+        let err = update_split(State(Arc::new(state)), Path("a".into()), Json(updated))
+            .await
+            .err()
+            .expect("update_split must reject a split tagged to an unknown account");
+
+        assert!(
+            matches!(err, Error::BadRequest(ref msg) if msg.contains("Unknown account")),
+            "expected a BadRequest containing 'Unknown account', got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_split_rejects_changed_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let splits_path = temp_dir.path().join("splits.json");
+
+        let mut state = test_state(&["known"], "known");
+        state.splits_config_path = splits_path.clone();
+
+        // Seed a split with id "a"
+        let existing_split = SplitInbox {
+            id: "a".into(),
+            name: "Original".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: None,
+        };
+        let config = SplitsConfig {
+            splits: vec![existing_split],
+        };
+        splits::save_splits(&config, &splits_path).expect("failed to save seed splits");
+
+        // Try to update it with a different id "b"
+        let updated = SplitInbox {
+            id: "b".into(),
+            name: "Updated".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: None,
+        };
+
+        let err = update_split(State(Arc::new(state)), Path("a".into()), Json(updated))
+            .await
+            .err()
+            .expect("update_split must reject a body id that differs from the path id");
+
+        assert!(
+            matches!(err, Error::BadRequest(ref msg) if msg.contains("immutable")),
+            "expected a BadRequest containing 'immutable', got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_split_without_account_untags() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let splits_path = temp_dir.path().join("splits.json");
+
+        let mut state = test_state(&["known"], "known");
+        state.splits_config_path = splits_path.clone();
+
+        // Seed a split with id "a" and account="known"
+        let existing_split = SplitInbox {
+            id: "a".into(),
+            name: "Original".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: Some("known".into()),
+        };
+        let config = SplitsConfig {
+            splits: vec![existing_split],
+        };
+        splits::save_splits(&config, &splits_path).expect("failed to save seed splits");
+
+        // Update it with account=None (PUT replaces everything)
+        let updated = SplitInbox {
+            id: "a".into(),
+            name: "Updated".into(),
+            icon: None,
+            filters: vec![],
+            match_mode: Default::default(),
+            account: None,
+        };
+
+        update_split(State(Arc::new(state)), Path("a".into()), Json(updated))
+            .await
+            .expect("update_split must succeed when account field is present and valid");
+
+        // Verify the stored split has account=None
+        let reloaded = splits::load_splits(&splits_path, None);
+        assert_eq!(reloaded.splits.len(), 1);
+        assert_eq!(reloaded.splits[0].id, "a");
+        assert_eq!(
+            reloaded.splits[0].account, None,
+            "account field must be None after PUT without account"
+        );
+    }
+
+    // =========================================================================
     // Mobile PWA tests
     // =========================================================================
 
