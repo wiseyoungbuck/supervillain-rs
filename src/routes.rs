@@ -463,12 +463,15 @@ async fn list_emails(
         provider::get_emails(&session, &email_ids, false, None).await?
     };
 
-    // Apply split filtering
+    // Apply split filtering, scoped to this account's splits so "primary"
+    // means "not matching any of *this account's* splits".
     if let Some(ref split_id) = params.split_id {
+        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
         let config = splits::load_splits(
             &state.splits_config_path,
             std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
-        );
+        )
+        .scoped_to(Some(&account_id));
         emails = splits::filter_by_split(emails, split_id, &config);
         emails.truncate(limit);
     }
@@ -989,12 +992,11 @@ async fn unsubscribe_and_archive(
 // =============================================================================
 // Splits CRUD
 //
-// These four handlers (list/create/update/delete) are GLOBAL: they always
-// read and write the single ~/.config/supervillain/splits.json regardless
-// of any ?account= query param. The frontend's ACCOUNT_SCOPED_API regex
-// appends ?account= here too, but it's harmless and dropped.
-// `/api/split-counts` (below) and `/api/emails?split_id=` (in list_emails)
-// DO use the account session — counts are per-account, definitions are global.
+// Definitions live in the single ~/.config/supervillain/splits.json, but
+// each split may be tagged with an owning account. Reads (`list_splits`)
+// scope to ?account=; writes validate the tag against the registry.
+// `/api/split-counts` and `/api/emails?split_id=` scope to the resolved
+// account before counting/filtering.
 // =============================================================================
 
 #[derive(Deserialize)]
@@ -1010,10 +1012,12 @@ async fn split_counts(
 ) -> Result<impl IntoResponse, Error> {
     let start = std::time::Instant::now();
 
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
     let config = splits::load_splits(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
-    );
+    )
+    .scoped_to(Some(&account_id));
     if config.splits.is_empty() {
         return Ok(Json(serde_json::json!({})));
     }
@@ -1024,7 +1028,7 @@ async fn split_counts(
     let is_cacheable = params.starred != Some(true);
 
     let counts: HashMap<String, u32> = if is_cacheable {
-        let id = resolve_account_id(&state, params.account.as_deref()).await?;
+        let id = account_id.clone();
         let mbox_for_key = params.mailbox_id.clone();
         let mbox_for_fetch = params.mailbox_id.clone();
         let cfg = config.clone();
@@ -1105,12 +1109,24 @@ pub(crate) async fn compute_split_counts(
     Ok(counts)
 }
 
-async fn list_splits(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct ListSplitsParams {
+    account: Option<String>,
+}
+
+async fn list_splits(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListSplitsParams>,
+) -> impl IntoResponse {
     let config = splits::load_splits(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
-    Json(serde_json::json!(config.splits))
+    // No ?account= → full list (management/debugging view). The UI always
+    // sends the active account via the api() helper.
+    Json(serde_json::json!(
+        config.scoped_to(params.account.as_deref()).splits
+    ))
 }
 
 async fn create_split(
@@ -1130,6 +1146,15 @@ async fn create_split(
         )));
     }
 
+    // Reject typos early: a split tagged to an unknown account would
+    // silently never render anywhere.
+    if let Some(ref acct) = new_split.account {
+        let reg = state.accounts.read().await;
+        if !reg.account_configs.contains_key(acct) {
+            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
+        }
+    }
+
     config.splits.push(new_split);
     splits::save_splits(&config, &state.splits_config_path)?;
 
@@ -1145,6 +1170,15 @@ async fn update_split(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
+
+    // Reject typos early: a split tagged to an unknown account would
+    // silently never render anywhere.
+    if let Some(ref acct) = updated.account {
+        let reg = state.accounts.read().await;
+        if !reg.account_configs.contains_key(acct) {
+            return Err(Error::BadRequest(format!("Unknown account '{acct}'")));
+        }
+    }
 
     let existing = config
         .splits

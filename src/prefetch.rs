@@ -674,7 +674,8 @@ async fn fetch_split_counts(
     let config = crate::splits::load_splits(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
-    );
+    )
+    .scoped_to(Some(account_id));
     if config.splits.is_empty() {
         return Ok(HashMap::new());
     }
