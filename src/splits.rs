@@ -1,16 +1,21 @@
 //! Split inbox filters.
 //!
-//! `splits.json` is a single global config. By construction — no
-//! `account_id` field on `SplitInbox` (see `crate::types`) — splits cannot
-//! be scoped per-account. Filters run against parsed `Email` objects after
-//! fetch, so the same definition works identically on Fastmail, Outlook,
-//! and Gmail. When the user switches accounts, the tab list stays the
-//! same; each tab matches that account's mail and shows zero if nothing
-//! hits.
+//! `splits.json` is a single file, but each `SplitInbox` may carry an
+//! `account` tag (a config-section id, e.g. "aristoi"). Tagged splits
+//! exist only for that account; untagged splits apply to every account.
+//! Route handlers scope the loaded config with [`SplitsConfig::scoped_to`]
+//! before filtering or counting, so the synthetic "primary" split means
+//! "not matching any of *this account's* splits". A split tagged to a
+//! since-deleted account is never listed but stays in the file for
+//! hand-editing.
 //!
-//! Auto-seeding (see [`seed_from_identities`]) runs ONCE at startup against
-//! the **default account's** identities, only when `splits.json` is empty.
-//! It deliberately does not re-run when accounts are added later: doing so
+//! Filters run against parsed `Email` objects after fetch, so the same
+//! definition works identically on Fastmail, Outlook, and Gmail.
+//!
+//! Auto-seeding (see [`seed_from_identities`]) runs ONCE at startup
+//! against the **default account's** identities, only when `splits.json`
+//! is empty, and tags every generated split with that account. It
+//! deliberately does not re-run when accounts are added later: doing so
 //! would silently clobber the user's edits.
 
 use crate::error::Error;
@@ -63,6 +68,29 @@ pub fn save_splits(config: &SplitsConfig, config_path: &Path) -> Result<(), Erro
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(config_path, json)?;
     Ok(())
+}
+
+// =============================================================================
+// Account scoping
+// =============================================================================
+
+impl SplitsConfig {
+    /// Splits visible to `account`: untagged splits (visible everywhere)
+    /// plus splits tagged with exactly this account. `None` returns the
+    /// full config — the management view.
+    pub fn scoped_to(&self, account: Option<&str>) -> SplitsConfig {
+        let Some(account) = account else {
+            return self.clone();
+        };
+        SplitsConfig {
+            splits: self
+                .splits
+                .iter()
+                .filter(|s| s.account.as_deref().is_none_or(|a| a == account))
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 // =============================================================================
@@ -295,6 +323,17 @@ mod tests {
         }
     }
 
+    fn tagged_split(id: &str, pattern: &str, account: Option<&str>) -> SplitInbox {
+        SplitInbox {
+            id: id.into(),
+            name: id.into(),
+            icon: None,
+            filters: vec![to_filter(pattern)],
+            match_mode: MatchMode::Any,
+            account: account.map(String::from),
+        }
+    }
+
     // --- FROM filter ---
 
     #[test]
@@ -517,6 +556,66 @@ mod tests {
         let result = filter_by_split(emails, "primary", &config);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].from[0].email, "friend@gmail.com");
+    }
+
+    // --- scoped_to ---
+
+    #[test]
+    fn scoped_to_keeps_own_and_untagged_drops_others() {
+        let config = SplitsConfig {
+            splits: vec![
+                tagged_split("aristoi", "*@aristoi.ai", Some("aristoi")),
+                tagged_split("gmail", "*@gmail.com", Some("gmail")),
+                tagged_split("calendar", "*@cal.test", None),
+            ],
+        };
+        let ids: Vec<String> = config
+            .scoped_to(Some("aristoi"))
+            .splits
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["aristoi", "calendar"]);
+    }
+
+    #[test]
+    fn scoped_to_none_returns_all() {
+        let config = SplitsConfig {
+            splits: vec![
+                tagged_split("aristoi", "*@aristoi.ai", Some("aristoi")),
+                tagged_split("calendar", "*@cal.test", None),
+            ],
+        };
+        assert_eq!(config.scoped_to(None).splits.len(), 2);
+    }
+
+    #[test]
+    fn scoped_to_unknown_account_keeps_only_untagged() {
+        // A split tagged to a since-deleted account is never listed.
+        let config = SplitsConfig {
+            splits: vec![
+                tagged_split("old", "*@old.test", Some("deleted-account")),
+                tagged_split("calendar", "*@cal.test", None),
+            ],
+        };
+        let scoped = config.scoped_to(Some("gmail"));
+        assert_eq!(scoped.splits.len(), 1);
+        assert_eq!(scoped.splits[0].id, "calendar");
+    }
+
+    #[test]
+    fn primary_with_scoped_config_ignores_other_accounts_splits() {
+        // The bug this feature fixes: a *@gmail.com split visible on every
+        // account swallowed all mail on the gmail account, emptying Primary
+        // — and conversely gmail-bound mail vanished from other accounts'
+        // Primary. Scoped away, the split must not claim the mail.
+        let emails = vec![make_email_with_to("alice@x.com", "matt@gmail.com", &[])];
+        let config = SplitsConfig {
+            splits: vec![tagged_split("gmail", "*@gmail.com", Some("gmail"))],
+        };
+        let scoped = config.scoped_to(Some("aristoi"));
+        let primary = filter_by_split(emails, "primary", &scoped);
+        assert_eq!(primary.len(), 1);
     }
 
     // --- matches_any_split ---
