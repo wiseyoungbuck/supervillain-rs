@@ -420,17 +420,36 @@ pub struct AppState {
     pub tokens_dir: PathBuf,
     pub token_store: std::sync::Arc<dyn crate::platform::TokenStore>,
     pub authorizing: crate::accounts::AuthorizingSlot,
-    /// Parse errors from the config file as it was read at startup. The
-    /// stale-config check in `list_accounts` compares fresh re-parse errors
-    /// against this snapshot: unchanged errors mean the file hasn't been
-    /// edited (they were already surfaced at startup); new/removed errors
-    /// mean a post-startup hand-edit even when the parsed accounts match.
-    pub startup_parse_errors: Vec<crate::accounts::ConfigParseError>,
+    /// Baseline of config parse errors for stale-config detection, seeded
+    /// from the startup read. `list_accounts` compares fresh re-parse errors
+    /// against it: unchanged errors mean the file hasn't been hand-edited
+    /// (they were already surfaced at startup); new/removed errors mean a
+    /// post-startup hand-edit even when the parsed accounts match. Every
+    /// app-made config write resets it to empty (app writes serialize
+    /// cleanly and drop any malformed startup sections from disk) so an
+    /// in-app save doesn't read as a hand-edit forever (roborev 268 #1).
+    /// Sync lock: critical sections are a clone/clear, never held across
+    /// `.await`.
+    pub config_error_baseline: std::sync::RwLock<Vec<crate::accounts::ConfigParseError>>,
     /// Cross-account background cache of mailboxes / identities / inbox-list
     /// / split-counts. Populated by `prefetch::spawn_warmer` at startup and
     /// every 5 min thereafter; consulted by the four hot routes (`list_*`,
     /// `split_counts`) before falling through to a live provider call.
     pub prefetch: std::sync::Arc<crate::prefetch::PrefetchCache>,
+}
+
+impl AppState {
+    /// Reset the stale-config parse-error baseline after an app-made config
+    /// write. App writes always serialize cleanly, so the correct baseline
+    /// is empty; leaving the startup snapshot in place would make the next
+    /// re-parse (0 errors ≠ startup errors) fire a permanent "restart to
+    /// apply hand-edits" banner after a plain Settings save.
+    pub fn reset_config_error_baseline(&self) {
+        self.config_error_baseline
+            .write()
+            .expect("config_error_baseline lock poisoned")
+            .clear();
+    }
 }
 
 // =============================================================================

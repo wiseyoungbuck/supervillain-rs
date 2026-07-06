@@ -100,7 +100,7 @@ async fn main() {
         tokens_dir,
         token_store,
         authorizing: accounts::AuthorizingSlot::default(),
-        startup_parse_errors: parse_errors,
+        config_error_baseline: std::sync::RwLock::new(parse_errors),
         prefetch: std::sync::Arc::new(prefetch::PrefetchCache::new()),
     });
 

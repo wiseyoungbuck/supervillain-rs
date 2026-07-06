@@ -315,11 +315,16 @@ async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let mut errors = state.account_errors.read().await.clone();
     // Hand-edits made after startup never take effect (config is loaded once
     // in main); tell the user instead of letting the edit silently rot.
+    let baseline = state
+        .config_error_baseline
+        .read()
+        .expect("config_error_baseline lock poisoned")
+        .clone();
     if let Some(banner) = crate::accounts::stale_config_banner(
         &state.config_path,
         &disk,
         &disk_parse_errors,
-        &state.startup_parse_errors,
+        &baseline,
         &reg.account_configs,
     ) {
         errors.push(banner);
@@ -3041,6 +3046,10 @@ white   = '#fdf6e3'
         // Roborev job 267 finding #1: a Fastmail account whose connect failed
         // is listed as pending; routing it into POST /authorize can only 400.
         // The authorize entry point must branch to the edit form instead.
+        // Substring tripwire only — it pins the guard expression in
+        // `authorizeAccountFromBanner`, so update it in lockstep with that
+        // function (a rename of the `acct` local breaks this; removal of the
+        // guard elsewhere would not).
         assert!(
             APP_JS.contains("acct.provider === 'fastmail'"),
             "authorizeAccountFromBanner should route fastmail to the edit form, not OAuth"
@@ -3051,6 +3060,7 @@ white   = '#fdf6e3'
     fn app_js_banner_heading_not_connection_specific_for_config_notices() {
         // The stale-config banner (provider "config") must not render under
         // a "failed to connect" heading with empty parentheses.
+        // Substring tripwire — update in lockstep with `showAccountErrors`.
         assert!(
             APP_JS.contains("attention:"),
             "banner should use a neutral heading when non-connection notices are present"

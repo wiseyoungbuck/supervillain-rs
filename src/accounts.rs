@@ -1089,6 +1089,7 @@ async fn upsert_account(
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
     }
+    state.reset_config_error_baseline();
 
     clear_setup_sentinel(&state).await;
     if needs_auth {
@@ -1153,6 +1154,7 @@ async fn delete_account(
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
     }
+    state.reset_config_error_baseline();
 
     if let Err(e) = std::fs::remove_file(token_file_path(&state.tokens_dir, &id))
         && e.kind() != std::io::ErrorKind::NotFound
@@ -1178,6 +1180,7 @@ async fn set_default_account(
         atomic_write_config(&state.config_path, &reg.snapshot())
             .map_err(|e| Error::Internal(format!("failed to write config: {e}")))?;
     }
+    state.reset_config_error_baseline();
     Ok(StatusCode::OK)
 }
 
@@ -1254,6 +1257,7 @@ async fn run_and_install_authorize(
             .map_err(|e| format!("failed to write config: {e}"))?;
         reg.default_account == id
     };
+    state.reset_config_error_baseline();
 
     Ok((updated_account, is_default))
 }
