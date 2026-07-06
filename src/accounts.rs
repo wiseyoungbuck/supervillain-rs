@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// Deserialized from JSON request bodies via serde's tag-based discrimination;
 /// converted to/from the on-disk INI format by `account_from_props` /
 /// `account_to_ini_lines` below.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum AccountConfig {
     Fastmail {
@@ -53,6 +53,24 @@ impl AccountConfig {
             Self::Fastmail { .. } => "fastmail",
             Self::Outlook { .. } => "outlook",
             Self::Gmail { .. } => "gmail",
+        }
+    }
+
+    /// The email address the config alone can vouch for, before any session
+    /// exists. Fastmail's username is canonical; OAuth providers may not know
+    /// it until the first authorize populates `email`.
+    pub fn configured_email(&self) -> Option<&str> {
+        match self {
+            Self::Fastmail { username, .. } => Some(username),
+            Self::Outlook { email, .. } | Self::Gmail { email, .. } => email.as_deref(),
+        }
+    }
+
+    /// OAuth client id, for providers that have one.
+    pub fn oauth_client_id(&self) -> Option<&str> {
+        match self {
+            Self::Outlook { client_id, .. } | Self::Gmail { client_id, .. } => Some(client_id),
+            Self::Fastmail { .. } => None,
         }
     }
 }
@@ -527,6 +545,65 @@ pub fn validate_email(s: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Cheap structural checks on OAuth credentials that catch paste errors at
+/// the boundary. Without this, a wrong client-id survives until token
+/// refresh and surfaces days later as an opaque "Token refresh failed"
+/// mid-session (or an Azure error page mid-authorize). Shape-only by design:
+/// no network, no live validation — the provider stays authoritative.
+///
+/// Shapes enforced: Azure Application (client) IDs are GUIDs; Google OAuth
+/// client IDs end in `.apps.googleusercontent.com`. Both have been stable
+/// for over a decade. A leading `fmu1-` (Fastmail API token prefix) gets a
+/// targeted message because that's the observed real-world paste error.
+pub fn credential_shape_error(acct: &AccountConfig) -> Option<String> {
+    match acct {
+        AccountConfig::Fastmail { .. } => None,
+        AccountConfig::Outlook { client_id, .. } => {
+            if is_guid(client_id) {
+                None
+            } else if client_id.starts_with("fmu1-") {
+                Some(
+                    "client-id looks like a Fastmail API token; Outlook needs the Azure \
+                     Application (client) ID — a GUID like 00000000-0000-0000-0000-000000000000"
+                        .into(),
+                )
+            } else {
+                Some(
+                    "client-id is not an Azure Application (client) ID (expected a GUID \
+                     like 00000000-0000-0000-0000-000000000000)"
+                        .into(),
+                )
+            }
+        }
+        AccountConfig::Gmail { client_id, .. } => {
+            if client_id.ends_with(".apps.googleusercontent.com") {
+                None
+            } else if client_id.starts_with("fmu1-") {
+                Some(
+                    "client-id looks like a Fastmail API token; Gmail needs the OAuth \
+                     client ID ending in .apps.googleusercontent.com"
+                        .into(),
+                )
+            } else {
+                Some(
+                    "client-id is not a Google OAuth client ID (expected to end with \
+                     .apps.googleusercontent.com)"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+fn is_guid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&parts)
+            .all(|(len, p)| p.len() == *len && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Aggregate per-field errors so the UI can highlight every offending input
 /// in one pass. Returns errors in DOM order (top-down through the form).
 pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<FieldError>> {
@@ -555,6 +632,8 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
                     FieldId::ClientId,
                     "client-id must not be empty",
                 ));
+            } else if let Some(msg) = credential_shape_error(cfg) {
+                errs.push(FieldError::new(FieldId::ClientId, msg));
             }
             if let Some(e) = email
                 && let Err(err) = validate_email(e)
@@ -572,6 +651,8 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
                     FieldId::ClientId,
                     "client-id must not be empty",
                 ));
+            } else if let Some(msg) = credential_shape_error(cfg) {
+                errs.push(FieldError::new(FieldId::ClientId, msg));
             }
             if client_secret.trim().is_empty() {
                 errs.push(FieldError::new(
@@ -724,6 +805,71 @@ pub fn delete_and_pick_new_default(cfg: &mut ConfigFile, id: &str) -> bool {
         cfg.default_account = cfg.accounts.keys().next().cloned();
     }
     removed
+}
+
+/// Build the `GET /api/accounts` wire list from config + live-session info.
+///
+/// Every configured account appears — accounts without a live session are
+/// included with `authStatus: "pending"` so the UI can show them with an
+/// Authorize affordance instead of silently omitting them (the old behavior,
+/// which made configured-but-unauthorized accounts invisible in the client).
+///
+/// `live` maps account id → (email, provider) for accounts with sessions;
+/// session data wins over config because it's authoritative post-connect.
+/// `clientId` is exposed for OAuth providers so the settings edit form can
+/// display it (it is public, not a secret).
+pub fn wire_account_list(
+    configs: &BTreeMap<String, AccountConfig>,
+    live: &std::collections::HashMap<String, (String, String)>,
+    default_account: &str,
+) -> Vec<serde_json::Value> {
+    configs
+        .iter()
+        .map(|(id, acct)| {
+            let session = live.get(id);
+            let email = match session {
+                Some((email, _)) => Some(email.as_str()),
+                None => acct.configured_email(),
+            };
+            let provider = match session {
+                Some((_, provider)) => provider.as_str(),
+                None => acct.provider_str(),
+            };
+            serde_json::json!({
+                "id": id,
+                "email": email,
+                "provider": provider,
+                "isDefault": id == default_account,
+                "authStatus": if session.is_some() { "ok" } else { "pending" },
+                "clientId": acct.oauth_client_id(),
+            })
+        })
+        .collect()
+}
+
+/// Compare the config file on disk against the running registry's accounts.
+/// Hand-edits after startup never take effect (main.rs loads config once),
+/// so a divergent file means the user is waiting on changes that will never
+/// arrive — return a banner telling them to restart.
+///
+/// `default_account` is deliberately NOT compared: the registry's default may
+/// legitimately diverge from disk when the configured default failed to
+/// connect and `resolve_default_account` picked a fallback.
+pub fn stale_config_banner(
+    config_path: &Path,
+    disk: &ConfigFile,
+    running: &BTreeMap<String, AccountConfig>,
+) -> Option<crate::types::AccountError> {
+    if disk.accounts == *running {
+        return None;
+    }
+    Some(crate::types::AccountError {
+        account: config_path.display().to_string(),
+        provider: String::new(),
+        error: "Config file changed on disk after startup — restart supervillain to apply \
+                hand-edits (Settings changes apply immediately and would overwrite them)"
+            .into(),
+    })
 }
 
 /// Idempotent set-default. Errors if the account isn't present.
@@ -1550,6 +1696,200 @@ api-token = tok
         });
         let parsed: AccountConfig = serde_json::from_value(good).unwrap();
         assert_eq!(parsed.provider_str(), "fastmail");
+    }
+
+    // ---- Credential shape validation ----
+
+    #[test]
+    fn credential_shape_flags_fastmail_token_pasted_as_outlook_client_id() {
+        // The real-world paste error: a Fastmail api-token in an Outlook
+        // section. Without this check it survives until token refresh and
+        // surfaces days later as an opaque "Token refresh failed".
+        let acct = outlook("fmu1-9d4140f1-deadbeef-0-cafe", None);
+        let msg = credential_shape_error(&acct).expect("fmu1- token must be flagged");
+        assert!(
+            msg.contains("Fastmail"),
+            "message should name the likely mistake: {msg}"
+        );
+    }
+
+    #[test]
+    fn credential_shape_requires_guid_for_outlook() {
+        assert!(credential_shape_error(&outlook("not-a-guid", None)).is_some());
+        assert!(
+            credential_shape_error(&outlook("0e86662a-14b9-4e95-97d6-e91972f91d48", None))
+                .is_none()
+        );
+        // Azure portal shows uppercase hex in some views; both must pass.
+        assert!(
+            credential_shape_error(&outlook("0E86662A-14B9-4E95-97D6-E91972F91D48", None))
+                .is_none()
+        );
+        // Right lengths, non-hex chars: still rejected.
+        assert!(
+            credential_shape_error(&outlook("0e86662g-14b9-4e95-97d6-e91972f91d48", None))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn credential_shape_requires_googleusercontent_suffix_for_gmail() {
+        // An Azure GUID pasted into a Gmail section is wrong too.
+        assert!(
+            credential_shape_error(&gmail("0e86662a-14b9-4e95-97d6-e91972f91d48", "s", None))
+                .is_some()
+        );
+        assert!(
+            credential_shape_error(&gmail("123-abc.apps.googleusercontent.com", "s", None))
+                .is_none()
+        );
+        let fm = credential_shape_error(&gmail("fmu1-sometoken", "s", None))
+            .expect("fmu1- flagged for gmail too");
+        assert!(fm.contains("Fastmail"));
+    }
+
+    #[test]
+    fn credential_shape_ignores_fastmail_accounts() {
+        assert!(credential_shape_error(&fastmail("u@fm.com", "fmu1-tok")).is_none());
+    }
+
+    #[test]
+    fn validate_account_rejects_malformed_client_id_shape() {
+        let errs = validate_account(&outlook("fmu1-token-pasted-here", None), "ok").unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, FieldId::ClientId);
+        // Empty client-id still reports the empty message, not the shape one.
+        let errs = validate_account(&outlook("", None), "ok").unwrap_err();
+        assert_eq!(errs[0].field, FieldId::ClientId);
+        assert!(errs[0].message.contains("empty"));
+    }
+
+    // ---- Wire account list (GET /api/accounts) ----
+
+    fn live(entries: &[(&str, &str, &str)]) -> std::collections::HashMap<String, (String, String)> {
+        entries
+            .iter()
+            .map(|(id, email, provider)| {
+                (
+                    (*id).to_string(),
+                    ((*email).to_string(), (*provider).to_string()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wire_list_includes_pending_accounts_with_config_email() {
+        // An OAuth account with no live session must still appear, marked
+        // pending, with whatever email the config knows. This is the fix for
+        // configured accounts being invisible in the client.
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "gm".into(),
+            gmail("x.apps.googleusercontent.com", "s", Some("u@g.com")),
+        );
+        configs.insert(
+            "ms".into(),
+            outlook("0e86662a-14b9-4e95-97d6-e91972f91d48", None),
+        );
+        let list = wire_account_list(&configs, &live(&[]), "gm");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["id"], "gm");
+        assert_eq!(list[0]["authStatus"], "pending");
+        assert_eq!(list[0]["email"], "u@g.com");
+        assert_eq!(list[0]["isDefault"], true);
+        // Outlook without a configured email: null, not a panic or "".
+        assert_eq!(list[1]["id"], "ms");
+        assert!(list[1]["email"].is_null());
+        assert_eq!(list[1]["isDefault"], false);
+    }
+
+    #[test]
+    fn wire_list_uses_session_email_and_marks_ok() {
+        let mut configs = BTreeMap::new();
+        configs.insert("fm".into(), fastmail("config@fm.com", "tok"));
+        // Session email wins over config (session is authoritative post-connect).
+        let list = wire_account_list(&configs, &live(&[("fm", "live@fm.com", "fastmail")]), "fm");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["authStatus"], "ok");
+        assert_eq!(list[0]["email"], "live@fm.com");
+        assert_eq!(list[0]["provider"], "fastmail");
+    }
+
+    #[test]
+    fn wire_list_exposes_client_id_for_oauth_only() {
+        // The settings edit form reads clientId from this list; Fastmail has
+        // none and must not grow a null field the UI trips on.
+        let mut configs = BTreeMap::new();
+        configs.insert("fm".into(), fastmail("u@fm.com", "tok"));
+        configs.insert(
+            "ms".into(),
+            outlook("0e86662a-14b9-4e95-97d6-e91972f91d48", None),
+        );
+        let list = wire_account_list(&configs, &live(&[]), "");
+        assert_eq!(list[1]["clientId"], "0e86662a-14b9-4e95-97d6-e91972f91d48");
+        assert!(list[0].get("clientId").is_none() || list[0]["clientId"].is_null());
+    }
+
+    // ---- Stale-config detection ----
+
+    #[test]
+    fn stale_banner_none_when_disk_matches_registry() {
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: accounts.clone(),
+        };
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &accounts).is_none());
+    }
+
+    #[test]
+    fn stale_banner_fires_when_disk_has_hand_edits() {
+        let mut running = BTreeMap::new();
+        running.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        // Hand-edit added a section after startup.
+        let mut edited = running.clone();
+        edited.insert("new-acct".to_string(), fastmail("n@fm.com", "t2"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: edited,
+        };
+        let banner =
+            stale_config_banner(Path::new("/x/config"), &disk, &running).expect("must fire");
+        assert!(
+            banner.error.contains("restart"),
+            "tells the user the fix: {}",
+            banner.error
+        );
+        assert_eq!(banner.account, "/x/config");
+    }
+
+    #[test]
+    fn stale_banner_fires_when_field_edited_in_place() {
+        let mut running = BTreeMap::new();
+        running.insert("fm".to_string(), fastmail("u@fm.com", "old-tok"));
+        let mut edited = BTreeMap::new();
+        edited.insert("fm".to_string(), fastmail("u@fm.com", "new-tok"));
+        let disk = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts: edited,
+        };
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &running).is_some());
+    }
+
+    #[test]
+    fn stale_banner_ignores_default_account_divergence() {
+        // The registry's default may legitimately differ from disk when the
+        // configured default failed to connect and startup picked a fallback.
+        // That must NOT read as "config changed on disk".
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), fastmail("u@fm.com", "tok"));
+        let disk = ConfigFile {
+            default_account: Some("something-else".into()),
+            accounts: accounts.clone(),
+        };
+        assert!(stale_config_banner(Path::new("/x/config"), &disk, &accounts).is_none());
     }
 
     // ---- Authorize single-flight ----

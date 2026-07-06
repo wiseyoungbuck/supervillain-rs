@@ -389,6 +389,11 @@ body {
     text-transform: uppercase;
 }
 
+.account-item.pending .account-email {
+    color: var(--fg-muted);
+    font-style: italic;
+}
+
 /* Views */
 .view {
     display: none;

@@ -4,6 +4,31 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Account visibility, credential-shape validation, stale-config detection
+
+`GET /api/accounts` now lists every configured account, not just the ones
+with live sessions. Accounts awaiting OAuth carry `authStatus: "pending"`
+(plus `clientId` so the settings edit form can display it), which lights up
+the existing Authorize affordances in the UI — previously a configured but
+unauthorized account was simply invisible in the client. The sidebar renders
+pending accounts dimmed with a "needs auth" tag, falls back to the account id
+when no email is known yet, and routes clicks into the authorize flow instead
+of firing doomed mailbox fetches.
+
+`credential_shape_error` catches OAuth credential paste errors at the
+boundary: Outlook client-ids must be Azure GUIDs, Gmail client-ids must end
+in `.apps.googleusercontent.com`, and a leading `fmu1-` (Fastmail API token)
+gets a targeted message. Enforced hard on account save and fail-fast at
+startup session load — a wrong client-id previously survived until token
+refresh and surfaced days later as an opaque "Token refresh failed".
+
+`stale_config_banner` compares the on-disk config against the running
+registry on every account listing. Hand-edits made after startup never take
+effect (config is loaded once in main), so a divergent file now surfaces a
+"restart supervillain to apply" banner instead of silently rotting. The
+registry's fallback default-account is deliberately excluded from the
+comparison.
+
 ## Outlook OAuth — User.Read scope + Graph /me hardening
 
 Outlook stays on the `/common` endpoint (supports both personal MSAs and

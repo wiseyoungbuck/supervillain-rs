@@ -290,17 +290,29 @@ async fn resolve_account_id(state: &AppState, account: Option<&str>) -> Result<S
 
 async fn list_accounts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let reg = state.accounts.read().await;
-    let mut accounts = Vec::new();
+    let mut live = std::collections::HashMap::new();
     for (name, session_lock) in &reg.sessions {
         let session = session_lock.read().await;
-        accounts.push(serde_json::json!({
-            "id": name,
-            "email": session.username(),
-            "provider": session.provider_name(),
-            "isDefault": *name == reg.default_account
-        }));
+        live.insert(
+            name.clone(),
+            (
+                session.username().to_string(),
+                session.provider_name().to_string(),
+            ),
+        );
     }
-    let errors = state.account_errors.read().await.clone();
+    let accounts =
+        crate::accounts::wire_account_list(&reg.account_configs, &live, &reg.default_account);
+
+    let mut errors = state.account_errors.read().await.clone();
+    // Hand-edits made after startup never take effect (config is loaded once
+    // in main); tell the user instead of letting the edit silently rot.
+    let (disk, _) = crate::accounts::parse_config(&state.config_path);
+    if let Some(banner) =
+        crate::accounts::stale_config_banner(&state.config_path, &disk, &reg.account_configs)
+    {
+        errors.push(banner);
+    }
     Json(serde_json::json!({
         "accounts": accounts,
         "errors": errors,
@@ -2985,6 +2997,39 @@ white   = '#fdf6e3'
         assert!(
             APP_JS.contains("escapeHtml("),
             "showAccountErrors should use escapeHtml for XSS prevention"
+        );
+    }
+
+    #[test]
+    fn app_js_renders_pending_accounts_in_selector() {
+        // Pending (configured-but-unauthorized) accounts are now included in
+        // GET /api/accounts; the sidebar must label them instead of rendering
+        // "undefined" for a missing email.
+        assert!(
+            APP_JS.contains("acc.email || acc.id"),
+            "account selector should fall back to the account id when email is absent"
+        );
+        assert!(
+            APP_JS.contains("needs auth"),
+            "account selector should mark pending accounts as needing authorization"
+        );
+    }
+
+    #[test]
+    fn app_js_routes_pending_account_clicks_to_authorize() {
+        // Clicking/selecting a pending account must not fire mailbox fetches
+        // that can only fail — it routes into the authorize flow instead.
+        assert!(
+            APP_JS.contains("account.authStatus === 'pending'"),
+            "selectAccount should guard against pending accounts"
+        );
+    }
+
+    #[test]
+    fn app_js_auto_selects_only_connected_accounts() {
+        assert!(
+            APP_JS.contains("a.authStatus !== 'pending'"),
+            "loadAccounts should auto-select from connected accounts only"
         );
     }
 

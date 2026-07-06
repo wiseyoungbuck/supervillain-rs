@@ -647,8 +647,21 @@ async function loadAccounts() {
             return;
         }
 
-        const defaultAcc = state.accounts.find(a => a.isDefault) || state.accounts[0];
-        if (defaultAcc) selectAccount(defaultAcc);
+        // Auto-select only a connected account — selecting a pending one
+        // would fire mailbox fetches that can only fail.
+        const connected = state.accounts.filter(a => a.authStatus !== 'pending');
+        const defaultAcc = connected.find(a => a.isDefault) || connected[0];
+        if (defaultAcc) {
+            selectAccount(defaultAcc);
+        } else {
+            // Accounts exist but none are authorized — land in settings so
+            // the user can complete authorization.
+            state.currentAccount = null;
+            state.currentMailbox = null;
+            state.emails = [];
+            els.mailboxName.textContent = 'NOT AUTHORIZED';
+            openSettings();
+        }
 
         // If we were already in settings (e.g. just completed first-run save),
         // re-render to show the new account list rather than the firstRun pane.
@@ -711,14 +724,17 @@ function renderAccounts() {
     }
 
     els.accountSelector.style.display = 'block';
-    els.accountSelector.innerHTML = state.accounts.map((acc, idx) => `
-        <div class="account-item ${state.currentAccount?.id === acc.id ? 'active' : ''}"
-             data-id="${acc.id}">
+    els.accountSelector.innerHTML = state.accounts.map((acc, idx) => {
+        const pending = acc.authStatus === 'pending';
+        return `
+        <div class="account-item ${state.currentAccount?.id === acc.id ? 'active' : ''}${pending ? ' pending' : ''}"
+             data-id="${escapeAttr(acc.id)}">
             <span class="account-key">${idx + 1}</span>
-            <span class="account-email">${acc.email}</span>
-            <span class="account-provider">${acc.provider}</span>
+            <span class="account-email">${escapeHtml(acc.email || acc.id)}</span>
+            <span class="account-provider">${escapeHtml(acc.provider)}${pending ? ' · needs auth' : ''}</span>
         </div>
-    `).join('');
+    `;
+    }).join('');
 
     els.accountSelector.querySelectorAll('.account-item').forEach(el => {
         el.addEventListener('click', () => {
@@ -729,6 +745,12 @@ function renderAccounts() {
 }
 
 function selectAccount(account) {
+    if (account.authStatus === 'pending') {
+        // Not authorized yet — every mailbox fetch would fail. Route into
+        // the authorize flow instead.
+        authorizeAccountFromBanner(account.id);
+        return;
+    }
     state.currentAccount = account;
     state.mailboxes = [];
     state.emails = [];

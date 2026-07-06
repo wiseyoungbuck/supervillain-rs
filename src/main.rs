@@ -154,6 +154,17 @@ async fn load_session(
     tokens_dir: &std::path::Path,
     token_store: &Arc<dyn TokenStore>,
 ) -> Result<ProviderSession, AccountError> {
+    // Fail fast on credentials that can't possibly work (e.g. a Fastmail
+    // token pasted as an Azure client-id). Loading a session anyway would
+    // produce a zombie account whose every token refresh fails with an
+    // opaque provider error.
+    if let Some(msg) = accounts::credential_shape_error(account) {
+        return Err(AccountError {
+            account: name.into(),
+            provider: account.provider_str().into(),
+            error: format!("{msg} — fix the account in Settings"),
+        });
+    }
     match account {
         AccountConfig::Fastmail {
             username,
