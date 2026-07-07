@@ -7,6 +7,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 LAUNCHER="$REPO/scripts/supervillain-launcher.sh"
+UPGRADE="$REPO/scripts/upgrade.sh"
 
 fail() {
     echo "FAIL: $1"
@@ -67,4 +68,39 @@ fi
 [[ "$out" == *SUPERVILLAIN_BIND* ]] ||
     fail "rejection message should name SUPERVILLAIN_BIND, got: $out"
 
-echo "PASS: launcher derives PORT and URL from SUPERVILLAIN_BIND and rejects portless values"
+# Case 5: leading-zero ports are normalized — ss reports the listener as
+# :8000, so an unnormalized 08000 would never match and the poll would
+# report a bogus 15s startup failure.
+out="$(
+    SUPERVILLAIN_BIND=0.0.0.0:08000 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'; printf '%s %s' \"\$PORT\" \"\$URL\""
+)"
+[[ "$out" == "8000 http://127.0.0.1:8000" ]] ||
+    fail "leading-zero port should normalize to 8000, got: $out"
+
+# Case 6: out-of-range ports fail here with a clear message instead of
+# only at bind time.
+if out="$(
+    SUPERVILLAIN_BIND=0.0.0.0:99999 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'" 2>&1
+)"; then
+    fail "out-of-range port should be rejected by the launcher, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "launcher range rejection should name SUPERVILLAIN_BIND, got: $out"
+
+# Case 7: upgrade.sh applies the same validation (its check runs before
+# any side effects, so --dry-run is safe belt-and-braces).
+if out="$(SUPERVILLAIN_BIND=0.0.0.0 "$UPGRADE" --dry-run 2>&1)"; then
+    fail "upgrade.sh should reject a portless SUPERVILLAIN_BIND, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "upgrade.sh rejection should name SUPERVILLAIN_BIND, got: $out"
+
+if out="$(SUPERVILLAIN_BIND=0.0.0.0:99999 "$UPGRADE" --dry-run 2>&1)"; then
+    fail "upgrade.sh should reject an out-of-range port, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "upgrade.sh range rejection should name SUPERVILLAIN_BIND, got: $out"
+
+echo "PASS: PORT/URL derivation, normalization, and bind validation hold in launcher and upgrade.sh"

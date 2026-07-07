@@ -11,10 +11,13 @@ set -euo pipefail
 # PORT derives from it so the port checks track a custom bind address.
 export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
 PORT="${SUPERVILLAIN_BIND##*:}"
-if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-    echo "Supervillain: SUPERVILLAIN_BIND='${SUPERVILLAIN_BIND}' has no numeric port (expected host:port)" >&2
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then
+    echo "Error: SUPERVILLAIN_BIND='${SUPERVILLAIN_BIND}' must be host:port with a port in 1-65535" >&2
     exit 1
 fi
+# Normalize leading zeros: ss reports the listener as :8000, so an
+# unnormalized 08000 would never match the port checks.
+PORT=$((10#$PORT))
 # URL host mirrors the binary's browser_url(): a wildcard bind is
 # reachable at loopback; a specific interface only listens on itself.
 HOST="${SUPERVILLAIN_BIND%:*}"
