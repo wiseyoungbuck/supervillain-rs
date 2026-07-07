@@ -11,7 +11,10 @@ set -euo pipefail
 # PORT derives from it so the port checks track a custom bind address.
 export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
 PORT="${SUPERVILLAIN_BIND##*:}"
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then
+# {1,5} also blocks 64-bit wraparound: a 20-digit port can evaluate to an
+# in-range value under bash's modular arithmetic.
+if [[ "$SUPERVILLAIN_BIND" != *:* ]] || ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] ||
+    ((10#$PORT < 1 || 10#$PORT > 65535)); then
     echo "Error: SUPERVILLAIN_BIND='${SUPERVILLAIN_BIND}' must be host:port with a port in 1-65535" >&2
     exit 1
 fi

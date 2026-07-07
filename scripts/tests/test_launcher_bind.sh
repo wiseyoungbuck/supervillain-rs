@@ -89,6 +89,29 @@ fi
 [[ "$out" == *SUPERVILLAIN_BIND* ]] ||
     fail "launcher range rejection should name SUPERVILLAIN_BIND, got: $out"
 
+# Case 5b: a 20-digit port must not sneak past the range check via
+# 64-bit arithmetic wraparound (18446744073709559616 % 2^64 == 8000).
+if out="$(
+    SUPERVILLAIN_BIND=0.0.0.0:18446744073709559616 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'" 2>&1
+)"; then
+    fail "overflow-length port should be rejected, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "overflow rejection should name SUPERVILLAIN_BIND, got: $out"
+
+# Case 5c: a colonless value is not host:port — ##*: leaves the whole
+# string as PORT, which previously validated as a port and produced
+# URL=http://8000:8000 plus an unparseable bind string for the binary.
+if out="$(
+    SUPERVILLAIN_BIND=8000 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'" 2>&1
+)"; then
+    fail "colonless SUPERVILLAIN_BIND should be rejected, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "colonless rejection should name SUPERVILLAIN_BIND, got: $out"
+
 # Case 7: upgrade.sh applies the same validation (its check runs before
 # any side effects, so --dry-run is safe belt-and-braces).
 if out="$(SUPERVILLAIN_BIND=0.0.0.0 "$UPGRADE" --dry-run 2>&1)"; then
@@ -102,5 +125,12 @@ if out="$(SUPERVILLAIN_BIND=0.0.0.0:99999 "$UPGRADE" --dry-run 2>&1)"; then
 fi
 [[ "$out" == *SUPERVILLAIN_BIND* ]] ||
     fail "upgrade.sh range rejection should name SUPERVILLAIN_BIND, got: $out"
+
+# upgrade.sh normalizes leading zeros too — observable in the dry-run
+# poll line; unnormalized 08000 would poll a port ss never reports.
+out="$(SUPERVILLAIN_BIND=0.0.0.0:08000 "$UPGRADE" --dry-run 2>&1)" ||
+    fail "leading-zero port should be accepted by upgrade.sh, got: $out"
+[[ "$out" == *":8000 "* ]] ||
+    fail "upgrade.sh should poll the normalized port 8000, got: $out"
 
 echo "PASS: PORT/URL derivation, normalization, and bind validation hold in launcher and upgrade.sh"
