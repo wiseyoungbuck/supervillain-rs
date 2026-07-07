@@ -2675,6 +2675,47 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_has_email_actions() {
+        // Archive/trash/read/star all go through existing server routes
+        // with optimistic updates (mirrors desktop's emailAction/
+        // toggleUnread/toggleFlag) — kata 6kx8 (task A4).
+        for route in ["/archive", "/trash", "/mark-unread", "/toggle-flag"] {
+            assert!(
+                MOBILE_APP_JS.contains(route),
+                "app.js should call the {route} route"
+            );
+        }
+        assert!(
+            MOBILE_APP_JS.contains("undoStack"),
+            "archive/trash should push onto an undo stack for a later undo (A5)"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_row_swipe_recognizer() {
+        // The row-swipe gesture must plug into the existing single-touch
+        // controller (kata 6kx8, task A4) rather than adding a second
+        // listener set — re-assert the invariant from
+        // mobile_app_js_single_touch_controller alongside the new
+        // recognizer so a regression here fails both tests together.
+        assert!(
+            MOBILE_APP_JS.contains("rowSwipeRecognizer"),
+            "app.js should implement row-swipe as a gesture recognizer"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("[pullToRefreshRecognizer, rowSwipeRecognizer]"),
+            "the row-swipe recognizer must be registered in gestureController.recognizers"
+        );
+        let touchstart_listeners = MOBILE_APP_JS
+            .matches("addEventListener('touchstart'")
+            .count();
+        assert_eq!(
+            touchstart_listeners, 1,
+            "row-swipe must not add its own touchstart listener (found {touchstart_listeners})"
+        );
+    }
+
+    #[test]
     fn mobile_sw_caches_app_shell() {
         assert!(
             MOBILE_SW.contains("/mobile/app.js"),
@@ -2700,6 +2741,22 @@ mod tests {
             MOBILE_HTML.contains("-webkit-overflow-scrolling: touch"),
             "email list should use momentum scrolling"
         );
+    }
+
+    #[test]
+    fn mobile_html_has_detail_action_bar() {
+        // Detail-view archive/trash/read/star buttons (kata 6kx8, task A4).
+        for id in [
+            "detail-archive-btn",
+            "detail-trash-btn",
+            "detail-read-btn",
+            "detail-star-btn",
+        ] {
+            assert!(
+                MOBILE_HTML.contains(id),
+                "detail action bar should include a #{id} button"
+            );
+        }
     }
 
     // =========================================================================

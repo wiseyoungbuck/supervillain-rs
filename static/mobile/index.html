@@ -27,6 +27,7 @@
             --text-muted: #888;
             --accent: #e94560;
             --accent-dim: #b8364d;
+            --success: #2ecc71;
             --border: #2a2a4a;
             --safe-top: env(safe-area-inset-top, 0px);
             --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -211,6 +212,15 @@
             min-height: 72px;
             border-bottom: 1px solid var(--border);
             cursor: pointer;
+            position: relative;
+            background: var(--bg);
+            transition: transform 0.2s ease;
+        }
+
+        /* Dragging (rowSwipeRecognizer, app.js): no transition so the row
+           tracks the finger 1:1; re-enabled on release for the spring-back. */
+        .email-row.swiping {
+            transition: none;
         }
 
         .email-row:active {
@@ -302,6 +312,53 @@
             height: 200px;
             color: var(--text-muted);
             font-size: 15px;
+        }
+
+        /* Swipe actions (rowSwipeRecognizer, app.js) — .email-row-wrap holds
+           the translated .email-row over a same-size .swipe-bg; dragging
+           right reveals archive (left-aligned, green), left reveals trash
+           (right-aligned, red). */
+        .email-row-wrap {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .swipe-bg {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            font-size: 20px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s;
+        }
+
+        .swipe-bg .swipe-icon-archive,
+        .swipe-bg .swipe-icon-trash {
+            display: none;
+        }
+
+        .swipe-bg.swipe-reveal-archive {
+            background: var(--success);
+            justify-content: flex-start;
+            padding-left: 24px;
+            opacity: 1;
+        }
+
+        .swipe-bg.swipe-reveal-archive .swipe-icon-archive {
+            display: block;
+        }
+
+        .swipe-bg.swipe-reveal-trash {
+            background: var(--accent);
+            justify-content: flex-end;
+            padding-right: 24px;
+            opacity: 1;
+        }
+
+        .swipe-bg.swipe-reveal-trash .swipe-icon-trash {
+            display: block;
         }
 
         #status-bar {
@@ -447,6 +504,37 @@
         #email-body a { color: var(--accent); }
 
         .plain-text-body { white-space: pre-wrap; }
+
+        /* Detail action bar — archive/trash/read/star (renderDetailActionBar,
+           handleDetailAction in app.js). A flex-row footer sibling of
+           #email-body, so it stays pinned below the scrolling body. */
+        #detail-actions {
+            display: flex;
+            border-top: 1px solid var(--border);
+            padding-bottom: var(--safe-bottom);
+        }
+
+        .detail-action-btn {
+            flex: 1;
+            background: none;
+            border: none;
+            color: var(--text);
+            font-size: 20px;
+            cursor: pointer;
+            padding: 10px 0;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .detail-action-btn:active {
+            background: var(--surface-hover);
+        }
+
+        .detail-action-btn.active {
+            color: var(--accent);
+        }
     </style>
 </head>
 <body>
@@ -473,6 +561,12 @@
             <div id="detail-attachments"></div>
             <div id="detail-calendar"></div>
             <div id="email-body"></div>
+            <div id="detail-actions">
+                <button id="detail-archive-btn" class="detail-action-btn" aria-label="Archive">&#128452;</button>
+                <button id="detail-trash-btn" class="detail-action-btn" aria-label="Trash">&#128465;</button>
+                <button id="detail-read-btn" class="detail-action-btn" aria-label="Toggle read status">&#9679;</button>
+                <button id="detail-star-btn" class="detail-action-btn" aria-label="Toggle star">&#9734;</button>
+            </div>
         </div>
         <div id="status-bar"></div>
     </div>

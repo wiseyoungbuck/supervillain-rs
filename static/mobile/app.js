@@ -31,6 +31,7 @@ const state = {
     listScrollTop: 0,
     emailCache: {},            // id → full email with body (LRU, max 50)
     lastRenderedGroup: null,   // date-divider continuity for append-only pages
+    undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId }], capped at UNDO_STACK_LIMIT — A5 builds the undo UI on top of this
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -39,6 +40,7 @@ const apiGlobal = makeApi(null);
 const PAGE_SIZE = 50;
 const CACHE_LIMIT = 200;  // Max emails kept in memory (per Fleury, lower than desktop)
 const BODY_CACHE_LIMIT = 50;
+const UNDO_STACK_LIMIT = 10;
 
 // ============================================================================
 // Date formatting (reused from desktop app.js)
@@ -406,6 +408,10 @@ async function loadMoreEmails() {
 // Renders rows for `emails`, threading the date-divider group through
 // `startGroup` so appended pages continue the sequence instead of
 // repeating a divider. Returns the HTML and the group the sequence ended on.
+//
+// Each row is wrapped in `.email-row-wrap` with a `.swipe-bg` sibling behind
+// it — the rowSwipeRecognizer (gesture controller, below) translates the
+// `.email-row` and toggles which half of `.swipe-bg` is visible underneath.
 function renderEmailRows(emails, startGroup) {
     let lastGroup = startGroup;
     const html = emails.map(email => {
@@ -419,18 +425,24 @@ function renderEmailRows(emails, startGroup) {
             divider = '<div class="date-divider"><span>' + escapeHtml(group) + '</span></div>';
         }
         return divider +
-            '<div class="email-row' + (email.isUnread ? ' unread' : '') + '" data-id="' + escapeHtml(email.id) + '">' +
-                '<div class="email-row-main">' +
-                    '<div class="email-row-top">' +
-                        '<span class="email-from">' + escapeHtml(fromDisplay) + '</span>' +
-                        '<span class="email-date">' + date + '</span>' +
-                    '</div>' +
-                    '<div class="email-subject">' + escapeHtml(email.subject) + '</div>' +
-                    '<div class="email-preview">' + escapeHtml(email.preview) + '</div>' +
+            '<div class="email-row-wrap">' +
+                '<div class="swipe-bg" aria-hidden="true">' +
+                    '<span class="swipe-icon-archive">\u{1F5C4}</span>' +
+                    '<span class="swipe-icon-trash">\u{1F5D1}</span>' +
                 '</div>' +
-                '<div class="email-row-indicators">' +
-                    (email.isFlagged ? '<span class="star">★</span>' : '') +
-                    (email.hasAttachment ? '<span class="attach">📎</span>' : '') +
+                '<div class="email-row' + (email.isUnread ? ' unread' : '') + '" data-id="' + escapeHtml(email.id) + '">' +
+                    '<div class="email-row-main">' +
+                        '<div class="email-row-top">' +
+                            '<span class="email-from">' + escapeHtml(fromDisplay) + '</span>' +
+                            '<span class="email-date">' + date + '</span>' +
+                        '</div>' +
+                        '<div class="email-subject">' + escapeHtml(email.subject) + '</div>' +
+                        '<div class="email-preview">' + escapeHtml(email.preview) + '</div>' +
+                    '</div>' +
+                    '<div class="email-row-indicators">' +
+                        (email.isFlagged ? '<span class="star">★</span>' : '') +
+                        (email.hasAttachment ? '<span class="attach">📎</span>' : '') +
+                    '</div>' +
                 '</div>' +
             '</div>';
     }).join('');
@@ -461,6 +473,117 @@ function appendEmailRows(newEmails) {
 function showStatus(msg) {
     const el = document.getElementById('status-bar');
     if (el) el.textContent = msg;
+}
+
+// ============================================================================
+// Email actions
+// ============================================================================
+// Optimistic updates mirroring desktop's emailAction/toggleUnread/toggleFlag
+// (static/app.js): mutate state.emails — and the cached detail body, when
+// present — immediately, then reconcile with the server. A failure reverts
+// the mutation and reports through showError, the only failure sink on a
+// phone without devtools.
+
+// Archive/trash push onto this so a later undo (A5) can restore them; capped
+// so a long swiping session can't grow it unbounded. This task only
+// maintains the stack — no undo toast/UI here.
+function pushUndo(action, email, index) {
+    state.undoStack.push({ action, email, index, mailboxId: state.inboxId });
+    if (state.undoStack.length > UNDO_STACK_LIMIT) state.undoStack.shift();
+}
+
+async function emailAction(type, emailId) {
+    const index = state.emails.findIndex(e => e.id === emailId);
+    if (index === -1) return;
+    const email = state.emails[index];
+
+    // Optimistic: remove from the list immediately.
+    state.emails.splice(index, 1);
+    pushUndo(type, email, index);
+    renderEmailList();
+
+    // Literal per-type paths (rather than interpolating `type` into the
+    // URL) so /archive and /trash are grep-able route strings, not just an
+    // artifact of string concatenation.
+    const path = type === 'archive'
+        ? '/emails/' + encodeURIComponent(emailId) + '/archive'
+        : '/emails/' + encodeURIComponent(emailId) + '/trash';
+
+    try {
+        await state.api('POST', path);
+    } catch (err) {
+        // Revert: re-insert at the original index and drop the stale undo entry.
+        state.undoStack.pop();
+        state.emails.splice(index, 0, email);
+        renderEmailList();
+        showError(type === 'archive' ? 'Archive' : 'Trash', err);
+    }
+}
+
+function archiveEmail(emailId) {
+    return emailAction('archive', emailId);
+}
+
+function trashEmail(emailId) {
+    return emailAction('trash', emailId);
+}
+
+async function toggleUnread(emailId) {
+    const email = state.emails.find(e => e.id === emailId);
+    const cached = state.emailCache[emailId];
+    if (!email && !cached) return;
+    const wasUnread = (email || cached).isUnread;
+
+    // Optimistic: flip immediately everywhere the email is held.
+    if (email) email.isUnread = !wasUnread;
+    if (cached) cached.isUnread = !wasUnread;
+    if (state.screen === Screen.LIST) renderEmailList();
+    if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+        renderDetailActionBar(email || cached);
+    }
+
+    const path = '/emails/' + encodeURIComponent(emailId) + (wasUnread ? '/mark-read' : '/mark-unread');
+
+    try {
+        await state.api('POST', path);
+    } catch (err) {
+        // Revert
+        if (email) email.isUnread = wasUnread;
+        if (cached) cached.isUnread = wasUnread;
+        if (state.screen === Screen.LIST) renderEmailList();
+        if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+            renderDetailActionBar(email || cached);
+        }
+        showError('Toggle read status', err);
+    }
+}
+
+async function toggleFlag(emailId) {
+    const email = state.emails.find(e => e.id === emailId);
+    const cached = state.emailCache[emailId];
+    if (!email && !cached) return;
+    const wasFlagged = (email || cached).isFlagged;
+
+    // Optimistic: flip immediately everywhere the email is held.
+    if (email) email.isFlagged = !wasFlagged;
+    if (cached) cached.isFlagged = !wasFlagged;
+    if (state.screen === Screen.LIST) renderEmailList();
+    if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+        renderDetailActionBar(email || cached);
+    }
+
+    try {
+        await state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/toggle-flag');
+    } catch (err) {
+        // Revert
+        if (email) email.isFlagged = wasFlagged;
+        if (cached) cached.isFlagged = wasFlagged;
+        if (state.screen === Screen.LIST) renderEmailList();
+        if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+            renderDetailActionBar(email || cached);
+        }
+        showError('Toggle star', err);
+    }
 }
 
 // ============================================================================
@@ -541,6 +664,10 @@ async function renderScreenDetail(emailId) {
     // The server auto-marks read on GET /emails/{id}; mirror it locally.
     if (listEmail?.isUnread) listEmail.isUnread = false;
     if (full.isUnread) full.isUnread = false;
+    // renderEmailDetail → renderEmailDetailPartial already drew the action
+    // bar from the pre-correction unread flag; redraw with the now-correct
+    // (read) state.
+    renderDetailActionBar(full);
 
     // Prefetch next emails
     prefetchAdjacentEmails(emailId);
@@ -560,6 +687,50 @@ function renderEmailDetailPartial(email) {
     document.getElementById('detail-calendar').innerHTML = '';
     document.getElementById('email-body').innerHTML =
         '<div style="padding:16px;color:var(--text-muted)">Loading...</div>';
+    renderDetailActionBar(email);
+}
+
+// Reflects the current email's read/starred state onto the detail action
+// bar's read and star buttons. Archive/trash are stateless (always the same
+// icon) so they need no equivalent here.
+function renderDetailActionBar(email) {
+    if (!email) return;
+    const readBtn = document.getElementById('detail-read-btn');
+    if (readBtn) {
+        readBtn.textContent = email.isUnread ? '●' : '○';
+        readBtn.setAttribute('aria-label', email.isUnread ? 'Mark as read' : 'Mark as unread');
+        readBtn.setAttribute('aria-pressed', String(!!email.isUnread));
+    }
+    const starBtn = document.getElementById('detail-star-btn');
+    if (starBtn) {
+        starBtn.textContent = email.isFlagged ? '★' : '☆';
+        starBtn.classList.toggle('active', !!email.isFlagged);
+        starBtn.setAttribute('aria-label', email.isFlagged ? 'Remove star' : 'Add star');
+        starBtn.setAttribute('aria-pressed', String(!!email.isFlagged));
+    }
+}
+
+// Archive/trash from the detail view auto-advance: stay in DETAIL on the
+// next email in the list (navigateTo replaces history since we're already
+// on DETAIL), or fall back to LIST via history.back() — mirroring the
+// back-btn handler below — when there's nothing after it. The action itself
+// is optimistic (emailAction), so we advance immediately rather than
+// waiting on the network round-trip; a failure reverts state.emails and
+// toasts in the background without pulling the user back.
+function handleDetailAction(type) {
+    const emailId = state.currentEmailId;
+    if (!emailId) return;
+    const index = state.emails.findIndex(e => e.id === emailId);
+    const next = index !== -1 ? state.emails[index + 1] : null;
+
+    if (type === 'archive') archiveEmail(emailId);
+    else trashEmail(emailId);
+
+    if (next) {
+        navigateTo(Screen.DETAIL, { emailId: next.id });
+    } else {
+        history.back();
+    }
 }
 
 function renderEmailDetail(email) {
@@ -650,11 +821,13 @@ function prefetchAdjacentEmails(emailId) {
 // One controller owns touchstart/touchmove/touchend on the list wrap. Each
 // gesture is claimed by exactly one recognizer, and the controller is the
 // ONLY place that calls preventDefault (so touchmove stays non-passive).
-// A single eligible recognizer locks at touchstart — today that's
-// pull-to-refresh when the list is at the top. When more than one recognizer
-// is eligible (the seam A4's horizontal row-swipe plugs into), the choice is
-// deferred to the first move and made by drag axis. Adding a recognizer is a
-// push onto `recognizers` — never another addEventListener set.
+// A single eligible recognizer locks at touchstart — e.g. pull-to-refresh at
+// the top of the list, or a row-swipe when scrolled down (the only
+// recognizer whose canStart() matches a mid-list touch). When more than one
+// recognizer is eligible — a row touched at scrollTop 0, where both
+// pull-to-refresh and row-swipe canStart() — the choice is deferred to the
+// first move and made by drag axis. Adding a recognizer is a push onto
+// `recognizers` — never another addEventListener set.
 
 // Pull-to-refresh recognizer: a downward drag from the top of the list.
 const pullToRefreshRecognizer = {
@@ -691,6 +864,72 @@ const pullToRefreshRecognizer = {
     },
 };
 
+// Row-swipe recognizer: horizontal drag on a `.email-row` — right reveals
+// archive (green), left reveals trash (red); crossing the threshold on
+// release performs the action, otherwise the row springs back (CSS
+// transition, toggled off via `.swiping` while actively dragging so the
+// translate tracks the finger 1:1).
+//
+// canStart() matches ANY touch on a row, so below the top of the list
+// (where pull-to-refresh isn't a candidate) this is the sole eligible
+// recognizer and locks immediately, before we know the drag direction —
+// unlike pull-to-refresh's own scrollTop gate, canStart() here can't see
+// direction yet. move() self-gates on axis the same way pull-to-refresh
+// self-gates on dy<=0: if the drag turns out to be vertical, it declines
+// (no preventDefault) so the list keeps scrolling normally.
+const SWIPE_TRIGGER_MIN_PX = 80;
+const SWIPE_TRIGGER_RATIO = 0.4; // ~40% of row width
+
+const rowSwipeRecognizer = {
+    axis: 'x',
+    row: null,
+    width: 0,
+    dx: 0,
+    canStart(ctx) {
+        return !!ctx.target && !!ctx.target.closest('.email-row');
+    },
+    start(ctx) {
+        this.row = ctx.target.closest('.email-row');
+        this.width = this.row.offsetWidth;
+        this.dx = 0;
+        this.row.classList.add('swiping');
+    },
+    // Returns true to preventDefault — once we've committed to a horizontal
+    // drag we own it so the list doesn't also try to scroll under it.
+    move(ctx) {
+        if (!this.row) return false;
+        const dx = ctx.x - ctx.startX;
+        const dy = ctx.y - ctx.startY;
+        if (Math.abs(dy) > Math.abs(dx)) return false;
+        this.dx = dx;
+        this.row.style.transform = 'translateX(' + dx + 'px)';
+        const bg = this.row.parentElement.querySelector('.swipe-bg');
+        if (bg) {
+            bg.classList.toggle('swipe-reveal-archive', dx > 0);
+            bg.classList.toggle('swipe-reveal-trash', dx < 0);
+        }
+        return true;
+    },
+    end() {
+        const row = this.row;
+        if (!row) return;
+        const dx = this.dx;
+        const id = row.dataset.id;
+        const triggered = Math.abs(dx) > SWIPE_TRIGGER_MIN_PX
+            || Math.abs(dx) > this.width * SWIPE_TRIGGER_RATIO;
+
+        row.classList.remove('swiping');
+        row.style.transform = '';
+        const bg = row.parentElement.querySelector('.swipe-bg');
+        if (bg) bg.classList.remove('swipe-reveal-archive', 'swipe-reveal-trash');
+        this.row = null;
+
+        if (!triggered || !id) return;
+        if (dx > 0) archiveEmail(id);
+        else trashEmail(id);
+    },
+};
+
 const gestureController = {
     listWrap: null,
     recognizers: [],
@@ -702,7 +941,7 @@ const gestureController = {
     init() {
         this.listWrap = document.getElementById('email-list-wrap');
         if (!this.listWrap) return;
-        this.recognizers = [pullToRefreshRecognizer];
+        this.recognizers = [pullToRefreshRecognizer, rowSwipeRecognizer];
         this.listWrap.addEventListener('touchstart', (e) => this.onStart(e), { passive: true });
         this.listWrap.addEventListener('touchmove', (e) => this.onMove(e), { passive: false });
         this.listWrap.addEventListener('touchend', () => this.onEnd());
@@ -715,6 +954,10 @@ const gestureController = {
             y: touch.clientY,
             startX: this.startX,
             startY: this.startY,
+            // A Touch's `target` is the element it started on, even once
+            // touchmove carries it elsewhere — lets rowSwipeRecognizer find
+            // its `.email-row` from the touchstart ctx alone.
+            target: touch.target,
         };
     },
 
@@ -840,6 +1083,17 @@ document.getElementById('email-list').addEventListener('click', (e) => {
     if (!row) return;
     const id = row.dataset.id;
     if (id) navigateTo(Screen.DETAIL, { emailId: id });
+});
+
+// Detail action bar: archive/trash auto-advance (handleDetailAction); read
+// and star toggle the current email in place.
+document.getElementById('detail-archive-btn').addEventListener('click', () => handleDetailAction('archive'));
+document.getElementById('detail-trash-btn').addEventListener('click', () => handleDetailAction('trash'));
+document.getElementById('detail-read-btn').addEventListener('click', () => {
+    if (state.currentEmailId) toggleUnread(state.currentEmailId);
+});
+document.getElementById('detail-star-btn').addEventListener('click', () => {
+    if (state.currentEmailId) toggleFlag(state.currentEmailId);
 });
 
 // Browser back/forward — history is the source of truth for the current
