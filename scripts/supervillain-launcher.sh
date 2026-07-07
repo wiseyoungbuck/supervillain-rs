@@ -11,7 +11,17 @@ set -euo pipefail
 # PORT derives from it so the port checks track a custom bind address.
 export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
 PORT="${SUPERVILLAIN_BIND##*:}"
-URL="http://127.0.0.1:${PORT}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "Supervillain: SUPERVILLAIN_BIND='${SUPERVILLAIN_BIND}' has no numeric port (expected host:port)" >&2
+    exit 1
+fi
+# URL host mirrors the binary's browser_url(): a wildcard bind is
+# reachable at loopback; a specific interface only listens on itself.
+HOST="${SUPERVILLAIN_BIND%:*}"
+case "$HOST" in
+    "0.0.0.0" | "[::]" | "::" | "") HOST="127.0.0.1" ;;
+esac
+URL="http://${HOST}:${PORT}"
 LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 
 port_listening() {
@@ -31,7 +41,7 @@ open_webapp() {
     if [[ "$OSTYPE" == darwin* ]]; then
         open "$URL"
     elif command -v omarchy-launch-or-focus-webapp &>/dev/null; then
-        omarchy-launch-or-focus-webapp "127.0.0.1:${PORT}" "$URL"
+        omarchy-launch-or-focus-webapp "${HOST}:${PORT}" "$URL"
     else
         xdg-open "$URL"
     fi

@@ -31,4 +31,40 @@ out="$(
 [[ "$out" == "127.0.0.1:9000 9000" ]] ||
     fail "override should be respected with PORT derived, got: $out"
 
-echo "PASS: launcher exports SUPERVILLAIN_BIND and derives PORT from it"
+# Case 3: URL host mirrors the binary's browser_url(): a wildcard bind is
+# reachable at loopback, a specific host (incl. bracketed IPv6) is only
+# listening on itself — opening loopback there hits a dead port.
+out="$(
+    env -u SUPERVILLAIN_BIND SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'; printf '%s' \"\$URL\""
+)"
+[[ "$out" == "http://127.0.0.1:8000" ]] ||
+    fail "wildcard bind should open loopback, got: $out"
+
+out="$(
+    SUPERVILLAIN_BIND='[::1]:9000' SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'; printf '%s %s' \"\$PORT\" \"\$URL\""
+)"
+[[ "$out" == "9000 http://[::1]:9000" ]] ||
+    fail "bracketed IPv6 bind should derive port and open the bound host, got: $out"
+
+out="$(
+    SUPERVILLAIN_BIND=100.64.1.5:8000 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'; printf '%s' \"\$URL\""
+)"
+[[ "$out" == "http://100.64.1.5:8000" ]] ||
+    fail "specific-host bind should open the bound host, got: $out"
+
+# Case 4: a value with no numeric port must fail loudly, naming the
+# variable — otherwise the scripts silently poll a nonsense port and
+# report a bogus 15s startup failure.
+if out="$(
+    SUPERVILLAIN_BIND=0.0.0.0 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+        "source '$LAUNCHER'" 2>&1
+)"; then
+    fail "portless SUPERVILLAIN_BIND should be rejected, got success with: $out"
+fi
+[[ "$out" == *SUPERVILLAIN_BIND* ]] ||
+    fail "rejection message should name SUPERVILLAIN_BIND, got: $out"
+
+echo "PASS: launcher derives PORT and URL from SUPERVILLAIN_BIND and rejects portless values"

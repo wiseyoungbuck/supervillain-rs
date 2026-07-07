@@ -6,6 +6,10 @@ set -euo pipefail
 # PORT derives from it so stop/poll checks track a custom bind address.
 export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
 PORT="${SUPERVILLAIN_BIND##*:}"
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "Error: SUPERVILLAIN_BIND='${SUPERVILLAIN_BIND}' has no numeric port (expected host:port)" >&2
+    exit 1
+fi
 LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DRY_RUN=false
