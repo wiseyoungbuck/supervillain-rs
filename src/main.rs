@@ -55,8 +55,11 @@ async fn main() {
 
     if sessions.is_empty() {
         tracing::warn!(
-            "No accounts configured or connected. Open http://127.0.0.1:8000/ \
-             to add an account via the settings UI."
+            "No accounts configured or connected. Open {}/ to add an account \
+             via the settings UI.",
+            browser_url(&bind_addr(
+                std::env::var("SUPERVILLAIN_BIND").ok().as_deref()
+            ))
         );
         if cfg.accounts.is_empty() {
             account_errors.push(AccountError {
@@ -115,14 +118,11 @@ async fn main() {
 
     let app = routes::router(state);
 
-    // Bind all interfaces so the UI is reachable from other devices on the
-    // LAN/tailnet, not just this machine. There is no authentication layer,
-    // so this trusts every host on those networks.
-    let addr = "0.0.0.0:8000";
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+    let addr = bind_addr(std::env::var("SUPERVILLAIN_BIND").ok().as_deref());
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));
     });
-    let url = "http://127.0.0.1:8000".to_string();
+    let url = browser_url(&addr);
     tracing::info!("Listening on {addr}; local UI at {url}");
 
     if !std::env::args().any(|a| a == "--no-browser") {
@@ -130,6 +130,30 @@ async fn main() {
     }
 
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Bind address: `SUPERVILLAIN_BIND` env var, defaulting to loopback.
+/// Binding beyond loopback (e.g. `0.0.0.0:8000` for LAN/tailnet access,
+/// as scripts/upgrade.sh and the launcher do) is an explicit per-deploy
+/// opt-in — there is no authentication layer, so a non-loopback bind
+/// trusts every host that can reach the interface (roborev 273).
+fn bind_addr(env_value: Option<&str>) -> String {
+    match env_value.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => "127.0.0.1:8000".to_string(),
+    }
+}
+
+/// Local UI URL for the auto-opened browser, derived from the bind
+/// address so the port is defined in exactly one place. A wildcard bind
+/// isn't routable in a URL; loopback always is.
+fn browser_url(addr: &str) -> String {
+    let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "8000"));
+    let host = match host {
+        "0.0.0.0" | "[::]" | "::" | "" => "127.0.0.1",
+        h => h,
+    };
+    format!("http://{host}:{port}")
 }
 
 /// Resolve the effective default account. Prefer the configured value if it
@@ -271,5 +295,47 @@ mod tests {
     fn resolve_default_account_empty_preferred_picks_first() {
         let sessions: HashMap<String, ()> = HashMap::from([("only".into(), ())]);
         assert_eq!(resolve_default_account(String::new(), &sessions), "only");
+    }
+
+    // ---- bind_addr / browser_url (roborev 273) ----
+
+    #[test]
+    fn bind_addr_defaults_to_loopback() {
+        // Safe by default: exposing the unauthenticated API beyond this
+        // machine must be an explicit opt-in, not the compiled-in state.
+        assert_eq!(bind_addr(None), "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn bind_addr_env_overrides() {
+        assert_eq!(bind_addr(Some("0.0.0.0:8000")), "0.0.0.0:8000");
+        assert_eq!(bind_addr(Some("100.64.1.5:9000")), "100.64.1.5:9000");
+    }
+
+    #[test]
+    fn bind_addr_blank_env_falls_back_to_default() {
+        assert_eq!(bind_addr(Some("")), "127.0.0.1:8000");
+        assert_eq!(bind_addr(Some("   ")), "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn browser_url_wildcard_bind_opens_loopback() {
+        assert_eq!(browser_url("0.0.0.0:8000"), "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn browser_url_carries_the_bind_port() {
+        // The port must be defined once (in the bind address) and derived
+        // everywhere else — a changed port silently opening the wrong URL
+        // was the original duplication bug.
+        assert_eq!(browser_url("127.0.0.1:9000"), "http://127.0.0.1:9000");
+        assert_eq!(browser_url("0.0.0.0:9000"), "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn browser_url_specific_host_is_used_as_is() {
+        // Bound to a single non-loopback interface (e.g. a tailnet IP),
+        // loopback may not be listening at all — open what we bound.
+        assert_eq!(browser_url("100.64.1.5:8000"), "http://100.64.1.5:8000");
     }
 }

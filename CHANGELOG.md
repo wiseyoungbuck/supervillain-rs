@@ -4,6 +4,16 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Configurable bind address, loopback by default
+
+The server binds `127.0.0.1:8000` unless `SUPERVILLAIN_BIND` says otherwise —
+the earlier unconditional `0.0.0.0` bind exposed the unauthenticated mailbox
+API to every network the machine joined. LAN/tailnet reachability is now a
+per-deployment opt-in: `scripts/upgrade.sh` and the launcher script export
+`SUPERVILLAIN_BIND=0.0.0.0:8000` (overridable). The auto-opened browser URL
+and startup hints derive host and port from the bind address instead of
+hardcoding them.
+
 ## Account-scoped split tabs
 
 Splits in `splits.json` may now carry an `account` tag (a config-section id

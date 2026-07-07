@@ -2,6 +2,9 @@
 set -euo pipefail
 
 PORT=8000
+# The binary defaults to loopback (no auth layer); this deployment opts in
+# to LAN/tailnet reachability. Override by exporting SUPERVILLAIN_BIND.
+export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:$PORT}"
 LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DRY_RUN=false
