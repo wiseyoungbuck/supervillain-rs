@@ -6,7 +6,11 @@
 
 set -euo pipefail
 
-PORT=8000
+# The binary defaults to loopback (no auth layer); this launcher opts in
+# to LAN/tailnet reachability. Override by exporting SUPERVILLAIN_BIND.
+# PORT derives from it so the port checks track a custom bind address.
+export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
+PORT="${SUPERVILLAIN_BIND##*:}"
 URL="http://127.0.0.1:${PORT}"
 LOG_FILE="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/supervillain.log"
 

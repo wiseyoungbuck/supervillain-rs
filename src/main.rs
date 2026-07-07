@@ -21,6 +21,10 @@ async fn main() {
 
     platform::init_tracing();
 
+    // Resolved once; the no-accounts hint and the listener bind below both
+    // use it so they can't drift apart.
+    let addr = bind_addr(std::env::var("SUPERVILLAIN_BIND").ok().as_deref());
+
     let (cfg, parse_errors) = accounts::parse_config(&config_path);
     let token_store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(tokens_dir.clone()));
 
@@ -57,9 +61,7 @@ async fn main() {
         tracing::warn!(
             "No accounts configured or connected. Open {}/ to add an account \
              via the settings UI.",
-            browser_url(&bind_addr(
-                std::env::var("SUPERVILLAIN_BIND").ok().as_deref()
-            ))
+            browser_url(&addr)
         );
         if cfg.accounts.is_empty() {
             account_errors.push(AccountError {
@@ -118,7 +120,6 @@ async fn main() {
 
     let app = routes::router(state);
 
-    let addr = bind_addr(std::env::var("SUPERVILLAIN_BIND").ok().as_deref());
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));
     });
@@ -337,5 +338,14 @@ mod tests {
         // Bound to a single non-loopback interface (e.g. a tailnet IP),
         // loopback may not be listening at all — open what we bound.
         assert_eq!(browser_url("100.64.1.5:8000"), "http://100.64.1.5:8000");
+    }
+
+    #[test]
+    fn browser_url_ipv6_binds() {
+        // Bracketed hosts must survive port splitting: rsplit_once(':')
+        // handles them today, but a refactor to split(':') or SocketAddr
+        // parsing could silently break these (roborev 279).
+        assert_eq!(browser_url("[::]:8000"), "http://127.0.0.1:8000");
+        assert_eq!(browser_url("[::1]:8000"), "http://[::1]:8000");
     }
 }
