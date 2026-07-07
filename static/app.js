@@ -43,10 +43,6 @@ const state = {
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
 };
 
-// Only these top-level path prefixes (after /api) get the ?account= query
-// param auto-appended. Settings routes are GLOBAL and must not be tagged.
-const ACCOUNT_SCOPED_API = /^\/(emails|mailboxes|identities|splits|upload|split-counts|calendar)/;
-
 // Simple cache: email id -> full email object with body
 const emailCache = {};
 // Scroll position cache: email id -> scrollTop
@@ -595,32 +591,12 @@ async function dismissTimezoneChange() {
     }
 }
 
-// API calls
+// API calls — the client itself lives in the shared api.js (loaded before
+// this script; makeApi/ApiError/ApiAuthError are its globals). The account
+// is read at call time because desktop switches accounts in-place.
 
-async function api(method, path, body = null, signal = null) {
-    const opts = {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-    };
-    if (body) opts.body = JSON.stringify(body);
-    if (signal) opts.signal = signal;
-
-    // Auto-append ?account= ONLY for account-scoped routes. Settings routes
-    // (`/accounts/...`, `/theme`) are global and must never be tagged.
-    let url = '/api' + path;
-    if (state.currentAccount && ACCOUNT_SCOPED_API.test(path)) {
-        const separator = url.includes('?') ? '&' : '?';
-        url += `${separator}account=${state.currentAccount.id}`;
-    }
-
-    const resp = await fetch(url, opts);
-    if (!resp.ok) {
-        const err = await resp.text();
-        throw new Error(err);
-    }
-    if (resp.status === 204) return null;
-    const text = await resp.text();
-    return text ? JSON.parse(text) : null;
+function api(method, path, body = null, signal = null) {
+    return makeApi(state.currentAccount?.id)(method, path, body, signal);
 }
 
 async function loadAccounts() {

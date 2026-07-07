@@ -57,103 +57,7 @@
             -webkit-tap-highlight-color: transparent;
         }
 
-        /* Login screen */
-        #login-screen {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100dvh;
-            padding: 24px;
-            padding-top: calc(24px + var(--safe-top));
-        }
-
-        #login-screen.hidden { display: none; }
-
-        .login-title {
-            font-size: 28px;
-            font-weight: 700;
-            margin-bottom: 8px;
-            color: var(--accent);
-        }
-
-        .login-subtitle {
-            font-size: 14px;
-            color: var(--text-muted);
-            margin-bottom: 32px;
-            text-align: center;
-            line-height: 1.4;
-        }
-
-        .login-field {
-            width: 100%;
-            max-width: 360px;
-            margin-bottom: 16px;
-        }
-
-        .login-field label {
-            display: block;
-            font-size: 13px;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-        }
-
-        .login-field input {
-            width: 100%;
-            padding: 12px 14px;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            color: var(--text);
-            font-size: 16px; /* prevents iOS zoom on focus */
-            outline: none;
-        }
-
-        .login-field input:focus {
-            border-color: var(--accent);
-        }
-
-        .login-btn {
-            width: 100%;
-            max-width: 360px;
-            padding: 14px;
-            background: var(--accent);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 8px;
-        }
-
-        .login-btn:active {
-            background: var(--accent-dim);
-        }
-
-        .login-error {
-            color: var(--accent);
-            font-size: 13px;
-            margin-top: 12px;
-            text-align: center;
-            min-height: 20px;
-        }
-
-        .login-help {
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-top: 24px;
-            text-align: center;
-            line-height: 1.5;
-            max-width: 360px;
-        }
-
-        .login-help a {
-            color: var(--accent);
-            text-decoration: none;
-        }
-
-        /* App shell (hidden until logged in) */
+        /* App shell (hidden until accounts load) */
         #app-shell {
             display: none;
             flex-direction: column;
@@ -182,14 +86,93 @@
             font-weight: 600;
         }
 
-        #app-header .logout-btn {
+        #app-header .account-btn {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            color: var(--text-muted);
+            font-size: 13px;
+            cursor: pointer;
+            padding: 4px 12px;
+            max-width: 55%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* Account picker overlay */
+        #account-picker {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            z-index: 30;
+        }
+
+        #account-picker.hidden { display: none; }
+
+        #account-picker .picker-sheet {
+            background: var(--bg);
+            border-top: 1px solid var(--border);
+            border-radius: 12px 12px 0 0;
+            padding: 8px 0 calc(8px + var(--safe-bottom));
+        }
+
+        #account-picker .picker-title {
+            font-size: 13px;
+            color: var(--text-muted);
+            padding: 8px 16px;
+        }
+
+        #account-picker .account-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
             background: none;
             border: none;
-            color: var(--text-muted);
-            font-size: 14px;
+            color: var(--text);
+            font-size: 16px;
+            padding: 14px 16px;
+            text-align: left;
             cursor: pointer;
-            padding: 4px 8px;
         }
+
+        #account-picker .account-row.current {
+            color: var(--accent);
+        }
+
+        #account-picker .account-row.pending {
+            color: var(--text-muted);
+        }
+
+        #account-picker .account-provider {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Error toast */
+        #error-toast {
+            position: fixed;
+            left: 16px;
+            right: 16px;
+            bottom: calc(16px + var(--safe-bottom));
+            background: var(--surface);
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 13px;
+            line-height: 1.4;
+            padding: 12px 14px;
+            z-index: 40;
+            word-break: break-word;
+        }
+
+        #error-toast.hidden { display: none; }
 
         /* Email list */
         #email-list-wrap {
@@ -465,36 +448,11 @@
     </style>
 </head>
 <body>
-    <!-- Login -->
-    <div id="login-screen">
-        <div class="login-title">Supervillain</div>
-        <div class="login-subtitle">
-            Mobile email client for Fastmail.<br>
-            Enter your JMAP API credentials to get started.
-        </div>
-        <div class="login-field">
-            <label for="login-username">Fastmail username</label>
-            <input type="email" id="login-username" placeholder="you@fastmail.com" autocapitalize="off" autocorrect="off">
-        </div>
-        <div class="login-field">
-            <label for="login-token">API token</label>
-            <input type="password" id="login-token" placeholder="fmu1-...">
-        </div>
-        <button class="login-btn" id="login-btn">Connect</button>
-        <div class="login-error" id="login-error"></div>
-        <div class="login-help">
-            Generate an API token at<br>
-            <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">
-                Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; API tokens
-            </a>
-        </div>
-    </div>
-
-    <!-- App shell (shown after login) -->
+    <!-- App shell (shown once accounts load) -->
     <div id="app-shell">
         <div id="app-header">
             <span class="title">Supervillain</span>
-            <button class="logout-btn" id="logout-btn">Sign out</button>
+            <button class="account-btn" id="account-btn" aria-label="Switch account"></button>
         </div>
         <div id="email-list-wrap">
             <div id="pull-indicator">Pull to refresh</div>
@@ -517,6 +475,18 @@
         <div id="status-bar"></div>
     </div>
 
+    <!-- Account picker (bottom sheet) -->
+    <div id="account-picker" class="hidden">
+        <div class="picker-sheet">
+            <div class="picker-title">Accounts</div>
+            <div id="account-picker-list"></div>
+        </div>
+    </div>
+
+    <!-- Error toast -->
+    <div id="error-toast" class="hidden"></div>
+
+    <script src="/api.js"></script>
     <script type="module" src="/mobile/app.js"></script>
 </body>
 </html>

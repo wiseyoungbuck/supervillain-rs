@@ -27,11 +27,11 @@ pub(crate) const DEFAULT_INBOX_LIMIT: usize = 150;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
+const API_JS: &str = include_str!("../static/api.js");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 
 const MOBILE_HTML: &str = include_str!("../static/mobile/index.html");
 const MOBILE_APP_JS: &str = include_str!("../static/mobile/app.js");
-const MOBILE_JMAP_JS: &str = include_str!("../static/mobile/jmap.js");
 const MOBILE_MANIFEST: &str = include_str!("../static/mobile/manifest.json");
 const MOBILE_SW: &str = include_str!("../static/mobile/sw.js");
 const FAVICON_32: &[u8] = include_bytes!("../static/favicon-32.png");
@@ -92,6 +92,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/", get(index_html))
         .route("/index.html", get(index_html))
         .route("/app.js", get(app_js))
+        .route("/api.js", get(api_js))
         .route("/style.css", get(style_css))
         .route("/favicon-32.png", get(favicon_32))
         .route("/icon-180.png", get(icon_180))
@@ -103,7 +104,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/", get(mobile_html))
         .route("/mobile/index.html", get(mobile_html))
         .route("/mobile/app.js", get(mobile_app_js))
-        .route("/mobile/jmap.js", get(mobile_jmap_js))
         .route("/mobile/manifest.json", get(mobile_manifest))
         .route("/mobile/sw.js", get(mobile_sw))
         .route("/mobile/icon-180.png", get(icon_180))
@@ -151,6 +151,13 @@ async fn app_js() -> impl IntoResponse {
     )
 }
 
+async fn api_js() -> impl IntoResponse {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        API_JS,
+    )
+}
+
 async fn style_css() -> impl IntoResponse {
     ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
 }
@@ -163,13 +170,6 @@ async fn mobile_app_js() -> impl IntoResponse {
     (
         [("content-type", "application/javascript; charset=utf-8")],
         MOBILE_APP_JS,
-    )
-}
-
-async fn mobile_jmap_js() -> impl IntoResponse {
-    (
-        [("content-type", "application/javascript; charset=utf-8")],
-        MOBILE_JMAP_JS,
     )
 }
 
@@ -1787,14 +1787,14 @@ mod tests {
 
     #[test]
     fn api_helper_excludes_settings_from_account_param() {
-        // The api() helper allowlists which paths receive ?account=.
+        // The shared api client allowlists which paths receive ?account=.
         // Settings paths (`/accounts/...`) must NOT be auto-tagged.
         assert!(
-            APP_JS.contains("ACCOUNT_SCOPED_API"),
-            "api() must use an allowlist regex for ?account= injection"
+            API_JS.contains("ACCOUNT_SCOPED_API"),
+            "api.js must use an allowlist regex for ?account= injection"
         );
         assert!(
-            APP_JS.contains("/(emails|mailboxes|identities|splits|upload|split-counts|calendar)"),
+            API_JS.contains("/(emails|mailboxes|identities|splits|upload|split-counts|calendar)"),
             "allowlist regex must enumerate account-scoped path prefixes"
         );
     }
@@ -2195,27 +2195,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mobile_jmap_module_has_session_discovery() {
+    #[tokio::test]
+    async fn api_js_serves_shared_client() {
+        let resp = api_js().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/javascript; charset=utf-8");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
         assert!(
-            MOBILE_JMAP_JS.contains("api.fastmail.com/jmap/session"),
-            "jmap.js should connect directly to Fastmail JMAP"
+            text.contains("class ApiAuthError extends ApiError"),
+            "api.js must define the auth-vs-network error taxonomy"
         );
         assert!(
-            MOBILE_JMAP_JS.contains("Bearer"),
-            "jmap.js should use Bearer token auth"
+            text.contains("function makeApi("),
+            "api.js must define makeApi()"
         );
     }
 
     #[test]
-    fn mobile_jmap_module_handles_offline_errors() {
+    fn shared_api_js_loaded_by_both_bundles() {
         assert!(
-            MOBILE_JMAP_JS.contains("JmapAuthError"),
-            "jmap.js should throw JmapAuthError on auth failure"
+            INDEX_HTML.contains(r#"<script src="api.js"></script>"#),
+            "desktop index.html must load the shared api.js before app.js"
         );
         assert!(
-            MOBILE_JMAP_JS.contains("JmapNetworkError"),
-            "jmap.js should throw JmapNetworkError on network failure"
+            MOBILE_HTML.contains(r#"<script src="/api.js"></script>"#),
+            "mobile index.html must load the shared api.js before the app module"
+        );
+        assert!(
+            APP_JS.contains("makeApi("),
+            "desktop app.js must delegate to the shared makeApi client"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("makeApi("),
+            "mobile app.js must delegate to the shared makeApi client"
+        );
+    }
+
+    #[test]
+    fn mobile_no_direct_jmap_and_no_stored_token() {
+        assert!(
+            !MOBILE_APP_JS.contains("api.fastmail.com"),
+            "mobile must talk to the server API, never directly to Fastmail"
+        );
+        assert!(
+            !MOBILE_SW.contains("api.fastmail.com"),
+            "service worker must not special-case Fastmail — the API is same-origin now"
+        );
+        assert!(
+            !MOBILE_APP_JS.contains("setItem('supervillain_session'"),
+            "mobile must never store a bearer token in localStorage"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("removeItem('supervillain_session')"),
+            "mobile must scrub the pre-rewire bearer token off installed PWAs"
+        );
+        assert!(
+            !MOBILE_HTML.contains("login-token"),
+            "the Fastmail-token login screen must not exist"
         );
     }
 
@@ -2276,8 +2321,8 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(
-            text.contains("api.fastmail.com"),
-            "SW should exclude JMAP API from caching"
+            text.contains("url.pathname.startsWith('/api/')"),
+            "SW should exclude server API calls from caching"
         );
         assert!(
             text.contains("resp.ok"),
@@ -2364,89 +2409,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mobile_jmap_js_serves_es_module() {
-        let resp = mobile_jmap_js().await.into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(ct, "application/javascript; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(
-            text.contains("export async function connect("),
-            "jmap.js should export connect()"
-        );
-        assert!(
-            text.contains("export async function jmapCall("),
-            "jmap.js should export jmapCall()"
-        );
-        assert!(
-            text.contains("export function getSession("),
-            "jmap.js should export getSession()"
-        );
-    }
-
     #[test]
-    fn mobile_jmap_js_has_error_types() {
+    fn shared_api_js_handles_auth_errors() {
+        // 401 and 403 must map to ApiAuthError, not plain ApiError
         assert!(
-            MOBILE_JMAP_JS.contains("export class JmapAuthError"),
-            "jmap.js should export JmapAuthError"
+            API_JS.contains("resp.status === 401 || resp.status === 403"),
+            "api.js should classify 401/403 as auth errors"
         );
         assert!(
-            MOBILE_JMAP_JS.contains("export class JmapNetworkError"),
-            "jmap.js should export JmapNetworkError"
-        );
-    }
-
-    #[test]
-    fn mobile_jmap_js_uses_jmap_capabilities() {
-        assert!(
-            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:core"),
-            "jmap.js should declare jmap:core capability"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:mail"),
-            "jmap.js should declare jmap:mail capability"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("urn:ietf:params:jmap:submission"),
-            "jmap.js should declare jmap:submission capability"
-        );
-    }
-
-    #[test]
-    fn mobile_jmap_js_handles_auth_errors() {
-        // 401 and 403 should throw auth errors, not network errors
-        assert!(
-            MOBILE_JMAP_JS.contains("resp.status === 401"),
-            "jmap.js should handle 401 status"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("resp.status === 403"),
-            "jmap.js should handle 403 status"
-        );
-    }
-
-    #[test]
-    fn mobile_jmap_js_has_blob_url_builder() {
-        assert!(
-            MOBILE_JMAP_JS.contains("export function blobUrl("),
-            "jmap.js should export blobUrl()"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("{accountId}"),
-            "blobUrl should replace accountId template"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("{blobId}"),
-            "blobUrl should replace blobId template"
+            API_JS.contains("throw new ApiAuthError"),
+            "api.js should throw ApiAuthError on auth failure"
         );
     }
 
@@ -2494,8 +2466,12 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(
-            text.contains("from '/mobile/jmap.js'"),
-            "app.js should import from jmap.js"
+            !text.contains("jmap.js"),
+            "mobile app.js must not reference the deleted direct-JMAP module"
+        );
+        assert!(
+            text.contains("apiGlobal('GET', '/accounts')"),
+            "mobile app.js should load accounts from the server API"
         );
     }
 
@@ -2567,46 +2543,14 @@ mod tests {
     }
 
     #[test]
-    fn mobile_jmap_js_has_data_functions() {
-        assert!(
-            MOBILE_JMAP_JS.contains("export async function getMailboxes("),
-            "jmap.js should export getMailboxes()"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("export async function getIdentities("),
-            "jmap.js should export getIdentities()"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("export async function queryEmails("),
-            "jmap.js should export queryEmails()"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("export async function getEmails("),
-            "jmap.js should export getEmails()"
-        );
-    }
-
-    #[test]
-    fn mobile_jmap_js_parses_email_keywords() {
-        assert!(
-            MOBILE_JMAP_JS.contains("$seen"),
-            "jmap.js should check $seen keyword for unread status"
-        );
-        assert!(
-            MOBILE_JMAP_JS.contains("$flagged"),
-            "jmap.js should check $flagged keyword for star status"
-        );
-    }
-
-    #[test]
     fn mobile_sw_caches_app_shell() {
         assert!(
             MOBILE_SW.contains("/mobile/app.js"),
             "service worker should cache app.js in app shell"
         );
         assert!(
-            MOBILE_SW.contains("/mobile/jmap.js"),
-            "service worker should cache jmap.js in app shell"
+            MOBILE_SW.contains("'/api.js'"),
+            "service worker should cache the shared api.js in app shell"
         );
         assert!(
             MOBILE_SW.contains("/mobile/index.html"),

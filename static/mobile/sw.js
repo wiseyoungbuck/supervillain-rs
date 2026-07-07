@@ -10,7 +10,7 @@ const APP_SHELL = [
     '/mobile/',
     '/mobile/index.html',
     '/mobile/app.js',
-    '/mobile/jmap.js',
+    '/api.js',
     '/mobile/manifest.json',
 ];
 
@@ -35,8 +35,10 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
 
-    // Never cache JMAP API calls
-    if (url.hostname === 'api.fastmail.com') return;
+    // Never cache server API calls — email data must always be live
+    // (offline data caching is tracked separately, kata 2chc).
+    if (url.pathname.startsWith('/api/')) return;
+    if (event.request.method !== 'GET') return;
 
     // Network-first for app shell, fall back to cache
     event.respondWith(
