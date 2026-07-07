@@ -25,6 +25,7 @@ const state = {
     emails: [],
     loading: false,
     loadingMore: false,
+    loadAbort: null,           // AbortController for in-flight loadEmails/loadMoreEmails
     screen: Screen.LIST,       // Screen.LIST | Screen.DETAIL
     currentEmailId: null,
     listScrollTop: 0,
@@ -274,6 +275,11 @@ function connectedAccounts() {
 }
 
 function selectAccount(account) {
+    // Cancel any in-flight load from the account we're leaving — otherwise
+    // a slow response can land after the switch and overwrite the new
+    // account's list (or get swallowed by the state.loading guard).
+    state.loadAbort?.abort();
+    state.loadAbort = new AbortController();
     state.currentAccount = account;
     state.api = makeApi(account.id);
     state.mailboxes = [];
@@ -338,14 +344,31 @@ function emailListPath(offset) {
 }
 
 async function loadEmails() {
-    if (state.loading) return;
+    // No account selected yet (e.g. no accounts configured) — nothing to
+    // load. Without this guard the call below throws 'state.api is not a
+    // function', and the resulting toast wipes the 'No accounts configured'
+    // status right after init() sets it.
+    if (!state.api) {
+        finishPullRefresh();
+        return;
+    }
+    if (state.loading) {
+        finishPullRefresh();
+        return;
+    }
     state.loading = true;
     showStatus('Loading...');
+    // Captured up front: if the account changes before this resolves, the
+    // response belongs to an account we've already navigated away from.
+    const acct = state.currentAccount.id;
     try {
-        state.emails = await state.api('GET', emailListPath(0));
+        const emails = await state.api('GET', emailListPath(0), null, state.loadAbort?.signal);
+        if (state.currentAccount?.id !== acct) return;
+        state.emails = emails;
         renderEmailList();
         showStatus('');
     } catch (err) {
+        if (err.name === 'AbortError') return;
         showStatus('');
         showError('Load emails', err);
     } finally {
@@ -358,8 +381,10 @@ async function loadMoreEmails() {
     if (state.loadingMore || state.loading) return;
     if (!state.emails.length || state.emails.length >= CACHE_LIMIT) return;
     state.loadingMore = true;
+    const acct = state.currentAccount.id;
     try {
-        const page = await state.api('GET', emailListPath(state.emails.length));
+        const page = await state.api('GET', emailListPath(state.emails.length), null, state.loadAbort?.signal);
+        if (state.currentAccount?.id !== acct) return;
         const existingIds = new Set(state.emails.map(e => e.id));
         const newEmails = page.filter(e => !existingIds.has(e.id));
         if (newEmails.length) {
@@ -367,6 +392,7 @@ async function loadMoreEmails() {
             appendEmailRows(newEmails);
         }
     } catch (err) {
+        if (err.name === 'AbortError') return;
         showError('Load more', err);
     } finally {
         state.loadingMore = false;
@@ -611,9 +637,10 @@ function prefetchAdjacentEmails(emailId) {
     }
     if (!toFetch.length) return;
     // Background warm-up only — a failure here costs nothing the user can
-    // see, so log instead of toasting.
+    // see, so log instead of toasting. mark_read=false: prefetching must
+    // not silently consume unread state for emails the user never opened.
     Promise.all(toFetch.map(id =>
-        state.api('GET', '/emails/' + encodeURIComponent(id)).then(e => cacheEmail(e))
+        state.api('GET', '/emails/' + encodeURIComponent(id) + '?mark_read=false').then(e => cacheEmail(e))
     )).catch(err => console.warn('Prefetch failed:', err));
 }
 
@@ -826,8 +853,10 @@ window.addEventListener('popstate', (e) => {
 history.replaceState({ screen: Screen.LIST }, '');
 
 // Register service worker. Skipped outside a secure context (plain http
-// on anything but localhost) since registration there always fails —
-// the serviceWorker API isn't exposed at all in that case.
+// on anything but localhost): on Chromium the serviceWorker API still
+// exists there but register() rejects, while on Firefox it isn't exposed
+// at all — either way, checking isSecureContext first avoids depending on
+// the exact per-browser failure mode.
 if ('serviceWorker' in navigator) {
     if (window.isSecureContext) {
         navigator.serviceWorker.register('/mobile/sw.js', { scope: '/mobile/' })

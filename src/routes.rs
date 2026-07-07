@@ -181,13 +181,24 @@ async fn mobile_manifest() -> impl IntoResponse {
 }
 
 async fn mobile_sw() -> impl IntoResponse {
-    // Version-bust the cache name at serve time so a new release always
+    // Version-bust the cache name at serve time so a new BUILD always
     // gets a fresh CACHE_NAME without a manual bump in the source file.
+    // CARGO_PKG_VERSION alone isn't enough: deploys happen per-commit via
+    // scripts/upgrade.sh and the crate version rarely changes, so
+    // consecutive deploys would otherwise share one cache. SUPERVILLAIN_BUILD_ID
+    // (set by build.rs from the git short sha) makes every build distinct.
     // `Cache-Control: no-cache` on sw.js itself matters more than usual:
     // browsers only re-check a service worker file at most once every 24h
     // by spec, and a stale cached copy would keep serving the old
     // (unreplaced) placeholder, defeating version-busting entirely.
-    let body = MOBILE_SW.replace("__SUPERVILLAIN_VERSION__", env!("CARGO_PKG_VERSION"));
+    let body = MOBILE_SW.replace(
+        "__SUPERVILLAIN_VERSION__",
+        concat!(
+            env!("CARGO_PKG_VERSION"),
+            "-",
+            env!("SUPERVILLAIN_BUILD_ID")
+        ),
+    );
     (
         [
             ("content-type", "application/javascript; charset=utf-8"),
@@ -262,6 +273,16 @@ struct RsvpBody {
 #[derive(Deserialize, Default)]
 struct AccountParam {
     account: Option<String>,
+}
+
+/// Params for `GET /api/emails/{id}`. Like `AccountParam` plus an opt-out
+/// from the auto-mark-read behavior — mobile's adjacent-email prefetch
+/// warms the body cache without the user ever opening the email, so it
+/// must not silently consume that email's unread state.
+#[derive(Deserialize, Default)]
+struct GetEmailParams {
+    account: Option<String>,
+    mark_read: Option<bool>,
 }
 
 // =============================================================================
@@ -542,7 +563,7 @@ async fn list_emails(
 async fn get_email(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
-    Query(params): Query<AccountParam>,
+    Query(params): Query<GetEmailParams>,
 ) -> Result<impl IntoResponse, Error> {
     let account_key = match params.account.clone() {
         Some(a) => a,
@@ -564,8 +585,8 @@ async fn get_email(
         .await?;
     let email = &email;
 
-    // Auto mark-read
-    if email.is_unread() {
+    // Auto mark-read (skippable via ?mark_read=false — see GetEmailParams)
+    if params.mark_read.unwrap_or(true) && email.is_unread() {
         let _ = provider::mark_read(&session, &email_id).await;
     }
 
@@ -1995,6 +2016,59 @@ mod tests {
     }
 
     // =========================================================================
+    // GetEmailParams deserialization (roborev 285) — mark_read opt-out lets
+    // mobile's prefetch warm the body cache without consuming unread state.
+    // =========================================================================
+
+    #[test]
+    fn get_email_params_mark_read_absent_defaults_to_read_semantics() {
+        let uri: axum::http::Uri = "/api/emails/e1".parse().unwrap();
+        let Query(params) = Query::<GetEmailParams>::try_from_uri(&uri)
+            .expect("no query string at all must still deserialize");
+        assert_eq!(params.mark_read, None);
+        assert!(
+            params.mark_read.unwrap_or(true),
+            "absent mark_read must preserve the current (auto-mark-read) behavior"
+        );
+    }
+
+    #[test]
+    fn get_email_params_mark_read_false_parses() {
+        let uri: axum::http::Uri = "/api/emails/e1?mark_read=false".parse().unwrap();
+        let Query(params) =
+            Query::<GetEmailParams>::try_from_uri(&uri).expect("mark_read=false must deserialize");
+        assert_eq!(params.mark_read, Some(false));
+    }
+
+    #[test]
+    fn get_email_params_mark_read_false_with_account_parses() {
+        // Mirrors the URL mobile actually sends: mark_read=false alongside
+        // ?account=, joined with '&' since the path already has a '?'.
+        let uri: axum::http::Uri = "/api/emails/e1?mark_read=false&account=work"
+            .parse()
+            .unwrap();
+        let Query(params) = Query::<GetEmailParams>::try_from_uri(&uri)
+            .expect("mark_read=false&account=... must deserialize");
+        assert_eq!(params.mark_read, Some(false));
+        assert_eq!(params.account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn mobile_app_js_prefetch_requests_mark_read_false() {
+        let start = MOBILE_APP_JS
+            .find("function prefetchAdjacentEmails")
+            .expect("prefetchAdjacentEmails must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("prefetchAdjacentEmails must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("mark_read=false"),
+            "prefetching adjacent emails must not silently mark them read \
+             (pass ?mark_read=false on the GET)"
+        );
+    }
+
+    // =========================================================================
     // create_split / update_split validation tests (roborev 271)
     // =========================================================================
 
@@ -2344,6 +2418,11 @@ mod tests {
         assert!(
             text.contains(env!("CARGO_PKG_VERSION")),
             "served sw.js should embed the crate version in CACHE_NAME"
+        );
+        assert!(
+            text.contains(env!("SUPERVILLAIN_BUILD_ID")),
+            "served sw.js should embed the per-build id in CACHE_NAME so consecutive \
+             deploys on the same crate version still get a fresh cache"
         );
         assert!(
             !text.contains("__SUPERVILLAIN_VERSION__"),

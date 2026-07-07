@@ -15,13 +15,15 @@ fail() {
 }
 
 # Case 1: no SUPERVILLAIN_BIND in the environment → launcher defaults to
-# loopback 127.0.0.1:8000 and PORT follows.
+# loopback 127.0.0.1:8000 and PORT follows. The default is a specific host
+# (not a wildcard), so URL must also exercise that branch of the HOST case
+# statement rather than the 0.0.0.0/[::]-to-loopback rewrite.
 out="$(
     env -u SUPERVILLAIN_BIND SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
-        "source '$LAUNCHER'; printf '%s %s' \"\$SUPERVILLAIN_BIND\" \"\$PORT\""
+        "source '$LAUNCHER'; printf '%s %s %s' \"\$SUPERVILLAIN_BIND\" \"\$PORT\" \"\$URL\""
 )"
-[[ "$out" == "127.0.0.1:8000 8000" ]] ||
-    fail "default should export SUPERVILLAIN_BIND=127.0.0.1:8000 with PORT=8000, got: $out"
+[[ "$out" == "127.0.0.1:8000 8000 http://127.0.0.1:8000" ]] ||
+    fail "default should export SUPERVILLAIN_BIND=127.0.0.1:8000 with PORT=8000 and URL=http://127.0.0.1:8000, got: $out"
 
 # Case 2: caller override → respected, and PORT derived from it so
 # port_listening polls the actual port.
