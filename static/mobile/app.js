@@ -486,10 +486,13 @@ function showStatus(msg) {
 
 // Archive/trash push onto this so a later undo (A5) can restore them; capped
 // so a long swiping session can't grow it unbounded. This task only
-// maintains the stack — no undo toast/UI here.
+// maintains the stack — no undo toast/UI here. Returns the entry so a
+// failed action can retract exactly its own push (see emailAction's catch).
 function pushUndo(action, email, index) {
-    state.undoStack.push({ action, email, index, mailboxId: state.inboxId });
+    const entry = { action, email, index, mailboxId: state.inboxId };
+    state.undoStack.push(entry);
     if (state.undoStack.length > UNDO_STACK_LIMIT) state.undoStack.shift();
+    return entry;
 }
 
 async function emailAction(type, emailId) {
@@ -499,7 +502,7 @@ async function emailAction(type, emailId) {
 
     // Optimistic: remove from the list immediately.
     state.emails.splice(index, 1);
-    pushUndo(type, email, index);
+    const undoEntry = pushUndo(type, email, index);
     renderEmailList();
 
     // Literal per-type paths (rather than interpolating `type` into the
@@ -512,8 +515,13 @@ async function emailAction(type, emailId) {
     try {
         await state.api('POST', path);
     } catch (err) {
-        // Revert: re-insert at the original index and drop the stale undo entry.
-        state.undoStack.pop();
+        // Revert: re-insert at the original index and retract OUR undo entry
+        // by identity — with two actions in flight, popping the tail could
+        // drop a different action's still-valid entry (the failed one isn't
+        // necessarily the most recent push). Entry may also already be gone
+        // if the capped stack shifted it out.
+        const undoIdx = state.undoStack.indexOf(undoEntry);
+        if (undoIdx !== -1) state.undoStack.splice(undoIdx, 1);
         state.emails.splice(index, 0, email);
         renderEmailList();
         showError(type === 'archive' ? 'Archive' : 'Trash', err);
