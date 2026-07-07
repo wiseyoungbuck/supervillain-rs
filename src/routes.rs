@@ -2685,6 +2685,12 @@ mod tests {
             total, inside,
             "all .style.display toggles must live inside setScreen ({inside} of {total} do)"
         );
+        // The third screen (compose, kata ryzd) must be shown/hidden here too,
+        // never via a scattered toggle elsewhere.
+        assert!(
+            region.contains("compose-screen"),
+            "the compose screen's show/hide must live inside setScreen's switch"
+        );
     }
 
     #[test]
@@ -2846,6 +2852,97 @@ mod tests {
             assert!(
                 MOBILE_HTML.contains(id),
                 "detail action bar should include a #{id} button"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Compose tests (kata ryzd, task A6): new / reply / reply-all / forward
+    // =========================================================================
+
+    #[test]
+    fn mobile_app_js_has_compose_screen() {
+        // Screen.COMPOSE is the third full-screen view — a new enum member
+        // plus one setScreen case, no scattered display toggles.
+        assert!(
+            MOBILE_APP_JS.contains("COMPOSE"),
+            "the Screen enum should include a COMPOSE member"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("Screen.COMPOSE"),
+            "compose navigation should route through Screen.COMPOSE"
+        );
+        // The verified send contract: POST /emails/send with reply threading.
+        assert!(
+            MOBILE_APP_JS.contains("/emails/send"),
+            "compose should POST to the /emails/send route"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("in_reply_to"),
+            "reply must thread the original via in_reply_to"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("from_address"),
+            "compose should send the selected identity as from_address"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_compose_prefill_modes() {
+        // All four entry modes mirror desktop's compose semantics
+        // (startReply covers reply + reply-all, startForward covers forward,
+        // startCompose the blank new message).
+        assert!(
+            MOBILE_APP_JS.contains("function startReply("),
+            "compose should implement startReply (reply + reply-all)"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function startForward("),
+            "compose should implement startForward"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function startCompose("),
+            "compose should implement startCompose for a blank new message"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("autoSelectFromAddress"),
+            "compose should auto-select the From identity from the original's recipients"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("/identities"),
+            "compose should load identities for the From selector"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_compose_screen() {
+        // Compose markup: the screen container, To/Subject inputs, and the
+        // Send button, plus the header compose (new message) entry point.
+        for id in [
+            "compose-screen",
+            "compose-to",
+            "compose-subject",
+            "compose-send-btn",
+            "compose-btn",
+        ] {
+            assert!(
+                MOBILE_HTML.contains(id),
+                "mobile compose markup should include #{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_html_has_compose_reply_actions() {
+        // Reply / reply-all / forward entry points on the detail action bar.
+        for id in [
+            "detail-reply-btn",
+            "detail-reply-all-btn",
+            "detail-forward-btn",
+        ] {
+            assert!(
+                MOBILE_HTML.contains(id),
+                "detail view should include a #{id} compose action"
             );
         }
     }

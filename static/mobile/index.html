@@ -87,6 +87,29 @@
             font-weight: 600;
         }
 
+        #app-header .header-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        #app-header .icon-btn {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 22px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+            min-width: 44px;
+            min-height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
         #app-header .account-btn {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -95,7 +118,7 @@
             font-size: 13px;
             cursor: pointer;
             padding: 4px 12px;
-            max-width: 55%;
+            max-width: 100%;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -551,6 +574,211 @@
         .detail-action-btn.active {
             color: var(--accent);
         }
+
+        /* Reply/reply-all/forward row — text labels rather than glyphs, sitting
+           above the stateful icon row. */
+        #detail-compose-actions {
+            display: flex;
+            border-top: 1px solid var(--border);
+        }
+
+        .detail-action-btn.compose-action {
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--accent);
+        }
+
+        /* ================= Compose screen (kata ryzd, task A6) ================= */
+        #compose-screen {
+            display: none;
+            flex-direction: column;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        #compose-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            min-height: 48px;
+        }
+
+        #compose-header button {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 16px;
+            cursor: pointer;
+            padding: 8px 4px;
+            min-height: 44px;
+            flex-shrink: 0;
+        }
+
+        #compose-header #compose-send-btn {
+            font-weight: 600;
+        }
+
+        #compose-header button:disabled {
+            color: var(--text-muted);
+            cursor: default;
+        }
+
+        #compose-header .compose-title {
+            font-size: 15px;
+            font-weight: 600;
+            flex: 1;
+            text-align: center;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* Inline discard confirmation — replaces a blocking confirm(). */
+        #compose-discard-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            background: var(--surface);
+        }
+
+        #compose-discard-bar.hidden { display: none; }
+
+        #compose-discard-bar .discard-label {
+            flex: 1;
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        #compose-discard-bar button {
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 13px;
+            cursor: pointer;
+            padding: 8px 12px;
+            min-height: 40px;
+        }
+
+        #compose-discard-bar #compose-discard-confirm {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        #compose-fields {
+            flex: 1;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .compose-field-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0 16px;
+            border-bottom: 1px solid var(--border);
+            min-height: 48px;
+        }
+
+        .compose-field-row.hidden { display: none; }
+
+        .compose-field-row label {
+            color: var(--text-muted);
+            font-size: 14px;
+            width: 48px;
+            flex-shrink: 0;
+        }
+
+        .compose-field-row input,
+        .compose-field-row select {
+            flex: 1;
+            min-width: 0;
+            background: none;
+            border: none;
+            color: var(--text);
+            /* 16px prevents iOS Safari from zooming the viewport on focus. */
+            font-size: 16px;
+            padding: 12px 0;
+        }
+
+        .compose-field-row input:focus,
+        .compose-field-row select:focus,
+        #compose-body:focus {
+            outline: none;
+        }
+
+        .compose-field-row select {
+            appearance: none;
+            -webkit-appearance: none;
+        }
+
+        #compose-body {
+            width: 100%;
+            min-height: 160px;
+            background: none;
+            border: none;
+            color: var(--text);
+            font-family: inherit;
+            /* 16px prevents iOS zoom-on-focus. */
+            font-size: 16px;
+            line-height: 1.5;
+            padding: 16px;
+            resize: none;
+            overflow: hidden;
+        }
+
+        /* Read-only quoted content (reply/forward), collapsed by default. */
+        #compose-quote {
+            border-top: 1px solid var(--border);
+        }
+
+        #compose-quote.hidden { display: none; }
+
+        #compose-quote-toggle {
+            width: 100%;
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 14px;
+            text-align: left;
+            cursor: pointer;
+            padding: 12px 16px;
+            min-height: 44px;
+        }
+
+        #compose-quote-body {
+            padding: 0 16px 16px;
+        }
+
+        #compose-quote-body.hidden { display: none; }
+
+        #compose-quote-body .quote-header {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        #compose-quote-body pre {
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: inherit;
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        #compose-quote-body iframe {
+            width: 100%;
+            height: 320px;
+            border: 0;
+            background: #fff;
+        }
     </style>
 </head>
 <body>
@@ -558,7 +786,10 @@
     <div id="app-shell">
         <div id="app-header">
             <span class="title">Supervillain</span>
-            <button class="account-btn" id="account-btn" aria-label="Switch account"></button>
+            <div class="header-right">
+                <button class="icon-btn" id="compose-btn" aria-label="New message">&#9998;</button>
+                <button class="account-btn" id="account-btn" aria-label="Switch account"></button>
+            </div>
         </div>
         <div id="email-list-wrap">
             <div id="pull-indicator">Pull to refresh</div>
@@ -577,11 +808,60 @@
             <div id="detail-attachments"></div>
             <div id="detail-calendar"></div>
             <div id="email-body"></div>
+            <!-- Reply / reply-all / forward (kata ryzd, task A6): a second
+                 action row above the stateful archive/trash/read/star row so
+                 all six targets stay 44px+ without crowding one strip. -->
+            <div id="detail-compose-actions">
+                <button id="detail-reply-btn" class="detail-action-btn compose-action" aria-label="Reply">Reply</button>
+                <button id="detail-reply-all-btn" class="detail-action-btn compose-action" aria-label="Reply all">Reply all</button>
+                <button id="detail-forward-btn" class="detail-action-btn compose-action" aria-label="Forward">Forward</button>
+            </div>
             <div id="detail-actions">
                 <button id="detail-archive-btn" class="detail-action-btn" aria-label="Archive">&#128452;</button>
                 <button id="detail-trash-btn" class="detail-action-btn" aria-label="Trash">&#128465;</button>
                 <button id="detail-read-btn" class="detail-action-btn" aria-label="Toggle read status">&#9679;</button>
                 <button id="detail-star-btn" class="detail-action-btn" aria-label="Toggle star">&#9734;</button>
+            </div>
+        </div>
+        <!-- Compose (kata ryzd, task A6): new / reply / reply-all / forward.
+             A full-screen sibling of the list and detail views; setScreen()
+             owns its show/hide. The quote block below the body is read-only —
+             it is appended at send time, mirroring desktop. -->
+        <div id="compose-screen">
+            <div id="compose-header">
+                <button id="compose-cancel-btn" aria-label="Cancel">Cancel</button>
+                <span id="compose-title" class="compose-title">New message</span>
+                <button id="compose-send-btn" aria-label="Send">Send</button>
+            </div>
+            <!-- Inline discard confirmation (no blocking confirm()): shown only
+                 when Cancel is pressed on a dirty draft. -->
+            <div id="compose-discard-bar" class="hidden">
+                <span class="discard-label">Discard draft?</span>
+                <button id="compose-discard-keep">Keep editing</button>
+                <button id="compose-discard-confirm">Discard</button>
+            </div>
+            <div id="compose-fields">
+                <div id="compose-from-row" class="compose-field-row hidden">
+                    <label for="compose-from">From</label>
+                    <select id="compose-from"></select>
+                </div>
+                <div class="compose-field-row">
+                    <label for="compose-to">To</label>
+                    <input id="compose-to" type="email" inputmode="email" autocapitalize="off" autocorrect="off" placeholder="Recipients (comma-separated)">
+                </div>
+                <div class="compose-field-row">
+                    <label for="compose-cc">Cc</label>
+                    <input id="compose-cc" type="email" inputmode="email" autocapitalize="off" autocorrect="off" placeholder="Cc (comma-separated)">
+                </div>
+                <div class="compose-field-row">
+                    <label for="compose-subject">Subject</label>
+                    <input id="compose-subject" type="text" placeholder="Subject">
+                </div>
+                <textarea id="compose-body" placeholder="Write your message"></textarea>
+                <div id="compose-quote" class="hidden">
+                    <button id="compose-quote-toggle" type="button">Show quoted text</button>
+                    <div id="compose-quote-body" class="hidden"></div>
+                </div>
             </div>
         </div>
         <div id="status-bar"></div>

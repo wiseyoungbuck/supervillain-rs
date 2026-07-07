@@ -10,7 +10,7 @@
 // a screen later (compose, mailboxes, search) is a new enum member plus one
 // switch case — never another scattered display toggle.
 
-const Screen = { LIST: 'list', DETAIL: 'detail' };
+const Screen = { LIST: 'list', DETAIL: 'detail', COMPOSE: 'compose' };
 
 // ============================================================================
 // State
@@ -26,12 +26,16 @@ const state = {
     loading: false,
     loadingMore: false,
     loadAbort: null,           // AbortController for in-flight loadEmails/loadMoreEmails
-    screen: Screen.LIST,       // Screen.LIST | Screen.DETAIL
+    screen: Screen.LIST,       // Screen.LIST | Screen.DETAIL | Screen.COMPOSE
     currentEmailId: null,
     listScrollTop: 0,
     emailCache: {},            // id → full email with body (LRU, max 50)
     lastRenderedGroup: null,   // date-divider continuity for append-only pages
     undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId, settled }], capped at UNDO_STACK_LIMIT — see performUndo
+    identities: [],            // [{ email, name }] for the current account's From selector
+    identitiesAccount: null,   // account id the cached identities belong to
+    replyContext: null,        // { inReplyTo?, quotedHtml, quotedText } appended at send time
+    sending: false,            // in-flight send lock (disables Send, ignores re-taps)
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -95,16 +99,23 @@ function escapeHtml(text) {
 
 let errorToastTimer = null;
 
-function showError(context, err) {
+// Bottom toast shared by showError (failures) and transient status like the
+// post-send "Sent" confirmation. One element, one timer — a newer message
+// always replaces the pending one.
+function showToast(message, duration = 6000) {
     const el = document.getElementById('error-toast');
     if (!el) return;
+    el.textContent = message;
+    el.classList.remove('hidden');
+    if (errorToastTimer) clearTimeout(errorToastTimer);
+    errorToastTimer = setTimeout(() => el.classList.add('hidden'), duration);
+}
+
+function showError(context, err) {
     const detail = err instanceof ApiAuthError
         ? 'account needs re-authorization (open Settings on desktop)'
         : err.message;
-    el.textContent = context + ': ' + detail;
-    el.classList.remove('hidden');
-    if (errorToastTimer) clearTimeout(errorToastTimer);
-    errorToastTimer = setTimeout(() => el.classList.add('hidden'), 6000);
+    showToast(context + ': ' + detail);
 }
 
 // ============================================================================
@@ -290,6 +301,12 @@ function selectAccount(account) {
     state.emailCache = {};
     state.lastRenderedGroup = null;
     state.listScrollTop = 0;
+    // Identities are account-scoped; drop the previous account's set and
+    // re-fetch for the From selector. A failure only disables the selector
+    // (compose still works), so it's fire-and-forget with its own error sink.
+    state.identities = [];
+    state.identitiesAccount = null;
+    loadIdentities(account.id);
     // Switching accounts drops any open detail view; without this the app
     // stays on a stale email from the account we just left.
     if (state.screen !== Screen.LIST) {
@@ -726,12 +743,29 @@ async function toggleFlag(emailId) {
 // owns the history push/replace rule before delegating to setScreen().
 
 function setScreen(screen, params = {}) {
+    // Leaving compose (Cancel, send, or browser-back) abandons the draft with
+    // no confirmation — the simplest correct popstate behavior. Captured
+    // before state.screen is overwritten.
+    const leavingCompose = state.screen === Screen.COMPOSE && screen !== Screen.COMPOSE;
     state.screen = screen;
     switch (screen) {
+        case Screen.COMPOSE:
+            state.currentEmailId = null;
+            document.getElementById('email-list-wrap').style.display = 'none';
+            document.getElementById('app-header').style.display = 'none';
+            document.getElementById('email-detail').style.display = 'none';
+            document.getElementById('compose-screen').style.display = 'flex';
+            // Fields are already prefilled by the entry point (startCompose/
+            // startReply/startForward) before navigateTo — nothing to render.
+            // Focus the first field the user still needs to fill: To when it's
+            // empty (new message, forward), otherwise the body (reply).
+            (composeEl('compose-to').value ? composeEl('compose-body') : composeEl('compose-to')).focus();
+            break;
         case Screen.DETAIL:
             state.currentEmailId = params.emailId;
             document.getElementById('email-list-wrap').style.display = 'none';
             document.getElementById('app-header').style.display = 'none';
+            document.getElementById('compose-screen').style.display = 'none';
             document.getElementById('email-detail').style.display = 'flex';
             renderScreenDetail(params.emailId);
             break;
@@ -739,12 +773,14 @@ function setScreen(screen, params = {}) {
         default:
             state.currentEmailId = null;
             document.getElementById('email-detail').style.display = 'none';
+            document.getElementById('compose-screen').style.display = 'none';
             document.getElementById('email-list-wrap').style.display = '';
             document.getElementById('app-header').style.display = '';
             document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
             renderEmailList();
             break;
     }
+    if (leavingCompose) clearComposeFields();
 }
 
 // Forward navigation owns history in one place: pushState on list→detail
@@ -978,6 +1014,316 @@ function prefetchAdjacentEmails(emailId) {
     Promise.all(toFetch.map(id =>
         state.api('GET', '/emails/' + encodeURIComponent(id) + '?mark_read=false').then(e => cacheEmail(e))
     )).catch(err => console.warn('Prefetch failed:', err));
+}
+
+// ============================================================================
+// Compose — new / reply / reply-all / forward
+// ============================================================================
+// Mirrors desktop's compose semantics (static/app.js sendEmail/startReply/
+// startForward/autoSelectFromAddress): the four entry points prefill the DOM
+// fields and stash a replyContext (quote + threading id), then navigate to
+// Screen.COMPOSE. The quote is never edited — it's appended at send time
+// exactly like desktop, both as '> '-prefixed plain text and as an HTML
+// <blockquote>. showError is the only failure sink.
+
+const COMPOSE_EL = {};
+
+function composeEl(id) {
+    return (COMPOSE_EL[id] ||= document.getElementById(id));
+}
+
+// Identities power the From selector. Account-scoped: the passed acct is
+// captured so a response landing after an account switch is discarded. A
+// failure just leaves the selector empty (hidden) — compose still works with
+// the account's default From, so this reports and moves on.
+async function loadIdentities(acct) {
+    try {
+        const identities = await state.api('GET', '/identities');
+        if (state.currentAccount?.id !== acct) return;
+        state.identities = Array.isArray(identities) ? identities : [];
+        state.identitiesAccount = acct;
+    } catch (err) {
+        if (state.currentAccount?.id !== acct) return;
+        state.identities = [];
+        state.identitiesAccount = acct;
+        showError('Load identities', err);
+    }
+    renderComposeFrom();
+}
+
+// Populate the From <select> and hide the whole row when there's 0 or 1
+// identity (nothing to choose). The single option still carries its value so
+// sendComposedEmail reads a from_address even while the row is hidden.
+function renderComposeFrom() {
+    const sel = composeEl('compose-from');
+    const row = composeEl('compose-from-row');
+    if (!sel || !row) return;
+    sel.innerHTML = state.identities.map(id =>
+        '<option value="' + escapeHtml(id.email) + '">'
+        + escapeHtml(id.email) + (id.name ? ' (' + escapeHtml(id.name) + ')' : '')
+        + '</option>'
+    ).join('');
+    row.classList.toggle('hidden', state.identities.length <= 1);
+}
+
+// Match an identity to the original email's recipients — To first, then Cc —
+// so a reply goes out from the address it was sent to. Falls back to the
+// select's default (first option) when nothing matches. Mirrors desktop.
+function autoSelectFromAddress(email) {
+    const sel = composeEl('compose-from');
+    if (!sel || !state.identities.length) return;
+    const lists = [email.to || [], email.cc || []];
+    for (const list of lists) {
+        for (const r of list) {
+            if (!r.email) continue;
+            const addr = r.email.toLowerCase();
+            for (const id of state.identities) {
+                if (id.email.toLowerCase() === addr) {
+                    sel.value = id.email;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+function htmlToPlainText(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    return doc.body.innerText || '';
+}
+
+// The full email (with body + recipients) backing a reply/forward. The detail
+// view guarantees it's cached before its action bar is reachable.
+function getComposeEmail() {
+    return state.emailCache[state.currentEmailId] || null;
+}
+
+// Reset every field to empty and drop any reply/forward context. Field-only:
+// the screen show/hide stays in setScreen.
+function clearComposeFields() {
+    composeEl('compose-to').value = '';
+    composeEl('compose-cc').value = '';
+    composeEl('compose-subject').value = '';
+    composeEl('compose-body').value = '';
+    autosizeComposeBody();
+    const quote = composeEl('compose-quote');
+    quote.classList.add('hidden');
+    composeEl('compose-quote-body').replaceChildren();
+    composeEl('compose-quote-body').classList.add('hidden');
+    composeEl('compose-quote-toggle').textContent = 'Show quoted text';
+    hideDiscardBar();
+    state.replyContext = null;
+    if (state.identities.length) composeEl('compose-from').value = state.identities[0].email;
+}
+
+// Renders the read-only quote preview: a header line plus the original body
+// (HTML in a sandboxed iframe, else plain text in a <pre>). Collapsed by
+// default — the toggle button reveals it. Content is display only; send-time
+// quoting reads state.replyContext, not this DOM.
+function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
+    const body = composeEl('compose-quote-body');
+    body.replaceChildren();
+    const header = document.createElement('div');
+    header.className = 'quote-header';
+    header.innerHTML = headerHtml;
+    body.appendChild(header);
+    if (quotedHtml) {
+        const host = document.createElement('div');
+        body.appendChild(host);
+        renderHtmlBodyIframe(host, quotedHtml);
+    } else {
+        const pre = document.createElement('pre');
+        pre.textContent = quotedText;
+        body.appendChild(pre);
+    }
+    body.classList.add('hidden');
+    composeEl('compose-quote-toggle').textContent = 'Show quoted text';
+    composeEl('compose-quote').classList.remove('hidden');
+}
+
+function toggleComposeQuote() {
+    const body = composeEl('compose-quote-body');
+    const collapsed = body.classList.toggle('hidden');
+    composeEl('compose-quote-toggle').textContent = collapsed ? 'Show quoted text' : 'Hide quoted text';
+}
+
+function setComposeTitle(text) {
+    composeEl('compose-title').textContent = text;
+}
+
+// New blank message.
+function startCompose() {
+    state.replyContext = null;
+    clearComposeFields();
+    setComposeTitle('New message');
+    navigateTo(Screen.COMPOSE);
+}
+
+// Reply / reply-all. Mirrors desktop startReply: To = original sender,
+// subject Re:… (no double-prefix), quote = htmlBody (else textBody),
+// in_reply_to = email.id. Reply-all additionally Cc's the original To
+// recipients (desktop's exact rule — email.to only, filtered of blanks).
+function startReply(replyAll) {
+    const email = getComposeEmail();
+    if (!email) return;
+
+    clearComposeFields();
+
+    const from = email.from?.[0];
+    composeEl('compose-to').value = from?.email || '';
+
+    if (replyAll && email.to) {
+        composeEl('compose-cc').value = email.to
+            .filter(t => t.email)
+            .map(t => t.email)
+            .join(', ');
+    }
+
+    composeEl('compose-subject').value = email.subject.startsWith('Re:')
+        ? email.subject
+        : 'Re: ' + email.subject;
+
+    const quotedHtml = email.htmlBody || null;
+    const quotedText = email.htmlBody ? htmlToPlainText(email.htmlBody) : (email.textBody || '');
+
+    state.replyContext = { inReplyTo: email.id, quotedHtml, quotedText };
+
+    autoSelectFromAddress(email);
+
+    const header = 'On ' + formatDate(email.receivedAt) + ', '
+        + escapeHtml(from?.name || from?.email || '') + ' wrote:';
+    renderComposeQuote(header, quotedHtml, quotedText);
+
+    setComposeTitle(replyAll ? 'Reply all' : 'Reply');
+    navigateTo(Screen.COMPOSE);
+}
+
+// Forward. Mirrors desktop startForward: subject Fwd:…, forwarded-message
+// header + quote, and NO in_reply_to (forwarding starts a new thread).
+// Desktop leaves To and Cc empty on a forward — the user picks recipients —
+// so this does too.
+function startForward() {
+    const email = getComposeEmail();
+    if (!email) return;
+
+    clearComposeFields();
+
+    composeEl('compose-subject').value = email.subject.startsWith('Fwd:')
+        ? email.subject
+        : 'Fwd: ' + email.subject;
+
+    const from = email.from?.[0];
+    const quotedHtml = email.htmlBody || null;
+    const quotedText = email.htmlBody ? htmlToPlainText(email.htmlBody) : (email.textBody || '');
+
+    // No inReplyTo → send maps it to null: a forward is a fresh thread.
+    state.replyContext = { quotedHtml, quotedText };
+
+    autoSelectFromAddress(email);
+
+    const header = '---------- Forwarded message ---------<br>'
+        + 'From: ' + escapeHtml(from?.name || '') + ' &lt;' + escapeHtml(from?.email || '') + '&gt;<br>'
+        + 'Subject: ' + escapeHtml(email.subject);
+    renderComposeQuote(header, quotedHtml, quotedText);
+
+    setComposeTitle('Forward');
+    navigateTo(Screen.COMPOSE);
+}
+
+// Auto-expanding body textarea: grow to fit content so the compose column
+// scrolls as one, no inner textarea scrollbar.
+function autosizeComposeBody() {
+    const ta = composeEl('compose-body');
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = ta.scrollHeight + 'px';
+}
+
+// Toggles the Send button between idle and in-flight. The lock lives on
+// state.sending; the button's disabled state mirrors it for the user.
+function setComposeSending(sending) {
+    state.sending = sending;
+    const btn = composeEl('compose-send-btn');
+    if (!btn) return;
+    btn.disabled = sending;
+    btn.textContent = sending ? 'Sending…' : 'Send';
+}
+
+// Send. Payload mirrors desktop sendEmail exactly: plain body carries the
+// '> '-quoted original, html_body (only when quoting HTML) wraps the user's
+// text in a <div> above a <blockquote> of the original. Validates ≥1 To,
+// locks against double-send, reports failures via showError with the form
+// left intact for a retry.
+async function sendComposedEmail() {
+    if (state.sending) return;
+
+    const to = composeEl('compose-to').value.split(',').map(s => s.trim()).filter(Boolean);
+    const cc = composeEl('compose-cc').value.split(',').map(s => s.trim()).filter(Boolean);
+    const fromAddress = composeEl('compose-from').value || null;
+    const subject = composeEl('compose-subject').value;
+    const userText = composeEl('compose-body').value;
+
+    if (!to.length) {
+        showError('Send', new Error('add at least one recipient'));
+        return;
+    }
+
+    const quotedText = state.replyContext?.quotedText;
+    const quotedHtml = state.replyContext?.quotedHtml;
+
+    const fullTextBody = quotedText
+        ? userText + '\n\n' + quotedText.split('\n').map(l => '> ' + l).join('\n')
+        : userText;
+
+    const fullHtmlBody = quotedHtml
+        ? '<div>' + escapeHtml(userText).replace(/\n/g, '<br>') + '</div>'
+          + '<blockquote style="border-left:2px solid #ccc;padding-left:12px;margin-left:0">' + quotedHtml + '</blockquote>'
+        : null;
+
+    setComposeSending(true);
+    try {
+        await state.api('POST', '/emails/send', {
+            to,
+            cc,
+            subject,
+            body: fullTextBody,
+            html_body: fullHtmlBody || undefined,
+            in_reply_to: state.replyContext?.inReplyTo || null,
+            from_address: fromAddress,
+        });
+        showToast('Sent', 3000);
+        clearComposeFields();
+        history.back();
+    } catch (err) {
+        showError('Send', err);
+    } finally {
+        setComposeSending(false);
+    }
+}
+
+// Cancel: discard immediately when the draft is empty, else surface the
+// inline "Discard draft?" bar (no blocking confirm() — it would freeze the
+// automation harness).
+function cancelCompose() {
+    const dirty = composeEl('compose-subject').value.trim() || composeEl('compose-body').value.trim();
+    if (dirty) {
+        showDiscardBar();
+    } else {
+        discardCompose();
+    }
+}
+
+function discardCompose() {
+    clearComposeFields();
+    history.back();
+}
+
+function showDiscardBar() {
+    composeEl('compose-discard-bar').classList.remove('hidden');
+}
+
+function hideDiscardBar() {
+    composeEl('compose-discard-bar').classList.add('hidden');
 }
 
 // ============================================================================
@@ -1259,6 +1605,28 @@ document.getElementById('detail-read-btn').addEventListener('click', () => {
 });
 document.getElementById('detail-star-btn').addEventListener('click', () => {
     if (state.currentEmailId) toggleFlag(state.currentEmailId);
+});
+
+// Compose entry points: header ✎ (new message) and the detail action bar's
+// reply / reply-all / forward.
+document.getElementById('compose-btn').addEventListener('click', startCompose);
+document.getElementById('detail-reply-btn').addEventListener('click', () => startReply(false));
+document.getElementById('detail-reply-all-btn').addEventListener('click', () => startReply(true));
+document.getElementById('detail-forward-btn').addEventListener('click', startForward);
+
+// Compose screen controls.
+document.getElementById('compose-cancel-btn').addEventListener('click', cancelCompose);
+document.getElementById('compose-send-btn').addEventListener('click', sendComposedEmail);
+document.getElementById('compose-discard-keep').addEventListener('click', hideDiscardBar);
+document.getElementById('compose-discard-confirm').addEventListener('click', discardCompose);
+document.getElementById('compose-quote-toggle').addEventListener('click', toggleComposeQuote);
+document.getElementById('compose-body').addEventListener('input', autosizeComposeBody);
+// Keyboard-aware without visualViewport gymnastics: nudge the focused field
+// into view above the on-screen keyboard (100dvh + native scroll do the rest).
+document.getElementById('compose-fields').addEventListener('focusin', (e) => {
+    if (e.target.matches('input, textarea, select')) {
+        e.target.scrollIntoView({ block: 'nearest' });
+    }
 });
 
 // Undo toast — tap anywhere on it to undo (no keyboard shortcut on a phone).
