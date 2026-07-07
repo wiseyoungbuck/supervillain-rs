@@ -293,7 +293,7 @@ function renderAccountPicker() {
         const current = state.currentAccount && a.id === state.currentAccount.id;
         const cls = 'account-row' + (current ? ' current' : '') + (pending ? ' pending' : '');
         return '<button class="' + cls + '" data-id="' + escapeHtml(a.id) + '">'
-            + '<span>' + escapeHtml(a.email) + (pending ? ' (needs authorization)' : '') + '</span>'
+            + '<span>' + escapeHtml(a.email || a.id) + (pending ? ' (needs authorization)' : '') + '</span>'
             + '<span class="account-provider">' + escapeHtml(a.provider || '') + '</span>'
             + '</button>';
     }).join('');
