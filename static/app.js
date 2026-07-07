@@ -3664,7 +3664,6 @@ function wrapEmailHtml(html, dark) {
         + 'td,th{padding:4px 8px;}'
         + 'pre,code{background:' + codeBg + ';padding:2px 4px;border-radius:3px;}'
         + '*{writing-mode: horizontal-tb !important;text-orientation: mixed !important;}'
-        + 'html,body{direction: ltr !important;unicode-bidi: normal !important;}'
         + '</style>'
         + '</head><body>'
         + html

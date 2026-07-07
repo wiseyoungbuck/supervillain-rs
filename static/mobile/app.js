@@ -152,7 +152,6 @@ function wrapEmailHtml(html, dark) {
         + 'a{color:' + linkColor + ';}'
         + 'blockquote{border-left:3px solid ' + quoteBorder + ';margin:8px 0;padding:4px 12px;color:' + quoteFg + ';}'
         + '*{writing-mode: horizontal-tb !important;text-orientation: mixed !important;}'
-        + 'html,body{direction: ltr !important;unicode-bidi: normal !important;}'
         + '</style>'
         + '</head><body>'
         + html
