@@ -1143,15 +1143,26 @@ async fn resolve_well_known_aliases(session: &OutlookSession, token: &str) -> Al
 /// The session's folder-id → role map, resolving well-known aliases on
 /// first use. Holds the cache lock across check-and-fill so concurrent
 /// cold calls (e.g. two tabs hitting a cold folder cache) don't each
-/// fire the six alias lookups. Only a complete resolution is pinned —
-/// caching a partially throttled map would leave folders role-less
-/// until process restart (roborev 274).
+/// fire the six alias lookups (roborev 274).
 async fn session_role_map(session: &OutlookSession, token: &str) -> HashMap<String, String> {
     let mut cached = session.folder_role_cache.lock().await;
     if let Some(map) = cached.as_ref() {
         return map.clone();
     }
     let resolution = resolve_well_known_aliases(session, token).await;
+    store_role_resolution(&mut cached, &resolution)
+}
+
+/// Build the role map from a resolution and pin it in the session cache
+/// iff the resolution is complete. Caching a partially throttled map
+/// would leave folders role-less until process restart; leaving the
+/// cache `None` makes the next folder fetch retry (roborev 274/278).
+/// Operates on the already-held lock guard's contents — pure enough to
+/// test without HTTP.
+fn store_role_resolution(
+    cached: &mut Option<HashMap<String, String>>,
+    resolution: &AliasResolution,
+) -> HashMap<String, String> {
     let map = roles_by_folder_id(&resolution.resolved);
     if resolution.complete {
         *cached = Some(map.clone());
@@ -3445,6 +3456,47 @@ mod tests {
         ]);
         assert!(!res.complete);
         assert!(res.resolved.is_empty());
+    }
+
+    #[test]
+    fn incomplete_resolution_is_returned_but_not_cached() {
+        // Roborev 278: pins the guard itself, not just the pure
+        // classification. A non-empty but incomplete map (inbox resolved,
+        // sentitems throttled) must be used for THIS fetch yet leave the
+        // cache None so the next fetch retries — a revert to the old
+        // "cache if non-empty" check fails here.
+        let mut cached = None;
+        let resolution = AliasResolution {
+            resolved: vec![("inbox".to_string(), "id1".to_string())],
+            complete: false,
+        };
+        let map = store_role_resolution(&mut cached, &resolution);
+        assert_eq!(map.get("id1").map(String::as_str), Some("inbox"));
+        assert!(cached.is_none(), "incomplete resolution must not be pinned");
+    }
+
+    #[test]
+    fn complete_resolution_is_cached() {
+        let mut cached = None;
+        let resolution = AliasResolution {
+            resolved: vec![("inbox".to_string(), "id1".to_string())],
+            complete: true,
+        };
+        let map = store_role_resolution(&mut cached, &resolution);
+        assert_eq!(cached.as_ref(), Some(&map));
+    }
+
+    #[test]
+    fn empty_transient_resolution_leaves_cache_none() {
+        // Total throttling: nothing resolved, nothing cached.
+        let mut cached = None;
+        let resolution = AliasResolution {
+            resolved: vec![],
+            complete: false,
+        };
+        let map = store_role_resolution(&mut cached, &resolution);
+        assert!(map.is_empty());
+        assert!(cached.is_none());
     }
 
     #[tokio::test]
