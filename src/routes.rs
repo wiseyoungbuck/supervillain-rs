@@ -2966,6 +2966,53 @@ white   = '#fdf6e3'
         );
     }
 
+    #[test]
+    fn app_js_wrap_email_html_neutralizes_vertical_writing_mode() {
+        // Sender CSS like `writing-mode: vertical-rl` (e.g. updates.cash.app)
+        // must be neutralized in the iframe's injected stylesheet, or the
+        // whole email body renders sideways and unreadable (kata 80v2).
+        let pos = APP_JS
+            .find("function wrapEmailHtml")
+            .expect("function wrapEmailHtml must exist");
+        let region = &APP_JS[pos..APP_JS.len().min(pos + 2500)];
+        assert!(
+            region.contains("writing-mode: horizontal-tb !important"),
+            "iframe stylesheet must force horizontal-tb writing-mode on all elements"
+        );
+        assert!(
+            region.contains("text-orientation: mixed !important"),
+            "iframe stylesheet must force mixed text-orientation on all elements"
+        );
+        assert!(
+            region
+                .contains("html,body{direction: ltr !important;unicode-bidi: normal !important;}"),
+            "direction/unicode-bidi override must be scoped to html/body only, not `*` \
+             (a blanket direction:ltr on every element would break legitimate RTL content)"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_wrap_email_html_neutralizes_vertical_writing_mode() {
+        let pos = MOBILE_APP_JS
+            .find("function wrapEmailHtml")
+            .expect("function wrapEmailHtml must exist");
+        let region = &MOBILE_APP_JS[pos..MOBILE_APP_JS.len().min(pos + 2500)];
+        assert!(
+            region.contains("writing-mode: horizontal-tb !important"),
+            "mobile iframe stylesheet must force horizontal-tb writing-mode on all elements"
+        );
+        assert!(
+            region.contains("text-orientation: mixed !important"),
+            "mobile iframe stylesheet must force mixed text-orientation on all elements"
+        );
+        assert!(
+            region
+                .contains("html,body{direction: ltr !important;unicode-bidi: normal !important;}"),
+            "direction/unicode-bidi override must be scoped to html/body only, not `*` \
+             (a blanket direction:ltr on every element would break legitimate RTL content)"
+        );
+    }
+
     #[tokio::test]
     async fn index_html_sets_restrictive_csp() {
         let resp = index_html().await.into_response();
