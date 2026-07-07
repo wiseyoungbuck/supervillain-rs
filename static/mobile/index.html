@@ -175,6 +175,26 @@
 
         #error-toast.hidden { display: none; }
 
+        /* Undo toast — sits above the error toast (both can show at once)
+           and is tappable anywhere to undo. */
+        #undo-toast {
+            position: fixed;
+            left: 16px;
+            right: 16px;
+            bottom: calc(72px + var(--safe-bottom));
+            background: var(--surface);
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            color: var(--text);
+            font-size: 13px;
+            line-height: 1.4;
+            padding: 12px 14px;
+            z-index: 41;
+            cursor: pointer;
+        }
+
+        #undo-toast.hidden { display: none; }
+
         /* Email list */
         #email-list-wrap {
             flex: 1;
@@ -578,6 +598,9 @@
             <div id="account-picker-list"></div>
         </div>
     </div>
+
+    <!-- Undo toast (archive/trash) -->
+    <div id="undo-toast" class="hidden"></div>
 
     <!-- Error toast -->
     <div id="error-toast" class="hidden"></div>

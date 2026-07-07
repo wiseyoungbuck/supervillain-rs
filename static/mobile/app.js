@@ -31,7 +31,7 @@ const state = {
     listScrollTop: 0,
     emailCache: {},            // id → full email with body (LRU, max 50)
     lastRenderedGroup: null,   // date-divider continuity for append-only pages
-    undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId }], capped at UNDO_STACK_LIMIT — A5 builds the undo UI on top of this
+    undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId }], capped at UNDO_STACK_LIMIT — see performUndo
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -484,15 +484,88 @@ function showStatus(msg) {
 // the mutation and reports through showError, the only failure sink on a
 // phone without devtools.
 
-// Archive/trash push onto this so a later undo (A5) can restore them; capped
-// so a long swiping session can't grow it unbounded. This task only
-// maintains the stack — no undo toast/UI here. Returns the entry so a
+// Archive/trash push onto this so a later undo can restore them; capped so a
+// long swiping session can't grow it unbounded. Returns the entry so a
 // failed action can retract exactly its own push (see emailAction's catch).
 function pushUndo(action, email, index) {
     const entry = { action, email, index, mailboxId: state.inboxId };
     state.undoStack.push(entry);
     if (state.undoStack.length > UNDO_STACK_LIMIT) state.undoStack.shift();
+    showUndoToast(entry);
     return entry;
+}
+
+// ============================================================================
+// Undo toast
+// ============================================================================
+// v1 UI surfaces only the single most recent undo — the stack still holds up
+// to UNDO_STACK_LIMIT entries for a future keyboard-style multi-undo, but a
+// new archive/trash always replaces the pending toast. undoToastEntry tracks
+// which stack entry the visible toast represents, so a failure elsewhere
+// (emailAction's catch) can tell whether it's still the one showing before
+// hiding it out from under a newer action.
+
+let undoToastTimer = null;
+let undoToastEntry = null;
+
+function showUndoToast(entry) {
+    const el = document.getElementById('undo-toast');
+    if (!el) return;
+    undoToastEntry = entry;
+    el.textContent = (entry.action === 'archive' ? 'Email archived' : 'Email trashed') + ' — Undo';
+    el.classList.remove('hidden');
+    if (undoToastTimer) clearTimeout(undoToastTimer);
+    undoToastTimer = setTimeout(() => {
+        el.classList.add('hidden');
+        undoToastEntry = null;
+    }, 5000);
+}
+
+// No-op unless `entry` is still the one the toast is showing — callers pass
+// the entry they know about so a stale hide (e.g. a failed action whose
+// toast a newer action already replaced) can't clobber the current toast.
+function hideUndoToast(entry) {
+    if (entry !== undoToastEntry) return;
+    const el = document.getElementById('undo-toast');
+    if (el) el.classList.add('hidden');
+    if (undoToastTimer) {
+        clearTimeout(undoToastTimer);
+        undoToastTimer = null;
+    }
+    undoToastEntry = null;
+}
+
+// Pop the most recent undo entry, re-insert its email, and ask the server to
+// move it back to the inbox it was archived/trashed from — mirrors desktop's
+// performUndo (static/app.js) with one deliberate divergence: on failure
+// desktop drops the entry for good, but here it goes back on the stack so a
+// retry stays possible (v1 UI just doesn't resurface a toast for it). Only
+// touches the list DOM when the list is the visible screen (same gating as
+// toggleUnread/toggleFlag) so undoing while viewing a *different* email in
+// DETAIL doesn't yank the user back to the list.
+async function performUndo() {
+    const entry = state.undoStack.pop();
+    if (!entry) return;
+
+    hideUndoToast(entry);
+
+    const index = Math.min(entry.index, state.emails.length);
+    state.emails.splice(index, 0, entry.email);
+    if (state.screen === Screen.LIST) renderEmailList();
+
+    try {
+        await state.api('POST', '/emails/' + encodeURIComponent(entry.email.id) + '/move', {
+            mailbox_id: entry.mailboxId,
+        });
+    } catch (err) {
+        // Revert the optimistic re-insert — the email stays removed, same
+        // as desktop's performUndo.
+        const idx = state.emails.indexOf(entry.email);
+        if (idx !== -1) state.emails.splice(idx, 1);
+        if (state.screen === Screen.LIST) renderEmailList();
+        state.undoStack.push(entry);
+        showError('Undo', err);
+    }
 }
 
 async function emailAction(type, emailId) {
@@ -522,6 +595,8 @@ async function emailAction(type, emailId) {
         // if the capped stack shifted it out.
         const undoIdx = state.undoStack.indexOf(undoEntry);
         if (undoIdx !== -1) state.undoStack.splice(undoIdx, 1);
+        // No-op if a later action already replaced our toast.
+        hideUndoToast(undoEntry);
         state.emails.splice(index, 0, email);
         renderEmailList();
         showError(type === 'archive' ? 'Archive' : 'Trash', err);
@@ -1103,6 +1178,9 @@ document.getElementById('detail-read-btn').addEventListener('click', () => {
 document.getElementById('detail-star-btn').addEventListener('click', () => {
     if (state.currentEmailId) toggleFlag(state.currentEmailId);
 });
+
+// Undo toast — tap anywhere on it to undo (no keyboard shortcut on a phone).
+document.getElementById('undo-toast').addEventListener('click', performUndo);
 
 // Browser back/forward — history is the source of truth for the current
 // screen; apply whatever the entry carries (defaulting to the list). No

@@ -2716,6 +2716,29 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_has_undo_toast() {
+        // A5 (kata ga3w): archive/trash pushes onto A4's undo stack, then
+        // surfaces a tappable toast so the user can reverse the action —
+        // adapted from desktop's pushUndo/performUndo (static/app.js).
+        assert!(
+            MOBILE_APP_JS.contains("function performUndo("),
+            "app.js should implement performUndo to pop the undo stack and restore the email"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("undo-toast"),
+            "app.js should reference the undo-toast element"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_undo_toast() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="undo-toast""#),
+            "mobile index.html should define the undo-toast element"
+        );
+    }
+
+    #[test]
     fn mobile_sw_caches_app_shell() {
         assert!(
             MOBILE_SW.contains("/mobile/app.js"),
