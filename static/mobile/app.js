@@ -292,12 +292,28 @@ function selectAccount(account) {
     state.listScrollTop = 0;
     // Switching accounts drops any open detail view; without this the app
     // stays on a stale email from the account we just left.
-    if (state.screen !== Screen.LIST) setScreen(Screen.LIST);
+    if (state.screen !== Screen.LIST) {
+        setScreen(Screen.LIST);
+        // setScreen() doesn't touch history — without this, history.state
+        // still carries the old account's {screen:'detail', emailId} and
+        // Back could pop straight onto a stale cross-account detail view.
+        history.replaceState({ screen: Screen.LIST }, '');
+    }
     renderAccountButton();
     hideAccountPicker();
-    loadMailboxes()
-        .then(() => loadEmails())
-        .catch(err => showError('Load mailboxes', err));
+    // Captured up front, mirroring loadEmails/loadMoreEmails: a /mailboxes
+    // response landing after a second switch belongs to an account we've
+    // already navigated away from and must not be applied.
+    const acct = account.id;
+    loadMailboxes(acct, state.loadAbort.signal)
+        .then(() => {
+            if (state.currentAccount?.id !== acct) return;
+            return loadEmails();
+        })
+        .catch(err => {
+            if (err.name === 'AbortError') return;
+            showError('Load mailboxes', err);
+        });
 }
 
 function renderAccountButton() {
@@ -332,8 +348,14 @@ function hideAccountPicker() {
 // Data loading
 // ============================================================================
 
-async function loadMailboxes() {
-    state.mailboxes = await state.api('GET', '/mailboxes');
+async function loadMailboxes(acct, signal) {
+    const mailboxes = await state.api('GET', '/mailboxes', null, signal);
+    // The account may have changed again while this was in flight (a second
+    // switch aborts the signal above, but a response that lands in the same
+    // tick as abort() can still resolve) — don't clobber the new account's
+    // freshly-reset state with data that belongs to the one we left.
+    if (state.currentAccount?.id !== acct) return;
+    state.mailboxes = mailboxes;
     const inbox = state.mailboxes.find(m => m.role === 'inbox');
     state.inboxId = inbox?.id || null;
 }
@@ -726,6 +748,7 @@ async function renderScreenDetail(emailId) {
 
     // Full body: use cache or fetch (delete+reinsert to promote in FIFO-with-promotion cache)
     let full = state.emailCache[emailId];
+    const cacheHit = !!full;
     if (full) {
         delete state.emailCache[emailId];
         state.emailCache[emailId] = full;
@@ -740,11 +763,33 @@ async function renderScreenDetail(emailId) {
                 '<div style="padding:16px;color:var(--text-muted)">Failed to load email body.</div>';
             return;
         }
+        // The user may have moved on to a different email while the GET
+        // above was in flight. It's still cached above for a later open,
+        // but rendering it now or mutating the LIST row's flags would
+        // clobber whatever the user is actually looking at.
+        if (state.currentEmailId !== emailId) return;
+    }
+
+    // Cache-hit opens skip the network GET entirely — prefetchAdjacentEmails
+    // fetches with mark_read=false so background warm-up never silently
+    // consumes unread state for emails the user hasn't opened. That means
+    // the server was never told THIS email is now read; unlike the
+    // network-fetch path above (whose GET auto-marks read server-side), we
+    // have to ask explicitly. Already-read cache entries (isUnread already
+    // false, e.g. reopening something already viewed) don't fire this.
+    if (cacheHit && full.isUnread) {
+        try {
+            await state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/mark-read');
+        } catch (err) {
+            showError('Mark read', err);
+        }
+        if (state.currentEmailId !== emailId) return;
     }
 
     renderEmailDetail(full);
 
-    // The server auto-marks read on GET /emails/{id}; mirror it locally.
+    // The server auto-marks read on the GET above (network path) or via the
+    // explicit mark-read call above (cache-hit path); mirror it locally.
     if (listEmail?.isUnread) listEmail.isUnread = false;
     if (full.isUnread) full.isUnread = false;
     // renderEmailDetail → renderEmailDetailPartial already drew the action

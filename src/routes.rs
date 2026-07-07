@@ -2068,6 +2068,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mobile_app_js_cache_hit_detail_marks_read_on_server() {
+        // Opening a prefetched (mark_read=false) email from cache issues no
+        // GET, so nothing tells the server it's now read unless
+        // renderScreenDetail does so explicitly — otherwise the local
+        // isUnread flip masks a still-unread server record until the next
+        // refresh resurfaces it (roborev 286).
+        let start = MOBILE_APP_JS
+            .find("async function renderScreenDetail")
+            .expect("renderScreenDetail must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("renderScreenDetail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("/mark-read"),
+            "renderScreenDetail's cache-hit path must explicitly mark the \
+             email read on the server"
+        );
+        assert!(
+            block.contains("cacheHit"),
+            "the mark-read call must be gated to the cache-hit path only — \
+             the network-fetch path's GET already auto-marks read server-side"
+        );
+    }
+
     // =========================================================================
     // create_split / update_split validation tests (roborev 271)
     // =========================================================================
