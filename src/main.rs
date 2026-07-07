@@ -115,12 +115,15 @@ async fn main() {
 
     let app = routes::router(state);
 
-    let addr = "127.0.0.1:8000";
+    // Bind all interfaces so the UI is reachable from other devices on the
+    // LAN/tailnet, not just this machine. There is no authentication layer,
+    // so this trusts every host on those networks.
+    let addr = "0.0.0.0:8000";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));
     });
-    let url = format!("http://{addr}");
-    tracing::info!("Listening on {url}");
+    let url = "http://127.0.0.1:8000".to_string();
+    tracing::info!("Listening on {addr}; local UI at {url}");
 
     if !std::env::args().any(|a| a == "--no-browser") {
         platform::open_browser(&url);
