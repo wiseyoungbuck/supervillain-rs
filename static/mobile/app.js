@@ -4,6 +4,15 @@
 // ApiError, and ApiAuthError are globals).
 
 // ============================================================================
+// Screen model
+// ============================================================================
+// Flat set of full-screen views. setScreen() owns every show/hide, so adding
+// a screen later (compose, mailboxes, search) is a new enum member plus one
+// switch case — never another scattered display toggle.
+
+const Screen = { LIST: 'list', DETAIL: 'detail' };
+
+// ============================================================================
 // State
 // ============================================================================
 
@@ -16,7 +25,7 @@ const state = {
     emails: [],
     loading: false,
     loadingMore: false,
-    currentView: 'list',      // 'list' | 'detail'
+    screen: Screen.LIST,       // Screen.LIST | Screen.DETAIL
     currentEmailId: null,
     listScrollTop: 0,
     emailCache: {},            // id → full email with body (LRU, max 50)
@@ -273,6 +282,9 @@ function selectAccount(account) {
     state.emailCache = {};
     state.lastRenderedGroup = null;
     state.listScrollTop = 0;
+    // Switching accounts drops any open detail view; without this the app
+    // stays on a stale email from the account we just left.
+    if (state.screen !== Screen.LIST) setScreen(Screen.LIST);
     renderAccountButton();
     hideAccountPicker();
     loadMailboxes()
@@ -426,26 +438,56 @@ function showStatus(msg) {
 }
 
 // ============================================================================
+// Navigation — screen state model
+// ============================================================================
+// setScreen() is the single owner of show/hide: one switch toggles the DOM
+// and dispatches the per-screen render. It is history-free, so popstate can
+// call it directly. navigateTo() is the forward-navigation entry point that
+// owns the history push/replace rule before delegating to setScreen().
+
+function setScreen(screen, params = {}) {
+    state.screen = screen;
+    switch (screen) {
+        case Screen.DETAIL:
+            state.currentEmailId = params.emailId;
+            document.getElementById('email-list-wrap').style.display = 'none';
+            document.getElementById('app-header').style.display = 'none';
+            document.getElementById('email-detail').style.display = 'flex';
+            renderScreenDetail(params.emailId);
+            break;
+        case Screen.LIST:
+        default:
+            state.currentEmailId = null;
+            document.getElementById('email-detail').style.display = 'none';
+            document.getElementById('email-list-wrap').style.display = '';
+            document.getElementById('app-header').style.display = '';
+            document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
+            renderEmailList();
+            break;
+    }
+}
+
+// Forward navigation owns history in one place: pushState on list→detail
+// (saving the list scroll first), replaceState on detail→detail so paging
+// between emails doesn't grow history unbounded. popstate never comes here —
+// it applies history's own state via setScreen().
+function navigateTo(screen, params = {}) {
+    if (screen === Screen.DETAIL && state.screen === Screen.DETAIL) {
+        history.replaceState({ screen, ...params }, '');
+    } else {
+        if (state.screen === Screen.LIST) {
+            state.listScrollTop = document.getElementById('email-list-wrap').scrollTop;
+        }
+        history.pushState({ screen, ...params }, '');
+    }
+    setScreen(screen, params);
+}
+
+// ============================================================================
 // Email detail view
 // ============================================================================
 
-async function showEmail(emailId) {
-    // Only pushState when transitioning from list; replaceState when navigating
-    // between emails to avoid unbounded history growth.
-    if (state.currentView === 'detail') {
-        history.replaceState({ view: 'detail', emailId }, '');
-    } else {
-        state.listScrollTop = document.getElementById('email-list-wrap').scrollTop;
-        history.pushState({ view: 'detail', emailId }, '');
-    }
-
-    state.currentView = 'detail';
-    state.currentEmailId = emailId;
-
-    document.getElementById('email-list-wrap').style.display = 'none';
-    document.getElementById('app-header').style.display = 'none';
-    document.getElementById('email-detail').style.display = 'flex';
-
+async function renderScreenDetail(emailId) {
     // Render partial detail from list data immediately
     const listEmail = state.emails.find(e => e.id === emailId);
     if (listEmail) renderEmailDetailPartial(listEmail);
@@ -559,21 +601,6 @@ function formatRecipients(email) {
     return parts.join('<br>');
 }
 
-function showList() {
-    state.currentView = 'list';
-    state.currentEmailId = null;
-
-    document.getElementById('email-detail').style.display = 'none';
-    document.getElementById('email-list-wrap').style.display = '';
-    document.getElementById('app-header').style.display = '';
-
-    // Restore scroll position
-    document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
-
-    // Re-render list to update read state
-    renderEmailList();
-}
-
 function prefetchAdjacentEmails(emailId) {
     const idx = state.emails.findIndex(e => e.id === emailId);
     if (idx === -1) return;
@@ -591,39 +618,40 @@ function prefetchAdjacentEmails(emailId) {
 }
 
 // ============================================================================
-// Pull-to-refresh
+// Gesture controller
 // ============================================================================
+// One controller owns touchstart/touchmove/touchend on the list wrap. Each
+// gesture is claimed by exactly one recognizer, and the controller is the
+// ONLY place that calls preventDefault (so touchmove stays non-passive).
+// A single eligible recognizer locks at touchstart — today that's
+// pull-to-refresh when the list is at the top. When more than one recognizer
+// is eligible (the seam A4's horizontal row-swipe plugs into), the choice is
+// deferred to the first move and made by drag axis. Adding a recognizer is a
+// push onto `recognizers` — never another addEventListener set.
 
-let pullStartY = 0;
-let pulling = false;
-
-function setupPullToRefresh() {
-    const listWrap = document.getElementById('email-list-wrap');
-    if (!listWrap) return;
-
-    listWrap.addEventListener('touchstart', (e) => {
-        if (listWrap.scrollTop === 0) {
-            pullStartY = e.touches[0].clientY;
-            pulling = true;
+// Pull-to-refresh recognizer: a downward drag from the top of the list.
+const pullToRefreshRecognizer = {
+    axis: 'y',
+    startY: 0,
+    // Eligible only when the list is scrolled to the very top.
+    canStart(ctx) {
+        return ctx.listWrap.scrollTop === 0;
+    },
+    start(ctx) {
+        this.startY = ctx.startY;
+    },
+    // Returns true to preventDefault — we consume every downward move.
+    move(ctx) {
+        const dy = ctx.y - this.startY;
+        if (dy <= 0) return false;
+        const indicator = document.getElementById('pull-indicator');
+        if (dy < 120) {
+            indicator.style.height = dy + 'px';
+            indicator.style.opacity = Math.min(dy / 60, 1);
         }
-    }, { passive: true });
-
-    listWrap.addEventListener('touchmove', (e) => {
-        if (!pulling) return;
-        const dy = e.touches[0].clientY - pullStartY;
-        if (dy > 0) {
-            e.preventDefault();
-            const indicator = document.getElementById('pull-indicator');
-            if (dy < 120) {
-                indicator.style.height = dy + 'px';
-                indicator.style.opacity = Math.min(dy / 60, 1);
-            }
-        }
-    }, { passive: false });
-
-    listWrap.addEventListener('touchend', () => {
-        if (!pulling) return;
-        pulling = false;
+        return true;
+    },
+    end() {
         const indicator = document.getElementById('pull-indicator');
         const h = parseInt(indicator.style.height) || 0;
         if (h > 60) {
@@ -633,8 +661,71 @@ function setupPullToRefresh() {
         } else {
             finishPullRefresh();
         }
-    });
-}
+    },
+};
+
+const gestureController = {
+    listWrap: null,
+    recognizers: [],
+    candidates: [],
+    active: null,
+    startX: 0,
+    startY: 0,
+
+    init() {
+        this.listWrap = document.getElementById('email-list-wrap');
+        if (!this.listWrap) return;
+        this.recognizers = [pullToRefreshRecognizer];
+        this.listWrap.addEventListener('touchstart', (e) => this.onStart(e), { passive: true });
+        this.listWrap.addEventListener('touchmove', (e) => this.onMove(e), { passive: false });
+        this.listWrap.addEventListener('touchend', () => this.onEnd());
+    },
+
+    ctx(touch) {
+        return {
+            listWrap: this.listWrap,
+            x: touch.clientX,
+            y: touch.clientY,
+            startX: this.startX,
+            startY: this.startY,
+        };
+    },
+
+    onStart(e) {
+        const t = e.touches[0];
+        this.startX = t.clientX;
+        this.startY = t.clientY;
+        const ctx = this.ctx(t);
+        this.candidates = this.recognizers.filter(r => r.canStart(ctx));
+        // Lock immediately when only one recognizer is eligible (today's path,
+        // identical to the old behavior); otherwise defer to onMove's axis pick.
+        this.active = this.candidates.length === 1 ? this.candidates[0] : null;
+        if (this.active) this.active.start(ctx);
+    },
+
+    onMove(e) {
+        if (!this.candidates.length) return;
+        const ctx = this.ctx(e.touches[0]);
+        if (!this.active) {
+            const dx = ctx.x - this.startX;
+            const dy = ctx.y - this.startY;
+            const axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+            this.active = this.candidates.find(r => r.axis === axis) || null;
+            if (!this.active) {
+                this.candidates = [];
+                return;
+            }
+            this.active.start(ctx);
+        }
+        if (this.active.move(ctx)) e.preventDefault();
+    },
+
+    onEnd() {
+        if (this.active) this.active.end();
+        this.active = null;
+        this.candidates = [];
+    },
+};
 
 function finishPullRefresh() {
     const indicator = document.getElementById('pull-indicator');
@@ -721,20 +812,18 @@ document.getElementById('email-list').addEventListener('click', (e) => {
     const row = e.target.closest('.email-row');
     if (!row) return;
     const id = row.dataset.id;
-    if (id) showEmail(id);
+    if (id) navigateTo(Screen.DETAIL, { emailId: id });
 });
 
-// Browser back button
+// Browser back/forward — history is the source of truth for the current
+// screen; apply whatever the entry carries (defaulting to the list). No
+// forward-nav guessing.
 window.addEventListener('popstate', (e) => {
-    if (e.state?.view === 'detail' && state.currentView !== 'detail') {
-        // Forward navigation to detail (not currently used, but safe)
-    } else if (state.currentView === 'detail') {
-        showList();
-    }
+    setScreen(e.state?.screen ?? Screen.LIST, e.state ?? {});
 });
 
 // Replace initial history state
-history.replaceState({ view: 'list' }, '');
+history.replaceState({ screen: Screen.LIST }, '');
 
 // Register service worker. Skipped outside a secure context (plain http
 // on anything but localhost) since registration there always fails —
@@ -748,6 +837,6 @@ if ('serviceWorker' in navigator) {
     }
 }
 
-setupPullToRefresh();
+gestureController.init();
 setupInfiniteScroll();
 init();

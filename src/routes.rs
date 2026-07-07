@@ -2517,8 +2517,8 @@ mod tests {
     #[test]
     fn mobile_app_js_has_pull_to_refresh() {
         assert!(
-            MOBILE_APP_JS.contains("setupPullToRefresh"),
-            "app.js should set up pull-to-refresh"
+            MOBILE_APP_JS.contains("pullToRefreshRecognizer"),
+            "app.js should implement pull-to-refresh as a gesture recognizer"
         );
         assert!(
             MOBILE_APP_JS.contains("touchstart"),
@@ -2527,6 +2527,59 @@ mod tests {
         assert!(
             MOBILE_APP_JS.contains("touchend"),
             "pull-to-refresh should use touchend events"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("Refreshing..."),
+            "pull-to-refresh should trigger a refresh once past the threshold"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_single_touch_controller() {
+        // One controller owns every touch gesture; A4's row-swipe recognizer
+        // plugs into it rather than registering a second listener set.
+        let touchstart_listeners = MOBILE_APP_JS
+            .matches("addEventListener('touchstart'")
+            .count();
+        assert_eq!(
+            touchstart_listeners, 1,
+            "exactly one gesture controller must own touchstart (found {touchstart_listeners})"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("gestureController"),
+            "touch handling should live in a single gesture controller"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_setscreen_owns_all_display_toggles() {
+        assert!(
+            MOBILE_APP_JS.contains("function setScreen("),
+            "navigation must funnel through a single setScreen()"
+        );
+        assert!(
+            !MOBILE_APP_JS.contains("currentView"),
+            "state.currentView must be replaced by state.screen everywhere"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("state.screen"),
+            "screen state should live on state.screen"
+        );
+        // Every show/hide toggle must live inside setScreen so screens can't
+        // drift out of sync — bound the function body the way
+        // mobile_app_js_guards_service_worker_registration bounds blocks.
+        let start = MOBILE_APP_JS
+            .find("function setScreen(")
+            .expect("setScreen must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("setScreen body must close");
+        let region = &rest[..end];
+        let total = MOBILE_APP_JS.matches(".style.display").count();
+        let inside = region.matches(".style.display").count();
+        assert!(inside > 0, "setScreen should own the display toggles");
+        assert_eq!(
+            total, inside,
+            "all .style.display toggles must live inside setScreen ({inside} of {total} do)"
         );
     }
 
