@@ -60,9 +60,12 @@ Pure-helper tests (repo discipline: pure helpers inline, no HTTP mocking):
 New top-level `e2e/` directory, isolated from cargo:
 
 - `package.json` with `@playwright/test`; `playwright.config.ts` with
-  `baseURL: http://127.0.0.1:8000`, single Chromium project,
-  `reuseExistingServer: true` (the user's server runs as a service; CI is a
-  non-goal).
+  `baseURL: http://127.0.0.1:8000` and a single Chromium project. **No
+  `webServer` block**: the suite assumes the service is already running
+  at `baseURL` (the user's server runs permanently as a service; CI is a
+  non-goal). A `webServer` block would require a `command` Playwright
+  tries to launch itself — `reuseExistingServer` is only meaningful
+  inside one and doesn't apply here.
 - Account discovery: a fixture fetches `/api/accounts` and parameterizes
   tests over accounts with `authStatus === "ok"`; pending accounts are
   skipped, not failed.

@@ -67,7 +67,10 @@ Applied at four points, always with the **resolved** account id (query
 param falling back to the default account, mirroring `resolve_session`):
 
 1. **`GET /api/splits`** (`list_splits`) — gains an `account` query
-   param; returns the scoped list. No param → full list.
+   param; returns the scoped list. No param → full list. A supplied but
+   unknown account id → 400 (`ensure_known_account`): a typo'd read
+   would otherwise silently return only the untagged splits,
+   indistinguishable from an account that owns no tagged splits.
 2. **`GET /api/emails?split_id=`** (`list_emails`) — scopes the config
    before `splits::filter_by_split`. Correctness fix: **"primary" becomes
    "not matching any of this account's splits"**.

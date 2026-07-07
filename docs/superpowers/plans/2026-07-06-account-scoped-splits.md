@@ -353,7 +353,7 @@ git commit -m "Tag auto-seeded splits with the seeding account"
 
 **Interfaces:**
 - Consumes: `SplitsConfig::scoped_to` (Task 2); existing `resolve_account_id(state, Option<&str>) -> Result<String, Error>` at routes.rs:275.
-- Produces: `GET /api/splits?account=X` returns only X's + untagged splits; `POST/PUT /api/splits` reject unknown `account` with 400. No new Rust symbols.
+- Produces: `GET /api/splits?account=X` returns only X's + untagged splits; reads and writes both reject an unknown `account` with 400 (a typo'd read would otherwise silently return only the untagged splits, indistinguishable from an account with no tagged splits). No new Rust symbols.
 
 This task is handler glue over already-tested logic; the behavioral tests are Task 2's unit tests plus Task 6's live E2E verification. It must compile clean and leave the whole suite green.
 
@@ -368,16 +368,23 @@ struct ListSplitsParams {
 async fn list_splits(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListSplitsParams>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, Error> {
+    // No ?account= → full list (management/debugging view). The UI always
+    // sends the active account via the api() helper. When an account IS
+    // given, validate it — a typo would otherwise silently compute against
+    // the untagged-only split list instead of 400ing.
+    if let Some(ref acct) = params.account {
+        let reg = state.accounts.read().await;
+        ensure_known_account(&reg, acct)?;
+    }
+
     let config = splits::load_splits(
         &state.splits_config_path,
         std::env::var("SUPERVILLAIN_SPLITS").ok().as_deref(),
     );
-    // No ?account= → full list (management/debugging view). The UI always
-    // sends the active account via the api() helper.
-    Json(serde_json::json!(
+    Ok(Json(serde_json::json!(
         config.scoped_to(params.account.as_deref()).splits
-    ))
+    )))
 }
 ```
 
@@ -484,13 +491,36 @@ git commit -m "Scope split listing, filtering, and counts to the active account"
     #[test]
     fn load_splits_goes_through_account_scoped_api_helper() {
         // A raw fetch skips ?account= and renders every account's tabs.
+        // NOTE: assert on `const splits = await api(...)`, NOT on
+        // `state.splits = await api(...)` — loadSplits must await into a
+        // local and only assign state after the stale-response guard, so
+        // a substring pinning direct assignment would force removal of
+        // the guards (roborev 271/272/275).
         assert!(
-            APP_JS.contains("state.splits = await api('GET', '/splits')"),
+            APP_JS.contains("const splits = await api('GET', '/splits')"),
             "loadSplits must use the api() helper so ?account= is appended"
         );
         assert!(
             !APP_JS.contains("fetch('/api/splits')"),
             "loadSplits must not bypass api() with a raw fetch"
+        );
+    }
+
+    #[test]
+    fn load_splits_guards_against_stale_account_switch() {
+        // On rapid account switches, account A's in-flight response can
+        // land after B's and overwrite state.splits while B is active.
+        let start = APP_JS
+            .find("async function loadSplits()")
+            .expect("loadSplits must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("loadSplits must close");
+        let body = &rest[..end];
+        assert!(
+            body.matches("state.currentAccount?.id !== accountId")
+                .count()
+                >= 2,
+            "loadSplits must discard BOTH a stale success and a stale failure"
         );
     }
 
@@ -518,20 +548,28 @@ git commit -m "Scope split listing, filtering, and counts to the active account"
 
 - [ ] **Step 2: Run to verify RED**
 
-Run: `cargo test -- load_splits_goes_through select_account_reloads_splits save_split_tags 2>&1 | tail -10`
-Expected: 3 test failures (assertion failures, not compile errors).
+Run: `cargo test -- load_splits select_account_reloads_splits save_split_tags 2>&1 | tail -10`
+Expected: 4 test failures (assertion failures, not compile errors).
 
 - [ ] **Step 3: Edit `static/app.js`** — three changes:
 
-`loadSplits` (replace the fetch line only):
+`loadSplits` (switch to the api() helper AND keep/add the stale guards —
+the account captured before the await must still be active before any
+state mutation, on both the success and failure paths):
 
 ```js
 async function loadSplits() {
+    const accountId = state.currentAccount?.id;
     try {
-        state.splits = await api('GET', '/splits');
+        const splits = await api('GET', '/splits');
+        if (state.currentAccount?.id !== accountId) return; // stale response guard
+        state.splits = splits;
         renderSplitTabs();
         loadSplitCounts();
     } catch (err) {
+        // Stale failure guard: a request from the previous account erroring
+        // late must not wipe the new account's already-loaded splits.
+        if (state.currentAccount?.id !== accountId) return;
         console.warn('Failed to load splits:', err);
         state.splits = [];
     }
@@ -597,7 +635,7 @@ git add CHANGELOG.md
 git commit -m "Changelog: account-scoped splits"
 ```
 
-- [ ] **Step 3: Migrate the live splits.json** (backup first; server still running old binary is fine — old code ignores unknown fields? NO: serde without deny_unknown_fields ignores extras, and `load_splits` falls back to default on parse failure. Verify parse with the new binary before restart):
+- [ ] **Step 3: Migrate the live splits.json** (backup first; the server still running the old binary is fine — serde without `deny_unknown_fields` ignores the new `account` field, so the old binary tolerates the migrated file. The `jq . > /dev/null` check below guards against jq producing malformed output, since `load_splits` silently falls back to defaults on parse failure):
 
 ```bash
 cp ~/.config/supervillain/splits.json ~/.config/supervillain/splits.json.bak-$(date +%Y%m%d)
