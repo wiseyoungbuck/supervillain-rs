@@ -1291,10 +1291,24 @@ async function sendComposedEmail() {
             in_reply_to: state.replyContext?.inReplyTo || null,
             from_address: fromAddress,
         });
-        showToast('Sent', 3000);
-        clearComposeFields();
-        history.back();
+        // The user may have browser-backed out of compose while the send was
+        // in flight — setScreen already popped the history entry on the way
+        // out, so firing history.back() now would pop a SECOND entry
+        // (detail→list, or clean out of the app), and a "Sent" toast for a
+        // draft they abandoned would just confuse. The send itself succeeded;
+        // only make sure no draft state lingers.
+        if (state.screen === Screen.COMPOSE) {
+            showToast('Sent', 3000);
+            clearComposeFields();
+            history.back();
+        } else {
+            clearComposeFields();
+        }
     } catch (err) {
+        // Always surface the failure — even if the user already left compose,
+        // a silently dropped send would look like it went out. But only the
+        // still-on-compose case keeps the form for a retry; never touch
+        // history from a stale completion.
         showError('Send', err);
     } finally {
         setComposeSending(false);

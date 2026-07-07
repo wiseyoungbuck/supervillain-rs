@@ -2933,6 +2933,25 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_compose_send_guards_stale_completion() {
+        // A send resolving after the user browser-backed out of compose must
+        // not fire a second history.back() (popping detail→list or out of the
+        // app) or a stray "Sent" toast — the success path is gated on the
+        // compose screen still being active (review follow-up on kata ryzd).
+        let start = MOBILE_APP_JS
+            .find("async function sendComposedEmail(")
+            .expect("sendComposedEmail must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("state.screen === Screen.COMPOSE"),
+            "sendComposedEmail's post-await paths must check the compose \
+             screen is still active before touching history"
+        );
+    }
+
+    #[test]
     fn mobile_html_has_compose_reply_actions() {
         // Reply / reply-all / forward entry points on the detail action bar.
         for id in [
