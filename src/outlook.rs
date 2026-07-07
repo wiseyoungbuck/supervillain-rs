@@ -769,6 +769,54 @@ pub(crate) fn roles_by_folder_id(alias_ids: &[(String, String)]) -> HashMap<Stri
         .collect()
 }
 
+/// Why a well-known-alias lookup failed. Permanent misses (the alias
+/// genuinely doesn't exist for this account, e.g. `archive` without
+/// In-Place Archive) leave the resolution cacheable; transient failures
+/// (throttling, 5xx, network) mean a retry could recover the role, so a
+/// map containing one must not be pinned for the session (roborev 274).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AliasFailure {
+    Permanent,
+    Transient,
+}
+
+/// Classify an alias-lookup HTTP status. Pure — testable without HTTP.
+pub(crate) fn classify_alias_failure(status: reqwest::StatusCode) -> Option<AliasFailure> {
+    if status.is_success() {
+        None
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        Some(AliasFailure::Permanent)
+    } else {
+        Some(AliasFailure::Transient)
+    }
+}
+
+/// The outcome of resolving all well-known aliases in one pass.
+pub(crate) struct AliasResolution {
+    /// `(alias, folder_id)` pairs that resolved.
+    pub(crate) resolved: Vec<(String, String)>,
+    /// False when any lookup failed transiently: the map may be missing
+    /// roles a retry would recover, so it must not be cached.
+    pub(crate) complete: bool,
+}
+
+/// Fold per-alias outcomes into a resolution. Pure — testable without
+/// HTTP.
+pub(crate) fn collect_alias_resolution(
+    outcomes: impl IntoIterator<Item = (&'static str, Result<String, AliasFailure>)>,
+) -> AliasResolution {
+    let mut resolved = Vec::new();
+    let mut complete = true;
+    for (alias, outcome) in outcomes {
+        match outcome {
+            Ok(id) => resolved.push((alias.to_string(), id)),
+            Err(AliasFailure::Permanent) => {}
+            Err(AliasFailure::Transient) => complete = false,
+        }
+    }
+    AliasResolution { resolved, complete }
+}
+
 // =============================================================================
 // Phase 4: Outlook email — mutation helpers (pure)
 // =============================================================================
@@ -1017,18 +1065,8 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
     // opaque folder id and matching ids. Tolerates individual alias
     // failures (e.g. `archive` 404s when In-Place Archive is disabled):
     // a folder whose alias didn't resolve is listed role-less, same as a
-    // user folder. Resolved once per session (see `folder_role_cache`).
-    let cached_roles = session.folder_role_cache.lock().await.clone();
-    let role_map = match cached_roles {
-        Some(map) => map,
-        None => {
-            let map = roles_by_folder_id(&resolve_well_known_aliases(session, &token).await);
-            if !map.is_empty() {
-                *session.folder_role_cache.lock().await = Some(map.clone());
-            }
-            map
-        }
-    };
+    // user folder. Resolved once per session (see `session_role_map`).
+    let role_map = session_role_map(session, &token).await;
 
     let folders: Vec<Mailbox> = parsed
         .value
@@ -1056,18 +1094,21 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
 
 /// Resolve each well-known alias (`/me/mailFolders/inbox` etc.) to its
 /// opaque folder id. Lookups run concurrently; a failed lookup drops that
-/// alias rather than failing the whole mailboxes fetch, so total Graph
+/// alias rather than failing the whole mailboxes fetch, so Graph
 /// throttling degrades to a role-less folder list instead of an error.
-async fn resolve_well_known_aliases(
-    session: &OutlookSession,
-    token: &str,
-) -> Vec<(String, String)> {
+/// Permanent misses (404) are distinguished from transient failures so
+/// callers know whether the resolution is safe to cache (roborev 274).
+async fn resolve_well_known_aliases(session: &OutlookSession, token: &str) -> AliasResolution {
     #[derive(Deserialize)]
     struct FolderIdResp {
         id: String,
     }
 
-    async fn lookup(session: &OutlookSession, token: &str, alias: &str) -> Option<String> {
+    async fn lookup(
+        session: &OutlookSession,
+        token: &str,
+        alias: &str,
+    ) -> Result<String, AliasFailure> {
         let url = format!("{GRAPH_BASE}/me/mailFolders/{alias}?$select=id");
         let resp = session
             .client
@@ -1075,29 +1116,47 @@ async fn resolve_well_known_aliases(
             .bearer_auth(token)
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
+            .map_err(|_| AliasFailure::Transient)?;
+        if let Some(failure) = classify_alias_failure(resp.status()) {
             tracing::debug!(
                 "well-known folder '{alias}' not resolved: {}",
                 resp.status()
             );
-            return None;
+            return Err(failure);
         }
-        resp.json::<FolderIdResp>().await.ok().map(|f| f.id)
+        resp.json::<FolderIdResp>()
+            .await
+            .map(|f| f.id)
+            .map_err(|_| AliasFailure::Transient)
     }
 
     let futures = WELL_KNOWN_ALIASES.map(|alias| lookup(session, token, alias));
     let [inbox, sent, drafts, trash, junk, archive] = futures;
     let results = tokio::join!(inbox, sent, drafts, trash, junk, archive);
-    let ids = [
+    let outcomes = [
         results.0, results.1, results.2, results.3, results.4, results.5,
     ];
 
-    WELL_KNOWN_ALIASES
-        .iter()
-        .zip(ids)
-        .filter_map(|(alias, id)| id.map(|id| (alias.to_string(), id)))
-        .collect()
+    collect_alias_resolution(WELL_KNOWN_ALIASES.into_iter().zip(outcomes))
+}
+
+/// The session's folder-id → role map, resolving well-known aliases on
+/// first use. Holds the cache lock across check-and-fill so concurrent
+/// cold calls (e.g. two tabs hitting a cold folder cache) don't each
+/// fire the six alias lookups. Only a complete resolution is pinned —
+/// caching a partially throttled map would leave folders role-less
+/// until process restart (roborev 274).
+async fn session_role_map(session: &OutlookSession, token: &str) -> HashMap<String, String> {
+    let mut cached = session.folder_role_cache.lock().await;
+    if let Some(map) = cached.as_ref() {
+        return map.clone();
+    }
+    let resolution = resolve_well_known_aliases(session, token).await;
+    let map = roles_by_folder_id(&resolution.resolved);
+    if resolution.complete {
+        *cached = Some(map.clone());
+    }
+    map
 }
 
 /// Invalidate the folder cache. Called after any mutation that changes
@@ -3302,6 +3361,111 @@ mod tests {
         // produce a bogus role — it's simply dropped.
         let alias_ids = vec![("scheduled".to_string(), "AQMkOpaque".to_string())];
         assert!(roles_by_folder_id(&alias_ids).is_empty());
+    }
+
+    // ---- alias failure classification + role-cache completeness ----
+    //
+    // Roborev 274: the per-session role cache must only pin a *complete*
+    // resolution. A partially throttled fetch (inbox resolves, sentitems
+    // 429s) yields a non-empty map that, if cached, leaves Sent/Trash
+    // role-less until process restart. Permanent 404s (archive with no
+    // In-Place Archive) are expected and must not block caching.
+
+    #[test]
+    fn alias_404_is_a_permanent_miss() {
+        assert_eq!(
+            classify_alias_failure(reqwest::StatusCode::NOT_FOUND),
+            Some(AliasFailure::Permanent)
+        );
+    }
+
+    #[test]
+    fn alias_throttle_and_server_errors_are_transient() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::UNAUTHORIZED,
+        ] {
+            assert_eq!(
+                classify_alias_failure(status),
+                Some(AliasFailure::Transient),
+                "{status} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_success_is_not_a_failure() {
+        assert_eq!(classify_alias_failure(reqwest::StatusCode::OK), None);
+    }
+
+    fn ok(id: &str) -> Result<String, AliasFailure> {
+        Ok(id.to_string())
+    }
+
+    #[test]
+    fn resolution_complete_when_all_aliases_resolve() {
+        let res = collect_alias_resolution([("inbox", ok("id1")), ("sentitems", ok("id2"))]);
+        assert!(res.complete);
+        assert_eq!(res.resolved.len(), 2);
+    }
+
+    #[test]
+    fn resolution_complete_despite_permanent_misses() {
+        // `archive` 404s for accounts without In-Place Archive — that's
+        // a stable fact about the account, not a reason to refetch.
+        let res = collect_alias_resolution([
+            ("inbox", ok("id1")),
+            ("archive", Err(AliasFailure::Permanent)),
+        ]);
+        assert!(res.complete);
+        assert_eq!(res.resolved.len(), 1);
+    }
+
+    #[test]
+    fn resolution_incomplete_on_any_transient_failure() {
+        // The partial-throttle case: caching this map would pin a
+        // role-less Sent folder for the session's lifetime.
+        let res = collect_alias_resolution([
+            ("inbox", ok("id1")),
+            ("sentitems", Err(AliasFailure::Transient)),
+        ]);
+        assert!(!res.complete);
+        assert_eq!(res.resolved.len(), 1);
+    }
+
+    #[test]
+    fn resolution_incomplete_when_all_lookups_fail_transiently() {
+        // Total throttling: nothing resolved, nothing cached — the next
+        // folder fetch retries (pins the d888b86 empty-map guard).
+        let res = collect_alias_resolution([
+            ("inbox", Err(AliasFailure::Transient)),
+            ("sentitems", Err(AliasFailure::Transient)),
+        ]);
+        assert!(!res.complete);
+        assert!(res.resolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preseeded_role_cache_short_circuits_resolution() {
+        // A populated folder_role_cache must be returned as-is, without
+        // firing any alias lookups: the bogus token here could never
+        // produce this map from a real resolution.
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_outlook_session_with_token_file(dir.path().join("t.json"));
+        let mut seeded = HashMap::new();
+        seeded.insert("opaque-id-1".to_string(), "inbox".to_string());
+        *session.folder_role_cache.lock().await = Some(seeded.clone());
+
+        let map = session_role_map(&session, "not-a-real-token").await;
+
+        assert_eq!(map, seeded);
+        assert_eq!(
+            session.folder_role_cache.lock().await.as_ref(),
+            Some(&seeded),
+            "cache must remain populated after a hit"
+        );
     }
 
     #[test]
