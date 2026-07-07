@@ -10,5 +10,9 @@
 - Lint: `cargo clippy -- -D warnings`
 - Format: `cargo fmt`
 
+## Issue tracking
+- kata, project `supervillain` (workspace-bound via `.kata.toml`): `kata list`, `kata show <ref>`, `kata create`
+- Migrated from Linear (THE-xxx) and TODO.md on 2026-07-07; kata is the source of truth
+
 ## Main branch
 - Main branch is called `main`

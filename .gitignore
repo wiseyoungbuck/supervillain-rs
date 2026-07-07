@@ -11,3 +11,4 @@ static/Gemini_Generated_Image_*.png
 # global gitignore excludes .claude/settings.local.json by default, so
 # this rule re-includes it for this repo.
 !.claude/settings.local.json
+.kata.local.toml
