@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Behavioral test: the launcher must export SUPERVILLAIN_BIND (defaulting
-# to the LAN/tailnet opt-in the binary itself no longer makes — roborev
-# 273/279) and derive PORT from it, so overriding the bind address keeps
-# the is-running/port-poll checks pointed at the right port.
+# to loopback, mirroring the binary's own default — kata 8e3w) and derive
+# PORT from it, so overriding the bind address keeps the is-running/
+# port-poll checks pointed at the right port.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -14,14 +14,14 @@ fail() {
     exit 1
 }
 
-# Case 1: no SUPERVILLAIN_BIND in the environment → launcher opts in to
-# 0.0.0.0:8000 and PORT follows.
+# Case 1: no SUPERVILLAIN_BIND in the environment → launcher defaults to
+# loopback 127.0.0.1:8000 and PORT follows.
 out="$(
     env -u SUPERVILLAIN_BIND SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
         "source '$LAUNCHER'; printf '%s %s' \"\$SUPERVILLAIN_BIND\" \"\$PORT\""
 )"
-[[ "$out" == "0.0.0.0:8000 8000" ]] ||
-    fail "default should export SUPERVILLAIN_BIND=0.0.0.0:8000 with PORT=8000, got: $out"
+[[ "$out" == "127.0.0.1:8000 8000" ]] ||
+    fail "default should export SUPERVILLAIN_BIND=127.0.0.1:8000 with PORT=8000, got: $out"
 
 # Case 2: caller override → respected, and PORT derived from it so
 # port_listening polls the actual port.
@@ -34,9 +34,11 @@ out="$(
 
 # Case 3: URL host mirrors the binary's browser_url(): a wildcard bind is
 # reachable at loopback, a specific host (incl. bracketed IPv6) is only
-# listening on itself — opening loopback there hits a dead port.
+# listening on itself — opening loopback there hits a dead port. The
+# default no longer exercises the wildcard branch (kata 8e3w), so this
+# opts in explicitly to keep the mapping covered.
 out="$(
-    env -u SUPERVILLAIN_BIND SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
+    SUPERVILLAIN_BIND=0.0.0.0:8000 SUPERVILLAIN_LAUNCHER_SOURCE_ONLY=1 bash -c \
         "source '$LAUNCHER'; printf '%s' \"\$URL\""
 )"
 [[ "$out" == "http://127.0.0.1:8000" ]] ||
@@ -111,6 +113,13 @@ if out="$(
 fi
 [[ "$out" == *SUPERVILLAIN_BIND* ]] ||
     fail "colonless rejection should name SUPERVILLAIN_BIND, got: $out"
+
+# Case 6b: upgrade.sh defaults to loopback too — observable in the
+# dry-run poll line, since --dry-run doesn't otherwise print the bind.
+out="$(env -u SUPERVILLAIN_BIND "$UPGRADE" --dry-run 2>&1)" ||
+    fail "upgrade.sh default bind should be accepted, got: $out"
+[[ "$out" == *":8000 "* ]] ||
+    fail "upgrade.sh should default to port 8000 (loopback), got: $out"
 
 # Case 7: upgrade.sh applies the same validation (its check runs before
 # any side effects, so --dry-run is safe belt-and-braces).

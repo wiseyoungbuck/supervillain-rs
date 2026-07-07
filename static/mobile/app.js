@@ -683,10 +683,16 @@ window.addEventListener('popstate', (e) => {
 // Replace initial history state
 history.replaceState({ view: 'list' }, '');
 
-// Register service worker
+// Register service worker. Skipped outside a secure context (plain http
+// on anything but localhost) since registration there always fails —
+// the serviceWorker API isn't exposed at all in that case.
 if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/mobile/sw.js', { scope: '/mobile/' })
-        .catch(() => {});
+    if (window.isSecureContext) {
+        navigator.serviceWorker.register('/mobile/sw.js', { scope: '/mobile/' })
+            .catch((err) => console.warn('Service worker registration failed:', err));
+    } else {
+        console.info('Skipping service worker registration: not a secure context');
+    }
 }
 
 setupPullToRefresh();

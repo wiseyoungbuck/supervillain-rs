@@ -181,12 +181,20 @@ async fn mobile_manifest() -> impl IntoResponse {
 }
 
 async fn mobile_sw() -> impl IntoResponse {
+    // Version-bust the cache name at serve time so a new release always
+    // gets a fresh CACHE_NAME without a manual bump in the source file.
+    // `Cache-Control: no-cache` on sw.js itself matters more than usual:
+    // browsers only re-check a service worker file at most once every 24h
+    // by spec, and a stale cached copy would keep serving the old
+    // (unreplaced) placeholder, defeating version-busting entirely.
+    let body = MOBILE_SW.replace("__SUPERVILLAIN_VERSION__", env!("CARGO_PKG_VERSION"));
     (
         [
             ("content-type", "application/javascript; charset=utf-8"),
             ("service-worker-allowed", "/mobile/"),
+            ("cache-control", "no-cache"),
         ],
-        MOBILE_SW,
+        body,
     )
 }
 
@@ -2253,6 +2261,16 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(scope, "/mobile/");
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            cache_control, "no-cache",
+            "sw.js must not be cached itself, or version-busting can never reach the client"
+        );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2264,6 +2282,27 @@ mod tests {
         assert!(
             text.contains("resp.ok"),
             "SW should only cache successful responses"
+        );
+        assert!(
+            text.contains("/mobile/index.html"),
+            "served SW app shell should include /mobile/index.html"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_sw_cache_name_embeds_crate_version() {
+        let resp = mobile_sw().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "served sw.js should embed the crate version in CACHE_NAME"
+        );
+        assert!(
+            !text.contains("__SUPERVILLAIN_VERSION__"),
+            "served sw.js must not leak the unreplaced version placeholder"
         );
     }
 
@@ -2477,6 +2516,29 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_guards_service_worker_registration() {
+        assert!(
+            MOBILE_APP_JS.contains("isSecureContext"),
+            "SW registration should skip on non-secure contexts (plain http off localhost)"
+        );
+        let start = MOBILE_APP_JS
+            .find("navigator.serviceWorker.register(")
+            .expect("mobile app.js should register the service worker");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("SW registration block must close");
+        let block = &rest[..end];
+        assert!(
+            !block.contains(".catch(() => {})"),
+            "SW registration must not silently swallow errors with an empty catch — \
+             errors should be surfaced via console.warn"
+        );
+        assert!(
+            block.contains("console.warn"),
+            "SW registration failure should be logged via console.warn"
+        );
+    }
+
+    #[test]
     fn mobile_app_js_has_pull_to_refresh() {
         assert!(
             MOBILE_APP_JS.contains("setupPullToRefresh"),
@@ -2545,6 +2607,10 @@ mod tests {
         assert!(
             MOBILE_SW.contains("/mobile/jmap.js"),
             "service worker should cache jmap.js in app shell"
+        );
+        assert!(
+            MOBILE_SW.contains("/mobile/index.html"),
+            "service worker should cache the /mobile/index.html alias in app shell"
         );
     }
 

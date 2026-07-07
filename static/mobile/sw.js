@@ -2,9 +2,13 @@
 // NOTE: iOS Safari evicts service workers after ~7 days of non-use.
 // The app must work without the service worker; it's for convenience only.
 
-const CACHE_NAME = 'supervillain-v3';
+// __SUPERVILLAIN_VERSION__ is substituted with the crate version by the
+// mobile_sw route handler (src/routes.rs) at serve time — this file on
+// disk is never fetched directly, so a stale cached copy never wins.
+const CACHE_NAME = 'supervillain-v__SUPERVILLAIN_VERSION__';
 const APP_SHELL = [
     '/mobile/',
+    '/mobile/index.html',
     '/mobile/app.js',
     '/mobile/jmap.js',
     '/mobile/manifest.json',

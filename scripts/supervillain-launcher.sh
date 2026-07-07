@@ -6,10 +6,12 @@
 
 set -euo pipefail
 
-# The binary defaults to loopback (no auth layer); this launcher opts in
-# to LAN/tailnet reachability. Override by exporting SUPERVILLAIN_BIND.
-# PORT derives from it so the port checks track a custom bind address.
-export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-0.0.0.0:8000}"
+# The binary defaults to loopback (no auth layer); this launcher mirrors
+# that default. Opt in to LAN/tailnet reachability by exporting
+# SUPERVILLAIN_BIND (e.g. 0.0.0.0:8000), or better, serve the loopback
+# port over your tailnet — see README.md "Serving over the tailnet
+# (HTTPS)". PORT derives from the bind so the port checks track it.
+export SUPERVILLAIN_BIND="${SUPERVILLAIN_BIND:-127.0.0.1:8000}"
 PORT="${SUPERVILLAIN_BIND##*:}"
 # {1,5} also blocks 64-bit wraparound: a 20-digit port can evaluate to an
 # in-range value under bash's modular arithmetic.

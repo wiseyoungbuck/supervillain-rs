@@ -37,7 +37,7 @@ Add more mailboxes any time via `g s` → `a`, or `Ctrl+K` → `Add Account`.
 name: supervillain
 binary: supervillain                       # at ~/.cargo/bin/ after `cargo install`
 language: Rust 1.85+ (edition 2024)
-server: 127.0.0.1:8000                     # local-only; see TODO.md for LAN/iOS
+server: 127.0.0.1:8000                     # local-only by default; see "Serving over the tailnet (HTTPS)"
 config_dir: ~/.config/supervillain/        # or $XDG_CONFIG_HOME/supervillain/
 config_files:
   config: accounts (INI, mode 0600); managed by settings UI
@@ -354,6 +354,38 @@ All optional when using the config file.
 | `SUPERVILLAIN_SPLITS` | Inline JSON splits config (overrides file) |
 | `XDG_CONFIG_HOME` | Config directory (default: `~/.config`) |
 | `RUST_LOG` | Log level (`info`, `debug`, `supervillain=debug`) |
+| `SUPERVILLAIN_BIND` | Server bind address (default: `127.0.0.1:8000`, loopback-only) |
+
+### Serving over the tailnet (HTTPS)
+
+Supervillain binds to loopback by default — no LAN exposure, no auth layer
+to worry about. To reach it securely from another device (e.g. your phone),
+serve the loopback port over your [Tailscale](https://tailscale.com/)
+tailnet rather than widening the bind address:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:8000
+```
+
+The app is then reachable at `https://<host>.<tailnet>.ts.net` with a
+valid cert — no port-forwarding, no `0.0.0.0` bind. Serve must be enabled
+once for the tailnet in the Tailscale admin console; the CLI prints the
+enablement link if it isn't.
+
+Not on Tailscale? Any TLS-terminating reverse proxy works, e.g.
+[Caddy](https://caddyserver.com/):
+
+```
+mail.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+Nothing in Supervillain assumes Tailscale — both of these just describe
+ways to reach a loopback-only server from elsewhere.
+
+**Breaking change:** previously the launcher bound `0.0.0.0`. If you
+relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly.
 
 ## Search syntax
 
