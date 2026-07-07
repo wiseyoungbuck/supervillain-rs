@@ -156,12 +156,26 @@
             letter-spacing: 0.5px;
         }
 
-        /* Error toast */
-        #error-toast {
+        /* Toasts — one fixed flex stack holds both as normal flow children
+           (undo above error) so a multi-line error toast can never overlap
+           the undo toast. The stack itself ignores pointer events so it
+           never blocks taps on content behind it; the toasts opt back in
+           (the undo toast is tappable anywhere to undo). */
+        #toast-stack {
             position: fixed;
             left: 16px;
             right: 16px;
             bottom: calc(16px + var(--safe-bottom));
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 40;
+            pointer-events: none;
+        }
+
+        #undo-toast,
+        #error-toast {
+            pointer-events: auto;
             background: var(--surface);
             border: 1px solid var(--accent);
             border-radius: 8px;
@@ -169,31 +183,13 @@
             font-size: 13px;
             line-height: 1.4;
             padding: 12px 14px;
-            z-index: 40;
             word-break: break-word;
         }
 
+        #undo-toast { cursor: pointer; }
+
+        #undo-toast.hidden,
         #error-toast.hidden { display: none; }
-
-        /* Undo toast — sits above the error toast (both can show at once)
-           and is tappable anywhere to undo. */
-        #undo-toast {
-            position: fixed;
-            left: 16px;
-            right: 16px;
-            bottom: calc(72px + var(--safe-bottom));
-            background: var(--surface);
-            border: 1px solid var(--accent);
-            border-radius: 8px;
-            color: var(--text);
-            font-size: 13px;
-            line-height: 1.4;
-            padding: 12px 14px;
-            z-index: 41;
-            cursor: pointer;
-        }
-
-        #undo-toast.hidden { display: none; }
 
         /* Email list */
         #email-list-wrap {
@@ -599,11 +595,11 @@
         </div>
     </div>
 
-    <!-- Undo toast (archive/trash) -->
-    <div id="undo-toast" class="hidden"></div>
-
-    <!-- Error toast -->
-    <div id="error-toast" class="hidden"></div>
+    <!-- Toast stack: undo (archive/trash) above error -->
+    <div id="toast-stack">
+        <div id="undo-toast" class="hidden"></div>
+        <div id="error-toast" class="hidden"></div>
+    </div>
 
     <script src="/api.js"></script>
     <script type="module" src="/mobile/app.js"></script>

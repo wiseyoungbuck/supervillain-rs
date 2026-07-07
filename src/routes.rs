@@ -2756,10 +2756,53 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_undo_awaits_action_settled() {
+        // A fast Undo tap must not race the original archive/trash request:
+        // the entry records the action's settlement and performUndo awaits
+        // it before issuing the move-back, otherwise out-of-order completion
+        // can leave the email archived despite the undo.
+        assert!(
+            MOBILE_APP_JS.contains("undoEntry.settled"),
+            "emailAction should record the action promise's settlement on the undo entry"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("await entry.settled"),
+            "performUndo must await the original action's settlement before the move-back"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_undo_repush_respects_cap() {
+        // Both places that push onto the undo stack (pushUndo and
+        // performUndo's failure re-push) must enforce UNDO_STACK_LIMIT
+        // through the shared helper — a bare push would bypass the cap.
+        let calls = MOBILE_APP_JS.matches("capUndoStack(").count();
+        assert!(
+            calls >= 3,
+            "capUndoStack should be defined and called from every stack push site (found {calls} occurrences)"
+        );
+    }
+
+    #[test]
     fn mobile_html_has_undo_toast() {
         assert!(
             MOBILE_HTML.contains(r#"id="undo-toast""#),
             "mobile index.html should define the undo-toast element"
+        );
+        // Both toasts live in one fixed flex stack (undo above error) so a
+        // multi-line error toast can never overlap the undo toast.
+        let stack = MOBILE_HTML
+            .find(r#"id="toast-stack""#)
+            .expect("mobile index.html should define the toast-stack container");
+        let undo = MOBILE_HTML
+            .find(r#"id="undo-toast""#)
+            .expect("undo-toast must exist");
+        let error = MOBILE_HTML
+            .find(r#"id="error-toast""#)
+            .expect("error-toast must exist");
+        assert!(
+            stack < undo && undo < error,
+            "toast-stack must contain undo-toast above error-toast (stack={stack}, undo={undo}, error={error})"
         );
     }
 

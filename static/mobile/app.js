@@ -31,7 +31,7 @@ const state = {
     listScrollTop: 0,
     emailCache: {},            // id → full email with body (LRU, max 50)
     lastRenderedGroup: null,   // date-divider continuity for append-only pages
-    undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId }], capped at UNDO_STACK_LIMIT — see performUndo
+    undoStack: [],             // [{ action: 'archive'|'trash', email, index, mailboxId, settled }], capped at UNDO_STACK_LIMIT — see performUndo
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -512,9 +512,15 @@ function showStatus(msg) {
 function pushUndo(action, email, index) {
     const entry = { action, email, index, mailboxId: state.inboxId };
     state.undoStack.push(entry);
-    if (state.undoStack.length > UNDO_STACK_LIMIT) state.undoStack.shift();
+    capUndoStack();
     showUndoToast(entry);
     return entry;
+}
+
+// Single owner of the cap so every push site (pushUndo above, performUndo's
+// failure re-push below) enforces it — a bare push would bypass the limit.
+function capUndoStack() {
+    if (state.undoStack.length > UNDO_STACK_LIMIT) state.undoStack.shift();
 }
 
 // ============================================================================
@@ -537,10 +543,7 @@ function showUndoToast(entry) {
     el.textContent = (entry.action === 'archive' ? 'Email archived' : 'Email trashed') + ' — Undo';
     el.classList.remove('hidden');
     if (undoToastTimer) clearTimeout(undoToastTimer);
-    undoToastTimer = setTimeout(() => {
-        el.classList.add('hidden');
-        undoToastEntry = null;
-    }, 5000);
+    undoToastTimer = setTimeout(() => hideUndoToast(entry), 5000);
 }
 
 // No-op unless `entry` is still the one the toast is showing — callers pass
@@ -575,6 +578,16 @@ async function performUndo() {
     state.emails.splice(index, 0, entry.email);
     if (state.screen === Screen.LIST) renderEmailList();
 
+    // The toast shows while the original archive/trash may still be in
+    // flight; firing the move-back concurrently could complete out of order
+    // on the server and leave the email archived despite the undo. The
+    // optimistic re-insert above stays immediate, but the move-back waits
+    // for the action to settle. If the action FAILED, there is nothing to
+    // undo: emailAction's catch has already reverted (its includes() guard
+    // leaves our re-inserted copy as the only one) and surfaced the error,
+    // so just keep the email in the list and skip the move-back.
+    if (entry.settled && !(await entry.settled)) return;
+
     try {
         await state.api('POST', '/emails/' + encodeURIComponent(entry.email.id) + '/move', {
             mailbox_id: entry.mailboxId,
@@ -586,6 +599,7 @@ async function performUndo() {
         if (idx !== -1) state.emails.splice(idx, 1);
         if (state.screen === Screen.LIST) renderEmailList();
         state.undoStack.push(entry);
+        capUndoStack();
         showError('Undo', err);
     }
 }
@@ -607,8 +621,17 @@ async function emailAction(type, emailId) {
         ? '/emails/' + encodeURIComponent(emailId) + '/archive'
         : '/emails/' + encodeURIComponent(emailId) + '/trash';
 
+    // The undo toast shows before this request settles, so performUndo
+    // needs to know when — and how — it finished: it awaits entry.settled
+    // (true = the action reached the server, safe to move back; false = it
+    // failed and the catch below already reverted, nothing to undo). The
+    // .then() handlers are attached before our own await, which guarantees
+    // this catch runs to completion before performUndo resumes.
+    const actionPromise = state.api('POST', path);
+    undoEntry.settled = actionPromise.then(() => true, () => false);
+
     try {
-        await state.api('POST', path);
+        await actionPromise;
     } catch (err) {
         // Revert: re-insert at the original index and retract OUR undo entry
         // by identity — with two actions in flight, popping the tail could
@@ -619,7 +642,10 @@ async function emailAction(type, emailId) {
         if (undoIdx !== -1) state.undoStack.splice(undoIdx, 1);
         // No-op if a later action already replaced our toast.
         hideUndoToast(undoEntry);
-        state.emails.splice(index, 0, email);
+        // A fast Undo tap may have optimistically re-inserted this email
+        // already (performUndo runs its insert before awaiting entry.settled)
+        // — in that case the list is already correct; don't double-insert.
+        if (!state.emails.includes(email)) state.emails.splice(index, 0, email);
         renderEmailList();
         showError(type === 'archive' ? 'Archive' : 'Trash', err);
     }
@@ -777,10 +803,17 @@ async function renderScreenDetail(emailId) {
     // network-fetch path above (whose GET auto-marks read server-side), we
     // have to ask explicitly. Already-read cache entries (isUnread already
     // false, e.g. reopening something already viewed) don't fire this.
+    // Optimistic, matching toggleUnread: flip everywhere the email is held,
+    // revert alongside showError on failure — otherwise a failed POST would
+    // leave the row rendered read while the server still has it unread.
     if (cacheHit && full.isUnread) {
+        full.isUnread = false;
+        if (listEmail) listEmail.isUnread = false;
         try {
             await state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/mark-read');
         } catch (err) {
+            full.isUnread = true;
+            if (listEmail) listEmail.isUnread = true;
             showError('Mark read', err);
         }
         if (state.currentEmailId !== emailId) return;
@@ -788,10 +821,14 @@ async function renderScreenDetail(emailId) {
 
     renderEmailDetail(full);
 
-    // The server auto-marks read on the GET above (network path) or via the
-    // explicit mark-read call above (cache-hit path); mirror it locally.
-    if (listEmail?.isUnread) listEmail.isUnread = false;
-    if (full.isUnread) full.isUnread = false;
+    // Network path only: the server auto-marked read on the GET above, so
+    // mirror it locally. (The cache-hit path reconciled its own flags around
+    // the explicit mark-read POST — flattening them here would clobber its
+    // failure revert.)
+    if (!cacheHit) {
+        if (listEmail?.isUnread) listEmail.isUnread = false;
+        if (full.isUnread) full.isUnread = false;
+    }
     // renderEmailDetail → renderEmailDetailPartial already drew the action
     // bar from the pre-correction unread flag; redraw with the now-correct
     // (read) state.
