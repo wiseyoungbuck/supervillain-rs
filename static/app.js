@@ -13,6 +13,13 @@ const state = {
     currentEmail: null,
     searchTokens: [],
     autocompleteIndex: 0,
+    // Contact autocomplete on compose To/Cc (kata e64s, task B6) — client-side
+    // only, no server surface. Harvested from loaded email list pages plus one
+    // background Sent-mailbox fetch per account session (see harvestContacts /
+    // harvestSentContactsOnce). email(lowercased) -> {email, name, lastSeen, count}.
+    contactIndex: new Map(),
+    contactAcField: null,     // 'to' | 'cc' | null — which compose field's dropdown is open
+    contactAcIndex: 0,        // highlighted row in the open contact dropdown
     undoStack: [],
     pendingG: false,          // for gg command
     commandPaletteIndex: 0,
@@ -70,6 +77,22 @@ let refillInFlight = false;
 const splitListCache = {};
 let loadEmailsController = null;
 
+// Contact autocomplete harvesting (kata e64s, task B6). All module-level and
+// session-only (reset on page reload), mirroring emailCache/splitListCache.
+// `${accountId}:${emailId}` keys already folded into state.contactIndex — a
+// re-render of an already-fetched page (e.g. the splitListCache instant-switch
+// snapshot) must not double-count the same message.
+const harvestedMessageIds = new Set();
+// accountIds whose Sent-mailbox background fetch has already been attempted
+// this session (attempted, not necessarily successful — see
+// harvestSentContactsOnce: a failure isn't retried).
+const sentHarvestedAccounts = new Set();
+// Lowercased addresses excluded from contact suggestions — accumulates across
+// every account whose identities have been loaded this session.
+const ownIdentityEmails = new Set();
+// Rows currently rendered in whichever contact dropdown is open.
+let contactAcMatches = [];
+
 const SEARCH_OPERATORS = [
     { op: 'from:', hint: 'Sender email', needsValue: true },
     { op: 'to:', hint: 'Recipient', needsValue: true },
@@ -109,6 +132,8 @@ function init() {
     els.composeFrom = document.getElementById('compose-from');
     els.composeTo = document.getElementById('compose-to');
     els.composeCc = document.getElementById('compose-cc');
+    els.composeToAutocomplete = document.getElementById('compose-to-autocomplete');
+    els.composeCcAutocomplete = document.getElementById('compose-cc-autocomplete');
     els.composeSubject = document.getElementById('compose-subject');
     els.composeBody = document.getElementById('compose-body');
     els.commandPalette = document.getElementById('command-palette');
@@ -263,6 +288,14 @@ function init() {
         // Debounced draft autosave (kata wm57): each edit reschedules the save.
         el.addEventListener('input', scheduleAutosave);
     });
+
+    // Contact autocomplete on To/Cc (kata e64s, task B6) — separate listeners
+    // from the generic block above so the dropdown wiring stays out of the
+    // unrelated Subject/Body autosave path.
+    els.composeTo.addEventListener('input', () => handleContactFieldInput('to'));
+    els.composeCc.addEventListener('input', () => handleContactFieldInput('cc'));
+    els.composeTo.addEventListener('blur', closeContactAutocomplete);
+    els.composeCc.addEventListener('blur', closeContactAutocomplete);
 
     // Auto-expand textarea as user types
     els.composeBody.addEventListener('input', autoResizeTextarea);
@@ -858,6 +891,13 @@ async function loadIdentities() {
     try {
         state.identities = await api('GET', '/identities');
         renderFromDropdown();
+        // Contact autocomplete (kata e64s): never suggest the user's own
+        // send-as addresses back to them. Accumulates across every account
+        // visited this session rather than resetting per switch — an
+        // address that's "you" on one account is still "you" everywhere.
+        for (const id of state.identities) {
+            if (id.email) ownIdentityEmails.add(id.email.toLowerCase());
+        }
     } catch (err) {
         console.warn('Failed to load identities:', err);
         state.identities = [];
@@ -950,6 +990,11 @@ async function loadMailboxes() {
         // Select inbox by default
         const inbox = state.mailboxes.find(m => m.role === 'inbox');
         if (inbox) selectMailbox(inbox);
+
+        // Contact autocomplete (kata e64s): background-fill the index with
+        // the Sent mailbox's first page, now that state.mailboxes can
+        // resolve it. Fire-and-forget — it self-handles its own failure.
+        harvestSentContactsOnce();
     } catch (err) {
         showStatus('Failed to load mailboxes: ' + err.message, 'error');
     }
@@ -1002,6 +1047,7 @@ async function loadEmails() {
         state.emails = emails;
         state.selectedIndex = 0;
         renderEmailList();
+        harvestContacts(emails, state.currentAccount?.id);
     } catch (err) {
         if (err.name !== 'AbortError') {
             showStatus('Failed to load emails: ' + err.message, 'error');
@@ -1029,12 +1075,204 @@ async function maybeRefillEmails() {
             state.emails = state.emails.concat(newEmails);
             splitListCache[context] = [...state.emails];
             renderEmailList();
+            harvestContacts(newEmails, state.currentAccount?.id);
         }
     } catch (err) {
         console.warn('Refill failed:', err);
     } finally {
         refillInFlight = false;
     }
+}
+
+// ============================================================================
+// Contact autocomplete on compose To/Cc (kata e64s, task B6)
+// ============================================================================
+// Client-side only — no Contact/CardDAV API exists, and this version adds no
+// server surface at all. state.contactIndex is built purely from mail
+// already fetched: (a) every loaded email list page's from/to/cc (hooked
+// into loadEmails/maybeRefillEmails above), and (b) one background fetch of
+// the Sent mailbox's first page per account session (harvestSentContactsOnce
+// below). Ranking is frequency count desc, then lastSeen desc; the account's
+// own identity addresses are excluded (see ownIdentityEmails).
+
+// Folds a page of Email objects (list-view shape: {id, from, to, cc,
+// receivedAt, ...}) into state.contactIndex. Idempotent per message id (keyed
+// per account) so re-rendering an already-fetched page — e.g. the
+// splitListCache instant-switch snapshot — never inflates counts.
+function harvestContacts(emails, accountId) {
+    if (!accountId || !emails || !emails.length) return;
+
+    for (const email of emails) {
+        const msgKey = `${accountId}:${email.id}`;
+        if (harvestedMessageIds.has(msgKey)) continue;
+        harvestedMessageIds.add(msgKey);
+
+        const seenInEmail = new Set();
+        const addrs = [].concat(email.from || [], email.to || [], email.cc || []);
+        for (const addr of addrs) {
+            const key = addr?.email?.toLowerCase();
+            if (!key || seenInEmail.has(key)) continue;
+            seenInEmail.add(key);
+
+            const existing = state.contactIndex.get(key);
+            if (existing) {
+                existing.count += 1;
+                if (addr.name) existing.name = addr.name;
+                if (email.receivedAt && email.receivedAt > existing.lastSeen) {
+                    existing.lastSeen = email.receivedAt;
+                }
+            } else {
+                state.contactIndex.set(key, {
+                    email: addr.email,
+                    name: addr.name || '',
+                    lastSeen: email.receivedAt || '',
+                    count: 1,
+                });
+            }
+        }
+    }
+}
+
+// One-shot per account session: resolves the Sent mailbox from
+// state.mailboxes (loadMailboxes must have populated it already) and
+// harvests its first ~100 messages. A failure here is not user-facing — it's
+// a background enrichment, not a load-bearing fetch — so it degrades
+// silently to list-only harvesting via console.warn.
+async function harvestSentContactsOnce() {
+    const accountId = state.currentAccount?.id;
+    if (!accountId || sentHarvestedAccounts.has(accountId)) return;
+    sentHarvestedAccounts.add(accountId);
+
+    const sent = state.mailboxes.find(m => m.role === 'sent');
+    if (!sent) return;
+
+    try {
+        const emails = await api('GET', `/emails?mailbox_id=${sent.id}&limit=100`);
+        harvestContacts(emails, accountId);
+    } catch (err) {
+        console.warn('Contact harvest: Sent mailbox fetch failed:', err);
+    }
+}
+
+// Comma-segment boundaries around `pos` in a To/Cc field's raw value. Shared
+// by the matcher (reads the in-progress segment) and acceptContactAutocomplete
+// (replaces it) so both agree on the same span — critical for correctness on
+// a mid-field edit (segment isn't necessarily the last one in the field).
+function contactSegmentBounds(value, pos) {
+    const commaBefore = value.lastIndexOf(',', pos - 1);
+    let start = commaBefore === -1 ? 0 : commaBefore + 1;
+    while (start < pos && value[start] === ' ') start++;
+    let end = value.indexOf(',', pos);
+    if (end === -1) end = value.length;
+    return [start, end];
+}
+
+// Pure rank/match helper: given the in-progress segment text, returns up to 6
+// contacts ranked by frequency count desc, then lastSeen desc. Matches on
+// email prefix OR name substring, case-insensitive; requires 2+ chars.
+function rankContactMatches(query) {
+    const q = query.trim().toLowerCase();
+    if (q.length < 2) return [];
+
+    const matches = [];
+    for (const c of state.contactIndex.values()) {
+        if (ownIdentityEmails.has(c.email.toLowerCase())) continue;
+        const emailMatch = c.email.toLowerCase().startsWith(q);
+        const nameMatch = c.name && c.name.toLowerCase().includes(q);
+        if (emailMatch || nameMatch) matches.push(c);
+    }
+
+    matches.sort((a, b) => (b.count - a.count) || (b.lastSeen || '').localeCompare(a.lastSeen || ''));
+    return matches.slice(0, 6);
+}
+
+function contactFieldEl(field) {
+    return field === 'to' ? els.composeTo : els.composeCc;
+}
+
+function contactAcEl(field) {
+    return field === 'to' ? els.composeToAutocomplete : els.composeCcAutocomplete;
+}
+
+function handleContactFieldInput(field) {
+    const input = contactFieldEl(field);
+    const pos = input.selectionStart ?? input.value.length;
+    const [start] = contactSegmentBounds(input.value, pos);
+    const query = input.value.slice(start, pos);
+
+    const matches = rankContactMatches(query);
+    if (matches.length === 0) {
+        closeContactAutocomplete();
+        return;
+    }
+
+    contactAcMatches = matches;
+    state.contactAcField = field;
+    state.contactAcIndex = 0;
+    renderContactAutocomplete(field);
+}
+
+function renderContactAutocomplete(field) {
+    const el = contactAcEl(field);
+    el.innerHTML = contactAcMatches.map((c, idx) => `
+        <div class="autocomplete-item ${idx === state.contactAcIndex ? 'selected' : ''}" data-index="${idx}">
+            <span>${escapeHtml(c.name || c.email)}</span>
+            ${c.name ? `<span class="ac-hint">${escapeHtml(c.email)}</span>` : ''}
+        </div>
+    `).join('');
+    el.classList.remove('hidden');
+
+    el.querySelectorAll('.autocomplete-item').forEach(item => {
+        item.addEventListener('mousedown', (e) => {
+            e.preventDefault(); // keep focus in the input, mirrors search autocomplete
+            state.contactAcIndex = parseInt(item.dataset.index);
+            acceptContactAutocomplete(field);
+        });
+    });
+}
+
+function renderContactAutocompleteHighlight() {
+    if (!state.contactAcField) return;
+    contactAcEl(state.contactAcField).querySelectorAll('.autocomplete-item').forEach((item, idx) => {
+        item.classList.toggle('selected', idx === state.contactAcIndex);
+    });
+}
+
+function closeContactAutocomplete() {
+    if (!state.contactAcField) return;
+    contactAcEl(state.contactAcField).classList.add('hidden');
+    state.contactAcField = null;
+    contactAcMatches = [];
+}
+
+// Replaces the current comma-segment with the selected contact's bare
+// address and appends ', ' — but only when completing the field's last
+// segment; a mid-field edit leaves whatever already follows untouched so it
+// doesn't get duplicated. Only contact.email is ever inserted: To/Cc are
+// parsed downstream as plain comma-separated address strings (see
+// sendEmail/build_draft_email), so a "Name <email>" form here would ship as
+// a literally-invalid recipient.
+function acceptContactAutocomplete(field) {
+    if (!contactAcMatches.length) return;
+
+    const idx = Math.min(state.contactAcIndex, contactAcMatches.length - 1);
+    const contact = contactAcMatches[idx];
+    const input = contactFieldEl(field);
+    const value = input.value;
+    const pos = input.selectionStart ?? value.length;
+    const [start, end] = contactSegmentBounds(value, pos);
+    const isLastSegment = end >= value.length;
+
+    const before = value.slice(0, start);
+    const after = isLastSegment ? '' : value.slice(end);
+    const insertion = contact.email + (isLastSegment ? ', ' : '');
+
+    input.value = before + insertion + after;
+    const caretPos = (before + insertion).length;
+    input.setSelectionRange(caretPos, caretPos);
+
+    closeContactAutocomplete();
+    scheduleAutosave();
 }
 
 async function loadEmailDetail(emailId) {
@@ -2344,6 +2582,33 @@ function handleKeyDown(e) {
 
     // Handle compose mode
     if (state.view === 'compose' && state.mode === 'insert') {
+        // Contact autocomplete (kata e64s): only intercept when the dropdown
+        // is actually open AND the event target is the To/Cc input it
+        // belongs to. Gating on both means a closed dropdown never eats a
+        // key, and the block below (Escape / Ctrl+Enter / Ctrl+Shift+A) stays
+        // reachable exactly as before everywhere else in compose.
+        if (state.contactAcField && (e.target === els.composeTo || e.target === els.composeCc)) {
+            if (e.key === 'Escape') {
+                closeContactAutocomplete();
+                e.preventDefault();
+                return;
+            } else if (e.key === 'ArrowDown') {
+                state.contactAcIndex = Math.min(state.contactAcIndex + 1, contactAcMatches.length - 1);
+                renderContactAutocompleteHighlight();
+                e.preventDefault();
+                return;
+            } else if (e.key === 'ArrowUp') {
+                state.contactAcIndex = Math.max(0, state.contactAcIndex - 1);
+                renderContactAutocompleteHighlight();
+                e.preventDefault();
+                return;
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+                acceptContactAutocomplete(state.contactAcField);
+                e.preventDefault();
+                return;
+            }
+        }
+
         if (e.key === 'Escape') {
             e.target.blur();
             setMode('normal');
@@ -2966,6 +3231,11 @@ function clearCompose() {
     state.draftId = null;
     els.composeTo.value = '';
     els.composeCc.value = '';
+    // A dropdown left open from the previous compose session must not linger
+    // (kata e64s) — same element, so a stale state.contactAcField would
+    // otherwise still gate keydown handling on the new session's first
+    // keystroke.
+    closeContactAutocomplete();
     els.composeSubject.value = '';
     els.composeBody.value = composeSignaturePrefill();
     // Dirty-check baseline: composeDirty compares the body against this exact

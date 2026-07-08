@@ -659,11 +659,31 @@ body {
 }
 
 .compose-field {
+    position: relative;
     display: flex;
     align-items: center;
     margin-bottom: 12px;
     border-bottom: 1px solid var(--border);
     padding-bottom: 12px;
+}
+
+/* Contact autocomplete dropdown (kata e64s) — anchored under a To/Cc field,
+   reusing the .autocomplete-item/.ac-hint idiom from #search-autocomplete. */
+.contact-autocomplete {
+    position: absolute;
+    top: 100%;
+    left: 80px;
+    right: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-top: none;
+    max-height: 220px;
+    overflow-y: auto;
+    z-index: 100;
+}
+
+.contact-autocomplete.hidden {
+    display: none;
 }
 
 .compose-field label {

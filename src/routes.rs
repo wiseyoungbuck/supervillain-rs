@@ -1923,6 +1923,180 @@ mod tests {
     }
 
     // ====================================================================
+    // Contact autocomplete on To/Cc (kata e64s, task B6) — client-side only,
+    // no server surface. These are string-invariant tests per repo
+    // convention (no JS harness): they pin the shape of static/app.js
+    // rather than executing it.
+    // ====================================================================
+
+    #[test]
+    fn contact_index_state_present() {
+        assert!(
+            APP_JS.contains("contactIndex: new Map()"),
+            "state.contactIndex must be a Map, built by harvesting from \
+             loaded email list pages and the Sent mailbox (kata e64s)"
+        );
+    }
+
+    #[test]
+    fn contact_rank_function_sorts_by_count_then_last_seen_and_excludes_self() {
+        let start = APP_JS
+            .find("function rankContactMatches(")
+            .expect("a pure rank/match helper must exist for contact autocomplete");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("rankContactMatches must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("b.count - a.count"),
+            "contacts must rank by frequency count descending first"
+        );
+        assert!(
+            block.contains("lastSeen") && block.contains("localeCompare"),
+            "ties must break by lastSeen descending"
+        );
+        assert!(
+            block.contains("ownIdentityEmails"),
+            "rank/match must exclude the account's own identity addresses"
+        );
+    }
+
+    #[test]
+    fn contact_harvest_hooks_list_load_and_refill_paths() {
+        assert!(
+            APP_JS.contains("function harvestContacts("),
+            "harvestContacts must exist to build the contact index from loaded emails"
+        );
+
+        // Primary list-load path.
+        let start = APP_JS
+            .find("async function loadEmails()")
+            .expect("loadEmails must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\nasync function maybeRefillEmails")
+            .expect("loadEmails must be followed by maybeRefillEmails");
+        assert!(
+            rest[..end].contains("harvestContacts("),
+            "loadEmails must harvest contacts from the fetched page"
+        );
+
+        // Infinite-scroll append path.
+        let start2 = APP_JS
+            .find("async function maybeRefillEmails()")
+            .expect("maybeRefillEmails must exist");
+        let rest2 = &APP_JS[start2..];
+        let end2 = rest2
+            .find("\nasync function loadEmailDetail")
+            .expect("maybeRefillEmails must be followed by loadEmailDetail");
+        assert!(
+            rest2[..end2].contains("harvestContacts("),
+            "maybeRefillEmails must harvest contacts from newly appended emails"
+        );
+    }
+
+    #[test]
+    fn sent_mailbox_background_harvest_degrades_silently() {
+        let start = APP_JS
+            .find("function harvestSentContactsOnce")
+            .expect("harvestSentContactsOnce must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("harvestSentContactsOnce must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("role === 'sent'"),
+            "must resolve the Sent mailbox from state.mailboxes by role"
+        );
+        assert!(
+            block.contains("console.warn"),
+            "a failed Sent-mailbox fetch must degrade silently (console.warn only)"
+        );
+        assert!(
+            !block.contains("showStatus"),
+            "a failed Sent-mailbox fetch must not surface an error banner to the user"
+        );
+    }
+
+    #[test]
+    fn contact_dropdown_keydown_scoped_to_focused_input_when_open() {
+        // The compose insert-mode key handler must only intercept dropdown
+        // navigation keys when the contact dropdown is actually open AND the
+        // event target is the To/Cc input it belongs to — otherwise it must
+        // fall through untouched to the existing Escape/Ctrl+Enter handling
+        // (autosave/send-lock from kata wm57 must not be disturbed).
+        let start = APP_JS
+            .find("state.view === 'compose' && state.mode === 'insert'")
+            .expect("compose insert-mode key handler must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\n    // Compose normal-mode:")
+            .expect("compose insert-mode block must be followed by the normal-mode 'a' handler");
+        let block = &rest[..end];
+        assert!(
+            block.contains("state.contactAcField"),
+            "compose keydown must gate contact-dropdown key handling on an open dropdown"
+        );
+        assert!(
+            block.contains("e.target === els.composeTo")
+                || block.contains("e.target === els.composeCc"),
+            "contact-dropdown key handling must be scoped to the focused To/Cc input"
+        );
+        assert!(
+            block.contains("sendEmail()"),
+            "existing Ctrl+Enter send handling must still be present"
+        );
+    }
+
+    #[test]
+    fn contact_autocomplete_inserts_bare_email_not_display_name() {
+        // To/Cc are parsed downstream as plain comma-separated address
+        // strings (see sendEmail / build_draft_email) — inserting a
+        // "Name <email>" form here would ship as a literally-invalid
+        // recipient address.
+        let start = APP_JS
+            .find("function acceptContactAutocomplete(")
+            .expect("acceptContactAutocomplete must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("acceptContactAutocomplete must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("contact.email"),
+            "acceptContactAutocomplete must insert the bare contact.email"
+        );
+        assert!(
+            !block.contains("contact.name"),
+            "acceptContactAutocomplete must not compose a 'Name <email>' string into the field"
+        );
+    }
+
+    #[test]
+    fn contact_segment_bounds_shared_by_match_and_accept() {
+        assert!(
+            APP_JS.contains("function contactSegmentBounds("),
+            "a single segment-bounds helper must exist so the matcher (read) \
+             and acceptContactAutocomplete (replace) agree on comma-segment \
+             boundaries — otherwise mid-field edits could replace the wrong span"
+        );
+    }
+
+    #[test]
+    fn contact_autocomplete_html_and_css_wired() {
+        assert!(INDEX_HTML.contains(r#"id="compose-to-autocomplete""#));
+        assert!(INDEX_HTML.contains(r#"id="compose-cc-autocomplete""#));
+        assert!(
+            STYLE_CSS.contains(".contact-autocomplete"),
+            "dropdown container styling must exist"
+        );
+        assert!(
+            STYLE_CSS.contains(".autocomplete-item"),
+            "contact dropdown rows should reuse the .autocomplete-item idiom from #search-autocomplete"
+        );
+    }
+
+    // ====================================================================
     // Settings view (account management) regression sentinels
     // ====================================================================
 
