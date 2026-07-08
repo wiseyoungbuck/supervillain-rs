@@ -2703,6 +2703,13 @@ pub async fn get_calendar_event(
         .client
         .get(&url)
         .bearer_auth(&token)
+        // roborev 296 #1: without this, Graph returns the event body
+        // HTML-wrapped by default. That HTML skeleton never equals the
+        // plain-text DESCRIPTION parsed from the incoming ICS, so the
+        // content-idempotence guard in events_content_match never sees a
+        // match and the destructive remove+re-add fires on every re-open of
+        // a SEQUENCE>=1 invite (with or without a real description change).
+        .header("Prefer", r#"outlook.body-content-type="text""#)
         .send()
         .await?
         .json()

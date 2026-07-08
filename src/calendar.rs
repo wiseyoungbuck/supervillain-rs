@@ -4,11 +4,19 @@ use chrono::{
 };
 use chrono_tz::Tz;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
 static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
+
+/// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
+/// DESCRIPTION we didn't expect to be HTML (see `normalize_description`).
+/// Not a real HTML parser: doesn't decode entities, doesn't handle
+/// unterminated tags. That's fine here — worst case a still-HTML-ish result
+/// fails `description_channel_is_faithful` and the caller skips the
+/// comparison instead of trusting a garbled string.
+static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]*>").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -168,8 +176,9 @@ pub fn events_content_match(stored: &CalendarEvent, incoming: &CalendarEvent) ->
         && dtend_matches_normalized(stored, incoming)
         && stored.summary == incoming.summary
         && stored.location == incoming.location
-        && normalize_description(&stored.description)
-            == normalize_description(&incoming.description)
+        && (!description_channel_is_faithful(&stored.description)
+            || normalize_description(&stored.description)
+                == normalize_description(&incoming.description))
         && attendee_email_set(&stored.attendees) == attendee_email_set(&incoming.attendees)
 }
 
@@ -182,26 +191,95 @@ pub fn events_content_match(stored: &CalendarEvent, incoming: &CalendarEvent) ->
 /// per-open destructive rewrite for every DTEND-less invite. Treat an
 /// incoming `None` as matching a stored DTEND that is exactly
 /// `dtstart + 1h` — the signature of Outlook's own default, not a real
-/// difference. Any other stored/incoming shape falls back to plain equality.
+/// difference.
+///
+/// roborev 296 #3: that default-fill only happens on providers whose parsed
+/// `CalendarEvent` never carries the original ICS body — `parse_graph_event`
+/// (Outlook) and `parse_google_event` (Gmail) both always set
+/// `raw_ics: String::new()`, while Fastmail's `get_calendar_event` round-trips
+/// the real CalDAV ICS text through `parse_ics`, which always populates
+/// `raw_ics` (non-empty, since `parse_ics` requires `BEGIN:VCALENDAR`). So
+/// `stored.raw_ics.is_empty()` reliably distinguishes "Graph/Google store-time
+/// default" from "Fastmail's real stored value happens to be dtstart + 1h" —
+/// only the former should be normalized away. Any other stored/incoming shape
+/// falls back to plain equality.
 fn dtend_matches_normalized(stored: &CalendarEvent, incoming: &CalendarEvent) -> bool {
     match (stored.dtend, incoming.dtend) {
-        (Some(stored_end), None) => stored_end == stored.dtstart + chrono::Duration::hours(1),
+        (Some(stored_end), None) if stored.raw_ics.is_empty() => {
+            stored_end == stored.dtstart + chrono::Duration::hours(1)
+        }
         (stored_end, incoming_end) => stored_end == incoming_end,
     }
 }
 
 /// Normalize DESCRIPTION for comparison: `None` and an empty string mean the
 /// same thing ("no description").
-fn normalize_description(description: &Option<String>) -> &str {
-    description.as_deref().unwrap_or("")
+///
+/// roborev 296 #1: whitespace-robust so a text-mode Graph body (which can
+/// carry a trailing `\r\n` even when `Prefer: outlook.body-content-type="text"`
+/// is honored) still compares equal to an ICS DESCRIPTION with no trailing
+/// whitespace — collapse CRLF to LF, then trim. As defense-in-depth against a
+/// body that came back HTML-wrapped anyway (e.g. the Prefer header wasn't
+/// honored), a value that still starts with `<` after trimming gets a crude
+/// tag-strip pass. Whether that pass actually produced clean plain text is
+/// judged separately by `description_channel_is_faithful` — callers must
+/// consult that before trusting this normalization to mean anything.
+fn normalize_description(description: &Option<String>) -> String {
+    let raw = description.as_deref().unwrap_or("");
+    let collapsed = raw.replace("\r\n", "\n");
+    let trimmed = collapsed.trim();
+    if trimmed.starts_with('<') {
+        HTML_TAG_RE.replace_all(trimmed, "").trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
-/// Normalize an attendee list to a lowercased, sorted set of email addresses
-/// for comparison — order and casing differences aren't content changes.
+/// True when a stored DESCRIPTION is a trustworthy plain-text channel to
+/// compare against an incoming ICS DESCRIPTION (which is always plain TEXT
+/// per RFC 5545).
+///
+/// roborev 296 #1: without a text-mode hint (or if a provider ignores one),
+/// Graph can return an HTML-wrapped body for a calendar event — the stored
+/// side then never equals the incoming plain-text DESCRIPTION even when the
+/// visible content is identical, permanently defeating the content-match
+/// guard. `normalize_description` crude-strips an HTML wrapper, but a crude
+/// strip can leave stray `<`/`>` behind (e.g. an unterminated tag) if the
+/// value wasn't well-formed HTML to begin with, or wasn't HTML at all — in
+/// either case we can't trust the leftover text as a faithful rendering of
+/// the original. When this returns `false`, `events_content_match` skips the
+/// description clause entirely rather than let a lossy provider round-trip
+/// block a legitimate no-op downgrade to `Unchanged`; this can't mask a real
+/// content change on other tracked fields (DTSTART/DTEND/SUMMARY/LOCATION/
+/// attendees), which still participate in the comparison.
+fn description_channel_is_faithful(stored: &Option<String>) -> bool {
+    let raw = stored.as_deref().unwrap_or("");
+    let collapsed = raw.replace("\r\n", "\n");
+    let trimmed = collapsed.trim();
+    if !trimmed.starts_with('<') {
+        return true;
+    }
+    let stripped = HTML_TAG_RE.replace_all(trimmed, "");
+    !stripped.contains('<') && !stripped.contains('>')
+}
+
+/// Normalize an attendee list to a lowercased, sorted, deduplicated set of
+/// email addresses for comparison — order, casing, and duplicate lines
+/// aren't content changes.
+///
+/// roborev 296 #2: a sender who emits the same ATTENDEE line twice (or a
+/// client that folds/duplicates one on send) produced two entries here while
+/// a provider that dedupes on store (e.g. Outlook/Google collapse repeated
+/// attendees to one) produced one — an under-comparison that always failed
+/// and permanently defeated the guard for that invite. Dedupe both sides so
+/// only the *set* of addresses is compared.
 fn attendee_email_set(attendees: &[Attendee]) -> Vec<String> {
-    let mut emails: Vec<String> = attendees.iter().map(|a| a.email.to_lowercase()).collect();
-    emails.sort();
-    emails
+    attendees
+        .iter()
+        .map(|a| a.email.to_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 // =============================================================================
@@ -1744,7 +1822,13 @@ END:VCALENDAR";
         // normalize to a match here, not a permanent mismatch (which would
         // resurrect the per-open destructive rewrite for every DTEND-less
         // invite on Outlook).
-        let stored = base_event(); // DTEND == DTSTART + 1h
+        //
+        // roborev 296 #3: the normalization is now scoped to raw_ics-empty
+        // (Graph/Google-shaped) stored events — clear it here to simulate
+        // that shape, since base_event() (parsed from real ICS text) is
+        // Fastmail-shaped by default.
+        let mut stored = base_event(); // DTEND == DTSTART + 1h
+        stored.raw_ics = String::new();
         let mut incoming = base_event();
         incoming.dtend = None;
         assert!(events_content_match(&stored, &incoming));
@@ -1757,7 +1841,30 @@ END:VCALENDAR";
         // that differs from that is a genuine value the DTEND-less incoming
         // side doesn't have — still a real mismatch.
         let mut stored = base_event();
+        stored.raw_ics = String::new(); // Graph/Google shape
         stored.dtend = stored.dtend.map(|dt| dt + chrono::Duration::hours(1)); // now +2h
+        let mut incoming = base_event();
+        incoming.dtend = None;
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    // --- DTEND normalization provider scoping (roborev 296 #3) ---
+
+    #[test]
+    fn content_match_false_when_fastmail_shaped_dtend_missing_even_if_default_duration() {
+        // The (Some(start+1h), None) normalization models Outlook/Google's
+        // store-time default-fill — signaled by an empty raw_ics, since
+        // parse_graph_event/parse_google_event never populate it while
+        // Fastmail's get_calendar_event round-trips real ICS text through
+        // parse_ics (always non-empty raw_ics). A Fastmail-stored event
+        // whose duration *happens* to be dtstart + 1h is not evidence of a
+        // default-fill — it's a genuine stored value — so a DTEND-less
+        // incoming ICS must NOT be normalized to a match here.
+        let stored = base_event(); // DTEND == DTSTART + 1h, real ICS (non-empty raw_ics)
+        assert!(
+            !stored.raw_ics.is_empty(),
+            "sanity: base_event() must be Fastmail-shaped for this test"
+        );
         let mut incoming = base_event();
         incoming.dtend = None;
         assert!(!events_content_match(&stored, &incoming));
@@ -1794,6 +1901,84 @@ END:VCALENDAR";
         let mut incoming = base_event();
         incoming.description = Some(String::new());
         assert!(events_content_match(&stored, &incoming));
+    }
+
+    // --- description robustness against a lossy Graph body read-back (roborev 296 #1) ---
+    //
+    // outlook::get_calendar_event now sends
+    // Prefer: outlook.body-content-type="text", but as defense-in-depth (the
+    // header might not be honored, or a caller might hit this path with an
+    // HTML body some other way) the comparison itself must not be defeated
+    // by an HTML-wrapped stored description or Graph's trailing CRLF.
+
+    #[test]
+    fn content_match_true_when_stored_description_is_html_wrapped_but_content_equal() {
+        // Without the Prefer header, Graph can return the body HTML-wrapped
+        // even though the incoming ICS DESCRIPTION is plain text. If the
+        // crude tag-strip recovers the identical plain text, it's still a
+        // match, not a permanent Update.
+        let mut stored = base_event();
+        stored.description = Some("<html><body><p>Daily standup meeting</p></body></html>".into());
+        let incoming = base_event(); // description: "Daily standup meeting"
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_stored_description_has_trailing_crlf() {
+        // Graph appends a trailing \r\n to text-mode bodies even when the
+        // Prefer header is honored.
+        let mut stored = base_event();
+        stored.description = Some("Daily standup meeting\r\n".into());
+        let incoming = base_event(); // "Daily standup meeting", no trailing whitespace
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_stored_description_still_html_after_crude_strip() {
+        // roborev 296 #1 part (c): if the crude strip can't fully clean the
+        // stored value (unterminated tag leaves a stray '<'), we can't trust
+        // it as a faithful plain-text channel. Skip the description clause
+        // rather than let the garbled leftover block a legitimate downgrade
+        // to Unchanged — this must not fail the match just because the
+        // (untrustworthy) stripped text differs from the incoming plain text.
+        let mut stored = base_event();
+        stored.description = Some("<p>Meeting notes < important".into());
+        let incoming = base_event(); // description: "Daily standup meeting" — differs
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn normalize_description_trims_and_collapses_crlf() {
+        assert_eq!(normalize_description(&Some("Hello\r\n".into())), "Hello");
+        assert_eq!(normalize_description(&Some("  Hello  \n".into())), "Hello");
+    }
+
+    #[test]
+    fn normalize_description_strips_well_formed_html_wrapper() {
+        assert_eq!(
+            normalize_description(&Some("<html><body><p>Hi</p></body></html>".into())),
+            "Hi"
+        );
+    }
+
+    #[test]
+    fn description_channel_faithful_for_plain_text_and_missing() {
+        assert!(description_channel_is_faithful(&Some(
+            "Plain description".into()
+        )));
+        assert!(description_channel_is_faithful(&None));
+    }
+
+    #[test]
+    fn description_channel_faithful_for_well_formed_html_wrapper() {
+        assert!(description_channel_is_faithful(&Some("<p>Hi</p>".into())));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_when_html_residue_remains() {
+        assert!(!description_channel_is_faithful(&Some(
+            "<p>Meeting notes < important".into()
+        )));
     }
 
     #[test]
@@ -1840,6 +2025,48 @@ END:VCALENDAR";
             a.name = None;
         }
         assert!(events_content_match(&stored, &incoming));
+    }
+
+    // --- attendee_email_set dedup (roborev 296 #2) ---
+
+    #[test]
+    fn content_match_true_when_incoming_has_duplicate_attendee_line() {
+        // A duplicated ATTENDEE line in the incoming ICS (e.g. a sender that
+        // emits the same attendee twice) must not permanently defeat the
+        // guard against a provider-deduped stored list.
+        let stored = base_event(); // bob + carol, one line each
+        let mut incoming = base_event();
+        let bob = incoming.attendees[0].clone();
+        incoming.attendees.push(bob); // duplicate Bob line
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_stored_has_duplicate_attendee_line() {
+        // Symmetric case: a stored list with a duplicate must also compare
+        // equal to a deduped incoming list.
+        let mut stored = base_event();
+        let bob = stored.attendees[0].clone();
+        stored.attendees.push(bob);
+        let incoming = base_event();
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn attendee_email_set_dedupes_case_insensitively() {
+        let attendees = vec![
+            Attendee {
+                email: "bob@example.com".into(),
+                name: None,
+                status: "NEEDS-ACTION".into(),
+            },
+            Attendee {
+                email: "BOB@EXAMPLE.COM".into(),
+                name: Some("Bob".into()),
+                status: "ACCEPTED".into(),
+            },
+        ];
+        assert_eq!(attendee_email_set(&attendees), vec!["bob@example.com"]);
     }
 
     // --- cancel_decision tests (roborev 292: CANCEL anti-spoof gate) ---
