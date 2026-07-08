@@ -24,6 +24,18 @@ const state = {
     contactAcField: null,     // 'to' | 'cc' | null — which compose field's dropdown is open
     contactAcIndex: 0,        // highlighted row in the open contact dropdown
     undoStack: [],
+    // Threading / conversation grouping in the desktop list view (kata 64z6,
+    // task B7) — client-side v1, no server Thread/get. threadGroups is built
+    // incrementally at APPEND time (see extendThreadGroups / rebuildThreadGroups)
+    // so grouping never costs an O(n^2) per-render scan: Map threadId -> ordered
+    // array of the email ids seen for that thread. It is append-only within a
+    // loaded list (never pruned on archive) — visibleRows() re-derives the LIVE
+    // present-member set from state.emails each render, so a member being
+    // archived/undone stays correct without touching this map. expandedThreads
+    // holds the threadIds the user has expanded inline; it resets on every full
+    // list replace (see rebuildThreadGroups).
+    threadGroups: new Map(),
+    expandedThreads: new Set(),
     pendingG: false,          // for gg command
     commandPaletteIndex: 0,
     replyContext: null,       // for reply/forward
@@ -279,6 +291,13 @@ function init() {
 
     // Single delegated click handler for email list — never re-bound, survives innerHTML updates
     els.emailList.addEventListener('click', (e) => {
+        // Threading (kata 64z6): a click on a collapsed thread's count badge
+        // toggles inline expansion instead of opening the newest message.
+        const countBadge = e.target.closest('.email-thread-count');
+        if (countBadge) {
+            toggleThreadExpand(countBadge.dataset.thread);
+            return;
+        }
         const row = e.target.closest('.email-row');
         if (!row) return;
         state.selectedIndex = parseInt(row.dataset.index);
@@ -804,6 +823,8 @@ function selectAccount(account) {
     state.currentAccount = account;
     state.mailboxes = [];
     state.emails = [];
+    state.threadGroups = new Map();
+    state.expandedThreads = new Set();
     state.currentMailbox = null;
     state.currentEmail = null;
     state.selectedIndex = 0;
@@ -1036,6 +1057,7 @@ async function loadEmails() {
     if (splitListCache[context]) {
         state.emails = [...splitListCache[context]];
         state.selectedIndex = 0;
+        rebuildThreadGroups();
         renderEmailList();
     } else if (state.emails.length === 0) {
         els.emailList.innerHTML = '<div class="loading">Loading</div>';
@@ -1051,6 +1073,7 @@ async function loadEmails() {
         splitListCache[context] = [...emails];
         state.emails = emails;
         state.selectedIndex = 0;
+        rebuildThreadGroups();
         renderEmailList();
         harvestContacts(emails, state.currentAccount?.id);
     } catch (err) {
@@ -1078,6 +1101,7 @@ async function maybeRefillEmails() {
         const newEmails = fresh.filter(e => !existingIds.has(e.id));
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
+            extendThreadGroups(newEmails);
             splitListCache[context] = [...state.emails];
             renderEmailList();
             harvestContacts(newEmails, state.currentAccount?.id);
@@ -1372,15 +1396,18 @@ function renderEmailDetailPartial(listItem) {
 // Prefetch next few emails so archive/navigation is instant.
 // Fire-and-forget — no awaits, no blocking the UI.
 function prefetchAdjacentEmails() {
-    const idx = state.emails.findIndex(e => e.id === state.currentEmail?.id);
+    // Walk the VISIBLE rows (kata 64z6) so prefetch matches the archive-walk
+    // order the user actually advances through.
+    const rows = visibleRows();
+    const idx = rows.findIndex(r => r.emailId === state.currentEmail?.id);
     if (idx < 0) return;
 
     // Prefetch next 3 emails (the ones you'll hit when archiving repeatedly)
     for (let i = 1; i <= 3; i++) {
-        const target = state.emails[idx + i];
-        if (target && !emailCache[cacheKey(target.id)]) {
-            const key = cacheKey(target.id);
-            api('GET', `/emails/${target.id}`)
+        const target = rows[idx + i];
+        if (target && !emailCache[cacheKey(target.emailId)]) {
+            const key = cacheKey(target.emailId);
+            api('GET', `/emails/${target.emailId}`)
                 .then(email => { emailCache[key] = email; })
                 .catch(() => {}); // Swallow — prefetch is best-effort
         }
@@ -1660,8 +1687,135 @@ function getRecipientBadge(email) {
     return null;
 }
 
+// ============================================================================
+// Threading / conversation grouping (kata 64z6, task B7) — client-side v1
+// ============================================================================
+// state.emails stays the flat DATA model (all fetch/sort/filter/splice ops act
+// on it unchanged). visibleRows() derives the VIEW model on top of it: a thread
+// with 2+ loaded members collapses to ONE row; an expanded thread yields that
+// header row plus one indented sub-row per older member. Selection,
+// auto-advance and undo re-insert all index into visibleRows() — that single
+// seam is what keeps thread-awareness out of every keyboard/action path.
+
+// Full rebuild — called only on a full list replace (loadEmails). Also clears
+// the expand set, since the list content is changing under it.
+function rebuildThreadGroups() {
+    state.threadGroups = new Map();
+    state.expandedThreads = new Set();
+    extendThreadGroups(state.emails);
+}
+
+// Append-time extension (Muratori constraint — no per-render O(n^2)): fold a
+// freshly-appended page into the existing groups, in place, at the same site
+// pages enter state.emails. Idempotent per id so a re-seen page (splitListCache
+// snapshot, refill overlap) never double-registers a member. threadGroups is
+// append-only: archived ids are left in place and simply drop out of the LIVE
+// present set that visibleRows() recomputes from state.emails.
+function extendThreadGroups(emails) {
+    if (!emails || !emails.length) return;
+    for (const email of emails) {
+        const tid = email.threadId;
+        if (!tid) continue; // empty threadId => unknown => never grouped
+        let ids = state.threadGroups.get(tid);
+        if (!ids) {
+            ids = [];
+            state.threadGroups.set(tid, ids);
+        }
+        if (!ids.includes(email.id)) ids.push(email.id);
+    }
+}
+
+// The seam. Derives the ordered visible-row model from state.emails +
+// state.threadGroups + state.expandedThreads. Each row:
+//   { kind, emailId, email, threadId, unread, starred, count?, expanded? }
+//   kind: 'single' (ungrouped/lone), 'thread' (collapsed header, acts on
+//   newest), 'member' (an older member exposed while expanded).
+// A thread groups only when it has 2+ members STILL PRESENT in state.emails,
+// so archiving a member down to one collapses it back to a single row and the
+// count badge stays live. The collapsed row sits at the newest member's
+// position in the current sort ("group order follows the newest member").
+function visibleRows() {
+    const emails = state.emails;
+    if (!emails.length) return [];
+
+    // One O(n) pass: per grouped thread, collect present members (in list
+    // order), the newest member, and aggregate unread/starred flags.
+    const groups = new Map(); // tid -> { members:[email], newest, anyUnread, anyStarred }
+    for (const email of emails) {
+        const tid = email.threadId;
+        if (!tid) continue;
+        const known = state.threadGroups.get(tid);
+        if (!known || known.length < 2) continue; // never grouped
+        let g = groups.get(tid);
+        if (!g) {
+            g = { members: [], newest: email, anyUnread: false, anyStarred: false };
+            groups.set(tid, g);
+        }
+        g.members.push(email);
+        if (email.isUnread) g.anyUnread = true;
+        if (email.isFlagged) g.anyStarred = true;
+        if (email.receivedAt > g.newest.receivedAt) g.newest = email;
+    }
+
+    const rows = [];
+    for (const email of emails) {
+        const tid = email.threadId;
+        const g = tid ? groups.get(tid) : null;
+        // Singleton: no threadId, thread not registered, or only one member
+        // still loaded/present.
+        if (!g || g.members.length < 2) {
+            rows.push({ kind: 'single', emailId: email.id, email, threadId: tid || '', unread: email.isUnread, starred: email.isFlagged });
+            continue;
+        }
+        // Grouped: emit the collapsed header once, at the newest member's
+        // position; skip the other members (they're folded in, or listed below
+        // when expanded).
+        if (email !== g.newest) continue;
+        const expanded = state.expandedThreads.has(tid);
+        rows.push({ kind: 'thread', emailId: g.newest.id, email: g.newest, threadId: tid, count: g.members.length, unread: g.anyUnread, starred: g.anyStarred, expanded });
+        if (expanded) {
+            for (const m of g.members) {
+                if (m === g.newest) continue;
+                rows.push({ kind: 'member', emailId: m.id, email: m, threadId: tid, unread: m.isUnread, starred: m.isFlagged });
+            }
+        }
+    }
+    return rows;
+}
+
+// Resolve the visible-row index that now represents a given email id — used
+// after a re-insert (undo) where the flat state.emails index is meaningless
+// against the collapsed view. Falls back to the email's collapsed thread
+// header when the id is a non-newest member folded into a thread.
+function visibleRowIndexForEmailId(id) {
+    const rows = visibleRows();
+    let idx = rows.findIndex(r => r.emailId === id);
+    if (idx >= 0) return idx;
+    const email = state.emails.find(e => e.id === id);
+    if (email && email.threadId) {
+        idx = rows.findIndex(r => r.threadId === email.threadId);
+    }
+    return idx >= 0 ? idx : 0;
+}
+
+// Expand/collapse a thread inline (count-badge click). Keeps selection on the
+// thread's header row so j/k resumes from a stable spot.
+function toggleThreadExpand(threadId) {
+    if (!threadId) return;
+    if (state.expandedThreads.has(threadId)) {
+        state.expandedThreads.delete(threadId);
+    } else {
+        state.expandedThreads.add(threadId);
+    }
+    const rows = visibleRows();
+    const headerIdx = rows.findIndex(r => r.kind === 'thread' && r.threadId === threadId);
+    if (headerIdx >= 0) state.selectedIndex = headerIdx;
+    renderEmailList();
+}
+
 function renderEmailList() {
-    if (!state.emails.length) {
+    const rows = visibleRows();
+    if (!rows.length) {
         els.emailList.innerHTML = '<div class="empty-state">No emails</div>';
         return;
     }
@@ -1669,7 +1823,8 @@ function renderEmailList() {
     const showBadge = state.currentSplit === 'all';
     let lastGroup = null;
 
-    els.emailList.innerHTML = state.emails.map((email, idx) => {
+    els.emailList.innerHTML = rows.map((row, idx) => {
+        const email = row.email;
         const from = email.from[0];
         const fromDisplay = from?.name || from?.email || 'Unknown';
         const date = formatDate(email.receivedAt);
@@ -1681,10 +1836,21 @@ function renderEmailList() {
             divider = `<div class="date-divider"><span class="date-divider-label">${group}</span></div>`;
         }
 
+        const isThread = row.kind === 'thread';
+        const isMember = row.kind === 'member';
+        const rowClass = `email-row${idx === state.selectedIndex ? ' selected' : ''}${row.unread ? ' unread' : ''}`
+            + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`;
+        // Collapsed/expanded thread header carries a clickable count badge; a
+        // click on it toggles expansion instead of opening the message.
+        const countBadge = isThread
+            ? `<span class="email-thread-count${row.expanded ? ' expanded' : ''}" data-thread="${escapeAttr(row.threadId)}" title="${row.expanded ? 'Collapse' : 'Expand'} conversation (${row.count})">${row.expanded ? '▾ ' : ''}${row.count}</span>`
+            : '';
+
         return divider + `
-            <div class="email-row ${idx === state.selectedIndex ? 'selected' : ''} ${email.isUnread ? 'unread' : ''}"
-                 data-id="${email.id}" data-index="${idx}">
-                <span class="email-flag ${email.isFlagged ? 'flagged' : ''}">${email.isFlagged ? '★' : '☆'}</span>
+            <div class="${rowClass}"
+                 data-id="${email.id}" data-index="${idx}"${isThread ? ` data-thread="${escapeAttr(row.threadId)}"` : ''}>
+                <span class="email-flag ${row.starred ? 'flagged' : ''}">${row.starred ? '★' : '☆'}</span>
+                ${countBadge}
                 <span class="email-from">${escapeHtml(fromDisplay)}</span>
                 ${badge ? `<span class="email-recipient-badge">${escapeHtml(badge)}</span>` : ''}
                 <span class="email-subject">
@@ -3001,8 +3167,11 @@ function handleSearchInputChange() {
 // Navigation actions
 
 function moveSelection(delta) {
+    // Navigation indexes the VISIBLE row model (kata 64z6): a collapsed thread
+    // is one step; an expanded thread's members are individual steps.
+    const rows = visibleRows();
     const newIndex = state.selectedIndex + delta;
-    if (newIndex < 0 || newIndex >= state.emails.length) return;
+    if (newIndex < 0 || newIndex >= rows.length) return;
 
     // Swap selected class directly — don't rebuild the entire list DOM.
     // j/k should be zero-cost, not O(n) innerHTML.
@@ -3018,7 +3187,8 @@ function moveSelection(delta) {
     }
 
     if (state.view === 'detail') {
-        loadEmailDetail(state.emails[state.selectedIndex].id);
+        const row = rows[state.selectedIndex];
+        if (row) loadEmailDetail(row.emailId);
     }
 }
 
@@ -3028,14 +3198,17 @@ function moveToTop() {
 }
 
 function moveToBottom() {
-    state.selectedIndex = Math.max(0, state.emails.length - 1);
+    state.selectedIndex = Math.max(0, visibleRows().length - 1);
     renderEmailList();
 }
 
 function openSelected() {
-    const email = state.emails[state.selectedIndex];
-    if (email) {
-        loadEmailDetail(email.id);
+    // Enter/o opens the selected visible row: a collapsed thread opens its
+    // NEWEST message (kata 64z6 — same as clicking the row body; expansion is
+    // the count-badge affordance, not Enter).
+    const row = visibleRows()[state.selectedIndex];
+    if (row) {
+        loadEmailDetail(row.emailId);
     }
 }
 
@@ -3052,8 +3225,10 @@ function getSelectedEmailId() {
     if (state.view === 'detail' && state.currentEmail) {
         return state.currentEmail.id;
     }
-    const email = state.emails[state.selectedIndex];
-    return email?.id;
+    // Acting on a collapsed thread row acts on the NEWEST message only (kata
+    // 64z6, v1 — no bulk thread actions): the visible row already carries it.
+    const row = visibleRows()[state.selectedIndex];
+    return row?.emailId;
 }
 
 function actionSelected(type) {
@@ -3067,20 +3242,23 @@ function actionSelected(type) {
 }
 
 function goToNextEmail() {
-    // emailAction already removed the current email from state.emails,
-    // so just pick the next one at the same index (or clamp to end).
-    if (state.emails.length === 0) {
+    // emailAction already removed the current email from state.emails, so the
+    // next VISIBLE row at the same index is the one to advance to (kata 64z6 —
+    // auto-advance walks visibleRows, not the flat list, so a collapsed thread
+    // is one stop).
+    const rows = visibleRows();
+    if (rows.length === 0) {
         showView('list');
         maybeRefillEmails();
         return;
     }
 
-    const nextIndex = Math.min(state.selectedIndex, state.emails.length - 1);
+    const nextIndex = Math.min(state.selectedIndex, rows.length - 1);
     state.selectedIndex = nextIndex;
-    const nextEmail = state.emails[nextIndex];
+    const nextRow = rows[nextIndex];
 
-    if (nextEmail) {
-        loadEmailDetail(nextEmail.id);
+    if (nextRow) {
+        loadEmailDetail(nextRow.emailId);
     } else {
         showView('list');
     }
@@ -3135,6 +3313,9 @@ async function unsubscribeAndArchiveAll() {
         if (removedEmails.length > 0) {
             state.emails = state.emails.concat(removedEmails);
             state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+            // Re-registration is idempotent (ids were never pruned from the
+            // append-only groups), but keep it explicit for the revert path.
+            extendThreadGroups(removedEmails);
             invalidateSplitListCache();
             renderEmailList();
             adjustSplitCounts(+removedEmails.length);
@@ -3151,8 +3332,13 @@ function removeEmailsFromList(keepFn, expectedRemoved) {
     state.emails = state.emails.filter(keepFn);
     adjustSplitCounts(-expectedRemoved);
     invalidateSplitListCache();
-    if (state.selectedIndex >= state.emails.length) {
-        state.selectedIndex = Math.max(0, state.emails.length - 1);
+    // threadGroups is append-only — the removed ids just drop out of the live
+    // present set visibleRows() recomputes. Clamp selection against the VISIBLE
+    // row count (kata 64z6), which may differ from state.emails.length once a
+    // thread has collapsed.
+    const visibleCount = visibleRows().length;
+    if (state.selectedIndex >= visibleCount) {
+        state.selectedIndex = Math.max(0, visibleCount - 1);
     }
     renderEmailList();
     maybeRefillEmails();
@@ -3167,7 +3353,9 @@ function startCompose() {
 }
 
 function getComposeEmail() {
-    return state.view === 'detail' ? state.currentEmail : state.emails[state.selectedIndex];
+    // From the list, reply/forward targets the selected visible row's message
+    // — a collapsed thread yields its newest (kata 64z6).
+    return state.view === 'detail' ? state.currentEmail : visibleRows()[state.selectedIndex]?.email;
 }
 
 function startReply(replyAll) {
@@ -3988,11 +4176,17 @@ async function performUndo() {
     els.undoToast.classList.add('hidden');
     showStatus('Undone', 'success');
 
-    // Optimistic: re-insert the email into the list immediately
+    // Optimistic: re-insert the email into the list immediately. insertIndex is
+    // a state.emails (DATA) position — correct for restoring sort order — but
+    // selection must land on the re-inserted email's VISIBLE row, which under
+    // grouping is not that flat index (kata 64z6).
     if (item.emailData) {
         const idx = Math.min(item.insertIndex, state.emails.length);
         state.emails.splice(idx, 0, item.emailData);
-        state.selectedIndex = idx;
+        // Guarantee the id is registered even in the edge case where its thread
+        // was never grouped; extend is idempotent per id.
+        extendThreadGroups([item.emailData]);
+        state.selectedIndex = visibleRowIndexForEmailId(item.emailId);
         invalidateSplitListCache();
         renderEmailList();
 

@@ -2132,6 +2132,161 @@ mod tests {
     }
 
     // ====================================================================
+    // Threading / conversation grouping in the desktop list view
+    // (kata 64z6, task B7) — client-side v1. String-invariant tests per
+    // repo convention (no JS harness): they pin the shape of static/app.js
+    // rather than executing it.
+    // ====================================================================
+
+    #[test]
+    fn thread_group_state_present() {
+        // The append-time grouping structure and the expand set both live on
+        // state. threadGroups: Map threadId -> ordered array of email ids;
+        // expandedThreads: Set of threadIds the user has expanded inline.
+        assert!(
+            APP_JS.contains("threadGroups: new Map()"),
+            "state.threadGroups must be a Map (threadId -> ordered email ids), \
+             built at append time (kata 64z6)"
+        );
+        assert!(
+            APP_JS.contains("expandedThreads: new Set()"),
+            "state.expandedThreads must be a Set of expanded threadIds (kata 64z6)"
+        );
+    }
+
+    #[test]
+    fn thread_groups_built_at_append_sites() {
+        // Muratori constraint: the grouping map is built/extended where pages
+        // enter state.emails, never rebuilt per-render. Full replace ->
+        // rebuildThreadGroups; infinite-scroll append -> extendThreadGroups.
+        assert!(
+            APP_JS.contains("function extendThreadGroups(")
+                && APP_JS.contains("function rebuildThreadGroups("),
+            "both an append-extend and a full-rebuild grouping helper must exist"
+        );
+
+        // Full list replace path harvests via rebuild.
+        let start = APP_JS
+            .find("async function loadEmails()")
+            .expect("loadEmails must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\nasync function maybeRefillEmails")
+            .expect("loadEmails must be followed by maybeRefillEmails");
+        assert!(
+            rest[..end].contains("rebuildThreadGroups("),
+            "loadEmails must rebuild thread groups on a full list replace"
+        );
+
+        // Infinite-scroll append path extends the existing groups in place —
+        // at the same concat site pages enter state.emails.
+        let start2 = APP_JS
+            .find("async function maybeRefillEmails()")
+            .expect("maybeRefillEmails must exist");
+        let rest2 = &APP_JS[start2..];
+        let end2 = rest2
+            .find("\nasync function loadEmailDetail")
+            .expect("maybeRefillEmails must be followed by loadEmailDetail");
+        let block = &rest2[..end2];
+        assert!(
+            block.contains("state.emails.concat(newEmails)")
+                && block.contains("extendThreadGroups("),
+            "maybeRefillEmails must extend thread groups at the append site"
+        );
+    }
+
+    #[test]
+    fn visible_rows_derivation_exists_and_keyboard_nav_consumes_it() {
+        // The single seam: selection / auto-advance / undo index into a
+        // derived VISIBLE row model (collapsed thread = 1 row, expanded = row
+        // per member), not into state.emails directly. Keyboard nav must go
+        // through it so a collapsed thread counts as one step.
+        assert!(
+            APP_JS.contains("function visibleRows("),
+            "a visibleRows() derivation must exist as the flat-row seam (kata 64z6)"
+        );
+
+        let start = APP_JS
+            .find("function moveSelection(")
+            .expect("moveSelection must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("moveSelection must close");
+        assert!(
+            rest[..end].contains("visibleRows("),
+            "j/k navigation must index into visibleRows(), not state.emails"
+        );
+    }
+
+    #[test]
+    fn thread_row_shows_count_badge_and_aggregate_flags() {
+        // A thread with 2+ loaded members collapses to one row carrying a
+        // count badge; it reads unread if ANY member is unread and starred if
+        // ANY member is starred (aggregate, computed live from state.emails so
+        // the badge stays accurate after a member is archived/undone).
+        let start = APP_JS
+            .find("function visibleRows(")
+            .expect("visibleRows must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}\n").expect("visibleRows must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("anyUnread") && block.contains("anyStarred"),
+            "a collapsed thread must aggregate unread/starred across members"
+        );
+        assert!(
+            block.contains("kind: 'thread'"),
+            "visibleRows must emit a collapsed-thread row kind"
+        );
+
+        assert!(
+            APP_JS.contains("email-thread-count"),
+            "the collapsed-thread row must render a count-badge element"
+        );
+        let rstart = APP_JS
+            .find("function renderEmailList(")
+            .expect("renderEmailList must exist");
+        let rrest = &APP_JS[rstart..];
+        let rend = rrest.find("\n}\n").expect("renderEmailList must close");
+        assert!(
+            rrest[..rend].contains("row.count"),
+            "the rendered count badge must show the thread's live member count"
+        );
+    }
+
+    #[test]
+    fn undo_reinsert_selects_by_visible_row_not_flat_index() {
+        // The flat-row landmine: performUndo used to set selectedIndex to the
+        // state.emails insert index. Under grouping, selection indexes the
+        // VISIBLE rows, so it must resolve the re-inserted email's visible row.
+        let start = APP_JS
+            .find("async function performUndo()")
+            .expect("performUndo must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}\n").expect("performUndo must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("visibleRowIndexForEmailId("),
+            "undo must select the re-inserted email's VISIBLE row, not a raw \
+             state.emails index"
+        );
+    }
+
+    #[test]
+    fn list_selection_reads_visible_row_email_id() {
+        // Acting on a collapsed thread row acts on the NEWEST message (v1, no
+        // bulk thread actions): the selected id comes from the visible row.
+        let start = APP_JS
+            .find("function getSelectedEmailId()")
+            .expect("getSelectedEmailId must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("getSelectedEmailId must close");
+        assert!(
+            rest[..end].contains("visibleRows("),
+            "the selected email id (list view) must come from the visible row model"
+        );
+    }
+
+    // ====================================================================
     // Settings view (account management) regression sentinels
     // ====================================================================
 
