@@ -1947,14 +1947,14 @@ async function sendComposedEmail() {
             }
         }
     } catch (err) {
-        // Surface the failure — a silently dropped send would look like it
-        // went out — but only when this send still owns the active draft;
-        // a stale failure (session moved on to a new draft) has no form
-        // left to leave "intact for a retry" and must not be blamed on
-        // whatever the user is composing now.
-        if (state.composeSession === session) {
-            showError('Send', err);
-        }
+        // ALWAYS surface the failure, even from a stale session — the
+        // message never went out, and suppressing the toast because the
+        // user moved on would leave them believing it sent: a silently
+        // lost email (A6 re-review: failure-after-leave must surface).
+        // The session gate only covers FORM handling — the old draft is
+        // gone and the new draft's fields belong to a send this one
+        // didn't create, so there's nothing to keep "intact for a retry".
+        showError('Send', err);
     } finally {
         setComposeSending(false);
     }

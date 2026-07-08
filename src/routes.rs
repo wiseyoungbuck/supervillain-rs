@@ -2994,9 +2994,11 @@ mod tests {
         // immediately starting a NEW draft also lands back on
         // Screen.COMPOSE, so a monotonic composeSession token (bumped by
         // startCompose/startReply/startForward) captured before the await
-        // must additionally still match — on both the success and failure
-        // paths — before the stale completion touches that new draft
-        // (roborev 288).
+        // must additionally still match before the stale completion touches
+        // that new draft (roborev 288). The failure-path showError is the
+        // one thing deliberately NOT session-gated: a failed send is a lost
+        // email and must surface even after the user moved on (A6
+        // re-review: failure-after-leave must surface).
         let start = MOBILE_APP_JS
             .find("async function sendComposedEmail(")
             .expect("sendComposedEmail must exist");
@@ -3013,11 +3015,22 @@ mod tests {
             "sendComposedEmail must capture state.composeSession before the \
              send's await"
         );
-        let matches = block.matches("state.composeSession === session").count();
         assert!(
-            matches >= 2,
-            "both the success-path clear/back and the failure-path handling \
-             must require composeSession to still match (found {matches} checks)"
+            block.contains("state.composeSession === session"),
+            "the success-path clear/back must require composeSession to \
+             still match"
+        );
+        let catch_start = block.find("} catch (err)").expect("send must have a catch");
+        let catch_block = &block[catch_start..];
+        assert!(
+            catch_block.contains("showError('Send', err)"),
+            "the failure path must surface the send error"
+        );
+        assert!(
+            !catch_block.contains("state.composeSession === session"),
+            "showError on failure must be UNCONDITIONAL — gating it on the \
+             session would silently swallow a lost email after the user \
+             starts a new draft"
         );
     }
 
