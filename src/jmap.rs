@@ -379,12 +379,20 @@ fn to_jmap_filter(query: Option<&ParsedQuery>, mailbox_id: Option<&str>) -> serd
     }
 }
 
+/// Build the JMAP `Email/query` `sort` clause for the given order. Pure —
+/// fixture-tested without a JMAP round-trip, same style as `to_jmap_filter`.
+fn jmap_sort_clause(sort: EmailSort) -> serde_json::Value {
+    let is_ascending = matches!(sort, EmailSort::DateAsc);
+    serde_json::json!([{ "property": "receivedAt", "isAscending": is_ascending }])
+}
+
 pub async fn query_emails(
     s: &JmapSession,
     mailbox_id: Option<&str>,
     limit: usize,
     position: usize,
     query: Option<&ParsedQuery>,
+    sort: EmailSort,
 ) -> Result<Vec<String>, Error> {
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
@@ -397,7 +405,7 @@ pub async fn query_emails(
             {
                 "accountId": account_id,
                 "filter": filter,
-                "sort": [{ "property": "receivedAt", "isAscending": false }],
+                "sort": jmap_sort_clause(sort),
                 "limit": limit,
                 "position": position
             },
@@ -3010,6 +3018,26 @@ END:VCALENDAR";
         assert_eq!(
             filter,
             serde_json::json!({"before": "2026-06-30T00:00:00Z"})
+        );
+    }
+
+    // --- query_emails sort clause (kata 09ef) ---
+
+    #[test]
+    fn jmap_sort_clause_date_desc_is_descending() {
+        let sort = jmap_sort_clause(EmailSort::DateDesc);
+        assert_eq!(
+            sort,
+            serde_json::json!([{ "property": "receivedAt", "isAscending": false }])
+        );
+    }
+
+    #[test]
+    fn jmap_sort_clause_date_asc_is_ascending() {
+        let sort = jmap_sort_clause(EmailSort::DateAsc);
+        assert_eq!(
+            sort,
+            serde_json::json!([{ "property": "receivedAt", "isAscending": true }])
         );
     }
 

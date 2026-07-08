@@ -8,18 +8,28 @@
 //! Gmail split-counts).
 
 use crate::error::Error;
-use crate::types::{Email, Identity, Mailbox};
+use crate::types::{Email, EmailSort, Identity, Mailbox};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 /// Lookup key for the cached inbox email list. Two cache hits must share
-/// the same mailbox and limit; otherwise the cached payload doesn't match
-/// what the caller would have fetched.
+/// the same mailbox, limit, and sort order; otherwise the cached payload
+/// doesn't match what the caller would have fetched.
+///
+/// `sort` joined this key in kata 09ef, alongside `mailbox_id`/`limit`:
+/// without it, a `DateAsc` request and the warmer's always-`DateDesc`
+/// entry would collide on the same slot, so whichever wrote last would
+/// silently serve the wrong order to the other. The background warmer
+/// only ever populates the `DateDesc` slot (see `fetch_inbox` /
+/// `warm_all_mailboxes`); non-default sort requests always miss the warm
+/// cache and fetch live, but still populate — and correctly reuse — their
+/// own slot within a session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct InboxKey {
     pub mailbox_id: String,
     pub limit: usize,
+    pub sort: EmailSort,
 }
 
 /// Per-account cache. `inbox_lists` is a map (one entry per (mailbox, limit))
@@ -525,6 +535,11 @@ async fn warm_all_mailboxes(
                         InboxKey {
                             mailbox_id: mailbox_id.clone(),
                             limit: crate::routes::DEFAULT_INBOX_LIMIT,
+                            // The warmer always warms the default (newest-first)
+                            // order — it has no notion of a per-session sort
+                            // toggle. Non-default-sort requests miss this entry
+                            // and fetch live; see the `InboxKey` doc comment.
+                            sort: EmailSort::DateDesc,
                         },
                         emails,
                     )
@@ -675,6 +690,7 @@ async fn fetch_inbox(
         crate::routes::DEFAULT_INBOX_LIMIT,
         0,
         None,
+        EmailSort::DateDesc,
     )
     .await?;
     crate::provider::get_emails(&session, &ids, false, None).await
@@ -853,6 +869,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache
             .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
@@ -957,6 +974,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         let calls = Arc::new(AtomicU32::new(0));
         let c2 = calls.clone();
@@ -982,6 +1000,7 @@ mod tests {
         let k2 = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 50,
+            sort: EmailSort::DateDesc,
         };
         let _ = cache
             .inbox_list_or_fetch("acc-1", k2, move || {
@@ -1058,6 +1077,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         let set = cache
             .try_set_inbox_list("acc-1", v0, key.clone(), vec![email("stale")])
@@ -1079,6 +1099,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "INBOX".into(),
             limit: crate::routes::DEFAULT_INBOX_LIMIT,
+            sort: EmailSort::DateDesc,
         };
         cache
             .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
@@ -1088,6 +1109,7 @@ mod tests {
         let lookup = InboxKey {
             mailbox_id: "INBOX".into(),
             limit: crate::routes::DEFAULT_INBOX_LIMIT,
+            sort: EmailSort::DateDesc,
         };
         assert!(
             cache.get_inbox_list("acc-1", &lookup).await.is_some(),
@@ -1254,6 +1276,7 @@ mod tests {
         let k150 = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache
             .set_inbox_list("acc-1", k150.clone(), vec![email("e1")])
@@ -1266,6 +1289,7 @@ mod tests {
         let k50 = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 50,
+            sort: EmailSort::DateDesc,
         };
         assert!(cache.get_inbox_list("acc-1", &k50).await.is_none());
 
@@ -1273,8 +1297,58 @@ mod tests {
         let k_other = InboxKey {
             mailbox_id: "archive".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         assert!(cache.get_inbox_list("acc-1", &k_other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbox_list_keyed_by_sort_too() {
+        // Regression test (kata 09ef): before `sort` joined `InboxKey`, a
+        // DateAsc request and the warmer's always-DateDesc entry shared the
+        // same (mailbox_id, limit) slot. Whichever wrote last would then be
+        // served to *both* — e.g. a warmed desc list could be handed back
+        // to a request that explicitly asked for ascending order, wrong
+        // order served silently rather than the plan's required error/
+        // documented-limitation path. `sort` in the key keeps them in
+        // separate slots.
+        let cache = PrefetchCache::new();
+        let desc_key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateDesc,
+        };
+        let asc_key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateAsc,
+        };
+
+        cache
+            .set_inbox_list("acc-1", desc_key.clone(), vec![email("newest-first")])
+            .await;
+
+        // Same mailbox/limit, different sort: must miss, not return the
+        // desc-ordered payload under a different name.
+        assert!(
+            cache.get_inbox_list("acc-1", &asc_key).await.is_none(),
+            "an asc lookup must not be served the desc-keyed entry"
+        );
+
+        cache
+            .set_inbox_list("acc-1", asc_key.clone(), vec![email("oldest-first")])
+            .await;
+
+        // Both entries coexist independently — storing asc must not have
+        // clobbered desc.
+        assert_eq!(
+            cache.get_inbox_list("acc-1", &desc_key).await.unwrap()[0].id,
+            "newest-first"
+        );
+        assert_eq!(
+            cache.get_inbox_list("acc-1", &asc_key).await.unwrap()[0].id,
+            "oldest-first"
+        );
     }
 
     #[tokio::test]
@@ -1286,10 +1360,12 @@ mod tests {
         let inbox_key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         let archive_key = InboxKey {
             mailbox_id: "archive".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache
             .set_inbox_list("acc-1", inbox_key.clone(), vec![email("a")])
@@ -1384,6 +1460,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache
             .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
@@ -1427,6 +1504,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
         cache.set_identities("acc-1", vec![ident("p")]).await;
@@ -1453,6 +1531,7 @@ mod tests {
         let key = InboxKey {
             mailbox_id: "inbox".into(),
             limit: 150,
+            sort: EmailSort::DateDesc,
         };
         cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
         cache.set_identities("acc-1", vec![ident("p")]).await;

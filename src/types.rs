@@ -307,6 +307,23 @@ impl ParsedQuery {
 }
 
 // =============================================================================
+// Email list sort (kata 09ef)
+// =============================================================================
+
+/// Desktop list sort order. Wire values are `date_desc` / `date_asc` via
+/// `rename_all = "snake_case"`. Deserializing an unrecognized value is a
+/// hard error (axum's `Query` extractor turns it into a 400) rather than a
+/// silent fallback to the default — see `ListEmailsParams::sort` in
+/// `routes.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmailSort {
+    #[default]
+    DateDesc,
+    DateAsc,
+}
+
+// =============================================================================
 // Split inbox types
 // =============================================================================
 
@@ -1087,5 +1104,43 @@ mod tests {
         // traversal sequences must not survive parse.
         assert!(BlobRef::parse("outlook:../escape:att").is_err());
         assert!(BlobRef::parse("outlook:msg:..%2Fescape").is_err());
+    }
+
+    // =========================================================================
+    // EmailSort deserialization (kata 09ef)
+    // =========================================================================
+
+    #[test]
+    fn email_sort_default_is_date_desc() {
+        assert_eq!(EmailSort::default(), EmailSort::DateDesc);
+    }
+
+    #[test]
+    fn email_sort_deserializes_date_desc() {
+        let v: EmailSort = serde_json::from_value(serde_json::json!("date_desc")).unwrap();
+        assert_eq!(v, EmailSort::DateDesc);
+    }
+
+    #[test]
+    fn email_sort_deserializes_date_asc() {
+        let v: EmailSort = serde_json::from_value(serde_json::json!("date_asc")).unwrap();
+        assert_eq!(v, EmailSort::DateAsc);
+    }
+
+    #[test]
+    fn email_sort_rejects_unknown_value() {
+        // Unknown sort values must be a hard deserialization error, never a
+        // silent fallback to the default — a typo'd `sort=` must not
+        // quietly serve newest-first while looking like it did something.
+        let result: Result<EmailSort, _> = serde_json::from_value(serde_json::json!("banana"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn email_sort_rejects_wrong_case() {
+        // Wire values are lowercase snake_case; the legacy-looking
+        // "DateDesc"/"DATE_DESC" spellings must not sneak through.
+        let result: Result<EmailSort, _> = serde_json::from_value(serde_json::json!("DateDesc"));
+        assert!(result.is_err());
     }
 }

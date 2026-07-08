@@ -242,6 +242,11 @@ struct ListEmailsParams {
     search: Option<String>,
     account: Option<String>,
     starred: Option<bool>,
+    /// List sort order. Absent means "use the default" (newest-first,
+    /// today's behavior); an unrecognized value is rejected at
+    /// deserialization (400), never silently coerced to the default —
+    /// see `EmailSort`'s doc comment (kata 09ef).
+    sort: Option<EmailSort>,
 }
 
 #[derive(Deserialize)]
@@ -440,6 +445,7 @@ async fn list_emails(
 ) -> Result<impl IntoResponse, Error> {
     let limit = params.limit.unwrap_or(DEFAULT_INBOX_LIMIT);
     let offset = params.offset.unwrap_or(0);
+    let sort = params.sort.unwrap_or_default();
 
     let mut query = params.search.as_deref().map(search::parse_query);
     // The sidebar Starred toggle takes precedence: when ?starred=true is
@@ -494,9 +500,13 @@ async fn list_emails(
         && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT;
 
     let mut emails = if is_cacheable {
+        // `sort` joins the cache key so a non-default-sort request can
+        // never collide with (and serve, or be served) the warmer's
+        // always-default-order entry — see `InboxKey`'s doc comment.
         let key = crate::prefetch::InboxKey {
             mailbox_id: params.mailbox_id.clone().unwrap(),
             limit,
+            sort,
         };
         state
             .prefetch
@@ -509,6 +519,7 @@ async fn list_emails(
                     fetch_limit,
                     offset,
                     query_ref,
+                    sort,
                 )
                 .await?;
                 provider::get_emails(&session, &email_ids, false, None).await
@@ -523,6 +534,7 @@ async fn list_emails(
             fetch_limit,
             offset,
             query_ref,
+            sort,
         )
         .await?;
         provider::get_emails(&session, &email_ids, false, None).await?
@@ -1035,7 +1047,10 @@ async fn unsubscribe_and_archive(
         from: vec![sender_email.clone()],
         ..Default::default()
     };
-    let all_ids = provider::query_emails(&session, None, 500, 0, Some(&query)).await?;
+    // Order doesn't matter here — every match gets archived regardless of
+    // the sequence they're fetched in — so the default is fine.
+    let all_ids =
+        provider::query_emails(&session, None, 500, 0, Some(&query), EmailSort::default()).await?;
 
     // Archive all
     let archived = provider::archive_batch(&session, &all_ids).await?;
@@ -1161,8 +1176,17 @@ pub(crate) async fn compute_split_counts(
     let session = session_lock.read().await;
 
     let fetch_limit = DEFAULT_INBOX_LIMIT * SPLIT_OVERFETCH_MULTIPLIER;
-    let email_ids =
-        provider::query_emails(&session, Some(mailbox_id), fetch_limit, 0, query.as_ref()).await?;
+    // Split counts are order-independent (just counting matches), so the
+    // default sort is fine here regardless of the user's list sort choice.
+    let email_ids = provider::query_emails(
+        &session,
+        Some(mailbox_id),
+        fetch_limit,
+        0,
+        query.as_ref(),
+        EmailSort::default(),
+    )
+    .await?;
 
     let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
     let mut all_emails = Vec::new();
@@ -1909,6 +1933,62 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Desktop sort control (kata 09ef) — buildEmailListUrl appends &sort=,
+    // splitCacheKey discriminates by it (mirrors starredOnly), and
+    // selectAccount resets it to the default like other per-session view state.
+    // =========================================================================
+
+    #[test]
+    fn build_email_list_url_appends_sort_param() {
+        let start = APP_JS
+            .find("function buildEmailListUrl")
+            .expect("buildEmailListUrl must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("buildEmailListUrl must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("sort="),
+            "buildEmailListUrl must append &sort= so the sort control reaches the server"
+        );
+        assert!(
+            body.contains("state.sortOrder"),
+            "buildEmailListUrl must read the sort value from state.sortOrder"
+        );
+    }
+
+    #[test]
+    fn split_cache_key_includes_sort_order() {
+        // Same bug class as the server's prefetch InboxKey: without this,
+        // toggling sort would render a stale, wrong-order splitListCache
+        // entry before the network refresh corrects it, and the refresh
+        // would then overwrite the *other* order's cached entry.
+        let start = APP_JS
+            .find("function splitCacheKey")
+            .expect("splitCacheKey must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("splitCacheKey must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.sortOrder"),
+            "splitCacheKey must fold state.sortOrder into the cache key"
+        );
+    }
+
+    #[test]
+    fn select_account_resets_sort_order_to_default() {
+        let start = APP_JS
+            .find("function selectAccount")
+            .expect("selectAccount must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("selectAccount must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.sortOrder"),
+            "selectAccount must reset state.sortOrder to the default on account switch"
+        );
+    }
+
     #[test]
     fn save_split_tags_current_account() {
         assert!(
@@ -2051,6 +2131,55 @@ mod tests {
             .expect("mark_read=false&account=... must deserialize");
         assert_eq!(params.mark_read, Some(false));
         assert_eq!(params.account.as_deref(), Some("work"));
+    }
+
+    // =========================================================================
+    // ListEmailsParams sort deserialization (kata 09ef) — accept both known
+    // values and absence, hard-reject anything else so a typo'd sort=
+    // param can never silently fall back to the default order.
+    // =========================================================================
+
+    #[test]
+    fn list_emails_params_sort_absent_deserializes_to_none() {
+        let uri: axum::http::Uri = "/api/emails?mailbox_id=inbox".parse().unwrap();
+        let Query(params) = Query::<ListEmailsParams>::try_from_uri(&uri)
+            .expect("no sort param must still deserialize");
+        assert_eq!(params.sort, None);
+        assert_eq!(
+            params.sort.unwrap_or_default(),
+            EmailSort::DateDesc,
+            "absent sort must resolve to today's default (newest-first) behavior"
+        );
+    }
+
+    #[test]
+    fn list_emails_params_sort_date_desc_parses() {
+        let uri: axum::http::Uri = "/api/emails?mailbox_id=inbox&sort=date_desc"
+            .parse()
+            .unwrap();
+        let Query(params) =
+            Query::<ListEmailsParams>::try_from_uri(&uri).expect("sort=date_desc must deserialize");
+        assert_eq!(params.sort, Some(EmailSort::DateDesc));
+    }
+
+    #[test]
+    fn list_emails_params_sort_date_asc_parses() {
+        let uri: axum::http::Uri = "/api/emails?mailbox_id=inbox&sort=date_asc"
+            .parse()
+            .unwrap();
+        let Query(params) =
+            Query::<ListEmailsParams>::try_from_uri(&uri).expect("sort=date_asc must deserialize");
+        assert_eq!(params.sort, Some(EmailSort::DateAsc));
+    }
+
+    #[test]
+    fn list_emails_params_sort_garbage_is_rejected() {
+        let uri: axum::http::Uri = "/api/emails?mailbox_id=inbox&sort=banana".parse().unwrap();
+        let result = Query::<ListEmailsParams>::try_from_uri(&uri);
+        assert!(
+            result.is_err(),
+            "an unrecognized sort value must be a 400, not a silent default"
+        );
     }
 
     #[test]

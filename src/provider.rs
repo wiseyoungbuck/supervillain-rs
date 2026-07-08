@@ -72,16 +72,17 @@ pub async fn query_emails(
     limit: usize,
     position: usize,
     query: Option<&ParsedQuery>,
+    sort: EmailSort,
 ) -> Result<Vec<String>, Error> {
     match s {
         ProviderSession::Fastmail(s) => {
-            jmap::query_emails(s, mailbox_id, limit, position, query).await
+            jmap::query_emails(s, mailbox_id, limit, position, query, sort).await
         }
         ProviderSession::Outlook(s) => {
-            outlook::query_emails(s, mailbox_id, limit, position, query).await
+            outlook::query_emails(s, mailbox_id, limit, position, query, sort).await
         }
         ProviderSession::Gmail(s) => {
-            gmail::query_emails(s, mailbox_id, limit, position, query).await
+            gmail::query_emails(s, mailbox_id, limit, position, query, sort).await
         }
     }
 }

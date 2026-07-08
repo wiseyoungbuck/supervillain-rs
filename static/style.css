@@ -457,6 +457,35 @@ body {
     margin-right: 5px;
 }
 
+/* List toolbar (sort control) */
+#list-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+}
+
+.sort-toggle-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.sort-toggle-btn:hover {
+    border-color: var(--accent);
+    color: var(--fg);
+}
+
+.sort-toggle-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
 /* Email list */
 #email-list {
     flex: 1;

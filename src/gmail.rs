@@ -28,7 +28,7 @@ use crate::provider_utils::{
     mime_type_from_filename, should_clear_tokens_on_refresh_failure,
 };
 use crate::rate_limit::RateLimiter;
-use crate::types::{CalendarEvent, Email, EmailAddress, Identity, Mailbox, ParsedQuery};
+use crate::types::{CalendarEvent, Email, EmailAddress, EmailSort, Identity, Mailbox, ParsedQuery};
 
 // =============================================================================
 // Endpoints + constants
@@ -786,18 +786,50 @@ fn record_page_fetched(
     cache[next_idx] = next_start;
 }
 
+/// Reorder a single fetched batch of message ids for the requested sort.
+///
+/// Gmail's `messages.list` has no server-side `orderBy` parameter — it
+/// always returns results in its own default order (newest-first for a
+/// plain list/search). There is no way to ask the API itself for
+/// oldest-first. Rather than silently ignoring `DateAsc` and returning the
+/// wrong order (which the plan explicitly forbids), we reverse the
+/// already-fetched page client-side.
+///
+/// This is **page-scoped, not a global sort**: `ids` here is exactly the
+/// `limit`-sized batch this call is about to return (the caller's one
+/// "page" of the infinite-scroll list), so reversing it yields a correct
+/// oldest-first ordering *within that batch*. It does NOT retroactively
+/// reorder across batches — paginating forward through `DateAsc` still
+/// walks Gmail's underlying pages newest-block-first; only the items
+/// inside each returned block are ascending. Documented v1 limitation
+/// (kata 09ef); a true global ascending order would require fetching and
+/// buffering the entire result set, which isn't cheap for large mailboxes.
+fn apply_sort_order(mut ids: Vec<String>, sort: EmailSort) -> Vec<String> {
+    if sort == EmailSort::DateAsc {
+        ids.reverse();
+    }
+    ids
+}
+
 /// Query email IDs. Translates cursor pagination to the route handler's
 /// offset model. The cache stores the `PageStart` for fetching page N for
 /// each (mailbox+query) key; first request seeds it, subsequent forward
 /// requests follow it, jump-backs re-walk from 0 (bounded by MAX_REWALK_PAGES).
 /// `PageStart::End` entries are respected — we never re-issue a page-0 fetch
 /// just because a later page returned no more results.
+///
+/// `sort` only affects the order of the ids returned from *this* call —
+/// see `apply_sort_order` for why it's page-scoped rather than global. The
+/// underlying page-token cursor cache (`session.page_cache`) is unaffected:
+/// Gmail's raw page fetches are identical regardless of the requested
+/// display order, so the same cursors are reused for both.
 pub async fn query_emails(
     session: &GmailSession,
     mailbox_id: Option<&str>,
     limit: usize,
     position: usize,
     query: Option<&ParsedQuery>,
+    sort: EmailSort,
 ) -> Result<Vec<String>, Error> {
     let q = query.map(translate_query_to_q).unwrap_or_default();
     let token = access_token(session).await?;
@@ -896,7 +928,7 @@ pub async fn query_emails(
     let mut cache_lock = session.page_cache.lock().await;
     cache_lock.insert(key, cache);
 
-    Ok(ids)
+    Ok(apply_sort_order(ids, sort))
 }
 
 // =============================================================================
@@ -3378,6 +3410,52 @@ mod tests {
         ];
         record_page_fetched(&mut cache, 0, Some("t1-new".into()));
         assert_eq!(cache[1], PageStart::With("t1-new".into()));
+    }
+
+    // ---- query_emails sort (kata 09ef): Gmail has no server-side orderBy,
+    // so DateAsc reverses the already-fetched page client-side ----
+
+    #[test]
+    fn apply_sort_order_date_desc_leaves_order_unchanged() {
+        let ids = vec![
+            "newest".to_string(),
+            "mid".to_string(),
+            "oldest".to_string(),
+        ];
+        assert_eq!(
+            apply_sort_order(ids.clone(), EmailSort::DateDesc),
+            ids,
+            "DateDesc matches Gmail's default order — no reversal"
+        );
+    }
+
+    #[test]
+    fn apply_sort_order_date_asc_reverses_the_page() {
+        let ids = vec![
+            "newest".to_string(),
+            "mid".to_string(),
+            "oldest".to_string(),
+        ];
+        assert_eq!(
+            apply_sort_order(ids, EmailSort::DateAsc),
+            vec![
+                "oldest".to_string(),
+                "mid".to_string(),
+                "newest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_sort_order_handles_empty_and_single_element() {
+        assert_eq!(
+            apply_sort_order(Vec::<String>::new(), EmailSort::DateAsc),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            apply_sort_order(vec!["only".to_string()], EmailSort::DateAsc),
+            vec!["only".to_string()]
+        );
     }
 
     // ---- nested multipart/related → multipart/alternative (roborev 173 #9) ----

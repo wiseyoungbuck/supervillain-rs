@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::provider_utils::{MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP};
 use crate::rate_limit::RateLimiter;
-use crate::types::{CalendarEvent, Mailbox};
+use crate::types::{CalendarEvent, EmailSort, Mailbox};
 
 // =============================================================================
 // Outlook Session
@@ -1249,6 +1249,21 @@ struct MessageRef {
     id: String,
 }
 
+/// Cache-key tag for the requested order. Graph's `@odata.nextLink` is an
+/// opaque URL that bakes in the `$orderby` the caller originally requested
+/// — following one built under a different order would silently return
+/// results in that *other* order (roborev-style latent bug this feature
+/// would otherwise introduce: before sort was toggleable, every query used
+/// the same hardcoded desc order, so the cursor cache could never be
+/// cross-contaminated between orders). Folding the order into the cache
+/// key keeps desc/asc cursors in separate slots.
+fn sort_cache_tag(sort: EmailSort) -> &'static str {
+    match sort {
+        EmailSort::DateDesc => "desc",
+        EmailSort::DateAsc => "asc",
+    }
+}
+
 /// Query messages with pagination. Graph paginates via opaque
 /// `@odata.nextLink` URLs; we cache the link verbatim for forward iteration
 /// and re-use `$skip` for jump-back. Bounded by `MAX_REWALK_PAGES` to keep
@@ -1259,16 +1274,19 @@ pub async fn query_emails(
     limit: usize,
     position: usize,
     query: Option<&crate::types::ParsedQuery>,
+    sort: EmailSort,
 ) -> Result<Vec<String>, Error> {
     let token = access_token(session).await?;
     let odata = query.map(translate_query_to_odata).unwrap_or_default();
 
-    // Cache key combines folder + serialized query for cursor reuse.
+    // Cache key combines folder + serialized query + sort order for cursor
+    // reuse. See `sort_cache_tag` for why the order must be part of the key.
     let cache_key = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         folder_id.unwrap_or(""),
         odata.filter.as_deref().unwrap_or(""),
-        odata.search.as_deref().unwrap_or("")
+        odata.search.as_deref().unwrap_or(""),
+        sort_cache_tag(sort)
     );
 
     // Forward iteration: if cache has a next_link for at_position == position,
@@ -1283,7 +1301,7 @@ pub async fn query_emails(
 
     let url = match cached_next_link {
         Some(link) => link,
-        None => build_outlook_query_url(folder_id, &odata, limit, position),
+        None => build_outlook_query_url(folder_id, &odata, limit, position, sort),
     };
 
     let resp = session.client.get(&url).bearer_auth(&token).send().await?;
@@ -1325,6 +1343,7 @@ fn build_outlook_query_url(
     odata: &OdataQuery,
     limit: usize,
     position: usize,
+    sort: EmailSort,
 ) -> String {
     let base = match folder_id {
         Some(id) if !id.is_empty() => format!(
@@ -1350,7 +1369,10 @@ fn build_outlook_query_url(
         // ($search results are relevance-ranked). Skipping $orderby when
         // $search is set is the load-bearing fix; results then come back
         // in Graph's default order (relevance for $search, server-default
-        // otherwise — usually receivedDateTime desc).
+        // otherwise — usually receivedDateTime desc). This applies
+        // regardless of the requested `sort` (kata 09ef): Graph's search
+        // relevance ranking takes priority over any explicit order, same
+        // pre-existing limitation as the old hardcoded-desc behavior.
         //
         // Roborev 179 #2 policy: when both $filter and $search are set,
         // we emit both. Graph's docs say this is supported on
@@ -1359,7 +1381,11 @@ fn build_outlook_query_url(
         // makes it visible. Switching to client-side filtering is the
         // documented fallback; defer until reports come in.
         if odata.search.is_none() {
-            q.append_pair("$orderby", "receivedDateTime desc");
+            let orderby = match sort {
+                EmailSort::DateDesc => "receivedDateTime desc",
+                EmailSort::DateAsc => "receivedDateTime asc",
+            };
+            q.append_pair("$orderby", orderby);
         }
     }
     url.to_string()
@@ -4107,7 +4133,7 @@ mod tests {
             filter: Some("isRead eq false".into()),
             search: None,
         };
-        let url = build_outlook_query_url(None, &odata, 25, 0);
+        let url = build_outlook_query_url(None, &odata, 25, 0, EmailSort::DateDesc);
         assert!(
             url.contains("%24orderby=receivedDateTime+desc")
                 || url.contains("%24orderby=receivedDateTime%20desc"),
@@ -4124,7 +4150,7 @@ mod tests {
             filter: None,
             search: Some(r#""newsletter""#.into()),
         };
-        let url = build_outlook_query_url(None, &odata, 25, 0);
+        let url = build_outlook_query_url(None, &odata, 25, 0, EmailSort::DateDesc);
         assert!(
             !url.contains("orderby"),
             "expected NO $orderby when $search present: {url}"
@@ -4137,7 +4163,7 @@ mod tests {
             filter: Some("isRead eq false".into()),
             search: Some(r#""urgent""#.into()),
         };
-        let url = build_outlook_query_url(None, &odata, 25, 0);
+        let url = build_outlook_query_url(None, &odata, 25, 0, EmailSort::DateDesc);
         assert!(!url.contains("orderby"));
         assert!(url.contains("%24filter=") || url.contains("$filter="));
         assert!(url.contains("%24search=") || url.contains("$search="));
@@ -4145,28 +4171,71 @@ mod tests {
 
     #[test]
     fn url_builder_uses_folder_path_when_id_given() {
-        let url = build_outlook_query_url(Some("inbox"), &OdataQuery::default(), 25, 0);
+        let url = build_outlook_query_url(
+            Some("inbox"),
+            &OdataQuery::default(),
+            25,
+            0,
+            EmailSort::DateDesc,
+        );
         assert!(url.contains("/me/mailFolders/inbox/messages"));
     }
 
     #[test]
     fn url_builder_uses_me_messages_when_folder_none() {
-        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0);
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0, EmailSort::DateDesc);
         assert!(url.contains("/me/messages"));
         assert!(!url.contains("mailFolders"));
     }
 
     #[test]
     fn url_builder_includes_top_and_skip() {
-        let url = build_outlook_query_url(None, &OdataQuery::default(), 50, 100);
+        let url =
+            build_outlook_query_url(None, &OdataQuery::default(), 50, 100, EmailSort::DateDesc);
         assert!(url.contains("%24top=50") || url.contains("$top=50"));
         assert!(url.contains("%24skip=100") || url.contains("$skip=100"));
     }
 
     #[test]
     fn url_builder_omits_skip_when_position_zero() {
-        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0);
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0, EmailSort::DateDesc);
         assert!(!url.contains("skip="));
+    }
+
+    // ---- kata 09ef: $orderby honors the requested sort direction ----
+
+    #[test]
+    fn url_builder_uses_ascending_orderby_for_date_asc() {
+        let url = build_outlook_query_url(None, &OdataQuery::default(), 25, 0, EmailSort::DateAsc);
+        assert!(
+            url.contains("%24orderby=receivedDateTime+asc")
+                || url.contains("%24orderby=receivedDateTime%20asc"),
+            "expected ascending $orderby for DateAsc: {url}"
+        );
+    }
+
+    #[test]
+    fn url_builder_omits_orderby_for_date_asc_when_search_present() {
+        // The $orderby/$search mutual-exclusion (roborev 179 #1) applies
+        // regardless of which order was requested.
+        let odata = OdataQuery {
+            filter: None,
+            search: Some(r#""newsletter""#.into()),
+        };
+        let url = build_outlook_query_url(None, &odata, 25, 0, EmailSort::DateAsc);
+        assert!(!url.contains("orderby"));
+    }
+
+    // ---- kata 09ef: page-cache cursor key must include sort order, or a
+    // cached opaque nextLink built for one order gets replayed for the
+    // other (Graph's nextLink bakes in the original $orderby) ----
+
+    #[test]
+    fn sort_cache_tag_distinguishes_desc_and_asc() {
+        assert_ne!(
+            sort_cache_tag(EmailSort::DateDesc),
+            sort_cache_tag(EmailSort::DateAsc)
+        );
     }
 
     // ---- Roborev 179 #11: classify_outlook_error tests ----

@@ -23,6 +23,8 @@ const state = {
     pendingAttachments: [],   // files being uploaded for compose
     splitCounts: {},          // email counts per split tab
     starredOnly: false,       // sidebar "Starred" filter — restricts list to $flagged emails
+    sortOrder: 'date_desc',   // list sort: 'date_desc' (newest first, default) | 'date_asc' (oldest first)
+                              // session-only — resets to default on account switch (see selectAccount)
     // Settings view (account management)
     selectedAccountId: null,  // which account is focused in settings
     settingsMode: 'view',     // 'view' | 'edit' | 'awaiting'
@@ -137,6 +139,7 @@ function init() {
     els.composeAttachmentsList = document.getElementById('compose-attachments-list');
     els.composeFileInput = document.getElementById('compose-file-input');
     els.starredItem = document.getElementById('starred-item');
+    els.sortToggle = document.getElementById('sort-toggle');
     els.accountErrorBanner = document.getElementById('account-error-banner');
     els.accountErrorDetails = document.getElementById('account-error-details');
     // Timezone banner + settings
@@ -193,6 +196,10 @@ function init() {
             }
         });
     }
+    if (els.sortToggle) {
+        els.sortToggle.addEventListener('click', toggleSortOrder);
+    }
+    renderSortToggle();
     els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
         els.accountErrorBanner.classList.add('hidden');
     });
@@ -752,6 +759,10 @@ function selectAccount(account) {
     state.currentSplit = 'all';
     state.splits = [];
     state.splitCounts = {};
+    // Sort order is session-only (kata 09ef), reset to the default on
+    // every account switch — same treatment as currentSplit above.
+    state.sortOrder = 'date_desc';
+    renderSortToggle();
     // splitListCache, emailCache, and scrollPositions are all account-scoped
     // (their keys include state.currentAccount.id). Switching accounts can't
     // surface previous-account state, and returning to an account finds its
@@ -885,7 +896,7 @@ function renderSplitTabs() {
 }
 
 function splitCacheKey() {
-    return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${state.starredOnly ? 'S' : ''}:${getSearchQuery()}`;
+    return `${state.currentAccount?.id || ''}:${state.currentMailbox?.id || ''}:${state.currentSplit || 'all'}:${state.starredOnly ? 'S' : ''}:${state.sortOrder}:${getSearchQuery()}`;
 }
 
 function invalidateSplitListCache() {
@@ -938,6 +949,7 @@ function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
         url += `&split_id=${state.currentSplit}`;
     }
     if (state.starredOnly) url += `&starred=true`;
+    url += `&sort=${state.sortOrder}`;
     const search = getSearchQuery();
     if (search) url += `&search=${encodeURIComponent(search)}`;
     return url;
@@ -1294,6 +1306,25 @@ function toggleStarredOnly() {
     updateMailboxNameDisplay();
     loadEmails();
     if (state.currentMailbox.role === 'inbox') loadSplitCounts();
+}
+
+function renderSortToggle() {
+    if (!els.sortToggle) return;
+    const isAsc = state.sortOrder === 'date_asc';
+    els.sortToggle.textContent = isAsc ? 'Oldest first' : 'Newest first';
+    els.sortToggle.setAttribute('aria-pressed', String(isAsc));
+    els.sortToggle.classList.toggle('active', isAsc);
+}
+
+function toggleSortOrder() {
+    if (!state.currentMailbox) return;
+    state.sortOrder = state.sortOrder === 'date_asc' ? 'date_desc' : 'date_asc';
+    // Cache key already encodes sort (splitCacheKey), so toggling switches
+    // to a different cached slot rather than throwing both away — same
+    // pattern as toggleStarredOnly. Split counts aren't order-sensitive,
+    // so no loadSplitCounts() call is needed here.
+    renderSortToggle();
+    loadEmails();
 }
 
 function updateMailboxNameDisplay() {
