@@ -124,6 +124,45 @@
             white-space: nowrap;
         }
 
+        /* Split tabs (kata 1wdy): horizontally scrollable, inbox-only. Hidden
+           by default; .visible (renderSplitTabs) shows it, setScreen's own
+           display toggle hides it entirely outside Screen.LIST. */
+        #split-tabs {
+            display: none;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+
+        #split-tabs.visible {
+            display: flex;
+        }
+
+        .split-tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-muted);
+            font-size: 13px;
+            padding: 10px 14px;
+            min-height: 44px;
+        }
+
+        .split-tab.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+
+        .split-count {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
         /* Account picker overlay */
         #account-picker {
             position: fixed;
@@ -407,6 +446,43 @@
             color: var(--text-muted);
             text-align: center;
             min-height: 29px;
+        }
+
+        /* Bottom nav (kata 1wdy): last flex child of #app-shell, so the
+           shell's own safe-area padding-bottom already covers it — no
+           position:fixed needed. setScreen shows/hides it per screen. */
+        #bottom-nav {
+            display: flex;
+            border-top: 1px solid var(--border);
+            background: var(--surface);
+        }
+
+        .nav-item {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 6px 0;
+            min-height: 48px;
+        }
+
+        .nav-item.active {
+            color: var(--accent);
+        }
+
+        .nav-icon {
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .nav-label {
+            font-size: 10px;
         }
 
         /* Email detail view */
@@ -894,6 +970,10 @@
                 <button class="account-btn" id="account-btn" aria-label="Switch account"></button>
             </div>
         </div>
+        <!-- Split tabs (kata 1wdy, task A8): inbox-only, hidden via the
+             .visible class in renderSplitTabs (screen-level show/hide is
+             setScreen's job, same as app-header). -->
+        <div id="split-tabs"></div>
         <div id="email-list-wrap">
             <div id="pull-indicator">Pull to refresh</div>
             <div id="email-list"></div>
@@ -978,6 +1058,32 @@
             </div>
         </div>
         <div id="status-bar"></div>
+        <!-- Bottom nav (kata 1wdy, task A8): the five role mailboxes only —
+             custom/role-less folders and Spam are out of scope for v1.
+             setScreen() owns show/hide (LIST only); renderBottomNav() owns
+             which item is active. -->
+        <nav id="bottom-nav">
+            <button class="nav-item" data-role="inbox" aria-label="Inbox">
+                <span class="nav-icon">&#128229;</span>
+                <span class="nav-label">Inbox</span>
+            </button>
+            <button class="nav-item" data-role="archive" aria-label="Archive">
+                <span class="nav-icon">&#128452;</span>
+                <span class="nav-label">Archive</span>
+            </button>
+            <button class="nav-item" data-role="sent" aria-label="Sent">
+                <span class="nav-icon">&#128228;</span>
+                <span class="nav-label">Sent</span>
+            </button>
+            <button class="nav-item" data-role="drafts" aria-label="Drafts">
+                <span class="nav-icon">&#128221;</span>
+                <span class="nav-label">Drafts</span>
+            </button>
+            <button class="nav-item" data-role="trash" aria-label="Trash">
+                <span class="nav-icon">&#128465;</span>
+                <span class="nav-label">Trash</span>
+            </button>
+        </nav>
     </div>
 
     <!-- Account picker (bottom sheet) -->

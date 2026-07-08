@@ -21,7 +21,10 @@ const state = {
     currentAccount: null,
     api: null,                 // makeApi(currentAccount.id)
     mailboxes: [],
-    inboxId: null,
+    currentMailbox: null,      // active mailbox object (role: inbox/archive/sent/drafts/trash)
+    currentSplit: 'all',       // active split tab id, or 'all'; only meaningful in the inbox
+    splits: [],                // this account's split definitions (GET /splits)
+    splitCounts: {},           // per-split counts (GET /split-counts), for tab badges
     emails: [],
     loading: false,
     loadingMore: false,
@@ -297,7 +300,10 @@ function selectAccount(account) {
     state.currentAccount = account;
     state.api = makeApi(account.id);
     state.mailboxes = [];
-    state.inboxId = null;
+    state.currentMailbox = null;
+    state.currentSplit = 'all';
+    state.splits = [];
+    state.splitCounts = {};
     state.emails = [];
     state.emailCache = {};
     state.lastRenderedGroup = null;
@@ -332,6 +338,10 @@ function selectAccount(account) {
             if (err.name === 'AbortError') return;
             showError('Load mailboxes', err);
         });
+    // Splits are account-scoped tabs, independent of the mailbox fetch
+    // above (default currentSplit is 'all', which needs no split data to
+    // render) — fire-and-forget with its own abort/stale-account guard.
+    loadSplits(acct, state.loadAbort.signal);
 }
 
 function renderAccountButton() {
@@ -374,14 +384,22 @@ async function loadMailboxes(acct, signal) {
     // freshly-reset state with data that belongs to the one we left.
     if (state.currentAccount?.id !== acct) return;
     state.mailboxes = mailboxes;
-    const inbox = state.mailboxes.find(m => m.role === 'inbox');
-    state.inboxId = inbox?.id || null;
+    state.currentMailbox = state.mailboxes.find(m => m.role === 'inbox') || null;
+    renderBottomNav();
+    // Splits may already have loaded (loadSplits runs in parallel) — render
+    // and fetch counts now in case that race landed first; both are no-ops
+    // otherwise (loadSplits does the same once it resolves).
+    renderSplitTabs();
+    loadSplitCounts();
 }
 
 function emailListPath(offset) {
     let path = '/emails?limit=' + PAGE_SIZE;
-    if (state.inboxId) path += '&mailbox_id=' + encodeURIComponent(state.inboxId);
+    if (state.currentMailbox) path += '&mailbox_id=' + encodeURIComponent(state.currentMailbox.id);
     if (offset > 0) path += '&offset=' + offset;
+    if (state.currentMailbox?.role === 'inbox' && state.currentSplit && state.currentSplit !== 'all' && state.splits.length > 0) {
+        path += '&split_id=' + encodeURIComponent(state.currentSplit);
+    }
     return path;
 }
 
@@ -439,6 +457,107 @@ async function loadMoreEmails() {
     } finally {
         state.loadingMore = false;
     }
+}
+
+// ============================================================================
+// Mailbox nav + split tabs (kata 1wdy)
+// ============================================================================
+// Splits are server-side (src/splits.rs) and account-scoped; this is UI +
+// state only, mirroring desktop's renderMailboxes/renderSplitTabs/
+// selectSplit/buildEmailListUrl (static/app.js) at mobile scale: a bottom
+// nav for the five role mailboxes instead of a sidebar, and a scrollable
+// tab row instead of a wrapping one.
+
+async function loadSplits(acct, signal) {
+    try {
+        const splits = await state.api('GET', '/splits', null, signal);
+        if (state.currentAccount?.id !== acct) return;
+        state.splits = splits;
+        renderSplitTabs();
+        loadSplitCounts();
+    } catch (err) {
+        if (err.name === 'AbortError') return;
+        if (state.currentAccount?.id !== acct) return;
+        state.splits = [];
+        renderSplitTabs();
+        showError('Load splits', err);
+    }
+}
+
+let splitCountsController = null;
+
+async function loadSplitCounts() {
+    if (state.currentMailbox?.role !== 'inbox' || state.splits.length === 0) return;
+    splitCountsController?.abort();
+    splitCountsController = new AbortController();
+    const mailboxId = state.currentMailbox.id;
+    try {
+        const path = '/split-counts?mailbox_id=' + encodeURIComponent(mailboxId);
+        const counts = await state.api('GET', path, null, splitCountsController.signal);
+        if (state.currentMailbox?.id !== mailboxId) return;
+        state.splitCounts = counts;
+        renderSplitTabs();
+    } catch (err) {
+        // Graceful degradation: tabs render without badges, no toast spam
+        // for a background count refresh (an aborted superseded request).
+        if (err.name !== 'AbortError') showError('Load split counts', err);
+    } finally {
+        splitCountsController = null;
+    }
+}
+
+function renderBottomNav() {
+    document.querySelectorAll('#bottom-nav .nav-item').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.role === state.currentMailbox?.role);
+    });
+}
+
+function renderSplitTabs() {
+    const el = document.getElementById('split-tabs');
+    const isInbox = state.currentMailbox?.role === 'inbox';
+    if (!isInbox || state.splits.length === 0) {
+        el.classList.remove('visible');
+        return;
+    }
+    el.classList.add('visible');
+    const tabs = [{ id: 'all', name: 'All' }, ...state.splits];
+    el.innerHTML = tabs.map(split => {
+        const count = state.splitCounts[split.id];
+        const badge = count != null ? '<span class="split-count">' + escapeHtml(String(count)) + '</span>' : '';
+        return '<button class="split-tab' + (state.currentSplit === split.id ? ' active' : '') + '" data-split="' + escapeHtml(split.id) + '">'
+            + '<span class="split-name">' + escapeHtml(split.name) + '</span>' + badge
+            + '</button>';
+    }).join('');
+}
+
+function selectSplit(splitId) {
+    if (state.currentSplit === splitId) return;
+    state.currentSplit = splitId;
+    renderSplitTabs();
+    loadEmails();
+}
+
+function selectMailbox(mailbox) {
+    if (state.currentMailbox?.id === mailbox.id) return;
+    // Abort any in-flight load for the mailbox we're leaving — mirrors
+    // selectAccount's guard so a slow response can't land after the switch
+    // and overwrite the new mailbox's list. The abort's rejection is async,
+    // so also release loadEmails's `loading` mutex synchronously here —
+    // otherwise the call below would find it still held by the abandoned
+    // request (guaranteed to reject, never to render) and silently no-op.
+    state.loadAbort?.abort();
+    state.loadAbort = new AbortController();
+    state.loading = false;
+    state.currentMailbox = mailbox;
+    state.currentSplit = 'all';
+    state.splitCounts = {};
+    state.emails = [];
+    state.lastRenderedGroup = null;
+    state.listScrollTop = 0;
+    renderBottomNav();
+    renderSplitTabs();
+    loadEmails();
+    if (mailbox.role === 'inbox') loadSplitCounts();
 }
 
 // ============================================================================
@@ -528,7 +647,9 @@ function showStatus(msg) {
 // long swiping session can't grow it unbounded. Returns the entry so a
 // failed action can retract exactly its own push (see emailAction's catch).
 function pushUndo(action, email, index) {
-    const entry = { action, email, index, mailboxId: state.inboxId };
+    // Restore to the CURRENT mailbox (kata 1wdy) — archiving/trashing from
+    // Archive/Sent/etc. must undo back there, not to a hardcoded inbox.
+    const entry = { action, email, index, mailboxId: state.currentMailbox?.id };
     state.undoStack.push(entry);
     capUndoStack();
     showUndoToast(entry);
@@ -754,6 +875,8 @@ function setScreen(screen, params = {}) {
             state.currentEmailId = null;
             document.getElementById('email-list-wrap').style.display = 'none';
             document.getElementById('app-header').style.display = 'none';
+            document.getElementById('split-tabs').style.display = 'none';
+            document.getElementById('bottom-nav').style.display = 'none';
             document.getElementById('email-detail').style.display = 'none';
             document.getElementById('compose-screen').style.display = 'flex';
             // Fields are already prefilled by the entry point (startCompose/
@@ -766,6 +889,8 @@ function setScreen(screen, params = {}) {
             state.currentEmailId = params.emailId;
             document.getElementById('email-list-wrap').style.display = 'none';
             document.getElementById('app-header').style.display = 'none';
+            document.getElementById('split-tabs').style.display = 'none';
+            document.getElementById('bottom-nav').style.display = 'none';
             document.getElementById('compose-screen').style.display = 'none';
             document.getElementById('email-detail').style.display = 'flex';
             renderScreenDetail(params.emailId);
@@ -777,6 +902,8 @@ function setScreen(screen, params = {}) {
             document.getElementById('compose-screen').style.display = 'none';
             document.getElementById('email-list-wrap').style.display = '';
             document.getElementById('app-header').style.display = '';
+            document.getElementById('split-tabs').style.display = '';
+            document.getElementById('bottom-nav').style.display = '';
             document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
             renderEmailList();
             break;
@@ -1761,6 +1888,20 @@ document.getElementById('account-picker').addEventListener('click', (e) => {
         return;
     }
     selectAccount(account);
+});
+
+// Bottom nav (kata 1wdy): tap a role to switch mailboxes.
+document.getElementById('bottom-nav').addEventListener('click', (e) => {
+    const btn = e.target.closest('.nav-item');
+    if (!btn) return;
+    const mailbox = state.mailboxes.find(m => m.role === btn.dataset.role);
+    if (mailbox) selectMailbox(mailbox);
+});
+
+// Split tabs (kata 1wdy): tap a tab to switch splits within the inbox.
+document.getElementById('split-tabs').addEventListener('click', (e) => {
+    const tab = e.target.closest('.split-tab');
+    if (tab) selectSplit(tab.dataset.split);
 });
 
 // Back button (detail → list) — use history.back() to pop the pushState entry

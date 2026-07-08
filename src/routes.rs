@@ -2691,6 +2691,12 @@ mod tests {
             region.contains("compose-screen"),
             "the compose screen's show/hide must live inside setScreen's switch"
         );
+        // The mailbox bottom nav (kata 1wdy) is LIST-only chrome — its
+        // show/hide must live here too, not a scattered toggle elsewhere.
+        assert!(
+            region.contains("bottom-nav"),
+            "the bottom nav's show/hide must live inside setScreen's switch"
+        );
     }
 
     #[test]
@@ -4288,6 +4294,105 @@ white   = '#fdf6e3'
         assert!(
             APP_JS.contains("formatEventTimeMultiTz"),
             "renderCalendarCard must use the multi-TZ formatter"
+        );
+    }
+
+    // ============================================================================
+    // Mobile: mailbox nav + split tabs (kata 1wdy, task A8)
+    // ============================================================================
+
+    #[test]
+    fn mobile_app_js_undo_entry_uses_current_mailbox() {
+        // A4's undo entries pinned the inbox id; once mailbox switching
+        // exists, undoing an archive/trash from any other mailbox must
+        // restore there, not to the inbox.
+        assert!(
+            !MOBILE_APP_JS.contains("state.inboxId"),
+            "inbox pinning must be fully replaced by state.currentMailbox"
+        );
+        let start = MOBILE_APP_JS
+            .find("function pushUndo(")
+            .expect("pushUndo must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("pushUndo must close");
+        assert!(
+            rest[..end].contains("state.currentMailbox"),
+            "undo entries must record the CURRENT mailbox, not a pinned inbox"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_email_list_path_has_split_id_wiring() {
+        let start = MOBILE_APP_JS
+            .find("function emailListPath(")
+            .expect("emailListPath must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("emailListPath must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("split_id"),
+            "emailListPath must append split_id to the query"
+        );
+        assert!(
+            body.contains("role === 'inbox'") && body.contains("currentSplit !== 'all'"),
+            "split_id must only be appended for the inbox with a non-'all' split selected \
+             (mirrors desktop buildEmailListUrl)"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_mailbox_bottom_nav() {
+        assert!(
+            MOBILE_APP_JS.contains("function renderBottomNav("),
+            "mobile app.js must render the bottom nav"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function selectMailbox("),
+            "mobile app.js must have a mailbox-selection entry point"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("bottom-nav"),
+            "mobile app.js must reference the bottom-nav element"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_split_tabs() {
+        for sym in [
+            "function renderSplitTabs(",
+            "function selectSplit(",
+            "function loadSplits(",
+        ] {
+            assert!(
+                MOBILE_APP_JS.contains(sym),
+                "mobile app.js must define {sym}"
+            );
+        }
+        assert!(
+            MOBILE_APP_JS.contains("split-count"),
+            "split tabs must render a count badge"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_bottom_nav_and_split_tabs() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="bottom-nav""#),
+            "mobile html must have a bottom nav element"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="split-tabs""#),
+            "mobile html must have a split-tabs row element"
+        );
+        for role in ["inbox", "archive", "sent", "drafts", "trash"] {
+            assert!(
+                MOBILE_HTML.contains(&format!(r#"data-role="{role}""#)),
+                "bottom nav must include a {role} item"
+            );
+        }
+        assert!(
+            !MOBILE_HTML.contains(r#"data-role="spam""#),
+            "v1 bottom nav excludes spam and role-less custom folders"
         );
     }
 }
