@@ -2162,8 +2162,14 @@ async function startDraftCompose(emailId) {
         }
     }
     state.composeSession++;
-    state.replyContext = null;
     clearComposeFields();
+    // Rehydrate threading (review follow-up): the draft persisted its
+    // in_reply_to, so restoring must carry it back into replyContext or every
+    // subsequent save/send would silently drop the threading headers. The
+    // quote context stays unreconstructed — body text only (documented v1).
+    state.replyContext = draft.inReplyTo
+        ? { inReplyTo: draft.inReplyTo, quotedHtml: null, quotedText: null }
+        : null;
     setComposeTitle('Draft');
     composeEl('compose-to').value = (draft.to || []).map(t => t.email).filter(Boolean).join(', ');
     composeEl('compose-cc').value = (draft.cc || []).map(t => t.email).filter(Boolean).join(', ');

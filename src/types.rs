@@ -38,6 +38,11 @@ pub struct Email {
     pub html_body: Option<String>,
     pub has_calendar: bool,
     pub attachments: Vec<Attachment>,
+    /// In-Reply-To of the message (first Message-ID when the header lists
+    /// several). Populated by the JMAP fetch path so a restored draft keeps
+    /// its threading (kata wm57); Gmail/Outlook leave it None in v1.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
 }
 
 impl Email {
@@ -512,6 +517,7 @@ mod tests {
             html_body: None,
             has_calendar: false,
             attachments: vec![],
+            in_reply_to: None,
         }
     }
 

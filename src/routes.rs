@@ -796,6 +796,9 @@ async fn get_email(
         "hasCalendar": email.has_calendar,
         "textBody": email.text_body,
         "htmlBody": email.html_body,
+        // Threading parent — lets a restored draft rehydrate its reply
+        // context so subsequent saves/sends keep in_reply_to (kata wm57).
+        "inReplyTo": email.in_reply_to,
         "calendarEvent": calendar_event,
         "attachments": email.attachments,
     })))
@@ -3999,6 +4002,80 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn draft_autosave_guarded_during_send() {
+        // Review follow-up: an autosave landing while the send is in flight
+        // would persist a ghost draft of the very mail being sent — never
+        // adopted (compose clears on success) and never deleted. Both
+        // runAutosave implementations must bail on the in-flight send lock.
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            let start = js
+                .find("function runAutosave")
+                .unwrap_or_else(|| panic!("{bundle} runAutosave must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("runAutosave must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("state.sending"),
+                "{bundle} runAutosave must bail while a send is in flight"
+            );
+        }
+        // Desktop additionally must kill the pending debounce before its
+        // await and hold the sending lock across it (mobile already does via
+        // setComposeSending).
+        let start = APP_JS
+            .find("async function sendEmail(")
+            .expect("desktop sendEmail must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("sendEmail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("cancelAutosave()"),
+            "desktop sendEmail must cancel the pending autosave debounce up front"
+        );
+        assert!(
+            block.contains("state.sending = true"),
+            "desktop sendEmail must set the sending lock runAutosave bails on"
+        );
+        assert!(
+            block.contains("state.sending = false"),
+            "desktop sendEmail must clear the sending lock when the send settles"
+        );
+    }
+
+    #[test]
+    fn draft_restore_rehydrates_reply_context() {
+        // Review follow-up: the draft persisted in_reply_to; restore must
+        // carry it back into replyContext or every subsequent save/send
+        // silently drops the threading headers.
+        for (js, bundle, func) in [
+            (APP_JS, "desktop", "function openDraftInCompose"),
+            (MOBILE_APP_JS, "mobile", "function startDraftCompose"),
+        ] {
+            let start = js
+                .find(func)
+                .unwrap_or_else(|| panic!("{bundle} {func} must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("restore fn must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("inReplyTo: draft.inReplyTo"),
+                "{bundle} restore must rehydrate replyContext from the \
+                 draft's persisted inReplyTo"
+            );
+        }
+        // Server half of the contract: the detail response must expose the
+        // field the clients read. (jmap.rs parse tests cover request+parse;
+        // this pins the Email→wire field the handler serializes.)
+        let mut email = test_email_with_recipients(vec![], vec![]);
+        email.in_reply_to = Some("<parent@example.com>".into());
+        let wire = serde_json::to_value(&email).unwrap();
+        assert_eq!(
+            wire["in_reply_to"], "<parent@example.com>",
+            "Email must carry in_reply_to through serialization"
+        );
+    }
+
+    #[test]
     fn upload_max_size_constant() {
         assert_eq!(MAX_UPLOAD_SIZE, 25 * 1024 * 1024);
     }
@@ -4395,6 +4472,7 @@ white   = '#fdf6e3'
             html_body: None,
             has_calendar: false,
             attachments: vec![],
+            in_reply_to: None,
         }
     }
 

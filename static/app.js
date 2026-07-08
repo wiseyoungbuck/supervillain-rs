@@ -24,6 +24,9 @@ const state = {
     composeSession: 0,        // bumped by clearCompose on every fresh/restored compose; an
                               // in-flight autosave adopts its returned id only while the token
                               // still matches, so a stale save can't corrupt a newer draft
+    sending: false,           // true while sendEmail's request is in flight; runAutosave bails
+                              // on it so a debounce firing mid-send can't persist a ghost
+                              // draft of the very mail being sent
     identities: [],           // send-as email addresses
     splits: [],               // split inbox definitions
     currentSplit: 'all',      // currently active split tab
@@ -1192,6 +1195,12 @@ async function toggleFlag(emailId) {
 }
 
 async function sendEmail() {
+    // A pending autosave firing mid-send would persist a fresh draft of the
+    // very mail being sent — un-adopted (compose clears on success) and never
+    // deleted. Kill the debounce up front; state.sending (set around each
+    // await below) blocks any new one from running until the send settles.
+    cancelAutosave();
+
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
     const fromAddress = els.composeFrom?.value || null;
@@ -1235,6 +1244,7 @@ async function sendEmail() {
         }
         const tz = (els.inviteTz.value.trim() || state.timezone?.primary || '').trim();
         const inviteAttendees = to.concat(cc).map(email => ({ email }));
+        state.sending = true;
         try {
             await api('POST', '/calendar/invite', {
                 to,
@@ -1259,10 +1269,13 @@ async function sendEmail() {
             showView('list');
         } catch (err) {
             showStatus('Invite send failed: ' + err.message, 'error');
+        } finally {
+            state.sending = false;
         }
         return;
     }
 
+    state.sending = true;
     try {
         await api('POST', '/emails/send', {
             to,
@@ -1280,6 +1293,8 @@ async function sendEmail() {
         showView('list');
     } catch (err) {
         showStatus('Send failed: ' + err.message, 'error');
+    } finally {
+        state.sending = false;
     }
 }
 
@@ -3033,7 +3048,9 @@ function flushAutosave() {
 
 async function runAutosave() {
     autosaveTimer = null;
-    if (!draftsEnabled() || !composeDirty()) return;
+    // state.sending: never save mid-send — the mail is about to stop being a
+    // draft, and a save landing now would leave a ghost copy in Drafts.
+    if (!draftsEnabled() || !composeDirty() || state.sending) return;
     // Capture everything synchronously: the caller may clear the compose right
     // after (flush-on-leave) while the request is still in flight.
     const session = state.composeSession;
@@ -3086,8 +3103,14 @@ async function openDraftInCompose(emailId) {
             return;
         }
     }
-    state.replyContext = null;
     clearCompose();
+    // Rehydrate threading (review follow-up): the draft persisted its
+    // in_reply_to, so restoring must carry it back into replyContext or every
+    // subsequent save/send would silently drop the threading headers. The
+    // quote context stays unreconstructed — body text only (documented v1).
+    state.replyContext = draft.inReplyTo
+        ? { inReplyTo: draft.inReplyTo, quotedHtml: null, quotedText: null }
+        : null;
     els.composeTo.value = (draft.to || []).map(t => t.email).filter(Boolean).join(', ');
     els.composeCc.value = (draft.cc || []).map(t => t.email).filter(Boolean).join(', ');
     els.composeSubject.value = draft.subject || '';

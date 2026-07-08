@@ -102,6 +102,11 @@ struct JmapEmailRaw {
     pub has_attachment: bool,
     #[serde(default, deserialize_with = "nullable_default")]
     pub size: i64,
+    /// RFC 8621 `inReplyTo`: `String[]|null` of Message-IDs (for drafts saved
+    /// by this app, the value the client sent at save time). Needed so a
+    /// restored draft keeps its threading (kata wm57 review follow-up).
+    #[serde(default)]
+    pub in_reply_to: Option<Vec<String>>,
     #[serde(default)]
     pub text_body: Vec<BodyPartRef>,
     #[serde(default)]
@@ -453,6 +458,7 @@ pub async fn get_emails(
             "preview",
             "hasAttachment",
             "size",
+            "inReplyTo",
         ]
     };
     if fetch_body {
@@ -583,6 +589,9 @@ fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
         html_body,
         has_calendar,
         attachments,
+        // JMAP inReplyTo is a list; a single parent is the only case this app
+        // produces (build_draft_email) and all the restore path needs.
+        in_reply_to: raw.in_reply_to.and_then(|v| v.into_iter().next()),
     }
 }
 
@@ -2470,6 +2479,26 @@ END:VCALENDAR";
         });
         let err = created_draft_id(&resp, "Draft creation").unwrap_err();
         assert!(matches!(err, Error::Internal(ref m) if m.contains("Draft creation failed")));
+    }
+
+    #[test]
+    fn parse_email_in_reply_to_takes_first_message_id() {
+        // The restore path needs the draft's threading parent back out of the
+        // fetch (kata wm57 review follow-up). JMAP inReplyTo is String[]|null.
+        let item = serde_json::json!({
+            "id": "e1",
+            "inReplyTo": ["<parent@example.com>", "<older@example.com>"]
+        });
+        let email = parse_jmap_email(&item, false);
+        assert_eq!(email.in_reply_to.as_deref(), Some("<parent@example.com>"));
+    }
+
+    #[test]
+    fn parse_email_in_reply_to_absent_or_null_is_none() {
+        let absent = parse_jmap_email(&serde_json::json!({ "id": "e1" }), false);
+        assert_eq!(absent.in_reply_to, None);
+        let null = parse_jmap_email(&serde_json::json!({ "id": "e1", "inReplyTo": null }), false);
+        assert_eq!(null.in_reply_to, None);
     }
 
     // --- parse_jmap_email tests (THE-153) ---

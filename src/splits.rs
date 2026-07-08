@@ -280,6 +280,7 @@ mod tests {
             html_body: None,
             has_calendar: false,
             attachments: vec![],
+            in_reply_to: None,
         }
     }
 

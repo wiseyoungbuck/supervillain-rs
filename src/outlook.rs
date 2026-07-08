@@ -615,6 +615,9 @@ pub(crate) fn parse_graph_message(
         html_body,
         has_calendar,
         attachments,
+        // Drafts (the only consumer) are Fastmail-only in v1 — not read from
+        // Graph's internetMessageHeaders yet.
+        in_reply_to: None,
     }
 }
 

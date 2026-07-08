@@ -1132,6 +1132,9 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
         html_body,
         has_calendar,
         attachments,
+        // Drafts (the only consumer) are Fastmail-only in v1 — not parsed
+        // out of Gmail's In-Reply-To header yet.
+        in_reply_to: None,
     }
 }
 
