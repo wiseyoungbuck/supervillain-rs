@@ -4477,6 +4477,121 @@ white   = '#fdf6e3'
         );
     }
 
+    // roborev 294 fix 4: two autosaves that would otherwise overlap must be
+    // serialized onto the same in-flight promise, or both could read the same
+    // stale (pre-adoption) draftId and double-POST a create. runAutosave must
+    // chain onto `saveInFlight` rather than performing the save itself —
+    // `doAutosave` (which reads/writes state.draftId) is only ever entered
+    // through that chain.
+    #[test]
+    fn draft_autosave_serializes_on_shared_in_flight_promise() {
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            assert!(
+                js.contains("let saveInFlight"),
+                "{bundle} must track the in-flight autosave at module scope"
+            );
+            assert!(
+                js.contains("function doAutosave("),
+                "{bundle} must split the actual save into doAutosave"
+            );
+            let start = js
+                .find("async function runAutosave")
+                .unwrap_or_else(|| panic!("{bundle} runAutosave must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("runAutosave must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("saveInFlight ="),
+                "{bundle} runAutosave must chain onto saveInFlight rather than \
+                 firing its own request directly"
+            );
+            assert!(
+                block.contains(".then(") && block.contains("doAutosave("),
+                "{bundle} runAutosave must chain the next save with .then(...) \
+                 onto whatever save is already in flight"
+            );
+        }
+    }
+
+    // roborev 294 fix 3: cancelAutosave() only clears the pending debounce
+    // TIMER — a save whose HTTP request already started keeps running. Send
+    // must await that in-flight save (settled either way) before deciding
+    // which draft to delete, or the late-landing save's id is dropped
+    // un-adopted and un-deleted: a ghost draft.
+    #[test]
+    fn draft_send_awaits_in_flight_save_before_deleting_draft() {
+        for (js, bundle, func) in [
+            (APP_JS, "desktop", "async function sendEmail("),
+            (MOBILE_APP_JS, "mobile", "async function sendComposedEmail("),
+        ] {
+            let start = js
+                .find(func)
+                .unwrap_or_else(|| panic!("{bundle} {func} must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("send fn must close");
+            let block = &rest[..end];
+            let await_pos = block
+                .find("await saveInFlight")
+                .unwrap_or_else(|| panic!("{bundle} send must await the in-flight autosave"));
+            let delete_pos = block.find("deleteTrackedDraft()").unwrap_or_else(|| {
+                panic!("{bundle} send must delete the tracked draft on success")
+            });
+            assert!(
+                await_pos < delete_pos,
+                "{bundle} send must await saveInFlight BEFORE deleteTrackedDraft(), \
+                 so a late-adopted id is the one that gets deleted"
+            );
+        }
+    }
+
+    // roborev 294 fix 2: the server destroys+recreates a draft on every
+    // update, so the tracked id rotates on almost every save. If the OLD id
+    // is left in the Drafts list row or email cache, it strands a dead id —
+    // reopening that row later fetches the now-destroyed old id. adoptDraftId
+    // must swap the id into both places (gated on Drafts being the mailbox in
+    // view) instead of just overwriting state.draftId directly.
+    #[test]
+    fn draft_id_rotation_updates_list_row_and_cache_key() {
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            let start = js
+                .find("function adoptDraftId(")
+                .unwrap_or_else(|| panic!("{bundle} must define adoptDraftId"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("adoptDraftId must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("role === 'drafts'"),
+                "{bundle} adoptDraftId must gate the swap on Drafts being the \
+                 current mailbox"
+            );
+            assert!(
+                block.contains("state.emails.find(e => e.id === oldId)"),
+                "{bundle} adoptDraftId must look up the list row by the OLD id"
+            );
+            assert!(
+                block.contains("row.id = newId"),
+                "{bundle} adoptDraftId must swap the list row's id in place"
+            );
+            assert!(
+                block.contains("delete "),
+                "{bundle} adoptDraftId must purge the stale old-id cache entry"
+            );
+            // doAutosave must route id adoption through adoptDraftId, not
+            // assign state.draftId directly — a direct assignment would skip
+            // the list/cache swap entirely.
+            let doautosave_start = js
+                .find("function doAutosave(")
+                .unwrap_or_else(|| panic!("{bundle} must define doAutosave"));
+            let doautosave_rest = &js[doautosave_start..];
+            let doautosave_end = doautosave_rest.find("\n}").expect("doAutosave must close");
+            let doautosave_block = &doautosave_rest[..doautosave_end];
+            assert!(
+                doautosave_block.contains("adoptDraftId(res.id)"),
+                "{bundle} doAutosave must adopt a rotated id through adoptDraftId"
+            );
+        }
+    }
+
     #[test]
     fn draft_restore_rehydrates_reply_context() {
         // Review follow-up: the draft persisted in_reply_to; restore must

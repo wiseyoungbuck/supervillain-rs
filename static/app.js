@@ -1488,6 +1488,12 @@ async function sendEmail() {
     // deleted. Kill the debounce up front; state.sending (set around each
     // await below) blocks any new one from running until the send settles.
     cancelAutosave();
+    // cancelAutosave() only kills the pending TIMER — a save already in
+    // flight keeps running. Without waiting for it, its created/updated id
+    // would land after the tracked draft is already deleted below and never
+    // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
+    // never rejects, but settle either way defensively.
+    if (saveInFlight) await saveInFlight.catch(() => {});
 
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -3498,6 +3504,16 @@ function clearCompose() {
 
 const AUTOSAVE_DEBOUNCE_MS = 3000;
 let autosaveTimer = null;
+// The promise of the most recently scheduled autosave request (roborev 294,
+// fixes 3+4). Every runAutosave() call chains onto this instead of firing its
+// own request directly: two saves that would otherwise overlap now run
+// strictly one after another, so the second always sees the first's adopted
+// draftId rather than racing it and double-POSTing a create. It also gives
+// sendEmail a handle to await — cancelAutosave() only kills the pending
+// debounce TIMER, not a save whose request is already in flight, so without
+// this a late-landing save's created id would never be adopted or deleted,
+// orphaning a ghost draft.
+let saveInFlight = null;
 
 function draftsEnabled() {
     return state.currentAccount?.provider === 'fastmail';
@@ -3549,6 +3565,18 @@ async function runAutosave() {
         in_reply_to: state.replyContext?.inReplyTo || null,
         from_address: els.composeFrom?.value || null,
     };
+    // Chain onto whatever save is already running (roborev 294, fix 4) rather
+    // than firing this one immediately: if the previous save hasn't adopted
+    // its id yet, running concurrently would race it — both would see the
+    // same (stale) state.draftId and could both POST a create instead of one
+    // PUTting the update. Chaining guarantees this one only starts once the
+    // prior save (and its id adoption) has fully settled.
+    const previous = saveInFlight || Promise.resolve();
+    saveInFlight = previous.then(() => doAutosave(session, payload));
+    await saveInFlight;
+}
+
+async function doAutosave(session, payload) {
     try {
         const res = state.draftId
             ? await api('PUT', `/drafts/${encodeURIComponent(state.draftId)}`, payload)
@@ -3556,12 +3584,39 @@ async function runAutosave() {
         // Adopt the (possibly changed) id only while this is still the active
         // compose — a newer draft must not inherit this save's id.
         if (state.composeSession === session && res?.id) {
-            state.draftId = res.id;
+            adoptDraftId(res.id);
             showStatus('Draft saved', 'info');
         }
     } catch (err) {
         console.warn('Autosave failed:', err);
     }
+}
+
+// Adopt a freshly (re)created draft id. The server destroys+recreates on
+// every update, so the tracked id rotates on almost every save — if the OLD
+// id is still sitting in the Drafts list or email cache, it's left pointing
+// at a now-destroyed message: tapping that row later fetches the dead id and
+// errors until a manual reload (roborev 294, fix 2). Swap it in place
+// instead. Gated on Drafts actually being the mailbox in view — the id
+// rotation is only meaningful for that list/cache; elsewhere there's nothing
+// of this draft's to swap.
+function adoptDraftId(newId) {
+    const oldId = state.draftId;
+    if (oldId && oldId !== newId && state.currentMailbox?.role === 'drafts') {
+        const row = state.emails.find(e => e.id === oldId);
+        if (row) {
+            row.id = newId;
+            renderEmailList();
+        }
+        const oldKey = cacheKey(oldId);
+        const cached = emailCache[oldKey];
+        delete emailCache[oldKey];
+        if (cached) {
+            cached.id = newId;
+            emailCache[cacheKey(newId)] = cached;
+        }
+    }
+    state.draftId = newId;
 }
 
 // Fire-and-forget delete of the tracked draft (on send / explicit discard).

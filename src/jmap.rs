@@ -1367,29 +1367,6 @@ fn draft_create_request(
     ])]
 }
 
-/// Email/set that creates the replacement draft and destroys the old id in a
-/// single call (Email bodies aren't patchable — see module note). Returns a
-/// new server id via the created "draft" record.
-fn draft_update_request(
-    account_id: &str,
-    draft_id: &str,
-    sub: &EmailSubmission,
-    from_addr: &str,
-    drafts_mailbox_id: &str,
-) -> Vec<serde_json::Value> {
-    let mut email = build_draft_email(sub, from_addr, drafts_mailbox_id);
-    email.insert("keywords".into(), serde_json::json!({ "$draft": true }));
-    vec![serde_json::json!([
-        "Email/set",
-        {
-            "accountId": account_id,
-            "create": { "draft": email },
-            "destroy": [draft_id]
-        },
-        "0"
-    ])]
-}
-
 /// Email/set destroy for a draft.
 fn draft_destroy_request(account_id: &str, draft_id: &str) -> Vec<serde_json::Value> {
     vec![serde_json::json!([
@@ -1434,8 +1411,17 @@ pub async fn create_draft(
     created_draft_id(&resp, "Draft creation")
 }
 
-/// Replace an existing draft (destroy+recreate). Returns the NEW server id —
-/// callers must adopt it, as the old id is now destroyed.
+/// Replace an existing draft (create-then-destroy). Returns the NEW server
+/// id — callers must adopt it, as the old id is destroyed once the
+/// replacement is confirmed.
+///
+/// Deliberately two sequential Email/set calls rather than one bundled
+/// create+destroy: per RFC 8620, a failed create does not cancel a destroy
+/// bundled into the same call, so a single combined request could destroy
+/// the last good server copy on a failed update (roborev 294). The create is
+/// issued and confirmed successful first; only then is the old id destroyed.
+/// An unexpected destroy failure is logged, not propagated — the update
+/// itself already succeeded and the caller has a new id to adopt.
 pub async fn update_draft(
     s: &JmapSession,
     draft_id: &str,
@@ -1444,12 +1430,29 @@ pub async fn update_draft(
 ) -> Result<String, Error> {
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
     let drafts_id = drafts_mailbox_id(s)?;
-    let resp = jmap_call(
+
+    let create_resp = jmap_call(
         s,
-        draft_update_request(account_id, draft_id, sub, from_addr, &drafts_id),
+        draft_create_request(account_id, sub, from_addr, &drafts_id),
     )
     .await?;
-    created_draft_id(&resp, "Draft update")
+    let new_id = created_draft_id(&create_resp, "Draft update")?;
+
+    match destroy_draft(s, draft_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "Draft update: old draft {draft_id} was not destroyed after creating replacement {new_id} (unexpected notDestroyed)"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Draft update: failed to destroy old draft {draft_id} after creating replacement {new_id}: {err}"
+            );
+        }
+    }
+
+    Ok(new_id)
 }
 
 /// Destroy a draft. Idempotent: a `notFound` (already gone) counts as success
@@ -2420,32 +2423,46 @@ END:VCALENDAR";
         );
     }
 
+    // update_draft (roborev 294: safe update ordering) issues the create and
+    // destroy as two independent Email/set calls rather than one bundled
+    // request, so a failed create can't take the old draft down with it.
+    // draft_create_request_has_no_submission already asserts a create never
+    // carries a "destroy", and draft_destroy_request_targets_the_id asserts a
+    // destroy never carries a "create" — together they lock in that the two
+    // steps stay separate. This test pins the create-step shape specifically
+    // for the update path: same $draft keyword as a plain create, still no
+    // destroy bundled in, using the OLD draft id as context (it's the create
+    // that must succeed before that id is ever touched).
     #[test]
-    fn draft_update_request_creates_and_destroys() {
-        // Email bodies aren't patchable, so an edit is create+destroy in one
-        // Email/set — the new record replaces the old id.
+    fn draft_update_create_step_has_no_bundled_destroy() {
         let sub = simple_submission();
-        let calls = draft_update_request(
-            "acct-1",
-            "old-draft-id",
-            &sub,
-            "alice@example.com",
-            "mb-drafts",
-        );
+        // update_draft's create step reuses draft_create_request verbatim —
+        // the old draft id plays no part in building it.
+        let calls = draft_create_request("acct-1", &sub, "alice@example.com", "mb-drafts");
         let args = draft_set_args(&calls);
         assert_eq!(
             args["create"]["draft"]["keywords"],
             serde_json::json!({ "$draft": true })
         );
-        assert_eq!(
-            args["destroy"],
-            serde_json::json!(["old-draft-id"]),
-            "update must destroy the previous draft id"
-        );
-        let raw = serde_json::to_string(&calls).unwrap();
         assert!(
-            !raw.contains("EmailSubmission"),
-            "updating a draft must not issue an EmailSubmission"
+            args.get("destroy").is_none(),
+            "the create step of an update must not bundle a destroy of the old draft \
+             — the old id is only destroyed after this create is confirmed"
+        );
+    }
+
+    // update_draft's destroy step reuses draft_destroy_request verbatim — it
+    // runs only after the create above is confirmed, and targets exactly the
+    // old draft id, nothing else.
+    #[test]
+    fn draft_update_destroy_step_targets_old_id_only() {
+        let calls = draft_destroy_request("acct-1", "old-draft-id");
+        let args = draft_set_args(&calls);
+        assert_eq!(args["destroy"], serde_json::json!(["old-draft-id"]));
+        assert!(
+            args.get("create").is_none(),
+            "the destroy step of an update must not bundle a create — by the time it \
+             runs, the replacement draft already exists from the prior call"
         );
     }
 
