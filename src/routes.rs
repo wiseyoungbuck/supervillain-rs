@@ -4827,22 +4827,6 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn mobile_app_js_unsub_opens_unsubscribe_url_when_present() {
-        let start = MOBILE_APP_JS
-            .find("async function unsubscribeAndArchiveAll(")
-            .expect("unsubscribeAndArchiveAll must exist");
-        let unsub_fn = &MOBILE_APP_JS[start..start + 1700];
-        assert!(
-            unsub_fn.contains("result.unsubscribeUrl"),
-            "should check for an unsubscribe URL on the response"
-        );
-        assert!(
-            unsub_fn.contains("window.open(result.unsubscribeUrl, '_blank')"),
-            "should open it in a new tab, mirroring desktop"
-        );
-    }
-
-    #[test]
     fn mobile_app_js_unsub_batch_has_no_undo_stack_entry() {
         // Explicitly out of scope per the brief — the batch bypasses
         // pushUndo/undoStack entirely, unlike single archive/trash.

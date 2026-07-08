@@ -1159,9 +1159,12 @@ function handleDetailAction(type) {
 // mobile equivalent of pressing 'U'. Semantics otherwise mirror desktop:
 // optimistic removal of every list row from that sender, POST the existing
 // /emails/:id/unsubscribe-and-archive-all route (server resolves the sender
-// from emailId — no new endpoint, see brief), open the unsubscribe URL if
-// present, revert + showError on failure. Deliberately NOT integrated with
-// the undo stack (out of scope for the batch — see brief).
+// from emailId — no new endpoint, see brief), revert + showError on
+// failure. Deliberately NOT integrated with the undo stack (out of scope
+// for the batch — see brief). No unsubscribe-URL handling: the server
+// response is only {success, archived, sender} — List-Unsubscribe parsing
+// doesn't exist server-side yet (tracked in kata 9rg8; the client wiring
+// returns with it).
 
 let unsubSheetTarget = null; // { emailId, senderEmail } while the sheet is open
 
@@ -1206,8 +1209,7 @@ async function unsubscribeAndArchiveAll() {
 
     try {
         const path = '/emails/' + encodeURIComponent(emailId) + '/unsubscribe-and-archive-all';
-        const result = await state.api('POST', path);
-        if (result.unsubscribeUrl) window.open(result.unsubscribeUrl, '_blank');
+        await state.api('POST', path);
     } catch (err) {
         // Revert: re-insert the removed emails, same as desktop's catch.
         if (removedEmails.length > 0) {
