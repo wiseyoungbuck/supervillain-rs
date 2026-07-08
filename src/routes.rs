@@ -2286,6 +2286,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mobile_app_js_cancel_dirty_check_uses_prefill_baseline() {
+        // With a signature configured, clearComposeFields prefills the body
+        // with "\n\n-- \n<sig>", so a dirty check based on
+        // compose-body.value.trim() is ALWAYS truthy — plain open→Cancel
+        // would falsely raise the Discard bar with zero typing. The body
+        // dirty test must instead compare against the captured prefill
+        // baseline.
+        let start = MOBILE_APP_JS
+            .find("function clearComposeFields()")
+            .expect("clearComposeFields must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("clearComposeFields must close");
+        let clear_block = &rest[..end];
+        assert!(
+            clear_block.contains("state.composeBaseline"),
+            "clearComposeFields must capture the prefilled body as state.composeBaseline"
+        );
+
+        let start = MOBILE_APP_JS
+            .find("function cancelCompose()")
+            .expect("cancelCompose must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("cancelCompose must close");
+        let cancel_block = &rest[..end];
+        assert!(
+            cancel_block.contains("!== state.composeBaseline"),
+            "cancelCompose's body-dirty test must compare against state.composeBaseline"
+        );
+        assert!(
+            !cancel_block.contains("compose-body').value.trim()"),
+            "cancelCompose must not treat the signature prefill as dirty via value.trim()"
+        );
+    }
+
     // =========================================================================
     // create_split / update_split validation tests (roborev 271)
     // =========================================================================

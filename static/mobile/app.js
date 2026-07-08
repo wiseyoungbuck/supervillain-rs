@@ -42,6 +42,9 @@ const state = {
     composeSession: 0,         // bumped by startCompose/startReply/startForward; lets an
                                // in-flight send tell a stale completion apart from a new
                                // draft that also happens to be on Screen.COMPOSE
+    composeBaseline: '',       // exact body value clearComposeFields prefilled (signature or
+                               // ''); cancelCompose treats the body as dirty only when it
+                               // differs, so an untouched prefill never prompts to discard
     pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
     searchQuery: '',           // active search string, or '' when inactive; combines with currentSplit (kata p80m)
 };
@@ -1727,6 +1730,9 @@ function clearComposeFields() {
     composeEl('compose-subject').value = '';
     const body = composeEl('compose-body');
     body.value = composeSignaturePrefill();
+    // Dirty-check baseline: cancelCompose compares against this exact
+    // string, so an untouched signature prefill doesn't read as a draft.
+    state.composeBaseline = body.value;
     body.setSelectionRange(0, 0);
     autosizeComposeBody();
     const quote = composeEl('compose-quote');
@@ -1979,12 +1985,15 @@ async function sendComposedEmail() {
 // automation harness). Dirty covers every field the user could have filled
 // in — a recipients-only draft (To/Cc typed, subject/body still blank) or an
 // attachment-only draft is just as real a draft as one with text in it and
-// must not be silently discarded.
+// must not be silently discarded. The body is compared against the exact
+// prefill baseline (captured by clearComposeFields) rather than trimmed
+// emptiness: a signature prefill makes the body non-empty from the first
+// paint, and an untouched prefill is not a draft.
 function cancelCompose() {
     const dirty = composeEl('compose-to').value.trim()
         || composeEl('compose-cc').value.trim()
         || composeEl('compose-subject').value.trim()
-        || composeEl('compose-body').value.trim()
+        || composeEl('compose-body').value !== state.composeBaseline
         || state.pendingAttachments.length > 0;
     if (dirty) {
         showDiscardBar();

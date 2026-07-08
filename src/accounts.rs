@@ -421,17 +421,47 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
 }
 
 /// Escape a plain-text signature so it fits on the single INI line
-/// `parse_config_str`'s line-based scanner expects: backslash and newline
-/// are the only two characters that would otherwise corrupt the format
-/// (a literal newline would start a new "line", potentially parsed as a new
-/// key or section header).
+/// `parse_config_str`'s line-based scanner expects. Two concerns:
+///
+/// * Structure: backslash and newline would corrupt the format (a literal
+///   newline starts a new "line", potentially parsed as a new key or
+///   section header) → `\` becomes `\\`, newline becomes `\n`.
+/// * Boundaries: the parser trims both the raw line and the value, so a
+///   space or tab at the very start or end of the encoded value would
+///   silently vanish on reload → the first and last character, when they
+///   are a space/tab, are escaped as `\s` (space) / `\t` (tab). One
+///   character per boundary suffices: once escaped, the value starts/ends
+///   with a backslash or the escape letter, so trim() can't reach the
+///   remaining interior whitespace.
 fn escape_ini_multiline(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', "\\n")
+    let mut out = s.replace('\\', "\\\\").replace('\n', "\\n");
+    // Leading boundary. The replacements above never produce a leading
+    // space/tab that wasn't already there in `s`.
+    if let Some(first) = out.chars().next() {
+        match first {
+            ' ' => out.replace_range(0..1, "\\s"),
+            '\t' => out.replace_range(0..1, "\\t"),
+            _ => {}
+        }
+    }
+    // Trailing boundary (checked after the leading escape so a value like
+    // " " — one char serving both roles — is only escaped once).
+    if let Some(last) = out.chars().next_back() {
+        let at = out.len() - last.len_utf8();
+        match last {
+            ' ' => out.replace_range(at.., "\\s"),
+            '\t' => out.replace_range(at.., "\\t"),
+            _ => {}
+        }
+    }
+    out
 }
 
-/// Inverse of `escape_ini_multiline`. Tolerant of a trailing lone backslash
-/// or an unrecognized escape (passes it through literally) rather than
-/// panicking on a hand-edited config.
+/// Inverse of `escape_ini_multiline` (`\n` → newline, `\\` → backslash,
+/// `\s` → space, `\t` → tab — the latter two accepted anywhere even though
+/// the escaper only emits them at the boundaries). Tolerant of a trailing
+/// lone backslash or an unrecognized escape (passes it through literally)
+/// rather than panicking on a hand-edited config.
 fn unescape_ini_multiline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -442,6 +472,8 @@ fn unescape_ini_multiline(s: &str) -> String {
         }
         match chars.next() {
             Some('n') => out.push('\n'),
+            Some('s') => out.push(' '),
+            Some('t') => out.push('\t'),
             Some('\\') => out.push('\\'),
             Some(other) => {
                 out.push('\\');
@@ -1561,6 +1593,59 @@ mod tests {
             unescape_ini_multiline(&escaped),
             "C:\\path\\to\\file\nline two"
         );
+    }
+
+    #[test]
+    fn signature_round_trips_boundary_whitespace() {
+        // parse_config_str trims both the raw line and the value, so any
+        // space/tab at the very start or end of the encoded single-line
+        // value would silently vanish on reload unless the escaper protects
+        // the boundaries. Leading whitespace on the FIRST line and trailing
+        // whitespace on the LAST line of the signature land exactly on
+        // those encoded-string boundaries.
+        let cases = [
+            "  indented first line\nlast line", // leading spaces
+            "first line\nlast line  ",          // trailing spaces
+            "\tindented\nlast\t",               // boundary tabs
+            " one-liner ",                      // both ends at once
+            "  ",                               // whitespace-only
+        ];
+        for sig in cases {
+            let escaped = escape_ini_multiline(sig);
+            assert_eq!(
+                unescape_ini_multiline(&escaped),
+                sig,
+                "escape/unescape must round-trip {sig:?}"
+            );
+            // The encoded value must survive parse_config_str's trim: no
+            // leading/trailing space or tab on the encoded line.
+            assert_eq!(
+                escaped.trim(),
+                escaped,
+                "encoded value must have no trimmable boundary whitespace: {escaped:?}"
+            );
+            // Full config-level round trip, same as the parser would see.
+            let mut accounts = BTreeMap::new();
+            accounts.insert(
+                "fm".to_string(),
+                AccountConfig::Fastmail {
+                    username: "u@fm.com".into(),
+                    api_token: "tok".into(),
+                    signature: Some(sig.into()),
+                },
+            );
+            let cfg = ConfigFile {
+                default_account: None,
+                accounts,
+            };
+            let (parsed, errors) = parse_config_str(&serialize_config(&cfg));
+            assert!(errors.is_empty(), "no parse errors for {sig:?}: {errors:?}");
+            assert_eq!(
+                parsed.accounts.get("fm").unwrap().signature(),
+                Some(sig),
+                "config round trip must preserve boundary whitespace of {sig:?}"
+            );
+        }
     }
 
     #[test]
