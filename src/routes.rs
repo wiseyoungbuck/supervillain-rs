@@ -54,6 +54,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/emails", get(list_emails))
         .route("/api/upload", post(upload_blob))
         .route("/api/emails/send", post(send_email_handler))
+        .route("/api/drafts", post(create_draft_handler))
+        .route(
+            "/api/drafts/{draft_id}",
+            put(update_draft_handler).delete(delete_draft_handler),
+        )
         .route("/api/emails/{email_id}", get(get_email))
         .route("/api/emails/{email_id}/archive", post(archive_email))
         .route("/api/emails/{email_id}/trash", post(trash_email))
@@ -273,6 +278,22 @@ struct SendEmailBody {
 #[derive(Deserialize)]
 struct RsvpBody {
     status: crate::types::RsvpStatus,
+}
+
+/// Body for the persistent-draft routes (kata wm57). Same field style as
+/// `/emails/send` minus attachments/bcc/html: v1 drafts are plain-text only.
+#[derive(Deserialize)]
+struct DraftBody {
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    in_reply_to: Option<String>,
+    from_address: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -961,6 +982,72 @@ async fn send_email_handler(
         Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
         None => Err(Error::Internal("Failed to send email".into())),
     }
+}
+
+// --- Persistent drafts (kata wm57) -----------------------------------------
+
+/// Build a plain-text `EmailSubmission` from a draft body. v1 persists no
+/// html_body, attachments, or calendar — those live only in the live compose
+/// session, never in the stored draft.
+fn draft_submission(body: DraftBody) -> EmailSubmission {
+    EmailSubmission {
+        to: body.to,
+        cc: body.cc,
+        subject: body.subject,
+        text_body: body.body,
+        bcc: None,
+        html_body: None,
+        in_reply_to: body.in_reply_to,
+        references: None,
+        attachments: Vec::new(),
+        calendar_ics: None,
+    }
+}
+
+async fn create_draft_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+    Json(body): Json<DraftBody>,
+) -> Result<impl IntoResponse, Error> {
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let session = session_lock.read().await;
+    let from_addr = body
+        .from_address
+        .clone()
+        .unwrap_or_else(|| session.username().to_string());
+    let submission = draft_submission(body);
+    let id = provider::create_draft(&session, &submission, &from_addr).await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn update_draft_handler(
+    State(state): State<Arc<AppState>>,
+    Path(draft_id): Path<String>,
+    Query(params): Query<AccountParam>,
+    Json(body): Json<DraftBody>,
+) -> Result<impl IntoResponse, Error> {
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let session = session_lock.read().await;
+    let from_addr = body
+        .from_address
+        .clone()
+        .unwrap_or_else(|| session.username().to_string());
+    let submission = draft_submission(body);
+    // Editing a draft is destroy+recreate (JMAP bodies aren't patchable), so
+    // this returns a NEW id the client must adopt.
+    let id = provider::update_draft(&session, &draft_id, &submission, &from_addr).await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn delete_draft_handler(
+    State(state): State<Arc<AppState>>,
+    Path(draft_id): Path<String>,
+    Query(params): Query<AccountParam>,
+) -> Result<impl IntoResponse, Error> {
+    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let session = session_lock.read().await;
+    let success = provider::destroy_draft(&session, &draft_id).await?;
+    Ok(Json(serde_json::json!({ "success": success })))
 }
 
 const MAX_UPLOAD_SIZE: usize = 25 * 1024 * 1024; // 25 MB
@@ -1958,7 +2045,9 @@ mod tests {
             "api.js must use an allowlist regex for ?account= injection"
         );
         assert!(
-            API_JS.contains("/(emails|mailboxes|identities|splits|upload|split-counts|calendar)"),
+            API_JS.contains(
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts)"
+            ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );
     }
@@ -2485,19 +2574,26 @@ mod tests {
             "clearComposeFields must capture the prefilled body as state.composeBaseline"
         );
 
+        // The dirty check moved into composeDirty() (kata wm57: shared with
+        // autosave) — cancelCompose now delegates to it. The baseline-compare
+        // invariant lives there.
         let start = MOBILE_APP_JS
-            .find("function cancelCompose()")
-            .expect("cancelCompose must exist");
+            .find("function composeDirty()")
+            .expect("composeDirty must exist");
         let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("cancelCompose must close");
-        let cancel_block = &rest[..end];
+        let end = rest.find("\n}").expect("composeDirty must close");
+        let dirty_block = &rest[..end];
         assert!(
-            cancel_block.contains("!== state.composeBaseline"),
-            "cancelCompose's body-dirty test must compare against state.composeBaseline"
+            dirty_block.contains("!== state.composeBaseline"),
+            "composeDirty's body-dirty test must compare against state.composeBaseline"
         );
         assert!(
-            !cancel_block.contains("compose-body').value.trim()"),
-            "cancelCompose must not treat the signature prefill as dirty via value.trim()"
+            !dirty_block.contains("compose-body').value.trim()"),
+            "composeDirty must not treat the signature prefill as dirty via value.trim()"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("if (composeDirty())"),
+            "cancelCompose must delegate its dirty decision to composeDirty()"
         );
     }
 
@@ -3558,14 +3654,16 @@ mod tests {
 
     #[test]
     fn mobile_app_js_cancel_compose_dirty_check_covers_recipients_and_attachments() {
-        // roborev 288: cancelCompose's dirty check only looked at subject/body,
-        // so a recipients-only draft (To/Cc typed, nothing else) or an
+        // roborev 288: the dirty check only looked at subject/body, so a
+        // recipients-only draft (To/Cc typed, nothing else) or an
         // attachment-only draft got silently discarded with no confirmation.
+        // The check moved into composeDirty() (kata wm57), shared by cancel and
+        // autosave — the recipients/attachments coverage lives there now.
         let start = MOBILE_APP_JS
-            .find("function cancelCompose(")
-            .expect("cancelCompose must exist");
+            .find("function composeDirty(")
+            .expect("composeDirty must exist");
         let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("cancelCompose must close");
+        let end = rest.find("\n}").expect("composeDirty must close");
         let block = &rest[..end];
         assert!(
             block.contains("compose-to').value.trim()"),
@@ -3781,6 +3879,123 @@ white   = '#fdf6e3'
         assert_eq!(body.attachments[0].name, "doc.pdf");
         assert_eq!(body.attachments[0].mime_type, "application/pdf");
         assert_eq!(body.attachments[0].size, 1024);
+    }
+
+    // =========================================================================
+    // Persistent drafts (kata wm57)
+    // =========================================================================
+
+    #[test]
+    fn draft_body_deserializes_plain_text() {
+        let json = r#"{"to":["a@b.com"],"cc":["c@d.com"],"subject":"WIP","body":"draft text","in_reply_to":"<m@x>","from_address":"me@fastmail.com"}"#;
+        let body: DraftBody = serde_json::from_str(json).unwrap();
+        assert_eq!(body.to, vec!["a@b.com"]);
+        assert_eq!(body.cc, vec!["c@d.com"]);
+        assert_eq!(body.subject, "WIP");
+        assert_eq!(body.body, "draft text");
+        assert_eq!(body.in_reply_to.as_deref(), Some("<m@x>"));
+        assert_eq!(body.from_address.as_deref(), Some("me@fastmail.com"));
+    }
+
+    #[test]
+    fn draft_body_defaults_empty_fields() {
+        // An autosave of a near-pristine compose (only a To typed) must still
+        // deserialize — every field except the recipients is optional.
+        let json = r#"{"to":["a@b.com"]}"#;
+        let body: DraftBody = serde_json::from_str(json).unwrap();
+        assert!(body.cc.is_empty());
+        assert_eq!(body.subject, "");
+        assert_eq!(body.body, "");
+        assert!(body.in_reply_to.is_none());
+    }
+
+    #[test]
+    fn draft_submission_is_plain_text_only() {
+        // v1 persists no html_body / attachments / calendar — those live only
+        // in the live compose session, never in the stored draft.
+        let body = DraftBody {
+            to: vec!["a@b.com".into()],
+            cc: vec![],
+            subject: "S".into(),
+            body: "B".into(),
+            in_reply_to: Some("<m@x>".into()),
+            from_address: None,
+        };
+        let sub = draft_submission(body);
+        assert_eq!(sub.text_body, "B");
+        assert_eq!(sub.in_reply_to.as_deref(), Some("<m@x>"));
+        assert!(sub.html_body.is_none(), "drafts persist no html body");
+        assert!(sub.attachments.is_empty(), "drafts persist no attachments");
+        assert!(sub.calendar_ics.is_none(), "drafts persist no calendar");
+        assert!(sub.bcc.is_none());
+    }
+
+    // Both clients must wire the same draft contract: a debounced autosave that
+    // POSTs then PUTs, a tracked draftId deleted on send, and the
+    // drafts-mailbox-opens-compose restore — all gated on the fastmail provider.
+    fn assert_bundle_has_draft_autosave(js: &str, bundle: &str) {
+        for needle in [
+            "AUTOSAVE_DEBOUNCE_MS",
+            "function scheduleAutosave",
+            "function runAutosave",
+            "function flushAutosave",
+            "function deleteTrackedDraft",
+            "state.draftId",
+            "'/drafts'",
+            "/drafts/",
+        ] {
+            assert!(
+                js.contains(needle),
+                "{bundle} must contain draft-autosave wiring: {needle}"
+            );
+        }
+        // Autosave and delete are Fastmail-only in v1.
+        assert!(
+            js.contains("provider === 'fastmail'"),
+            "{bundle} must gate drafts on the fastmail provider"
+        );
+        // Restore: opening a draft-mailbox row goes to compose, not detail.
+        assert!(
+            js.contains("role === 'drafts'"),
+            "{bundle} must special-case the drafts mailbox for restore"
+        );
+    }
+
+    #[test]
+    fn app_js_has_draft_autosave_wiring() {
+        assert_bundle_has_draft_autosave(APP_JS, "desktop app.js");
+        assert!(
+            APP_JS.contains("function openDraftInCompose"),
+            "desktop must route a drafts-mailbox open into compose"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_draft_autosave_wiring() {
+        assert_bundle_has_draft_autosave(MOBILE_APP_JS, "mobile app.js");
+        assert!(
+            MOBILE_APP_JS.contains("function startDraftCompose"),
+            "mobile must route a drafts-mailbox open into compose"
+        );
+    }
+
+    #[test]
+    fn draft_autosave_never_fires_on_pristine_compose() {
+        // The debounce fire must bail when the compose isn't dirty, so an
+        // untouched (or signature-only) compose never creates a draft.
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            let start = js
+                .find("function runAutosave")
+                .unwrap_or_else(|| panic!("{bundle} runAutosave must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("runAutosave must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("composeDirty()"),
+                "{bundle} runAutosave must guard on composeDirty() so a pristine \
+                 compose is never autosaved"
+            );
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 // Auto-append ?account= ONLY for account-scoped routes. Settings routes
 // (`/accounts/...`, `/theme`, `/timezone*`) are global and must never be
 // tagged.
-const ACCOUNT_SCOPED_API = /^\/(emails|mailboxes|identities|splits|upload|split-counts|calendar)/;
+const ACCOUNT_SCOPED_API = /^\/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts)/;
 
 // Error taxonomy: ApiAuthError means the account's provider session needs
 // re-authorization (401/403 from the server); everything else — network

@@ -202,6 +202,52 @@ pub async fn send_email(
     }
 }
 
+// =============================================================================
+// Persistent drafts (kata wm57) — Fastmail-only in v1
+// =============================================================================
+//
+// Only the Fastmail (JMAP) arm is implemented. Gmail and Outlook return a
+// clear BadRequest so the client can surface "not supported for this provider
+// yet" instead of a generic failure. The client gates the whole draft feature
+// on `provider === 'fastmail'`, so these arms are defense in depth.
+
+fn drafts_unsupported(s: &ProviderSession) -> Error {
+    Error::BadRequest(format!(
+        "drafts are not supported for {} yet",
+        s.provider_name()
+    ))
+}
+
+pub async fn create_draft(
+    s: &ProviderSession,
+    sub: &EmailSubmission,
+    from_addr: &str,
+) -> Result<String, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::create_draft(s, sub, from_addr).await,
+        other => Err(drafts_unsupported(other)),
+    }
+}
+
+pub async fn update_draft(
+    s: &ProviderSession,
+    draft_id: &str,
+    sub: &EmailSubmission,
+    from_addr: &str,
+) -> Result<String, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::update_draft(s, draft_id, sub, from_addr).await,
+        other => Err(drafts_unsupported(other)),
+    }
+}
+
+pub async fn destroy_draft(s: &ProviderSession, draft_id: &str) -> Result<bool, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::destroy_draft(s, draft_id).await,
+        other => Err(drafts_unsupported(other)),
+    }
+}
+
 pub async fn get_calendar_data(
     s: &ProviderSession,
     email_id: &str,
@@ -516,5 +562,61 @@ mod tests {
     fn sends_rsvp_automatically_false_for_fastmail() {
         let s = make_fastmail_session();
         assert!(!s.sends_rsvp_automatically());
+    }
+
+    // --- draft provider gating (kata wm57) ---
+
+    fn draft_submission() -> EmailSubmission {
+        EmailSubmission {
+            to: vec!["bob@example.com".into()],
+            cc: vec![],
+            subject: "Draft".into(),
+            text_body: "wip".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: None,
+        }
+    }
+
+    fn assert_drafts_unsupported(err: Error, provider: &str) {
+        match err {
+            Error::BadRequest(msg) => {
+                assert!(
+                    msg.contains("not supported") && msg.contains(provider),
+                    "expected a clear per-provider not-supported message, got: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_draft_rejected_for_gmail() {
+        let s = make_gmail_session();
+        let err = create_draft(&s, &draft_submission(), "me@gmail.com")
+            .await
+            .expect_err("gmail must reject draft creation in v1");
+        assert_drafts_unsupported(err, "gmail");
+    }
+
+    #[tokio::test]
+    async fn update_draft_rejected_for_outlook() {
+        let s = make_outlook_session();
+        let err = update_draft(&s, "draft-1", &draft_submission(), "me@outlook.com")
+            .await
+            .expect_err("outlook must reject draft update in v1");
+        assert_drafts_unsupported(err, "outlook");
+    }
+
+    #[tokio::test]
+    async fn destroy_draft_rejected_for_gmail() {
+        let s = make_gmail_session();
+        let err = destroy_draft(&s, "draft-1")
+            .await
+            .expect_err("gmail must reject draft destroy in v1");
+        assert_drafts_unsupported(err, "gmail");
     }
 }

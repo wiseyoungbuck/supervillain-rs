@@ -1312,6 +1312,152 @@ pub async fn send_email(
 }
 
 // =============================================================================
+// Persistent drafts (kata wm57)
+// =============================================================================
+//
+// Unlike the send flow's transient draft (created then immediately moved to
+// Sent), these are drafts the user keeps: created in the Drafts mailbox with
+// the `$draft` keyword and NO EmailSubmission, so nothing is dispatched. v1 is
+// plain-text only — no html_body, no persisted attachments — so callers build
+// the EmailSubmission with those fields empty and the body construction is
+// reused from `build_draft_email` rather than duplicated.
+//
+// JMAP Email objects are immutable except for `mailboxIds`/`keywords`
+// (RFC 8621): the body, subject and recipients of an existing draft cannot be
+// patched in place. Editing a draft is therefore a destroy+recreate — one
+// Email/set that creates the replacement and destroys the old id — which
+// yields a NEW server id the caller must adopt (`update_draft` returns it).
+
+/// Look up the Drafts mailbox id from the session cache, or error if the
+/// account has no drafts mailbox. Mirrors the inline lookup in `send_email`.
+fn drafts_mailbox_id(s: &JmapSession) -> Result<String, Error> {
+    s.mailbox_cache
+        .values()
+        .find(|mb| mb.role.as_deref() == Some("drafts"))
+        .map(|mb| mb.id.clone())
+        .ok_or_else(|| Error::Internal("No drafts mailbox found".into()))
+}
+
+/// Email/set create for a persistent draft: `build_draft_email` plus the
+/// `$draft` keyword, no submission. Pure so the request shape is testable.
+fn draft_create_request(
+    account_id: &str,
+    sub: &EmailSubmission,
+    from_addr: &str,
+    drafts_mailbox_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut email = build_draft_email(sub, from_addr, drafts_mailbox_id);
+    email.insert("keywords".into(), serde_json::json!({ "$draft": true }));
+    vec![serde_json::json!([
+        "Email/set",
+        {
+            "accountId": account_id,
+            "create": { "draft": email }
+        },
+        "0"
+    ])]
+}
+
+/// Email/set that creates the replacement draft and destroys the old id in a
+/// single call (Email bodies aren't patchable — see module note). Returns a
+/// new server id via the created "draft" record.
+fn draft_update_request(
+    account_id: &str,
+    draft_id: &str,
+    sub: &EmailSubmission,
+    from_addr: &str,
+    drafts_mailbox_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut email = build_draft_email(sub, from_addr, drafts_mailbox_id);
+    email.insert("keywords".into(), serde_json::json!({ "$draft": true }));
+    vec![serde_json::json!([
+        "Email/set",
+        {
+            "accountId": account_id,
+            "create": { "draft": email },
+            "destroy": [draft_id]
+        },
+        "0"
+    ])]
+}
+
+/// Email/set destroy for a draft.
+fn draft_destroy_request(account_id: &str, draft_id: &str) -> Vec<serde_json::Value> {
+    vec![serde_json::json!([
+        "Email/set",
+        {
+            "accountId": account_id,
+            "destroy": [draft_id]
+        },
+        "0"
+    ])]
+}
+
+/// Pull the created draft's id out of an Email/set response, or build an error
+/// carrying the server's `notCreated` detail.
+fn created_draft_id(resp: &serde_json::Value, action: &str) -> Result<String, Error> {
+    let created = &resp["methodResponses"][0][1]["created"]["draft"];
+    if let Some(id) = created["id"].as_str() {
+        return Ok(id.to_string());
+    }
+    let not_created = &resp["methodResponses"][0][1]["notCreated"];
+    let detail = if not_created.is_null() {
+        "no detail".into()
+    } else {
+        not_created.to_string()
+    };
+    Err(Error::Internal(format!("{action} failed: {detail}")))
+}
+
+/// Create a persistent draft. Returns the new draft's server id.
+pub async fn create_draft(
+    s: &JmapSession,
+    sub: &EmailSubmission,
+    from_addr: &str,
+) -> Result<String, Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let drafts_id = drafts_mailbox_id(s)?;
+    let resp = jmap_call(
+        s,
+        draft_create_request(account_id, sub, from_addr, &drafts_id),
+    )
+    .await?;
+    created_draft_id(&resp, "Draft creation")
+}
+
+/// Replace an existing draft (destroy+recreate). Returns the NEW server id —
+/// callers must adopt it, as the old id is now destroyed.
+pub async fn update_draft(
+    s: &JmapSession,
+    draft_id: &str,
+    sub: &EmailSubmission,
+    from_addr: &str,
+) -> Result<String, Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let drafts_id = drafts_mailbox_id(s)?;
+    let resp = jmap_call(
+        s,
+        draft_update_request(account_id, draft_id, sub, from_addr, &drafts_id),
+    )
+    .await?;
+    created_draft_id(&resp, "Draft update")
+}
+
+/// Destroy a draft. Idempotent: a `notFound` (already gone) counts as success
+/// so the fire-and-forget delete on send/discard never surfaces a spurious
+/// error for a draft the send flow already removed.
+pub async fn destroy_draft(s: &JmapSession, draft_id: &str) -> Result<bool, Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let resp = jmap_call(s, draft_destroy_request(account_id, draft_id)).await?;
+    let destroyed = resp["methodResponses"][0][1]["destroyed"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(draft_id)));
+    let already_gone = resp["methodResponses"][0][1]["notDestroyed"][draft_id]["type"].as_str()
+        == Some("notFound");
+    Ok(destroyed || already_gone)
+}
+
+// =============================================================================
 // Calendar
 // =============================================================================
 
@@ -2212,6 +2358,118 @@ END:VCALENDAR";
             .values()
             .find(|mb| mb.role.as_deref() == Some("drafts"));
         assert_eq!(result.unwrap().id, "drafts-id");
+    }
+
+    // --- persistent draft request-shape tests (kata wm57) ---
+
+    fn draft_set_args(calls: &[serde_json::Value]) -> &serde_json::Value {
+        // Every draft request is a single Email/set method call.
+        assert_eq!(calls.len(), 1, "draft requests are a single method call");
+        assert_eq!(calls[0][0], "Email/set", "draft persistence uses Email/set");
+        &calls[0][1]
+    }
+
+    #[test]
+    fn draft_create_request_has_draft_keyword_and_mailbox() {
+        let sub = simple_submission();
+        let calls = draft_create_request("acct-1", &sub, "alice@example.com", "mb-drafts");
+        let args = draft_set_args(&calls);
+        assert_eq!(args["accountId"], "acct-1");
+        let create = &args["create"]["draft"];
+        assert_eq!(
+            create["keywords"],
+            serde_json::json!({ "$draft": true }),
+            "a persistent draft must carry the $draft keyword"
+        );
+        assert_eq!(
+            create["mailboxIds"],
+            serde_json::json!({ "mb-drafts": true }),
+            "the draft must land in the Drafts mailbox"
+        );
+        assert_eq!(create["subject"], "Test");
+        assert_eq!(
+            create["to"],
+            serde_json::json!([{"email": "bob@example.com"}])
+        );
+    }
+
+    #[test]
+    fn draft_create_request_has_no_submission() {
+        // The distinguishing feature vs the send flow: no EmailSubmission,
+        // so nothing is dispatched — the draft just sits in Drafts.
+        let sub = simple_submission();
+        let calls = draft_create_request("acct-1", &sub, "alice@example.com", "mb-drafts");
+        let raw = serde_json::to_string(&calls).unwrap();
+        assert!(
+            !raw.contains("EmailSubmission"),
+            "creating a draft must not issue an EmailSubmission"
+        );
+        let args = draft_set_args(&calls);
+        assert!(
+            args.get("destroy").is_none(),
+            "a plain create must not destroy anything"
+        );
+    }
+
+    #[test]
+    fn draft_update_request_creates_and_destroys() {
+        // Email bodies aren't patchable, so an edit is create+destroy in one
+        // Email/set — the new record replaces the old id.
+        let sub = simple_submission();
+        let calls = draft_update_request(
+            "acct-1",
+            "old-draft-id",
+            &sub,
+            "alice@example.com",
+            "mb-drafts",
+        );
+        let args = draft_set_args(&calls);
+        assert_eq!(
+            args["create"]["draft"]["keywords"],
+            serde_json::json!({ "$draft": true })
+        );
+        assert_eq!(
+            args["destroy"],
+            serde_json::json!(["old-draft-id"]),
+            "update must destroy the previous draft id"
+        );
+        let raw = serde_json::to_string(&calls).unwrap();
+        assert!(
+            !raw.contains("EmailSubmission"),
+            "updating a draft must not issue an EmailSubmission"
+        );
+    }
+
+    #[test]
+    fn draft_destroy_request_targets_the_id() {
+        let calls = draft_destroy_request("acct-1", "draft-xyz");
+        let args = draft_set_args(&calls);
+        assert_eq!(args["accountId"], "acct-1");
+        assert_eq!(args["destroy"], serde_json::json!(["draft-xyz"]));
+        assert!(args.get("create").is_none());
+    }
+
+    #[test]
+    fn created_draft_id_reads_new_id() {
+        let resp = serde_json::json!({
+            "methodResponses": [["Email/set", { "created": { "draft": { "id": "new-id-1" } } }, "0"]]
+        });
+        assert_eq!(
+            created_draft_id(&resp, "Draft creation").unwrap(),
+            "new-id-1"
+        );
+    }
+
+    #[test]
+    fn created_draft_id_surfaces_not_created() {
+        let resp = serde_json::json!({
+            "methodResponses": [["Email/set", {
+                "created": {},
+                "notCreated": { "draft": { "type": "invalidProperties" } }
+            }, "0"]]
+        });
+        let err = created_draft_id(&resp, "Draft creation").unwrap_err();
+        assert!(matches!(err, Error::Internal(ref m) if m.contains("Draft creation failed")));
     }
 
     // --- parse_jmap_email tests (THE-153) ---

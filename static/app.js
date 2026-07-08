@@ -17,6 +17,13 @@ const state = {
     pendingG: false,          // for gg command
     commandPaletteIndex: 0,
     replyContext: null,       // for reply/forward
+    draftId: null,            // server id of the persistent draft this compose is autosaving (kata wm57)
+    composeBaseline: '',      // compose body value at clear/restore time; composeDirty compares
+                              // against it so an untouched signature prefill (or restored draft)
+                              // never reads as a change worth autosaving
+    composeSession: 0,        // bumped by clearCompose on every fresh/restored compose; an
+                              // in-flight autosave adopts its returned id only while the token
+                              // still matches, so a stale save can't corrupt a newer draft
     identities: [],           // send-as email addresses
     splits: [],               // split inbox definitions
     currentSplit: 'all',      // currently active split tab
@@ -250,6 +257,8 @@ function init() {
     [els.composeTo, els.composeCc, els.composeSubject, els.composeBody].forEach(el => {
         el.addEventListener('focus', () => setMode('insert'));
         el.addEventListener('blur', () => setMode('normal'));
+        // Debounced draft autosave (kata wm57): each edit reschedules the save.
+        el.addEventListener('input', scheduleAutosave);
     });
 
     // Auto-expand textarea as user types
@@ -1026,6 +1035,15 @@ async function maybeRefillEmails() {
 }
 
 async function loadEmailDetail(emailId) {
+    // Drafts restore (kata wm57): in the Drafts mailbox on Fastmail, opening a
+    // row edits the draft in compose rather than showing the read-only detail.
+    // Gated so every other mailbox — and every other provider — keeps the
+    // normal detail open.
+    if (state.currentMailbox?.role === 'drafts' && draftsEnabled()) {
+        openDraftInCompose(emailId);
+        return;
+    }
+
     // Save scroll position of the email we're leaving (if any)
     saveScrollPosition();
 
@@ -1236,6 +1254,7 @@ async function sendEmail() {
                 attachments: readyAttachments.length ? readyAttachments : undefined,
             });
             showStatus('Invite sent!', 'success');
+            deleteTrackedDraft();
             clearCompose();
             showView('list');
         } catch (err) {
@@ -1256,6 +1275,7 @@ async function sendEmail() {
             attachments: readyAttachments.length ? readyAttachments : undefined,
         });
         showStatus('Sent!', 'success');
+        deleteTrackedDraft();
         clearCompose();
         showView('list');
     } catch (err) {
@@ -2459,6 +2479,10 @@ function handleNormalModeKey(e) {
             if (state.view === 'detail') {
                 showView('list');
             } else if (state.view === 'compose') {
+                // Cancel-with-keep: persist the last edits, then leave the
+                // draft saved on the server (kata wm57). clearCompose stops
+                // tracking it without deleting.
+                flushAutosave();
                 clearCompose();
                 showView('list');
             }
@@ -2917,10 +2941,21 @@ function composeSignaturePrefill() {
 }
 
 function clearCompose() {
+    // Every fresh (or restored) compose is a new autosave session: bump the
+    // token so a still-in-flight save from the previous draft can't adopt its
+    // id here, and cancel any pending debounce. draftId is nulled — a restore
+    // sets it again after this runs; a plain new compose leaves it null until
+    // the first autosave POSTs.
+    state.composeSession++;
+    cancelAutosave();
+    state.draftId = null;
     els.composeTo.value = '';
     els.composeCc.value = '';
     els.composeSubject.value = '';
     els.composeBody.value = composeSignaturePrefill();
+    // Dirty-check baseline: composeDirty compares the body against this exact
+    // string, so an untouched signature prefill isn't autosaved as a draft.
+    state.composeBaseline = els.composeBody.value;
     els.composeBody.setSelectionRange(0, 0);
     els.composeQuote.innerHTML = '';
     els.composeQuote.classList.add('hidden');
@@ -2946,6 +2981,126 @@ function clearCompose() {
         els.inviteEnd.value = '';
         els.inviteTz.value = '';
     }
+}
+
+// ============================================================================
+// Draft autosave / restore (kata wm57) — Fastmail-only, plain-text
+// ============================================================================
+// A debounced background save keeps the compose persisted as a real Drafts
+// message: the first save POSTs (adopting the returned id into state.draftId),
+// each edit after re-saves as a PUT. Because JMAP can't patch an email body in
+// place, the server destroys+recreates on PUT and returns a NEW id, which we
+// re-adopt. Autosave never fires on a pristine compose (composeDirty gate) and
+// is silent on failure (console.warn only). Sending or explicitly discarding
+// deletes the tracked draft; backing out keeps it — that's the feature.
+
+const AUTOSAVE_DEBOUNCE_MS = 3000;
+let autosaveTimer = null;
+
+function draftsEnabled() {
+    return state.currentAccount?.provider === 'fastmail';
+}
+
+// True when the compose holds anything worth saving. Mirrors the send-time
+// notion of "has content": any recipient/subject, body diverging from the
+// prefill baseline, or a pending attachment (attachments aren't persisted, but
+// their presence still marks the compose as a real draft).
+function composeDirty() {
+    return !!(els.composeTo.value.trim()
+        || els.composeCc.value.trim()
+        || els.composeSubject.value.trim()
+        || els.composeBody.value !== state.composeBaseline
+        || state.pendingAttachments.length);
+}
+
+function cancelAutosave() {
+    if (autosaveTimer) { clearTimeout(autosaveTimer); autosaveTimer = null; }
+}
+
+function scheduleAutosave() {
+    if (!draftsEnabled()) return;
+    cancelAutosave();
+    autosaveTimer = setTimeout(runAutosave, AUTOSAVE_DEBOUNCE_MS);
+}
+
+// Immediately fire any pending autosave (used when leaving compose so the last
+// few seconds of typing aren't lost). No-op when nothing is pending.
+function flushAutosave() {
+    if (!autosaveTimer) return;
+    cancelAutosave();
+    runAutosave();
+}
+
+async function runAutosave() {
+    autosaveTimer = null;
+    if (!draftsEnabled() || !composeDirty()) return;
+    // Capture everything synchronously: the caller may clear the compose right
+    // after (flush-on-leave) while the request is still in flight.
+    const session = state.composeSession;
+    const payload = {
+        to: els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean),
+        cc: els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean),
+        subject: els.composeSubject.value,
+        body: els.composeBody.value,
+        in_reply_to: state.replyContext?.inReplyTo || null,
+        from_address: els.composeFrom?.value || null,
+    };
+    try {
+        const res = state.draftId
+            ? await api('PUT', `/drafts/${encodeURIComponent(state.draftId)}`, payload)
+            : await api('POST', '/drafts', payload);
+        // Adopt the (possibly changed) id only while this is still the active
+        // compose — a newer draft must not inherit this save's id.
+        if (state.composeSession === session && res?.id) {
+            state.draftId = res.id;
+            showStatus('Draft saved', 'info');
+        }
+    } catch (err) {
+        console.warn('Autosave failed:', err);
+    }
+}
+
+// Fire-and-forget delete of the tracked draft (on send / explicit discard).
+// Nulls draftId up front so a racing autosave completion can't resurrect it.
+function deleteTrackedDraft() {
+    const id = state.draftId;
+    state.draftId = null;
+    cancelAutosave();
+    if (!id || !draftsEnabled()) return;
+    api('DELETE', `/drafts/${encodeURIComponent(id)}`)
+        .catch(err => console.warn('Draft delete failed:', err));
+}
+
+// Restore: open a Drafts-mailbox message in compose (prefilled) instead of the
+// read-only detail view, tracking its id so autosave updates it and send
+// deletes it. Plain text only — the reply/forward quote context is not
+// reconstructed (the draft body is whatever plain text was saved).
+async function openDraftInCompose(emailId) {
+    let draft = emailCache[cacheKey(emailId)];
+    if (!draft || draft.textBody === undefined) {
+        try {
+            draft = await api('GET', `/emails/${emailId}`);
+            emailCache[cacheKey(emailId)] = draft;
+        } catch (err) {
+            showStatus('Failed to load draft: ' + err.message, 'error');
+            return;
+        }
+    }
+    state.replyContext = null;
+    clearCompose();
+    els.composeTo.value = (draft.to || []).map(t => t.email).filter(Boolean).join(', ');
+    els.composeCc.value = (draft.cc || []).map(t => t.email).filter(Boolean).join(', ');
+    els.composeSubject.value = draft.subject || '';
+    els.composeBody.value = draft.textBody || (draft.htmlBody ? htmlToPlainText(draft.htmlBody) : '');
+    const fromEmail = draft.from?.[0]?.email;
+    if (els.composeFrom && fromEmail && state.identities.some(i => i.email === fromEmail)) {
+        els.composeFrom.value = fromEmail;
+    }
+    // Track the existing draft and baseline the restored body so simply
+    // opening it (no edit) doesn't trigger a redundant save.
+    state.draftId = emailId;
+    state.composeBaseline = els.composeBody.value;
+    showView('compose');
 }
 
 let attachmentIdCounter = 0;
