@@ -477,8 +477,12 @@
             margin-top: 4px;
         }
 
-        /* Attachments */
+        /* Attachments (kata 0g9v: inline image preview + Download All) */
         #detail-attachments .att-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
             padding: 8px 16px;
             font-size: 13px;
             font-weight: 600;
@@ -486,10 +490,22 @@
             border-bottom: 1px solid var(--border);
         }
 
-        .att-item {
+        .att-download-all {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            padding: 4px;
+            min-height: 44px;
             display: flex;
             align-items: center;
-            gap: 10px;
+        }
+
+        .att-item {
+            display: flex;
+            flex-direction: column;
             padding: 10px 16px;
             min-height: 44px;
             border-bottom: 1px solid var(--border);
@@ -498,6 +514,20 @@
         }
 
         .att-item:active { background: var(--surface-hover); }
+
+        /* Inline preview for image/* attachments only — tapping the row
+           (image included) opens the full blob via the anchor, same as a
+           non-image row. */
+        .att-preview {
+            display: block;
+            max-width: 100%;
+            max-height: 240px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            object-fit: contain;
+        }
+
+        .att-row { display: flex; align-items: center; gap: 10px; }
         .att-icon { font-size: 18px; flex-shrink: 0; }
         .att-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
         .att-size { color: var(--text-muted); font-size: 12px; flex-shrink: 0; }
@@ -779,6 +809,79 @@
             border: 0;
             background: #fff;
         }
+
+        /* Compose attachments (kata 0g9v) */
+        #compose-attach-row {
+            padding: 4px 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        #compose-attach-btn {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 14px;
+            cursor: pointer;
+            padding: 10px 4px;
+            min-height: 44px;
+        }
+
+        #compose-attachments.hidden { display: none; }
+
+        #compose-attachments {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .compose-attachment-chip {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            max-width: 100%;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 6px 6px 6px 10px;
+            font-size: 13px;
+            color: var(--text);
+        }
+
+        .compose-attachment-chip.uploading { opacity: 0.7; }
+
+        .compose-attachment-chip.error {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .att-chip-name {
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .att-chip-status {
+            color: var(--text-muted);
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+
+        .compose-attachment-chip.error .att-chip-status { color: var(--accent); }
+
+        .att-chip-remove {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 4px;
+            min-width: 32px;
+            min-height: 32px;
+        }
     </style>
 </head>
 <body>
@@ -858,6 +961,16 @@
                     <input id="compose-subject" type="text" placeholder="Subject">
                 </div>
                 <textarea id="compose-body" placeholder="Write your message"></textarea>
+                <!-- Attachment sending (kata 0g9v): the file input is hidden and
+                     opened via the visible 📎 button — file inputs render
+                     inconsistently across mobile browsers when shown directly. -->
+                <div id="compose-attach-row">
+                    <button id="compose-attach-btn" type="button">&#128206; Attach</button>
+                    <input id="compose-file-input" type="file" multiple style="display:none">
+                </div>
+                <div id="compose-attachments" class="hidden">
+                    <div id="compose-attachments-list"></div>
+                </div>
                 <div id="compose-quote" class="hidden">
                     <button id="compose-quote-toggle" type="button">Show quoted text</button>
                     <div id="compose-quote-body" class="hidden"></div>

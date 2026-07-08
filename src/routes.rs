@@ -2967,6 +2967,171 @@ mod tests {
     }
 
     // =========================================================================
+    // Attachment tests (kata 0g9v): detail-view polish + compose sending
+    // =========================================================================
+
+    #[test]
+    fn mobile_app_js_uploads_attachments_with_explicit_account_param() {
+        // Mobile posts raw bytes to /api/upload — state.api() JSON-encodes
+        // bodies, so it can't carry a binary File. This bypasses it, and
+        // (like attachmentUrl()) must append ?account= explicitly since
+        // there's no implicit per-tab session the way desktop's bare-URL xhr
+        // assumes (a known, intentionally-not-copied desktop gap).
+        assert!(
+            MOBILE_APP_JS.contains("/api/upload"),
+            "mobile app.js should call the upload endpoint"
+        );
+        let start = MOBILE_APP_JS
+            .find("/api/upload")
+            .expect("upload endpoint reference must exist");
+        let region = &MOBILE_APP_JS[start..start + 200];
+        assert!(
+            region.contains("account="),
+            "the upload URL must explicitly append ?account= (region: {region})"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("X-Filename"),
+            "upload request should set X-Filename like desktop's uploadAttachment"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_tracks_pending_attachments() {
+        assert!(
+            MOBILE_APP_JS.contains("pendingAttachments"),
+            "mobile app.js should track compose attachments on state.pendingAttachments"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("'uploading'"),
+            "pending attachments should carry an uploading status"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("'ready'"),
+            "pending attachments should carry a ready status"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("'error'"),
+            "pending attachments should carry an error status"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_blocks_send_during_upload() {
+        let start = MOBILE_APP_JS
+            .find("async function sendComposedEmail(")
+            .expect("sendComposedEmail must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("status === 'uploading'"),
+            "send should block while any attachment is still uploading"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_send_includes_ready_attachments() {
+        let start = MOBILE_APP_JS
+            .find("async function sendComposedEmail(")
+            .expect("sendComposedEmail must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("blob_id") && block.contains("mime_type"),
+            "send payload should map ready attachments to {{blob_id, name, mime_type, size}}"
+        );
+        assert!(
+            block.contains("undefined"),
+            "attachments should be omitted (undefined) rather than sent as an empty array"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_clears_attachments_on_compose_reset() {
+        // clearComposeFields is the single reset path shared by cancel,
+        // discard, send-success, and re-entering compose — attachment
+        // cleanup belongs there so every path clears it.
+        let start = MOBILE_APP_JS
+            .find("function clearComposeFields(")
+            .expect("clearComposeFields must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("clearComposeFields must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("PendingAttachments") || block.contains("pendingAttachments"),
+            "clearComposeFields should reset pendingAttachments \
+             (region: {block})"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_inline_image_preview() {
+        let start = MOBILE_APP_JS
+            .find("function renderAttachments(")
+            .expect("renderAttachments must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\nfunction ")
+            .expect("renderAttachments must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains(r#"loading="lazy""#),
+            "image/* attachments should render a lazy-loaded inline preview"
+        );
+        assert!(
+            region.contains("image/"),
+            "the preview must be gated on image/* mime types"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_download_all() {
+        let start = MOBILE_APP_JS
+            .find("function renderAttachments(")
+            .expect("renderAttachments must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\nfunction ")
+            .expect("renderAttachments must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("Download All"),
+            "2+ attachments should offer a Download All action"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function downloadAllAttachments("),
+            "Download All should mirror desktop's sequential-click helper"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_no_share_sheet_integration() {
+        // Deviation from the stale kata body (task A7 brief): no
+        // navigator.share — iOS long-press on the attachment link already
+        // offers the native share sheet.
+        assert!(
+            !MOBILE_APP_JS.contains("navigator.share"),
+            "mobile app.js should not add navigator.share — the link's \
+             long-press share sheet already covers this"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_attach_button_and_file_input() {
+        for id in ["compose-attach-btn", "compose-file-input"] {
+            assert!(
+                MOBILE_HTML.contains(id),
+                "compose markup should include #{id}"
+            );
+        }
+        assert!(
+            MOBILE_HTML.contains(r#"type="file""#),
+            "the attach control should be backed by a file input"
+        );
+    }
+
+    // =========================================================================
     // Theme tests
     // =========================================================================
 

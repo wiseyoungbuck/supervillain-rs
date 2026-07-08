@@ -36,6 +36,7 @@ const state = {
     identitiesAccount: null,   // account id the cached identities belong to
     replyContext: null,        // { inReplyTo?, quotedHtml, quotedText } appended at send time
     sending: false,            // in-flight send lock (disables Send, ignores re-taps)
+    pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -968,18 +969,41 @@ function renderEmailDetail(email) {
 }
 
 function renderAttachments(attachments, emailId) {
-    const header = '<div class="att-header">Attachments (' + attachments.length + ')</div>';
+    // "Download All" only earns its place with 2+ attachments (kata 0g9v) —
+    // mirrors desktop's downloadAllAttachments condition exactly.
+    const downloadAll = attachments.length > 1
+        ? '<button type="button" class="att-download-all">Download All</button>'
+        : '';
+    const header = '<div class="att-header"><span>Attachments (' + attachments.length + ')</span>' + downloadAll + '</div>';
     const items = attachments.map(att => {
         const icon = getFileIcon(att.mime_type, att.name);
         const size = formatFileSize(att.size);
         const url = attachmentUrl(emailId, att);
+        // Inline preview for images only; tapping it (or the row) opens the
+        // full blob in a new tab via the same anchor — no separate viewer.
+        const preview = att.mime_type.startsWith('image/')
+            ? '<img class="att-preview" loading="lazy" src="' + escapeHtml(url) + '" alt="">'
+            : '';
         return '<a class="att-item" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' +
+            preview +
+            '<span class="att-row">' +
             '<span class="att-icon">' + icon + '</span>' +
             '<span class="att-name">' + escapeHtml(att.name) + '</span>' +
             '<span class="att-size">' + size + '</span>' +
+            '</span>' +
             '</a>';
     }).join('');
     return header + items;
+}
+
+// Sequential anchor clicks with a small stagger — mirrors desktop's
+// downloadAllAttachments. Each anchor targets _blank, so this opens one new
+// tab per attachment (a popup blocker may cap how many actually go through).
+function downloadAllAttachments() {
+    const links = document.querySelectorAll('#detail-attachments .att-item');
+    links.forEach((a, i) => {
+        setTimeout(() => a.click(), i * 200);
+    });
 }
 
 function formatDetailDate(isoString) {
@@ -1098,6 +1122,133 @@ function getComposeEmail() {
     return state.emailCache[state.currentEmailId] || null;
 }
 
+// ----------------------------------------------------------------------------
+// Compose — attachment sending (kata 0g9v)
+// ----------------------------------------------------------------------------
+// Mirrors desktop's pendingAttachments lifecycle (static/app.js addFiles /
+// uploadAttachment / renderComposeAttachments), with two deliberate mobile
+// deviations: fetch instead of XHR — no upload progress percentage, so
+// status chips only ever show uploading/ready/error — and an explicit
+// ?account= query param on the upload endpoint. state.api() JSON-encodes
+// every body, so it can't carry a binary File; this posts raw bytes directly
+// and, like attachmentUrl(), must name the account explicitly. (Desktop's
+// bare-URL xhr against the browser's one implicit session is a known
+// pre-existing gap — not copied here.)
+
+let attachmentIdCounter = 0;
+
+function handleAttachmentFileSelect() {
+    const input = composeEl('compose-file-input');
+    const files = input.files;
+    if (!files || !files.length) return;
+    for (const file of files) addComposeAttachment(file);
+    input.value = '';
+}
+
+function addComposeAttachment(file) {
+    const id = ++attachmentIdCounter;
+    const controller = new AbortController();
+    state.pendingAttachments.push({
+        _id: id,
+        name: file.name,
+        mime_type: file.type || 'application/octet-stream',
+        size: file.size,
+        status: 'uploading',
+        blob_id: null,
+        controller,
+    });
+    renderComposeAttachments();
+    uploadComposeAttachment(file, id, controller);
+}
+
+async function uploadComposeAttachment(file, id, controller) {
+    const url = '/api/upload?account=' + encodeURIComponent(state.currentAccount.id);
+    let data;
+    try {
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': file.type || 'application/octet-stream',
+                'X-Filename': file.name,
+            },
+            body: file,
+            signal: controller.signal,
+        });
+        if (!resp.ok) throw new Error((await resp.text()) || 'upload failed');
+        data = await resp.json();
+    } catch (err) {
+        if (err.name === 'AbortError') return; // removed mid-upload — not a failure
+        const att = state.pendingAttachments.find(a => a._id === id);
+        if (att) {
+            att.status = 'error';
+            att.controller = null;
+            renderComposeAttachments();
+        }
+        showError('Upload ' + file.name, err);
+        return;
+    }
+    const att = state.pendingAttachments.find(a => a._id === id);
+    if (att) {
+        att.blob_id = data.blob_id;
+        att.status = 'ready';
+        att.controller = null;
+        renderComposeAttachments();
+    }
+}
+
+// Status chips only — no progress bar. uploading… while in flight, name +
+// size once ready, and an Error label on failure; every chip (including
+// error) keeps its ✕ remove control.
+function renderComposeAttachments() {
+    const wrap = composeEl('compose-attachments');
+    const list = composeEl('compose-attachments-list');
+    if (!state.pendingAttachments.length) {
+        wrap.classList.add('hidden');
+        list.innerHTML = '';
+        return;
+    }
+    wrap.classList.remove('hidden');
+    list.innerHTML = state.pendingAttachments.map(att => {
+        const icon = getFileIcon(att.mime_type, att.name);
+        const statusLabel = att.status === 'uploading' ? 'Uploading…'
+            : att.status === 'error' ? 'Error' : formatFileSize(att.size);
+        const cls = 'compose-attachment-chip'
+            + (att.status === 'error' ? ' error' : '')
+            + (att.status === 'uploading' ? ' uploading' : '');
+        return '<span class="' + cls + '" data-id="' + att._id + '">' +
+            '<span class="att-chip-icon">' + icon + '</span>' +
+            '<span class="att-chip-name">' + escapeHtml(att.name) + '</span>' +
+            '<span class="att-chip-status">' + statusLabel + '</span>' +
+            '<button type="button" class="att-chip-remove" data-id="' + att._id
+            + '" aria-label="Remove ' + escapeHtml(att.name) + '">×</button>' +
+            '</span>';
+    }).join('');
+}
+
+function handleComposeAttachmentListClick(e) {
+    const removeBtn = e.target.closest('.att-chip-remove');
+    if (!removeBtn) return;
+    const id = Number(removeBtn.dataset.id);
+    const idx = state.pendingAttachments.findIndex(a => a._id === id);
+    if (idx === -1) return;
+    const att = state.pendingAttachments[idx];
+    if (att.controller) att.controller.abort();
+    state.pendingAttachments.splice(idx, 1);
+    renderComposeAttachments();
+}
+
+// Aborts any in-flight uploads and drops every pending attachment. Called
+// from clearComposeFields so every compose reset path — cancel/discard,
+// send-success, and re-entering compose for a new draft — clears it too.
+function clearPendingAttachments() {
+    for (const att of state.pendingAttachments) {
+        if (att.controller) att.controller.abort();
+    }
+    state.pendingAttachments = [];
+    composeEl('compose-file-input').value = '';
+    renderComposeAttachments();
+}
+
 // Reset every field to empty and drop any reply/forward context. Field-only:
 // the screen show/hide stays in setScreen.
 function clearComposeFields() {
@@ -1114,6 +1265,7 @@ function clearComposeFields() {
     hideDiscardBar();
     state.replyContext = null;
     if (state.identities.length) composeEl('compose-from').value = state.identities[0].email;
+    clearPendingAttachments();
 }
 
 // Renders the read-only quote preview: a header line plus the original body
@@ -1268,6 +1420,13 @@ async function sendComposedEmail() {
         return;
     }
 
+    // Mirrors desktop sendEmail's guard: an attachment still uploading has no
+    // blob_id yet, so sending now would either drop it or race the upload.
+    if (state.pendingAttachments.some(a => a.status === 'uploading')) {
+        showError('Send', new Error('wait for uploads to finish'));
+        return;
+    }
+
     const quotedText = state.replyContext?.quotedText;
     const quotedHtml = state.replyContext?.quotedHtml;
 
@@ -1280,6 +1439,10 @@ async function sendComposedEmail() {
           + '<blockquote style="border-left:2px solid #ccc;padding-left:12px;margin-left:0">' + quotedHtml + '</blockquote>'
         : null;
 
+    const readyAttachments = state.pendingAttachments
+        .filter(a => a.status === 'ready')
+        .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
+
     setComposeSending(true);
     try {
         await state.api('POST', '/emails/send', {
@@ -1290,6 +1453,7 @@ async function sendComposedEmail() {
             html_body: fullHtmlBody || undefined,
             in_reply_to: state.replyContext?.inReplyTo || null,
             from_address: fromAddress,
+            attachments: readyAttachments.length ? readyAttachments : undefined,
         });
         // The user may have browser-backed out of compose while the send was
         // in flight — setScreen already popped the history entry on the way
@@ -1641,6 +1805,20 @@ document.getElementById('compose-fields').addEventListener('focusin', (e) => {
     if (e.target.matches('input, textarea, select')) {
         e.target.scrollIntoView({ block: 'nearest' });
     }
+});
+
+// Compose attachments (kata 0g9v): the 📎 button opens the hidden file
+// input; the input's change event does the actual upload kick-off.
+document.getElementById('compose-attach-btn').addEventListener('click', () => {
+    composeEl('compose-file-input').click();
+});
+document.getElementById('compose-file-input').addEventListener('change', handleAttachmentFileSelect);
+document.getElementById('compose-attachments-list').addEventListener('click', handleComposeAttachmentListClick);
+
+// Detail attachments: delegated so re-renders (a fresh innerHTML per email)
+// never need their own rebind.
+document.getElementById('detail-attachments').addEventListener('click', (e) => {
+    if (e.target.closest('.att-download-all')) downloadAllAttachments();
 });
 
 // Undo toast — tap anywhere on it to undo (no keyboard shortcut on a phone).
