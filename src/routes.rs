@@ -628,6 +628,9 @@ async fn get_email(
         let mut skip_partstat_merge = false;
 
         if event.method == "REQUEST" {
+            // Anti-spoof input: this trusts the From header as delivered (i.e.
+            // whatever survived the provider's DMARC/SPF filtering) — it is not
+            // cryptographic verification of the organizer.
             let sender_email = email.from.first().map(|a| a.email.as_str());
             let decision = calendar::invite_update_decision(
                 stored_event.as_ref().map(|e| e.sequence),
@@ -4167,7 +4170,7 @@ white   = '#fdf6e3'
     fn app_js_user_status_not_block_scoped() {
         // userStatus must be declared before the cancelled if/else, not inside the else block
         let pos = APP_JS
-            .find("const userStatus = event.user_rsvp_status")
+            .find("const userStatus = event.isUpdate ? null : (event.user_rsvp_status")
             .expect("should declare userStatus");
         let after = &APP_JS[pos..];
         let cancelled_pos = after
@@ -4264,6 +4267,16 @@ white   = '#fdf6e3'
         assert!(
             MOBILE_HTML.contains(".cal-updated"),
             "mobile index.html should style .cal-updated"
+        );
+        // Desktop reset gate: on an Update, userStatus must be forced null so
+        // the getUserRsvpStatus attendee-scan fallback can't re-highlight a
+        // button (or show "You responded X") from the incoming ICS's stale
+        // PARTSTAT under the "please respond again" banner.
+        assert!(
+            APP_JS.contains(
+                "const userStatus = event.isUpdate ? null : (event.user_rsvp_status || getUserRsvpStatus(event));"
+            ),
+            "app.js must gate the RSVP highlight on isUpdate (null on update)"
         );
     }
 

@@ -3844,8 +3844,10 @@ function renderCalendarCard(event) {
         els.calAttendees.style.display = 'none';
     }
 
-    // Find current user's RSVP status
-    const userStatus = event.user_rsvp_status || getUserRsvpStatus(event);
+    // Find current user's RSVP status. On an Update (rescheduled invite) the
+    // response was reset server-side — force null so the attendee-scan fallback
+    // can't resurrect a stale highlight from the incoming ICS's PARTSTAT.
+    const userStatus = event.isUpdate ? null : (event.user_rsvp_status || getUserRsvpStatus(event));
 
     // Hide RSVP actions for cancelled events
     const actions = els.calendarEvent.querySelector('.calendar-actions');
