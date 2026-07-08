@@ -4839,6 +4839,83 @@ white   = '#fdf6e3'
             "batch unsubscribe/archive must not push an undo-stack entry (out of scope, see brief)"
         );
     }
+
+    // =========================================================================
+    // Offline banner (kata 115b, task A12)
+    // =========================================================================
+
+    #[test]
+    fn mobile_html_has_offline_banner() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="offline-banner""#),
+            "should have a persistent #offline-banner element"
+        );
+        assert!(
+            MOBILE_HTML.contains("Offline") && MOBILE_HTML.contains("data may be stale"),
+            "banner copy should tell the user data may be stale while offline"
+        );
+        // It must default hidden and toggle via a class (never .style.display,
+        // see mobile_app_js_offline_banner_uses_class_toggle) — a normal-flow
+        // element, not a fixed overlay, so it inherits the app-shell's own
+        // safe-top padding for free like bottom-nav does for safe-bottom.
+        assert!(
+            MOBILE_HTML.contains("#offline-banner {") && MOBILE_HTML.contains("display: none;"),
+            "banner should default hidden via CSS"
+        );
+        assert!(
+            MOBILE_HTML.contains("#offline-banner.visible"),
+            "banner visibility should be a class toggle, not a screen"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_offline_banner_uses_class_toggle() {
+        // The banner is connectivity-driven chrome, not a screen — its
+        // show/hide must NOT live inside setScreen or use .style.display,
+        // or it would trip the display-ownership invariant (see
+        // mobile_app_js_setscreen_owns_all_display_toggles above).
+        assert!(
+            MOBILE_APP_JS.contains("getElementById('offline-banner').classList.toggle("),
+            "offline banner visibility should be a classList.toggle, not .style.display"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_offline_listeners() {
+        assert!(
+            MOBILE_APP_JS.contains("addEventListener('online',"),
+            "should listen for the online event"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("addEventListener('offline',"),
+            "should listen for the offline event"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("navigator.onLine"),
+            "should check navigator.onLine at boot, not just wait for an event"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_offline_reconnect_refreshes_list() {
+        // Reconnecting should clear the banner and refresh the list — same
+        // abort/reload protocol as selectAccount/selectMailbox/selectSplit
+        // (abortListLoad guards every list switch, kata 1wdy).
+        let start = MOBILE_APP_JS
+            .find("function handleOnline(")
+            .expect("handleOnline must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("handleOnline body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("abortListLoad()"),
+            "reconnect should abort any stale in-flight load first"
+        );
+        assert!(
+            region.contains("loadEmails()"),
+            "reconnect should trigger a list refresh"
+        );
+    }
 }
 
 // External dep for theme path

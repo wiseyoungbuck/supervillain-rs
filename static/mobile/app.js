@@ -2088,6 +2088,32 @@ function finishPullRefresh() {
 }
 
 // ============================================================================
+// Offline banner (kata 115b, task A12)
+// ============================================================================
+// Persistent chrome, not a toast: driven by connectivity (online/offline
+// events + navigator.onLine at boot below), not navigation, so it stays
+// outside setScreen's display-ownership switch — a class toggle only, never
+// an inline style — and remains visible across screen changes rather than
+// being torn down on navigation like a screen-scoped element would be.
+
+function setOfflineBanner(offline) {
+    document.getElementById('offline-banner').classList.toggle('visible', offline);
+}
+
+function handleOffline() {
+    setOfflineBanner(true);
+}
+
+function handleOnline() {
+    setOfflineBanner(false);
+    // Data loaded (or left stale) while offline needs a refresh. Same
+    // abort/reload protocol as selectAccount/selectMailbox/selectSplit
+    // (abortListLoad guards every list switch, kata 1wdy).
+    abortListLoad();
+    loadEmails();
+}
+
+// ============================================================================
 // Infinite scroll
 // ============================================================================
 
@@ -2265,6 +2291,13 @@ document.getElementById('undo-toast').addEventListener('click', performUndo);
 window.addEventListener('popstate', (e) => {
     setScreen(e.state?.screen ?? Screen.LIST, e.state ?? {});
 });
+
+// Offline banner (kata 115b, task A12): connectivity, not navigation — wired
+// once at boot like popstate above. navigator.onLine covers the case where
+// the page itself loads while already offline (an event alone would miss it).
+window.addEventListener('online', handleOnline);
+window.addEventListener('offline', handleOffline);
+setOfflineBanner(!navigator.onLine);
 
 // Replace initial history state
 history.replaceState({ screen: Screen.LIST }, '');

@@ -28,6 +28,7 @@
             --accent: #e94560;
             --accent-dim: #b8364d;
             --success: #2ecc71;
+            --warning: #f5a623;
             --border: #2a2a4a;
             --safe-top: env(safe-area-inset-top, 0px);
             --safe-bottom: env(safe-area-inset-bottom, 0px);
@@ -122,6 +123,13 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
+            /* Touch-target audit (kata 115b, task A12): the pill's own box was
+               ~24px tall (padding + line height) — no shorter than icon-btn's
+               44px next to it, since the header's height is already set by
+               icon-btn regardless. */
+            min-height: 44px;
+            display: inline-flex;
+            align-items: center;
         }
 
         /* Search bar (kata p80m, task A9): overlays/replaces the normal
@@ -152,6 +160,9 @@
             min-width: 0;
             font-size: 16px;
             padding: 8px 10px;
+            /* Touch-target audit (kata 115b, task A12): padding alone put
+               this under 44px tall. */
+            min-height: 44px;
             border: 1px solid var(--border);
             border-radius: 8px;
             background: var(--surface);
@@ -166,8 +177,9 @@
             line-height: 1;
             cursor: pointer;
             padding: 0;
-            min-width: 32px;
-            min-height: 32px;
+            /* Touch-target audit (kata 115b, task A12): bumped 32px -> 44px. */
+            min-width: 44px;
+            min-height: 44px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -211,6 +223,28 @@
         .split-count {
             font-size: 11px;
             color: var(--text-muted);
+        }
+
+        /* Offline banner (kata 115b, task A12): persistent chrome driven by
+           connectivity events (online/offline + navigator.onLine at boot in
+           app.js), not navigation — it must survive screen changes instead
+           of being torn down like a toast, so it stays outside setScreen's
+           switch and toggles via a class only, never .style.display (would
+           trip the display-ownership invariant). As a normal-flow element
+           ahead of the list/detail/compose sections it inherits the
+           app-shell's own safe-top padding for free, the same trick
+           bottom-nav uses for safe-bottom. */
+        #offline-banner {
+            display: none;
+            padding: 6px 16px;
+            background: var(--accent-dim);
+            color: #fff;
+            font-size: 12px;
+            text-align: center;
+        }
+
+        #offline-banner.visible {
+            display: block;
         }
 
         /* Bottom-sheet overlay pattern — originally the account picker, now
@@ -434,7 +468,7 @@
         }
 
         .email-row-indicators .star {
-            color: #f5a623;
+            color: var(--warning);
             font-size: 14px;
         }
 
@@ -732,7 +766,7 @@
         .rsvp-btn:active { opacity: 0.7; }
 
         .rsvp-btn.accept.active { background: var(--success); border-color: var(--success); color: #fff; }
-        .rsvp-btn.maybe.active { background: #f5a623; border-color: #f5a623; color: #fff; }
+        .rsvp-btn.maybe.active { background: var(--warning); border-color: var(--warning); color: #fff; }
         .rsvp-btn.decline.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
         .rsvp-status-label {
@@ -893,7 +927,8 @@
             font-size: 13px;
             cursor: pointer;
             padding: 8px 12px;
-            min-height: 40px;
+            /* Touch-target audit (kata 115b, task A12): bumped 40px -> 44px. */
+            min-height: 44px;
         }
 
         #compose-discard-bar #compose-discard-confirm {
@@ -1072,6 +1107,12 @@
 
         .compose-attachment-chip.error .att-chip-status { color: var(--accent); }
 
+        /* Touch-target audit (kata 115b, task A12): deliberately left at
+           32px, not bumped to 44px — it sits inside a compact inline chip
+           (.compose-attachment-chip) among several chips per row; a 44px
+           target here would force one chip per row and wreck density for a
+           low-frequency, low-consequence action (remove one attachment
+           before send, easily re-added). */
         .att-chip-remove {
             background: none;
             border: none;
@@ -1107,6 +1148,12 @@
              .visible class in renderSplitTabs (screen-level show/hide is
              setScreen's job, same as app-header). -->
         <div id="split-tabs"></div>
+        <!-- Offline banner (kata 115b, task A12): shown/hidden purely by
+             connectivity (see the CSS comment above and setOfflineBanner in
+             app.js) — not a screen, so it isn't in setScreen's switch and
+             stays visible across screen changes rather than being scoped to
+             LIST. -->
+        <div id="offline-banner">Offline — data may be stale</div>
         <div id="email-list-wrap">
             <div id="pull-indicator">Pull to refresh</div>
             <div id="email-list"></div>
