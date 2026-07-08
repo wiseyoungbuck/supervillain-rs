@@ -1939,6 +1939,41 @@ mod tests {
     }
 
     #[test]
+    fn contact_index_is_account_scoped() {
+        // selectAccount's documented convention: caches are account-scoped
+        // (splitListCache/emailCache/scrollPositions all key by account and
+        // are never shared across a switch). The contact index must follow
+        // it — Account A's contacts leaking into Account B's compose would
+        // cross-pollinate address books. Pins: a per-account accessor
+        // exists, harvest writes through it, and rankContactMatches only
+        // reads the CURRENT account's entries.
+        assert!(
+            APP_JS.contains("function contactIndexFor("),
+            "a per-account contact-map accessor must exist"
+        );
+
+        let start = APP_JS
+            .find("function harvestContacts(")
+            .expect("harvestContacts must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("harvestContacts must close");
+        assert!(
+            rest[..end].contains("contactIndexFor(accountId)"),
+            "harvestContacts must write into the harvested account's own map"
+        );
+
+        let start2 = APP_JS
+            .find("function rankContactMatches(")
+            .expect("rankContactMatches must exist");
+        let rest2 = &APP_JS[start2..];
+        let end2 = rest2.find("\n}").expect("rankContactMatches must close");
+        assert!(
+            rest2[..end2].contains("state.currentAccount"),
+            "rankContactMatches must only surface the current account's contacts"
+        );
+    }
+
+    #[test]
     fn contact_rank_function_sorts_by_count_then_last_seen_and_excludes_self() {
         let start = APP_JS
             .find("function rankContactMatches(")

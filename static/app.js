@@ -16,7 +16,10 @@ const state = {
     // Contact autocomplete on compose To/Cc (kata e64s, task B6) — client-side
     // only, no server surface. Harvested from loaded email list pages plus one
     // background Sent-mailbox fetch per account session (see harvestContacts /
-    // harvestSentContactsOnce). email(lowercased) -> {email, name, lastSeen, count}.
+    // harvestSentContactsOnce). Account-scoped like every other cache in this
+    // file (see selectAccount): accountId -> Map of
+    // email(lowercased) -> {email, name, lastSeen, count}. Access via
+    // contactIndexFor(accountId) — never share entries across accounts.
     contactIndex: new Map(),
     contactAcField: null,     // 'to' | 'cc' | null — which compose field's dropdown is open
     contactAcIndex: 0,        // highlighted row in the open contact dropdown
@@ -88,7 +91,9 @@ const harvestedMessageIds = new Set();
 // harvestSentContactsOnce: a failure isn't retried).
 const sentHarvestedAccounts = new Set();
 // Lowercased addresses excluded from contact suggestions — accumulates across
-// every account whose identities have been loaded this session.
+// every account whose identities have been loaded this session. Deliberately
+// NOT account-scoped, unlike contactIndex: it is exclusion-only, so
+// over-excluding another account's "you" fails safe.
 const ownIdentityEmails = new Set();
 // Rows currently rendered in whichever contact dropdown is open.
 let contactAcMatches = [];
@@ -1095,13 +1100,27 @@ async function maybeRefillEmails() {
 // below). Ranking is frequency count desc, then lastSeen desc; the account's
 // own identity addresses are excluded (see ownIdentityEmails).
 
+// The one account's contact map inside state.contactIndex, created on first
+// touch. Per-account isolation follows the selectAccount convention
+// (splitListCache/emailCache/scrollPositions): a switch must never surface
+// another account's contacts in compose.
+function contactIndexFor(accountId) {
+    let index = state.contactIndex.get(accountId);
+    if (!index) {
+        index = new Map();
+        state.contactIndex.set(accountId, index);
+    }
+    return index;
+}
+
 // Folds a page of Email objects (list-view shape: {id, from, to, cc,
-// receivedAt, ...}) into state.contactIndex. Idempotent per message id (keyed
-// per account) so re-rendering an already-fetched page — e.g. the
-// splitListCache instant-switch snapshot — never inflates counts.
+// receivedAt, ...}) into the harvested account's contact map. Idempotent per
+// message id (keyed per account) so re-rendering an already-fetched page —
+// e.g. the splitListCache instant-switch snapshot — never inflates counts.
 function harvestContacts(emails, accountId) {
     if (!accountId || !emails || !emails.length) return;
 
+    const index = contactIndexFor(accountId);
     for (const email of emails) {
         const msgKey = `${accountId}:${email.id}`;
         if (harvestedMessageIds.has(msgKey)) continue;
@@ -1114,7 +1133,7 @@ function harvestContacts(emails, accountId) {
             if (!key || seenInEmail.has(key)) continue;
             seenInEmail.add(key);
 
-            const existing = state.contactIndex.get(key);
+            const existing = index.get(key);
             if (existing) {
                 existing.count += 1;
                 if (addr.name) existing.name = addr.name;
@@ -1122,7 +1141,7 @@ function harvestContacts(emails, accountId) {
                     existing.lastSeen = email.receivedAt;
                 }
             } else {
-                state.contactIndex.set(key, {
+                index.set(key, {
                     email: addr.email,
                     name: addr.name || '',
                     lastSeen: email.receivedAt || '',
@@ -1168,14 +1187,18 @@ function contactSegmentBounds(value, pos) {
 }
 
 // Pure rank/match helper: given the in-progress segment text, returns up to 6
-// contacts ranked by frequency count desc, then lastSeen desc. Matches on
-// email prefix OR name substring, case-insensitive; requires 2+ chars.
+// of the CURRENT account's contacts ranked by frequency count desc, then
+// lastSeen desc. Matches on email prefix OR name substring, case-insensitive;
+// requires 2+ chars.
 function rankContactMatches(query) {
     const q = query.trim().toLowerCase();
     if (q.length < 2) return [];
 
+    const index = state.contactIndex.get(state.currentAccount?.id);
+    if (!index) return [];
+
     const matches = [];
-    for (const c of state.contactIndex.values()) {
+    for (const c of index.values()) {
         if (ownIdentityEmails.has(c.email.toLowerCase())) continue;
         const emailMatch = c.email.toLowerCase().startsWith(q);
         const nameMatch = c.name && c.name.toLowerCase().includes(q);
