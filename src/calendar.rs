@@ -148,14 +148,60 @@ pub fn invite_update_decision(
 /// decision, callers should check this: if the content is unchanged, there's
 /// nothing to update — downgrade to `Unchanged` instead.
 ///
-/// Compares DTSTART/DTEND/SUMMARY/LOCATION only (the fields that matter for
-/// "did this actually get rescheduled"); a real reschedule changes at least
-/// one of them and still triggers `Update`.
+/// IMPORTANT (roborev 295 #1): callers must scope this check to the
+/// sequence-blind cases above, i.e. only call it when the *stored*
+/// SEQUENCE is 0. Once a provider round-trips SEQUENCE faithfully (stored
+/// SEQUENCE > 0), the `invite_update_decision` comparison is trustworthy on
+/// its own — downgrading a claimed Update based on content match alone would
+/// risk swallowing a genuine change to a field this function doesn't track.
+///
+/// Compares DTSTART/SUMMARY/LOCATION/DESCRIPTION and the attendee email set,
+/// plus a normalized DTEND (see `dtend_matches_normalized`) — a real
+/// reschedule, a description edit (e.g. a new meeting link), or an attendee
+/// change all still trigger `Update`. DESCRIPTION normalizes `None` and
+/// `Some("")` as equal. Attendees are compared as a lowercased, sorted set
+/// of email addresses only — name/PARTSTAT differences don't count as
+/// content changes here (PARTSTAT is the user's own RSVP, merged
+/// separately by the caller).
 pub fn events_content_match(stored: &CalendarEvent, incoming: &CalendarEvent) -> bool {
     stored.dtstart == incoming.dtstart
-        && stored.dtend == incoming.dtend
+        && dtend_matches_normalized(stored, incoming)
         && stored.summary == incoming.summary
         && stored.location == incoming.location
+        && normalize_description(&stored.description)
+            == normalize_description(&incoming.description)
+        && attendee_email_set(&stored.attendees) == attendee_email_set(&incoming.attendees)
+}
+
+/// DTEND equality for `events_content_match`, normalized for Outlook's
+/// store-time default (roborev 295 #2): `build_graph_event` fills a missing
+/// incoming DTEND with `dtstart + 1h` before persisting to Graph, so a
+/// DTEND-less invite reads back from Outlook as `Some(dtstart + 1h)`, never
+/// `None`. Comparing raw `Option`s would make that shape a permanent
+/// mismatch (stored: `Some(start+1h)`, incoming: `None`) and resurrect the
+/// per-open destructive rewrite for every DTEND-less invite. Treat an
+/// incoming `None` as matching a stored DTEND that is exactly
+/// `dtstart + 1h` — the signature of Outlook's own default, not a real
+/// difference. Any other stored/incoming shape falls back to plain equality.
+fn dtend_matches_normalized(stored: &CalendarEvent, incoming: &CalendarEvent) -> bool {
+    match (stored.dtend, incoming.dtend) {
+        (Some(stored_end), None) => stored_end == stored.dtstart + chrono::Duration::hours(1),
+        (stored_end, incoming_end) => stored_end == incoming_end,
+    }
+}
+
+/// Normalize DESCRIPTION for comparison: `None` and an empty string mean the
+/// same thing ("no description").
+fn normalize_description(description: &Option<String>) -> &str {
+    description.as_deref().unwrap_or("")
+}
+
+/// Normalize an attendee list to a lowercased, sorted set of email addresses
+/// for comparison — order and casing differences aren't content changes.
+fn attendee_email_set(attendees: &[Attendee]) -> Vec<String> {
+    let mut emails: Vec<String> = attendees.iter().map(|a| a.email.to_lowercase()).collect();
+    emails.sort();
+    emails
 }
 
 // =============================================================================
@@ -1689,8 +1735,29 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn content_match_false_when_only_one_side_missing_dtend() {
-        let stored = base_event(); // has DTEND
+    fn content_match_true_when_incoming_dtend_missing_matches_outlook_default() {
+        // roborev 295 #2: Outlook's build_graph_event defaults a missing
+        // DTEND to dtstart + 1h at store time, so the stored side reads back
+        // Some(dtstart + 1h) even for an originally DTEND-less invite.
+        // SAMPLE_ICS's DTEND (11:00) is exactly DTSTART (10:00) + 1h — the
+        // signature of that default — so a DTEND-less incoming ICS must
+        // normalize to a match here, not a permanent mismatch (which would
+        // resurrect the per-open destructive rewrite for every DTEND-less
+        // invite on Outlook).
+        let stored = base_event(); // DTEND == DTSTART + 1h
+        let mut incoming = base_event();
+        incoming.dtend = None;
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_incoming_dtend_missing_and_stored_not_default_duration() {
+        // The DTEND-missing normalization only covers the exact
+        // Outlook-default shape (stored == dtstart + 1h). A stored DTEND
+        // that differs from that is a genuine value the DTEND-less incoming
+        // side doesn't have — still a real mismatch.
+        let mut stored = base_event();
+        stored.dtend = stored.dtend.map(|dt| dt + chrono::Duration::hours(1)); // now +2h
         let mut incoming = base_event();
         incoming.dtend = None;
         assert!(!events_content_match(&stored, &incoming));
@@ -1702,6 +1769,77 @@ END:VCALENDAR";
         let mut incoming = base_event();
         incoming.location = None;
         assert!(!events_content_match(&stored, &incoming));
+    }
+
+    // --- events_content_match description/attendee coverage (roborev 295 #1) ---
+    //
+    // The guard originally compared only DTSTART/DTEND/SUMMARY/LOCATION, so a
+    // SEQUENCE-bumped update that changed only the DESCRIPTION (e.g. a new
+    // meeting link) or the attendee list was silently downgraded to
+    // Unchanged. Both fields must now participate in the comparison.
+
+    #[test]
+    fn content_match_false_when_description_differs() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.description = Some("New meeting link: https://example.com/new".into());
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_description_none_matches_empty_string() {
+        // None and Some("") both mean "no description" — not a content change.
+        let mut stored = base_event();
+        stored.description = None;
+        let mut incoming = base_event();
+        incoming.description = Some(String::new());
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_attendee_added() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.attendees.push(Attendee {
+            email: "dave@example.com".into(),
+            name: None,
+            status: "NEEDS-ACTION".into(),
+        });
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_attendee_removed() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.attendees.pop();
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_attendees_reordered_and_case_differs() {
+        // Attendee comparison is a lowercased, sorted set — order and email
+        // casing aren't content changes.
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.attendees.reverse();
+        for a in incoming.attendees.iter_mut() {
+            a.email = a.email.to_uppercase();
+        }
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_only_attendee_partstat_differs() {
+        // PARTSTAT/name changes aren't content changes here — PARTSTAT is
+        // the user's own RSVP, merged separately by the caller.
+        let stored = base_event();
+        let mut incoming = base_event();
+        for a in incoming.attendees.iter_mut() {
+            a.status = "ACCEPTED".into();
+            a.name = None;
+        }
+        assert!(events_content_match(&stored, &incoming));
     }
 
     // --- cancel_decision tests (roborev 292: CANCEL anti-spoof gate) ---

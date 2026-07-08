@@ -323,11 +323,26 @@ pub async fn add_to_calendar(
                 outlook::add_to_calendar(s, ics_data, &event).await
             } else {
                 // Explicit add — remove first then re-add to handle updates.
+                // Propagate remove failures (roborev 295 #3): if the delete
+                // failed, the event still exists, and the follow-up add hits
+                // the existence check and short-circuits to Ok(true), leaving
+                // the user thinking the update landed while the content is
+                // stale. `outlook::remove_from_calendar` is tolerant of "not
+                // found" (returns Ok(true) on a 404, same as a successful
+                // delete) — only Err and Ok(false) are real failures here.
+                match outlook::remove_from_calendar(s, uid).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Error::Internal(format!(
+                            "Failed to remove existing Outlook calendar event {uid} before re-adding"
+                        )));
+                    }
+                    Err(e) => return Err(e),
+                }
                 // If the re-add fails right after a successful remove, the
                 // calendar would silently lack the meeting until the next
                 // email open — retry the add once immediately before giving
                 // up (roborev 292 #3).
-                let _ = outlook::remove_from_calendar(s, uid).await;
                 let first = outlook::add_to_calendar(s, ics_data, &event).await;
                 if matches!(first, Ok(true)) {
                     first
@@ -693,6 +708,38 @@ mod tests {
         assert!(
             outlook_block.contains("outlook::remove_from_calendar(s, uid).await"),
             "the Outlook branch must still remove before re-adding"
+        );
+    }
+
+    // --- Outlook explicit-add remove-failure propagation (roborev 295 #3) ---
+    //
+    // The only_if_new=false Outlook branch used to discard the remove result
+    // entirely (`let _ = outlook::remove_from_calendar(...).await;`), so a
+    // failed delete (network error, non-2xx/non-404 status) went unnoticed:
+    // the follow-up add's "already exists" check would short-circuit to
+    // Ok(true), reporting success while the stale event was never replaced.
+    // Same source-shape assertion pattern as the retry test above — no mock
+    // HTTP server is wired up in this codebase for real request injection.
+
+    #[test]
+    fn add_to_calendar_propagates_outlook_remove_failure() {
+        let fn_src = add_to_calendar_fn_src();
+        let outlook_block = fn_src
+            .split("ProviderSession::Outlook(s) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("ProviderSession::Gmail(s) => {").next())
+            .expect("Outlook arm of add_to_calendar dispatch must exist");
+        assert!(
+            !outlook_block.contains("let _ = outlook::remove_from_calendar"),
+            "the Outlook branch must not silently discard remove failures"
+        );
+        assert!(
+            outlook_block.contains("Err(e) => return Err(e)"),
+            "the Outlook branch must propagate a remove Err instead of continuing to add"
+        );
+        assert!(
+            outlook_block.contains("Ok(false) => {"),
+            "the Outlook branch must treat a failed (non-404) remove as an error, not silent success"
         );
     }
 

@@ -680,21 +680,27 @@ async fn get_email(
                 stored_event.as_ref().map(|e| e.organizer_email.as_str()),
                 sender_email,
             );
-            // Content-idempotence guard (roborev 292): Outlook's parse_graph_event
-            // always reports sequence: 0 (Graph has no SEQUENCE field), so any
-            // invite with ICS SEQUENCE >= 1 hits this Update arm on *every*
-            // re-open — and remove+re-add wipes the user's stored responseStatus
-            // each time. A Gmail event stored before SEQUENCE round-tripping was
-            // added has the same issue as a one-time artifact. If the stored
-            // event's user-visible fields already match the incoming ICS,
-            // nothing actually changed — downgrade to Unchanged so we don't fire
-            // the destructive rewrite. A real reschedule (content differs) still
-            // Updates on all providers.
+            // Content-idempotence guard (roborev 292, scoped in roborev 295):
+            // Outlook's parse_graph_event always reports sequence: 0 (Graph has
+            // no SEQUENCE field), so any invite with ICS SEQUENCE >= 1 hits this
+            // Update arm on *every* re-open — and remove+re-add wipes the user's
+            // stored responseStatus each time. A Gmail event stored before
+            // SEQUENCE round-tripping was added has the same issue as a
+            // one-time artifact. If the stored event's user-visible fields
+            // already match the incoming ICS, nothing actually changed —
+            // downgrade to Unchanged so we don't fire the destructive rewrite.
+            //
+            // Scope this to the sequence-blind cases only: stored.sequence == 0.
+            // Once a provider round-trips SEQUENCE faithfully (stored.sequence
+            // > 0), the SEQUENCE comparison in invite_update_decision is
+            // trustworthy on its own — skip the content-match guard entirely so
+            // a real reschedule can't be masked by a content check that doesn't
+            // track every field. A real reschedule (content differs) still
+            // Updates in the sequence-blind case too.
             let decision = if decision == calendar::InviteAction::Update
-                && stored_event
-                    .as_ref()
-                    .is_some_and(|stored| calendar::events_content_match(stored, &event))
-            {
+                && stored_event.as_ref().is_some_and(|stored| {
+                    stored.sequence == 0 && calendar::events_content_match(stored, &event)
+                }) {
                 calendar::InviteAction::Unchanged
             } else {
                 decision
@@ -5291,6 +5297,26 @@ white   = '#fdf6e3'
         assert!(
             handler_src.contains("calendar::InviteAction::Unchanged"),
             "the guard must downgrade a no-op Update to Unchanged"
+        );
+    }
+
+    #[test]
+    fn get_email_content_idempotence_guard_scoped_to_stored_sequence_zero() {
+        // roborev 295 #1: events_content_match only tracks a subset of
+        // fields (DTSTART/DTEND/SUMMARY/LOCATION/DESCRIPTION/attendees).
+        // Once a provider round-trips SEQUENCE faithfully (stored.sequence >
+        // 0), the SEQUENCE comparison in invite_update_decision is already
+        // trustworthy — the content-match downgrade must not run in that
+        // case, or a genuine reschedule that touches a field the guard
+        // doesn't track could be masked as Unchanged. Only the
+        // sequence-blind cases (stored.sequence == 0: Outlook always,
+        // pre-round-trip legacy Gmail events) should hit the guard.
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            handler_src
+                .contains("stored.sequence == 0 && calendar::events_content_match(stored, &event)"),
+            "the content-idempotence guard must be scoped to stored.sequence == 0"
         );
     }
 
