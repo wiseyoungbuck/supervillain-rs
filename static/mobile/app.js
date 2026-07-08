@@ -39,6 +39,9 @@ const state = {
     identitiesAccount: null,   // account id the cached identities belong to
     replyContext: null,        // { inReplyTo?, quotedHtml, quotedText } appended at send time
     sending: false,            // in-flight send lock (disables Send, ignores re-taps)
+    composeSession: 0,         // bumped by startCompose/startReply/startForward; lets an
+                               // in-flight send tell a stale completion apart from a new
+                               // draft that also happens to be on Screen.COMPOSE
     pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
     searchQuery: '',           // active search string, or '' when inactive; combines with currentSplit (kata p80m)
 };
@@ -302,6 +305,10 @@ function selectAccount(account) {
     // a slow response can land after the switch and overwrite the new
     // account's list.
     abortListLoad();
+    // An undo entry's mailboxId belongs to the account we're leaving —
+    // stale by definition once the account changes, so drop the toast
+    // rather than let it keep offering an undo that no longer applies here.
+    hideUndoToast(undoToastEntry);
     state.currentAccount = account;
     state.api = makeApi(account.id);
     state.mailboxes = [];
@@ -351,8 +358,9 @@ function selectAccount(account) {
         });
     // Splits are account-scoped tabs, independent of the mailbox fetch
     // above (default currentSplit is 'all', which needs no split data to
-    // render) — fire-and-forget with its own abort/stale-account guard.
-    loadSplits(acct, state.loadAbort.signal);
+    // render) — fire-and-forget with its own dedicated abort/stale-account
+    // guard (not state.loadAbort — see loadSplits).
+    loadSplits(acct);
 }
 
 function renderAccountButton() {
@@ -520,7 +528,21 @@ async function loadMoreEmails() {
 // nav for the five role mailboxes instead of a sidebar, and a scrollable
 // tab row instead of a wrapping one.
 
-async function loadSplits(acct, signal) {
+// Dedicated controller (mirrors splitCountsController below), deliberately
+// NOT the shared state.loadAbort: selectMailbox/selectSplit call
+// abortListLoad() on every list switch, and sharing that controller meant
+// any such switch landing before /splits resolved silently killed the
+// splits fetch for the rest of the account session — the tab row never
+// retried and stayed permanently empty. This controller is only aborted
+// and recreated by loadSplits itself, so it's independent of list-load
+// churn and only resets when an account switch (or restore) calls
+// loadSplits again.
+let splitsController = null;
+
+async function loadSplits(acct) {
+    splitsController?.abort();
+    splitsController = new AbortController();
+    const signal = splitsController.signal;
     try {
         const splits = await state.api('GET', '/splits', null, signal);
         if (state.currentAccount?.id !== acct) return;
@@ -585,6 +607,13 @@ function renderSplitTabs() {
 function selectSplit(splitId) {
     if (state.currentSplit === splitId) return;
     abortListLoad();
+    // The pending undo's re-insert is gated on state.currentMailbox (see
+    // performUndo) and a split change doesn't touch that — but the toast
+    // still invites tapping Undo into a list that's about to be replaced
+    // by a different split's results, which reads as the undo landing in
+    // the wrong place. Hide it rather than leave it dangling over a list
+    // it no longer describes.
+    hideUndoToast(undoToastEntry);
     state.currentSplit = splitId;
     renderSplitTabs();
     loadEmails();
@@ -593,6 +622,10 @@ function selectSplit(splitId) {
 function selectMailbox(mailbox) {
     if (state.currentMailbox?.id === mailbox.id) return;
     abortListLoad();
+    // Undoing an archive/trash re-inserts only into the mailbox it happened
+    // in (performUndo's mailboxId gate) — once we've navigated to a
+    // different mailbox, that toast no longer describes the visible list.
+    hideUndoToast(undoToastEntry);
     state.currentMailbox = mailbox;
     state.currentSplit = 'all';
     state.splitCounts = {};
@@ -806,15 +839,26 @@ function hideUndoToast(entry) {
 // touches the list DOM when the list is the visible screen (same gating as
 // toggleUnread/toggleFlag) so undoing while viewing a *different* email in
 // DETAIL doesn't yank the user back to the list.
+//
+// The optimistic local re-insert is additionally gated on still being on the
+// mailbox the email was archived/trashed from (entry.mailboxId): the toast
+// stays tappable across a mailbox switch (selectMailbox/selectSplit hide it,
+// but there's a window before that runs), and splicing the email into
+// whatever list is CURRENTLY shown — e.g. archive in Inbox, switch to
+// Archive, tap Undo — would drop it into an unrelated list at a stale
+// index. Off the origin mailbox, only the server move-back happens.
 async function performUndo() {
     const entry = state.undoStack.pop();
     if (!entry) return;
 
     hideUndoToast(entry);
 
-    const index = Math.min(entry.index, state.emails.length);
-    state.emails.splice(index, 0, entry.email);
-    if (state.screen === Screen.LIST) renderEmailList();
+    const sameMailbox = state.currentMailbox?.id === entry.mailboxId;
+    if (sameMailbox) {
+        const index = Math.min(entry.index, state.emails.length);
+        state.emails.splice(index, 0, entry.email);
+        if (state.screen === Screen.LIST) renderEmailList();
+    }
 
     // The toast shows while the original archive/trash may still be in
     // flight; firing the move-back concurrently could complete out of order
@@ -832,10 +876,13 @@ async function performUndo() {
         });
     } catch (err) {
         // Revert the optimistic re-insert — the email stays removed, same
-        // as desktop's performUndo.
-        const idx = state.emails.indexOf(entry.email);
-        if (idx !== -1) state.emails.splice(idx, 1);
-        if (state.screen === Screen.LIST) renderEmailList();
+        // as desktop's performUndo. No-op if we never inserted it locally
+        // (sameMailbox was false).
+        if (sameMailbox) {
+            const idx = state.emails.indexOf(entry.email);
+            if (idx !== -1) state.emails.splice(idx, 1);
+            if (state.screen === Screen.LIST) renderEmailList();
+        }
         state.undoStack.push(entry);
         capUndoStack();
         showError('Undo', err);
@@ -1716,6 +1763,9 @@ function setComposeTitle(text) {
 
 // New blank message.
 function startCompose() {
+    // Bumped on every new draft (including reply/forward below) — see
+    // sendComposedEmail's stale-completion guard.
+    state.composeSession++;
     state.replyContext = null;
     clearComposeFields();
     setComposeTitle('New message');
@@ -1730,6 +1780,7 @@ function startReply(replyAll) {
     const email = getComposeEmail();
     if (!email) return;
 
+    state.composeSession++;
     clearComposeFields();
 
     const from = email.from?.[0];
@@ -1769,6 +1820,7 @@ function startForward() {
     const email = getComposeEmail();
     if (!email) return;
 
+    state.composeSession++;
     clearComposeFields();
 
     composeEl('compose-subject').value = email.subject.startsWith('Fwd:')
@@ -1820,6 +1872,15 @@ function setComposeSending(sending) {
 async function sendComposedEmail() {
     if (state.sending) return;
 
+    // Captured up front, before the await below: backing out of compose
+    // mid-send and immediately starting a NEW draft also lands back on
+    // Screen.COMPOSE, so the screen check alone can't distinguish this
+    // send's stale completion from the new draft. composeSession is bumped
+    // by every startCompose/startReply/startForward — requiring it to still
+    // match gates both the success-path clear/back and the failure-path
+    // handling below against touching a draft this send didn't create.
+    const session = state.composeSession;
+
     const to = composeEl('compose-to').value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = composeEl('compose-cc').value.split(',').map(s => s.trim()).filter(Boolean);
     const fromAddress = composeEl('compose-from').value || null;
@@ -1870,21 +1931,30 @@ async function sendComposedEmail() {
         // in flight — setScreen already popped the history entry on the way
         // out, so firing history.back() now would pop a SECOND entry
         // (detail→list, or clean out of the app), and a "Sent" toast for a
-        // draft they abandoned would just confuse. The send itself succeeded;
-        // only make sure no draft state lingers.
-        if (state.screen === Screen.COMPOSE) {
-            showToast('Sent', 3000);
-            clearComposeFields();
-            history.back();
-        } else {
-            clearComposeFields();
+        // draft they abandoned would just confuse. Worse, they may have
+        // already started composing something else entirely — that also
+        // reads as Screen.COMPOSE, so the composeSession check is what
+        // actually tells this stale completion apart from the new draft.
+        // The send itself succeeded; only make sure no draft state lingers,
+        // and never touch a draft this send didn't create.
+        if (state.composeSession === session) {
+            if (state.screen === Screen.COMPOSE) {
+                showToast('Sent', 3000);
+                clearComposeFields();
+                history.back();
+            } else {
+                clearComposeFields();
+            }
         }
     } catch (err) {
-        // Always surface the failure — even if the user already left compose,
-        // a silently dropped send would look like it went out. But only the
-        // still-on-compose case keeps the form for a retry; never touch
-        // history from a stale completion.
-        showError('Send', err);
+        // Surface the failure — a silently dropped send would look like it
+        // went out — but only when this send still owns the active draft;
+        // a stale failure (session moved on to a new draft) has no form
+        // left to leave "intact for a retry" and must not be blamed on
+        // whatever the user is composing now.
+        if (state.composeSession === session) {
+            showError('Send', err);
+        }
     } finally {
         setComposeSending(false);
     }
@@ -1892,9 +1962,16 @@ async function sendComposedEmail() {
 
 // Cancel: discard immediately when the draft is empty, else surface the
 // inline "Discard draft?" bar (no blocking confirm() — it would freeze the
-// automation harness).
+// automation harness). Dirty covers every field the user could have filled
+// in — a recipients-only draft (To/Cc typed, subject/body still blank) or an
+// attachment-only draft is just as real a draft as one with text in it and
+// must not be silently discarded.
 function cancelCompose() {
-    const dirty = composeEl('compose-subject').value.trim() || composeEl('compose-body').value.trim();
+    const dirty = composeEl('compose-to').value.trim()
+        || composeEl('compose-cc').value.trim()
+        || composeEl('compose-subject').value.trim()
+        || composeEl('compose-body').value.trim()
+        || state.pendingAttachments.length > 0;
     if (dirty) {
         showDiscardBar();
     } else {
@@ -2313,12 +2390,13 @@ function restoreFromSnapshot({ offline = false } = {}) {
     // yanked. On completion the stale indicator clears; on failure the snapshot
     // list stays (stale beats blank) and the error surfaces as usual.
     //
-    // Splits are kicked off in parallel (own abort/stale-account guard, errors
-    // sunk inside loadSplits — it never rejects), but a saved split filter must
-    // wait for them: emailListPath only appends split_id once state.splits is
+    // Splits are kicked off in parallel (own dedicated abort/stale-account
+    // guard — not state.loadAbort, see loadSplits — errors sunk inside
+    // loadSplits, it never rejects), but a saved split filter must wait for
+    // them: emailListPath only appends split_id once state.splits is
     // non-empty, so a refresh that outran the split definitions would fetch the
     // UNFILTERED inbox and nothing would re-fetch.
-    const splitsPromise = loadSplits(acct, state.loadAbort.signal);
+    const splitsPromise = loadSplits(acct);
     loadMailboxes(acct, state.loadAbort.signal, snapshot.mailboxRole || 'inbox')
         .then(() => {
             if (snapshot.splitId && snapshot.splitId !== 'all') return splitsPromise;

@@ -2796,6 +2796,52 @@ mod tests {
     }
 
     #[test]
+    fn mobile_app_js_undo_gates_reinsert_on_current_mailbox() {
+        // roborev 288: archive in Inbox, switch to Archive, tap Undo must not
+        // splice the email into the Archive list at a stale index — the
+        // optimistic local re-insert (and its failure-path revert) is gated
+        // on still being on the mailbox the email was archived/trashed from;
+        // only the server move-back happens unconditionally.
+        let start = MOBILE_APP_JS
+            .find("async function performUndo(")
+            .expect("performUndo must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("performUndo must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("state.currentMailbox?.id === entry.mailboxId"),
+            "performUndo must gate the optimistic re-insert on the entry's origin mailbox"
+        );
+        let matches = block.matches("sameMailbox").count();
+        assert!(
+            matches >= 3,
+            "sameMailbox must guard both the optimistic re-insert and its \
+             failure-path revert (found {matches} references)"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_mailbox_and_split_switches_hide_undo_toast() {
+        // roborev 288: an undo toast left over from a different mailbox/split
+        // invites tapping Undo into a list it no longer describes — every
+        // list-switch entry point must hide it, mirroring the abortListLoad()
+        // guard those same functions already carry (kata 1wdy).
+        for func in [
+            "function selectAccount(",
+            "function selectMailbox(",
+            "function selectSplit(",
+        ] {
+            let start = MOBILE_APP_JS.find(func).expect("function must exist");
+            let rest = &MOBILE_APP_JS[start..];
+            let end = rest.find("\n}").expect("function must close");
+            assert!(
+                rest[..end].contains("hideUndoToast(undoToastEntry)"),
+                "{func} must hide any pending undo toast on switch"
+            );
+        }
+    }
+
+    #[test]
     fn mobile_html_has_undo_toast() {
         assert!(
             MOBILE_HTML.contains(r#"id="undo-toast""#),
@@ -2944,6 +2990,13 @@ mod tests {
         // not fire a second history.back() (popping detail→list or out of the
         // app) or a stray "Sent" toast — the success path is gated on the
         // compose screen still being active (review follow-up on kata ryzd).
+        // The screen check alone isn't sufficient: backing out and
+        // immediately starting a NEW draft also lands back on
+        // Screen.COMPOSE, so a monotonic composeSession token (bumped by
+        // startCompose/startReply/startForward) captured before the await
+        // must additionally still match — on both the success and failure
+        // paths — before the stale completion touches that new draft
+        // (roborev 288).
         let start = MOBILE_APP_JS
             .find("async function sendComposedEmail(")
             .expect("sendComposedEmail must exist");
@@ -2954,6 +3007,17 @@ mod tests {
             block.contains("state.screen === Screen.COMPOSE"),
             "sendComposedEmail's post-await paths must check the compose \
              screen is still active before touching history"
+        );
+        assert!(
+            block.contains("const session = state.composeSession"),
+            "sendComposedEmail must capture state.composeSession before the \
+             send's await"
+        );
+        let matches = block.matches("state.composeSession === session").count();
+        assert!(
+            matches >= 2,
+            "both the success-path clear/back and the failure-path handling \
+             must require composeSession to still match (found {matches} checks)"
         );
     }
 
@@ -3068,6 +3132,31 @@ mod tests {
             block.contains("PendingAttachments") || block.contains("pendingAttachments"),
             "clearComposeFields should reset pendingAttachments \
              (region: {block})"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_cancel_compose_dirty_check_covers_recipients_and_attachments() {
+        // roborev 288: cancelCompose's dirty check only looked at subject/body,
+        // so a recipients-only draft (To/Cc typed, nothing else) or an
+        // attachment-only draft got silently discarded with no confirmation.
+        let start = MOBILE_APP_JS
+            .find("function cancelCompose(")
+            .expect("cancelCompose must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("cancelCompose must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("compose-to').value.trim()"),
+            "cancelCompose's dirty check must include the To field"
+        );
+        assert!(
+            block.contains("compose-cc').value.trim()"),
+            "cancelCompose's dirty check must include the Cc field"
+        );
+        assert!(
+            block.contains("pendingAttachments.length"),
+            "cancelCompose's dirty check must include pending attachments"
         );
     }
 
@@ -4371,6 +4460,39 @@ white   = '#fdf6e3'
         assert!(
             MOBILE_APP_JS.contains("split-count"),
             "split tabs must render a count badge"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_load_splits_owns_dedicated_abort_controller() {
+        // roborev 288: loadSplits used to share state.loadAbort with the
+        // list-load abort protocol — any selectMailbox/selectSplit landing
+        // before /splits resolved silently aborted it with nothing to
+        // retry, permanently losing the split tabs for the session. It must
+        // instead own its own controller (mirroring splitCountsController),
+        // aborted and recreated only inside loadSplits itself.
+        let start = MOBILE_APP_JS
+            .find("async function loadSplits(")
+            .expect("loadSplits must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("loadSplits must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("splitsController?.abort()")
+                && block.contains("splitsController = new AbortController()"),
+            "loadSplits must abort and recreate its own dedicated AbortController"
+        );
+        assert!(
+            !block.contains("state.loadAbort"),
+            "loadSplits must not share state.loadAbort — a list-load switch \
+             must not silently kill the in-flight splits fetch"
+        );
+        // The two call sites (selectAccount, restoreFromSnapshot) must call
+        // it with just the account id — no shared signal to couple it back
+        // to the list-load abort protocol.
+        assert!(
+            MOBILE_APP_JS.contains("loadSplits(acct)"),
+            "loadSplits call sites must not pass state.loadAbort.signal"
         );
     }
 
