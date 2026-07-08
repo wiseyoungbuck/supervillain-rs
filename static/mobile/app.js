@@ -294,9 +294,8 @@ function connectedAccounts() {
 function selectAccount(account) {
     // Cancel any in-flight load from the account we're leaving — otherwise
     // a slow response can land after the switch and overwrite the new
-    // account's list (or get swallowed by the state.loading guard).
-    state.loadAbort?.abort();
-    state.loadAbort = new AbortController();
+    // account's list.
+    abortListLoad();
     state.currentAccount = account;
     state.api = makeApi(account.id);
     state.mailboxes = [];
@@ -403,6 +402,18 @@ function emailListPath(offset) {
     return path;
 }
 
+// Single owner of the list-load abort protocol (selectAccount/selectMailbox/
+// selectSplit): cancel the in-flight request, arm a fresh controller, and
+// release loadEmails's `loading` mutex — the abort's rejection is async, so
+// without the synchronous release a caller that immediately re-issues
+// loadEmails() would find the mutex still held by the abandoned request
+// (guaranteed to reject, never to render) and silently no-op.
+function abortListLoad() {
+    state.loadAbort?.abort();
+    state.loadAbort = new AbortController();
+    state.loading = false;
+}
+
 async function loadEmails() {
     // No account selected yet (e.g. no accounts configured) — nothing to
     // load. Without this guard the call below throws 'state.api is not a
@@ -418,12 +429,14 @@ async function loadEmails() {
     }
     state.loading = true;
     showStatus('Loading...');
-    // Captured up front: if the account changes before this resolves, the
-    // response belongs to an account we've already navigated away from.
+    // Captured up front: if the account changes — or abortListLoad ran; a
+    // response landing the same tick as abort() can still resolve — before
+    // this settles, the response belongs to a list we've navigated away from.
     const acct = state.currentAccount.id;
+    const signal = state.loadAbort?.signal;
     try {
-        const emails = await state.api('GET', emailListPath(0), null, state.loadAbort?.signal);
-        if (state.currentAccount?.id !== acct) return;
+        const emails = await state.api('GET', emailListPath(0), null, signal);
+        if (signal?.aborted || state.currentAccount?.id !== acct) return;
         state.emails = emails;
         renderEmailList();
         showStatus('');
@@ -432,7 +445,10 @@ async function loadEmails() {
         showStatus('');
         showError('Load emails', err);
     } finally {
-        state.loading = false;
+        // An aborted request's mutex was already released — and re-taken by
+        // the successor load — in abortListLoad; clearing it here would
+        // break the successor's lock mid-flight.
+        if (!signal?.aborted) state.loading = false;
         finishPullRefresh();
     }
 }
@@ -442,9 +458,13 @@ async function loadMoreEmails() {
     if (!state.emails.length || state.emails.length >= CACHE_LIMIT) return;
     state.loadingMore = true;
     const acct = state.currentAccount.id;
+    const signal = state.loadAbort?.signal;
     try {
-        const page = await state.api('GET', emailListPath(state.emails.length), null, state.loadAbort?.signal);
-        if (state.currentAccount?.id !== acct) return;
+        const page = await state.api('GET', emailListPath(state.emails.length), null, signal);
+        // signal.aborted also covers a mailbox/split switch (same account,
+        // response resolving the same tick as the abort) — stale rows must
+        // not be appended to the freshly-reset list.
+        if (signal?.aborted || state.currentAccount?.id !== acct) return;
         const existingIds = new Set(state.emails.map(e => e.id));
         const newEmails = page.filter(e => !existingIds.has(e.id));
         if (newEmails.length) {
@@ -532,6 +552,7 @@ function renderSplitTabs() {
 
 function selectSplit(splitId) {
     if (state.currentSplit === splitId) return;
+    abortListLoad();
     state.currentSplit = splitId;
     renderSplitTabs();
     loadEmails();
@@ -539,15 +560,7 @@ function selectSplit(splitId) {
 
 function selectMailbox(mailbox) {
     if (state.currentMailbox?.id === mailbox.id) return;
-    // Abort any in-flight load for the mailbox we're leaving — mirrors
-    // selectAccount's guard so a slow response can't land after the switch
-    // and overwrite the new mailbox's list. The abort's rejection is async,
-    // so also release loadEmails's `loading` mutex synchronously here —
-    // otherwise the call below would find it still held by the abandoned
-    // request (guaranteed to reject, never to render) and silently no-op.
-    state.loadAbort?.abort();
-    state.loadAbort = new AbortController();
-    state.loading = false;
+    abortListLoad();
     state.currentMailbox = mailbox;
     state.currentSplit = 'all';
     state.splitCounts = {};
@@ -877,6 +890,7 @@ function setScreen(screen, params = {}) {
             document.getElementById('app-header').style.display = 'none';
             document.getElementById('split-tabs').style.display = 'none';
             document.getElementById('bottom-nav').style.display = 'none';
+            document.getElementById('toast-stack').classList.remove('nav-visible');
             document.getElementById('email-detail').style.display = 'none';
             document.getElementById('compose-screen').style.display = 'flex';
             // Fields are already prefilled by the entry point (startCompose/
@@ -891,6 +905,7 @@ function setScreen(screen, params = {}) {
             document.getElementById('app-header').style.display = 'none';
             document.getElementById('split-tabs').style.display = 'none';
             document.getElementById('bottom-nav').style.display = 'none';
+            document.getElementById('toast-stack').classList.remove('nav-visible');
             document.getElementById('compose-screen').style.display = 'none';
             document.getElementById('email-detail').style.display = 'flex';
             renderScreenDetail(params.emailId);
@@ -904,6 +919,10 @@ function setScreen(screen, params = {}) {
             document.getElementById('app-header').style.display = '';
             document.getElementById('split-tabs').style.display = '';
             document.getElementById('bottom-nav').style.display = '';
+            // Toasts anchor to the viewport bottom; lift them clear of the
+            // nav band while the nav shows (layout offset via class — the
+            // display ownership above stays untouched).
+            document.getElementById('toast-stack').classList.add('nav-visible');
             document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
             renderEmailList();
             break;

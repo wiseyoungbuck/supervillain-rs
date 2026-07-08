@@ -4375,6 +4375,61 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn mobile_app_js_list_switches_abort_inflight_load() {
+        // Review follow-up: loadEmails guards re-entry with a blocking
+        // `loading` mutex (unlike desktop's self-aborting loads), so every
+        // synchronous re-issue path must go through abortListLoad() — abort
+        // the in-flight request AND release the mutex — or the new request
+        // is silently dropped (highlighted tab/nav over a stale list).
+        for func in [
+            "function selectAccount(",
+            "function selectMailbox(",
+            "function selectSplit(",
+        ] {
+            let start = MOBILE_APP_JS.find(func).expect("function must exist");
+            let rest = &MOBILE_APP_JS[start..];
+            let end = rest.find("\n}").expect("function must close");
+            assert!(
+                rest[..end].contains("abortListLoad()"),
+                "{func} must abort the in-flight list load before reloading"
+            );
+        }
+        let start = MOBILE_APP_JS
+            .find("function abortListLoad(")
+            .expect("abortListLoad must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("abortListLoad must close");
+        assert!(
+            rest[..end].contains("state.loading = false"),
+            "abortListLoad must release loadEmails's loading mutex"
+        );
+    }
+
+    #[test]
+    fn mobile_toast_stack_rides_above_bottom_nav_on_list() {
+        // Review follow-up: the fixed toast stack and the bottom nav both
+        // anchor to the viewport bottom on LIST — the stack must be lifted
+        // clear of the nav band there (and only there).
+        assert!(
+            MOBILE_HTML.contains("#toast-stack.nav-visible"),
+            "mobile html must offset the toast stack above the bottom nav"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="toast-stack" class="nav-visible""#),
+            "toast stack must boot lifted — LIST shows without an initial setScreen call"
+        );
+        let start = MOBILE_APP_JS
+            .find("function setScreen(")
+            .expect("setScreen must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("setScreen must close");
+        assert!(
+            rest[..end].contains("nav-visible"),
+            "setScreen must toggle the toast stack's nav offset with the screen"
+        );
+    }
+
+    #[test]
     fn mobile_html_has_bottom_nav_and_split_tabs() {
         assert!(
             MOBILE_HTML.contains(r#"id="bottom-nav""#),
