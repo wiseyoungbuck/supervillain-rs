@@ -47,6 +47,11 @@ const state = {
                                // differs, so an untouched prefill never prompts to discard
     pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
     searchQuery: '',           // active search string, or '' when inactive; combines with currentSplit (kata p80m)
+    emailsFetchedAt: null,     // when state.emails was actually fetched (loadEmails success, or
+                               // carried over from a restored snapshot's savedAt) — persistState's
+                               // freshness stamp, kept separate from "last time we wrote to
+                               // localStorage" so a degraded offline session re-persisting stale
+                               // rows can't re-stamp its way past the 24h gate.
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -477,6 +482,10 @@ async function loadEmails({ silent = false } = {}) {
         const emails = await state.api('GET', emailListPath(0), null, signal);
         if (signal?.aborted || state.currentAccount?.id !== acct) return;
         state.emails = emails;
+        // The freshness stamp persistState relies on — set only where rows
+        // actually come off the network, so a background re-persist of the
+        // same (possibly stale) rows never resets the 24h gate.
+        state.emailsFetchedAt = Date.now();
         renderEmailList();
         // Belt-and-suspenders snapshot (kata mhck): keep the resume state warm
         // after every successful load so a kill that skips visibilitychange
@@ -674,9 +683,18 @@ function closeSearchBar() {
 // Same abort/reload protocol as selectAccount/selectMailbox/selectSplit
 // (abortListLoad guards every list switch, kata 1wdy). No-ops the reload
 // when there was nothing active to clear (e.g. tapping ✕ on an empty box).
-function clearSearch() {
+//
+// close: false skips hiding the search bar. Only submitSearch passes this —
+// WebKit's native search-input cancel button fires a 'search' event with an
+// empty value the instant it's tapped, and if the input still has focus (the
+// user tapped straight back in to keep typing) closing the bar out from
+// under them reads as the field vanishing mid-interaction. The explicit ✕
+// button (search-clear-btn) always closes, matching prior behavior — and
+// since it's wired as `addEventListener('click', clearSearch)`, the MouseEvent
+// passed in has no `close` property, so the default of true applies there too.
+function clearSearch({ close = true } = {}) {
     document.getElementById('search-input').value = '';
-    closeSearchBar();
+    if (close) closeSearchBar();
     if (!state.searchQuery) return;
     abortListLoad();
     state.searchQuery = '';
@@ -684,9 +702,13 @@ function clearSearch() {
 }
 
 function submitSearch() {
-    const raw = document.getElementById('search-input').value.trim();
+    const input = document.getElementById('search-input');
+    const raw = input.value.trim();
     if (!raw) {
-        clearSearch();
+        // Keep the bar open when the input still has focus (see clearSearch)
+        // — otherwise (Enter/Go on an already-empty box, or the native clear
+        // tapped while unfocused) close it as before.
+        clearSearch({ close: document.activeElement !== input });
         return;
     }
     if (raw === state.searchQuery) return;
@@ -2324,7 +2346,12 @@ function persistState() {
             searchQuery: state.searchQuery,
             emails: state.emails.slice(0, PAGE_SIZE),
             listScrollTop,
-            savedAt: Date.now(),
+            // The rows' actual fetch time, not "now" — re-persisting the same
+            // rows (e.g. a degraded offline session's background snapshot
+            // cycle) must not re-stamp them fresh and defeat restoreFromSnapshot's
+            // 24h gate. Falls back to now before any fetch has happened this
+            // session (first-run boot), matching prior behavior.
+            savedAt: state.emailsFetchedAt ?? Date.now(),
         }));
     } catch (err) {
         // Quota exceeded or a private-mode storage denial — a warm snapshot is
@@ -2386,9 +2413,21 @@ function restoreFromSnapshot({ offline = false } = {}) {
     state.currentSplit = snapshot.splitId || 'all';
     state.searchQuery = snapshot.searchQuery || '';
     state.emails = snapshot.emails;
+    // Carry the snapshot's own fetch time forward — these rows were fetched
+    // at savedAt, not now; persistState must keep stamping that same value
+    // (not "now") until a real loadEmails success replaces it, or the 24h
+    // freshness gate would never trip on a degraded, repeatedly-persisted
+    // session (see persistState).
+    state.emailsFetchedAt = snapshot.savedAt;
     state.listScrollTop = snapshot.listScrollTop || 0;
     renderAccountButton();
-    if (state.searchQuery) document.getElementById('search-input').value = state.searchQuery;
+    if (state.searchQuery) {
+        document.getElementById('search-input').value = state.searchQuery;
+        // Surface the restored filter instead of silently applying it — open
+        // the bar but skip openSearch()'s focus() so a cold-start restore
+        // doesn't pop the keyboard.
+        document.getElementById('app-header').classList.add('searching');
+    }
     renderEmailList();
     document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
 
@@ -2426,6 +2465,17 @@ function restoreFromSnapshot({ offline = false } = {}) {
         })
         .then(() => {
             if (state.currentAccount?.id !== acct) return;
+            // splitsPromise has settled by now for any non-'all' restored
+            // split (loadSplits never rejects — it sinks its own errors), so
+            // state.splits reflects the account's current definitions. A
+            // split deleted since the snapshot was saved would otherwise send
+            // split_id=<deleted> and the server would silently return an
+            // empty list with no highlighted tab. Fall back to 'all' before
+            // the reload below fires.
+            if (state.currentSplit !== 'all' && !state.splits.some(s => s.id === state.currentSplit)) {
+                state.currentSplit = 'all';
+                renderSplitTabs();
+            }
             return loadEmails({ silent: true });
         })
         .then(() => {
@@ -2443,44 +2493,57 @@ function restoreFromSnapshot({ offline = false } = {}) {
 // Boot
 // ============================================================================
 
+// In-flight guard: bursty online/offline/online events each route through
+// handleOnline, which re-runs init() on a snapshot-less or degraded boot.
+// Two overlapping init() runs would race loadAccounts/restoreFromSnapshot/
+// selectAccount against each other, so a second call while one is still
+// pending is a no-op rather than a re-entrant boot.
+let initInFlight = false;
+
 async function init() {
-    // Scrub the pre-rewire Fastmail bearer token off installed PWAs — the
-    // direct-JMAP client (and its localStorage session) no longer exists.
-    localStorage.removeItem('supervillain_session');
-
-    document.getElementById('app-shell').classList.add('active');
-
+    if (initInFlight) return;
+    initInFlight = true;
     try {
-        await loadAccounts();
-    } catch (err) {
-        // Server unreachable (offline relaunch — the SW never caches /api/*,
-        // so there's no cached account list either). A DEGRADED restore still
-        // beats a dead end: render the snapshot list with the account
-        // synthesized from the snapshot itself and skip the refresh cascade —
-        // the offline banner covers the state, and handleOnline re-runs
-        // init() on reconnect for the full boot. With no usable snapshot,
-        // keep today's error path.
-        if (restoreFromSnapshot({ offline: true })) return;
-        showError('Load accounts', err);
-        showStatus('Cannot reach server');
-        return;
-    }
+        // Scrub the pre-rewire Fastmail bearer token off installed PWAs — the
+        // direct-JMAP client (and its localStorage session) no longer exists.
+        localStorage.removeItem('supervillain_session');
 
-    // Resume from a snapshot when one is valid (kata mhck, task A13): renders
-    // the last list instantly and arms a silent refresh, short-circuiting the
-    // default-account boot. With no usable snapshot this is a no-op and the
-    // original boot below runs unchanged — the first-run path is untouched.
-    if (restoreFromSnapshot()) return;
+        document.getElementById('app-shell').classList.add('active');
 
-    const connected = connectedAccounts();
-    const defaultAcc = connected.find(a => a.isDefault) || connected[0];
-    if (defaultAcc) {
-        selectAccount(defaultAcc);
-    } else {
-        renderAccountButton();
-        showStatus(state.accounts.length
-            ? 'No authorized accounts — authorize in desktop Settings'
-            : 'No accounts configured — add one in desktop Settings');
+        try {
+            await loadAccounts();
+        } catch (err) {
+            // Server unreachable (offline relaunch — the SW never caches /api/*,
+            // so there's no cached account list either). A DEGRADED restore still
+            // beats a dead end: render the snapshot list with the account
+            // synthesized from the snapshot itself and skip the refresh cascade —
+            // the offline banner covers the state, and handleOnline re-runs
+            // init() on reconnect for the full boot. With no usable snapshot,
+            // keep today's error path.
+            if (restoreFromSnapshot({ offline: true })) return;
+            showError('Load accounts', err);
+            showStatus('Cannot reach server');
+            return;
+        }
+
+        // Resume from a snapshot when one is valid (kata mhck, task A13): renders
+        // the last list instantly and arms a silent refresh, short-circuiting the
+        // default-account boot. With no usable snapshot this is a no-op and the
+        // original boot below runs unchanged — the first-run path is untouched.
+        if (restoreFromSnapshot()) return;
+
+        const connected = connectedAccounts();
+        const defaultAcc = connected.find(a => a.isDefault) || connected[0];
+        if (defaultAcc) {
+            selectAccount(defaultAcc);
+        } else {
+            renderAccountButton();
+            showStatus(state.accounts.length
+                ? 'No authorized accounts — authorize in desktop Settings'
+                : 'No accounts configured — add one in desktop Settings');
+        }
+    } finally {
+        initInFlight = false;
     }
 }
 

@@ -5573,6 +5573,190 @@ white   = '#fdf6e3'
             "a null currentMailbox must fall back to the previous snapshot's mailbox"
         );
     }
+
+    // =========================================================================
+    // roborev 289 follow-up: restore split validation, fetch-time freshness,
+    // visible restored search
+    // =========================================================================
+
+    #[test]
+    fn mobile_app_js_restore_resets_deleted_split_before_refresh() {
+        // A split can be deleted server-side between snapshot and restore.
+        // splitsPromise has settled by the time this runs (see
+        // mobile_app_js_restore_awaits_splits_before_filtered_refresh) — an
+        // unrecognized non-'all' split must fall back to 'all' and re-render
+        // the tabs BEFORE the loadEmails leg, or split_id=<deleted> silently
+        // returns an empty list with no highlighted tab.
+        let start = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("state.splits.some(s => s.id === state.currentSplit)"),
+            "restore must check the restored split still exists among state.splits"
+        );
+        assert!(
+            region.contains("state.currentSplit = 'all';") && region.contains("renderSplitTabs();"),
+            "restore must fall back to 'all' and re-render tabs when the split is missing"
+        );
+        let validate = region
+            .find("state.splits.some(s => s.id === state.currentSplit)")
+            .expect("split-validity check must be present");
+        let load = region
+            .find("loadEmails({ silent: true })")
+            .expect("restore must refresh silently");
+        assert!(
+            validate < load,
+            "the split-validity check must run before the loadEmails leg fires"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_tracks_fetch_time_separately_from_persist_time() {
+        // savedAt must reflect when the rows were actually fetched, not when
+        // persistState happened to run — otherwise a degraded offline
+        // session's background snapshot cycle re-stamps stale rows fresh
+        // every cycle and the 24h freshness gate never trips.
+        assert!(
+            MOBILE_APP_JS.contains("emailsFetchedAt:"),
+            "state must track emailsFetchedAt separately from the persisted savedAt"
+        );
+
+        let start = MOBILE_APP_JS
+            .find("async function loadEmails(")
+            .expect("loadEmails must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("loadEmails body must close");
+        assert!(
+            rest[..end].contains("state.emailsFetchedAt = Date.now();"),
+            "loadEmails' success path must stamp emailsFetchedAt when rows are actually fetched"
+        );
+
+        let pstart = MOBILE_APP_JS
+            .find("function persistState(")
+            .expect("persistState must exist");
+        let prest = &MOBILE_APP_JS[pstart..];
+        let pend = prest.find("\n}").expect("persistState body must close");
+        assert!(
+            prest[..pend].contains("savedAt: state.emailsFetchedAt ?? Date.now(),"),
+            "persistState must stamp savedAt from emailsFetchedAt, not the current write time"
+        );
+
+        let rstart = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rrest = &MOBILE_APP_JS[rstart..];
+        let rend = rrest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        assert!(
+            rrest[..rend].contains("state.emailsFetchedAt = snapshot.savedAt;"),
+            "restore must carry the snapshot's own fetch time forward into emailsFetchedAt"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_restore_opens_search_bar_without_focus() {
+        // A restored non-empty searchQuery must surface visibly (the bar
+        // open) rather than silently filter the list — but restoring
+        // shouldn't pop the keyboard on a cold start, so this must add the
+        // 'searching' class directly instead of calling openSearch() (which
+        // also focuses the input).
+        let start = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("if (state.searchQuery) {"),
+            "restore must branch on a restored search query to open the bar"
+        );
+        assert!(
+            region.contains("classList.add('searching')"),
+            "restore must open the search bar for a restored query"
+        );
+        assert!(
+            !region.contains("search-input').focus()"),
+            "restore must not focus the search input — that would pop the keyboard on a cold start"
+        );
+        let value_set = region
+            .find("search-input').value = state.searchQuery;")
+            .expect("restore must fill the search input value");
+        let open_bar = region
+            .find("classList.add('searching')")
+            .expect("restore must open the bar");
+        assert!(
+            value_set < open_bar,
+            "the input value should be set before the bar becomes visible"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_submit_search_keeps_bar_open_while_input_focused() {
+        // WebKit fires the 'search' event with an empty value the instant the
+        // native cancel button is tapped. If the input still has focus (the
+        // user tapped back in to keep typing), submitSearch must not close
+        // the bar out from under them — clearSearch's close: false skips
+        // that, keeping the explicit ✕ button's close-always behavior intact.
+        let start = MOBILE_APP_JS
+            .find("function submitSearch(")
+            .expect("submitSearch must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("submitSearch body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("clearSearch({ close: document.activeElement !== input })"),
+            "submitSearch's empty-value path must gate closing the bar on input focus"
+        );
+
+        let cstart = MOBILE_APP_JS
+            .find("function clearSearch(")
+            .expect("clearSearch must exist");
+        let crest = &MOBILE_APP_JS[cstart..];
+        let cend = crest.find("\n}").expect("clearSearch body must close");
+        assert!(
+            crest[..cend].contains("if (close) closeSearchBar();"),
+            "clearSearch must make closing the bar conditional on its close param"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_init_guards_reentrancy() {
+        // Bursty online/offline/online events can each call handleOnline,
+        // which re-runs init() on a snapshot-less or degraded boot. Two
+        // overlapping init() runs would race loadAccounts/restoreFromSnapshot/
+        // selectAccount — guard with an in-flight boolean, released in a
+        // finally so it can't get stuck true after an error or early return.
+        assert!(
+            MOBILE_APP_JS.contains("let initInFlight = false;"),
+            "app.js must track an in-flight guard for init()"
+        );
+        let start = MOBILE_APP_JS
+            .find("async function init(")
+            .expect("init must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("init body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("if (initInFlight) return;"),
+            "init must no-op when a run is already in flight"
+        );
+        assert!(
+            region.contains("initInFlight = true;"),
+            "init must claim the in-flight guard before doing any work"
+        );
+        assert!(
+            region.contains("} finally {") && region.contains("initInFlight = false;"),
+            "init must release the guard in a finally block"
+        );
+    }
 }
 
 // External dep for theme path
