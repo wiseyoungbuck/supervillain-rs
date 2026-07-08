@@ -2286,6 +2286,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expanded_member_rows_suppress_date_dividers() {
+        // An expanded thread's member sub-rows are older than the collapsed
+        // header they sit under, so letting them participate in the date-
+        // divider computation injects a stray divider mid-thread AND forces a
+        // duplicate divider for the next non-member row. The divider logic
+        // must skip member rows entirely: no divider emitted for them and
+        // lastGroup must not advance on them.
+        let start = APP_JS
+            .find("function renderEmailList(")
+            .expect("renderEmailList must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}\n").expect("renderEmailList must close");
+        let block = &rest[..end];
+
+        let guard = block
+            .find("!isMember")
+            .expect("the divider computation must be gated off member rows");
+        let advance = block
+            .find("lastGroup = group")
+            .expect("the divider computation must advance lastGroup");
+        assert!(
+            guard < advance,
+            "the member-row guard must wrap the divider/lastGroup advance — \
+             member sub-rows must neither emit a divider nor move lastGroup"
+        );
+    }
+
     // ====================================================================
     // Settings view (account management) regression sentinels
     // ====================================================================

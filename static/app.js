@@ -1754,7 +1754,7 @@ function visibleRows() {
         g.members.push(email);
         if (email.isUnread) g.anyUnread = true;
         if (email.isFlagged) g.anyStarred = true;
-        if (email.receivedAt > g.newest.receivedAt) g.newest = email;
+        if (new Date(email.receivedAt) > new Date(g.newest.receivedAt)) g.newest = email;
     }
 
     const rows = [];
@@ -1829,15 +1829,21 @@ function renderEmailList() {
         const fromDisplay = from?.name || from?.email || 'Unknown';
         const date = formatDate(email.receivedAt);
         const badge = showBadge ? getRecipientBadge(email) : null;
-        const group = getDateGroup(email.receivedAt);
-        let divider = '';
-        if (group !== lastGroup) {
-            lastGroup = group;
-            divider = `<div class="date-divider"><span class="date-divider-label">${group}</span></div>`;
-        }
-
         const isThread = row.kind === 'thread';
         const isMember = row.kind === 'member';
+
+        // Date dividers skip member sub-rows entirely (kata 64z6 review): a
+        // member is older than the header it sits under, so letting it emit a
+        // divider would inject one mid-thread — and advancing lastGroup on it
+        // would force a duplicate divider for the next non-member row.
+        let divider = '';
+        if (!isMember) {
+            const group = getDateGroup(email.receivedAt);
+            if (group !== lastGroup) {
+                lastGroup = group;
+                divider = `<div class="date-divider"><span class="date-divider-label">${group}</span></div>`;
+            }
+        }
         const rowClass = `email-row${idx === state.selectedIndex ? ' selected' : ''}${row.unread ? ' unread' : ''}`
             + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`;
         // Collapsed/expanded thread header carries a clickable count badge; a
