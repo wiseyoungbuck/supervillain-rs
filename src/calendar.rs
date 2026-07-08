@@ -75,7 +75,63 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
         method,
         raw_ics: data.to_string(),
         user_rsvp_status: None,
+        is_update: false,
     })
+}
+
+// =============================================================================
+// Invite update decision (RFC 5546 SEQUENCE semantics + anti-spoof)
+// =============================================================================
+
+/// Outcome of comparing an incoming REQUEST invite against the event already
+/// stored in the user's calendar for the same UID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteAction {
+    /// No stored event for this UID — the normal first-time auto-add path.
+    NoStored,
+    /// Stored SEQUENCE >= incoming — idempotent re-receipt; nothing new to do.
+    Unchanged,
+    /// Higher incoming SEQUENCE from the verified organizer — overwrite the
+    /// stored event and reset the user's now-stale RSVP.
+    Update,
+    /// Higher incoming SEQUENCE but the sender is not the stored organizer (or
+    /// the organizer / sender is missing) — a possible spoofed overwrite.
+    /// Touch nothing; render the incoming ICS as-is.
+    RejectSpoof,
+}
+
+/// Decide how an incoming REQUEST invite relates to the stored event.
+///
+/// RFC 5546 uses SEQUENCE to order revisions of the same event (UID); a higher
+/// SEQUENCE is a genuine reschedule/update. But SEQUENCE alone is forgeable:
+/// any sender who learns a UID could mail an ICS with SEQUENCE=999 and silently
+/// overwrite a real event. We therefore only honor an update when the message
+/// sender matches the *stored* event's organizer (case-insensitively). See the
+/// bwjm test matrix T9.4.
+///
+/// `stored_seq` is `None` when the event isn't in the calendar yet (or the
+/// lookup failed — we degrade to the first-time add path). An empty organizer
+/// or sender is treated as missing.
+pub fn invite_update_decision(
+    stored_seq: Option<i32>,
+    incoming_seq: i32,
+    stored_organizer_email: Option<&str>,
+    sender_email: Option<&str>,
+) -> InviteAction {
+    let Some(stored_seq) = stored_seq else {
+        return InviteAction::NoStored;
+    };
+    if incoming_seq <= stored_seq {
+        return InviteAction::Unchanged;
+    }
+    // incoming_seq > stored_seq: a claimed update. Verify it came from the
+    // organizer of record before letting it touch the calendar.
+    match (stored_organizer_email, sender_email) {
+        (Some(org), Some(sender)) if !org.is_empty() && org.eq_ignore_ascii_case(sender) => {
+            InviteAction::Update
+        }
+        _ => InviteAction::RejectSpoof,
+    }
 }
 
 fn unfold_lines(s: &str) -> String {
@@ -1392,6 +1448,114 @@ END:VCALENDAR";
         let result = strip_method(ics);
         assert!(!result.contains("METHOD:"));
         assert!(result.contains("BEGIN:VCALENDAR"));
+    }
+
+    // --- invite_update_decision tests (RFC 5546 SEQUENCE + anti-spoof) ---
+
+    #[test]
+    fn invite_decision_no_stored_event() {
+        // Nothing stored yet — the normal first-time auto-add path.
+        assert_eq!(
+            invite_update_decision(None, 0, None, Some("alice@example.com")),
+            InviteAction::NoStored
+        );
+        // A high incoming SEQUENCE is still NoStored when nothing is stored.
+        assert_eq!(
+            invite_update_decision(
+                None,
+                5,
+                Some("alice@example.com"),
+                Some("alice@example.com")
+            ),
+            InviteAction::NoStored
+        );
+    }
+
+    #[test]
+    fn invite_decision_unchanged_when_seq_not_higher() {
+        // Equal SEQUENCE — idempotent re-receipt of the same invite.
+        assert_eq!(
+            invite_update_decision(
+                Some(2),
+                2,
+                Some("alice@example.com"),
+                Some("alice@example.com")
+            ),
+            InviteAction::Unchanged
+        );
+        // Lower incoming SEQUENCE — out-of-order / replayed older invite.
+        assert_eq!(
+            invite_update_decision(
+                Some(3),
+                1,
+                Some("alice@example.com"),
+                Some("alice@example.com")
+            ),
+            InviteAction::Unchanged
+        );
+    }
+
+    #[test]
+    fn invite_decision_update_when_organizer_matches() {
+        assert_eq!(
+            invite_update_decision(
+                Some(0),
+                1,
+                Some("alice@example.com"),
+                Some("alice@example.com")
+            ),
+            InviteAction::Update
+        );
+    }
+
+    #[test]
+    fn invite_decision_update_organizer_match_is_case_insensitive() {
+        assert_eq!(
+            invite_update_decision(
+                Some(1),
+                2,
+                Some("Alice@Example.COM"),
+                Some("alice@example.com")
+            ),
+            InviteAction::Update
+        );
+    }
+
+    #[test]
+    fn invite_decision_reject_spoof_on_sender_mismatch() {
+        // Higher SEQUENCE but the sender is not the stored organizer: a sender
+        // who knows the UID trying to overwrite a real event (bwjm T9.4).
+        assert_eq!(
+            invite_update_decision(
+                Some(0),
+                9,
+                Some("alice@example.com"),
+                Some("mallory@evil.example")
+            ),
+            InviteAction::RejectSpoof
+        );
+    }
+
+    #[test]
+    fn invite_decision_reject_spoof_on_missing_organizer() {
+        // No stored organizer to verify against — can't trust the update.
+        assert_eq!(
+            invite_update_decision(Some(0), 1, None, Some("alice@example.com")),
+            InviteAction::RejectSpoof
+        );
+        // An empty stored organizer counts as missing.
+        assert_eq!(
+            invite_update_decision(Some(0), 1, Some(""), Some("alice@example.com")),
+            InviteAction::RejectSpoof
+        );
+    }
+
+    #[test]
+    fn invite_decision_reject_spoof_on_missing_sender() {
+        assert_eq!(
+            invite_update_decision(Some(0), 1, Some("alice@example.com"), None),
+            InviteAction::RejectSpoof
+        );
     }
 
     // --- timezone handling tests ---

@@ -2499,6 +2499,12 @@ function handleNormalModeKey(e) {
                 e.preventDefault();
             }
             break;
+        case 'm':
+            if (state.view === 'detail' && state.currentEmail?.calendarEvent) {
+                rsvpToEvent('TENTATIVE');
+                e.preventDefault();
+            }
+            break;
 
         // Search
         case '/':
@@ -3807,6 +3813,22 @@ function renderCalendarCard(event) {
         }
     } else if (banner) {
         banner.remove();
+    }
+
+    // Show/hide updated banner (rescheduled invite — non-destructive; distinct
+    // from the cancelled banner). user_rsvp_status is None on an update, so the
+    // RSVP buttons already render un-highlighted below.
+    const isUpdate = !!event.isUpdate && !cancelled;
+    let updBanner = els.calendarEvent.querySelector('.cal-updated');
+    if (isUpdate) {
+        if (!updBanner) {
+            updBanner = document.createElement('div');
+            updBanner.className = 'cal-updated';
+            updBanner.textContent = 'Updated — please respond again';
+            card.querySelector('.cal-header').after(updBanner);
+        }
+    } else if (updBanner) {
+        updBanner.remove();
     }
 
     // Render attendees

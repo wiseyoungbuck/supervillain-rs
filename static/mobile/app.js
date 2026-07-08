@@ -1441,7 +1441,13 @@ function renderCalendarCard(event) {
     const showActions = !cancelled && event.method !== 'PUBLISH';
     const userStatus = event.user_rsvp_status;
 
-    const banner = cancelled ? '<div class="cal-cancelled">CANCELLED</div>' : '';
+    // Rescheduled invite: non-destructive "updated" banner (distinct from the
+    // cancelled banner). user_rsvp_status is None on an update, so the RSVP
+    // buttons render un-highlighted. Mutually exclusive with cancelled.
+    const isUpdate = !!event.isUpdate && !cancelled;
+    const banner = cancelled
+        ? '<div class="cal-cancelled">CANCELLED</div>'
+        : (isUpdate ? '<div class="cal-updated">Updated — please respond again</div>' : '');
     const location = event.location
         ? '<div class="cal-location">' + escapeHtml(event.location) + '</div>'
         : '';

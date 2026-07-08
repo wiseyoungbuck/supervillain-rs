@@ -2782,10 +2782,19 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
         organizer_email,
         organizer_name,
         attendees,
+        // Graph's default event resource does not surface the iCalendar SEQUENCE
+        // (it lives in the PidLidAppointmentSequence MAPI extended property, which
+        // would need a fragile $expand=singleValueExtendedProperties query). We
+        // report 0. Consequence for the get_email SEQUENCE-update path: a genuine
+        // reschedule is still detected (incoming SEQUENCE > 0), but the decision
+        // is not idempotent — re-opening a rescheduled invite re-fires the Update
+        // (redundant remove+re-add, banner shown again). The RSVP send itself is
+        // never lost. See Task B4 notes.
         sequence: 0,
         method: "REQUEST".to_string(),
         raw_ics: String::new(),
         user_rsvp_status: None,
+        is_update: false,
     })
 }
 
@@ -2984,6 +2993,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = build_graph_event(&event);
         assert_eq!(json["subject"], "Team Meeting");
@@ -3008,6 +3018,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = build_graph_event(&event);
         assert!(json["end"]["dateTime"].is_string());
@@ -3040,6 +3051,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = build_graph_event(&event);
         let attendees = json["attendees"].as_array().unwrap();
@@ -3065,6 +3077,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = build_graph_event(&event);
         assert!(json.get("location").is_none());
@@ -3086,6 +3099,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = build_graph_event(&event);
         assert_eq!(json["body"]["content"], "");

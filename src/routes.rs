@@ -608,20 +608,85 @@ async fn get_email(
         && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
         && let Some(mut event) = calendar::parse_ics(&ics_data)
     {
+        // Fetch the stored calendar event once — reused for both the SEQUENCE
+        // update decision (REQUEST) and the PARTSTAT merge below. None when the
+        // event isn't in the calendar yet or the lookup failed (degrade to the
+        // first-time add path / email ICS).
+        let stored_event = match provider::get_calendar_event(&session, &event.uid).await {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(
+                    "Calendar fetch failed for {}, falling back to email ICS: {e}",
+                    event.uid
+                );
+                None
+            }
+        };
+
+        // On an Update (rescheduled invite from the verified organizer) we must
+        // NOT re-apply the stale stored PARTSTAT — the response is being reset.
+        let mut skip_partstat_merge = false;
+
         if event.method == "REQUEST" {
-            // Auto-add to calendar (non-blocking, won't overwrite existing)
-            let state_clone = state.clone();
-            let ics_clone = ics_data.clone();
-            let uid = event.uid.clone();
-            let acct = account_key.clone();
-            tokio::spawn(async move {
-                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
-                    let s = s_lock.read().await;
-                    if let Err(e) = provider::add_to_calendar(&s, &ics_clone, &uid, true).await {
-                        tracing::warn!("Calendar auto-add failed for {uid}: {e}");
-                    }
+            let sender_email = email.from.first().map(|a| a.email.as_str());
+            let decision = calendar::invite_update_decision(
+                stored_event.as_ref().map(|e| e.sequence),
+                event.sequence,
+                stored_event.as_ref().map(|e| e.organizer_email.as_str()),
+                sender_email,
+            );
+            match decision {
+                // First-time add or idempotent re-receipt: today's behavior —
+                // add if missing, never overwrite (only_if_new = true).
+                calendar::InviteAction::NoStored | calendar::InviteAction::Unchanged => {
+                    let state_clone = state.clone();
+                    let ics_clone = ics_data.clone();
+                    let uid = event.uid.clone();
+                    let acct = account_key.clone();
+                    tokio::spawn(async move {
+                        if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
+                            let s = s_lock.read().await;
+                            if let Err(e) =
+                                provider::add_to_calendar(&s, &ics_clone, &uid, true).await
+                            {
+                                tracing::warn!("Calendar auto-add failed for {uid}: {e}");
+                            }
+                        }
+                    });
                 }
-            });
+                // Rescheduled invite (higher SEQUENCE, organizer verified):
+                // overwrite the stored event (only_if_new = false) and reset the
+                // user's now-stale RSVP.
+                calendar::InviteAction::Update => {
+                    event.is_update = true;
+                    skip_partstat_merge = true;
+                    let state_clone = state.clone();
+                    let ics_clone = ics_data.clone();
+                    let uid = event.uid.clone();
+                    let acct = account_key.clone();
+                    tokio::spawn(async move {
+                        if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
+                            let s = s_lock.read().await;
+                            if let Err(e) =
+                                provider::add_to_calendar(&s, &ics_clone, &uid, false).await
+                            {
+                                tracing::warn!("Calendar update failed for {uid}: {e}");
+                            }
+                        }
+                    });
+                }
+                // Higher SEQUENCE but the sender is not the stored organizer.
+                // Touch nothing: no calendar write, no status reset. Render the
+                // incoming ICS as-is (no banner).
+                calendar::InviteAction::RejectSpoof => {
+                    tracing::warn!(
+                        "Rejected spoofed calendar update for {} (sender {:?} != organizer {:?})",
+                        event.uid,
+                        sender_email,
+                        stored_event.as_ref().map(|e| e.organizer_email.as_str()),
+                    );
+                }
+            }
         } else if event.method == "CANCEL" {
             let state_clone = state.clone();
             let uid = event.uid.clone();
@@ -635,10 +700,12 @@ async fn get_email(
                 }
             });
         }
-        // Merge current PARTSTAT from calendar (CalDAV/Graph) so the UI
-        // reflects the user's actual RSVP status, not the stale email ICS
-        match provider::get_calendar_event(&session, &event.uid).await {
-            Ok(Some(cal_event)) => {
+
+        // Merge current PARTSTAT from the stored calendar event so the UI
+        // reflects the user's actual RSVP status, not the stale email ICS.
+        // Skipped on Update — a reschedule resets the user's response.
+        if !skip_partstat_merge {
+            if let Some(cal_event) = &stored_event {
                 for att in &mut event.attendees {
                     if let Some(cal_att) = cal_event
                         .attendees
@@ -649,19 +716,14 @@ async fn get_email(
                     }
                 }
                 tracing::debug!("Merged calendar PARTSTAT for event {}", event.uid);
-            }
-            Ok(None) => {
+            } else {
                 tracing::debug!("Event {} not in calendar yet, using email ICS", event.uid);
             }
-            Err(e) => {
-                tracing::warn!(
-                    "Calendar fetch failed for {}, falling back to email ICS: {e}",
-                    event.uid
-                );
-            }
         }
-        // Set user_rsvp_status from the (now-merged) attendee list
-        if event.method == "REQUEST" {
+
+        // Set user_rsvp_status from the (now-merged) attendee list — but not on
+        // an Update, where the response was intentionally reset to None.
+        if event.method == "REQUEST" && !event.is_update {
             let attendee_email = determine_attendee_email(email, &event, session.username());
             if let Some(att) = event
                 .attendees
@@ -4025,6 +4087,7 @@ white   = '#fdf6e3'
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         }
     }
 
@@ -4164,6 +4227,86 @@ white   = '#fdf6e3'
             APP_JS.contains("rsvp-btn"),
             "app.js should check for rsvp-btn class on focused element"
         );
+    }
+
+    #[test]
+    fn app_js_has_tentative_keyboard_shortcut() {
+        // m for tentative/maybe, alongside y (accept) and n (decline).
+        assert!(
+            APP_JS.contains("case 'm':") && APP_JS.contains("rsvpToEvent('TENTATIVE')"),
+            "app.js should map the 'm' key to a TENTATIVE RSVP"
+        );
+    }
+
+    #[test]
+    fn both_clients_render_update_banner() {
+        // Rescheduled invites (calendarEvent.isUpdate) show a non-destructive
+        // "updated — please respond again" banner in both bundles.
+        for (name, js) in [("app.js", APP_JS), ("mobile/app.js", MOBILE_APP_JS)] {
+            assert!(
+                js.contains("event.isUpdate"),
+                "{name} renderCalendarCard should read event.isUpdate"
+            );
+            assert!(
+                js.contains("cal-updated"),
+                "{name} should render the cal-updated banner element"
+            );
+            assert!(
+                js.contains("Updated — please respond again"),
+                "{name} should show the update banner copy"
+            );
+        }
+        // Both stylesheets style the banner.
+        assert!(
+            STYLE_CSS.contains(".cal-updated"),
+            "style.css should style .cal-updated"
+        );
+        assert!(
+            MOBILE_HTML.contains(".cal-updated"),
+            "mobile index.html should style .cal-updated"
+        );
+    }
+
+    #[test]
+    fn get_email_reaches_only_if_new_false_on_update() {
+        // The SEQUENCE-update path must overwrite the stored event: an Update
+        // decision spawns add_to_calendar with only_if_new = false, and sets
+        // is_update so the client banners it.
+        let src = include_str!("routes.rs");
+        assert!(
+            src.contains("calendar::invite_update_decision("),
+            "get_email must call the pure decision helper"
+        );
+        assert!(
+            src.contains("calendar::InviteAction::Update =>"),
+            "get_email must handle the Update arm"
+        );
+        assert!(
+            src.contains("provider::add_to_calendar(&s, &ics_clone, &uid, false)"),
+            "the Update arm must add with only_if_new = false (overwrite)"
+        );
+        assert!(
+            src.contains("event.is_update = true;"),
+            "the Update arm must flag the event as an update"
+        );
+        // RejectSpoof must write nothing — no add_to_calendar in that arm.
+        assert!(
+            src.contains("calendar::InviteAction::RejectSpoof =>"),
+            "get_email must handle the RejectSpoof arm"
+        );
+    }
+
+    #[test]
+    fn calendar_event_is_update_serializes_camel_case() {
+        let mut event = test_calendar_event(vec!["bob@example.com"]);
+        event.is_update = true;
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["isUpdate"], true);
+        // Default stays false and is exposed as isUpdate (not is_update).
+        let plain = test_calendar_event(vec!["bob@example.com"]);
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(plain_json["isUpdate"], false);
+        assert!(plain_json.get("is_update").is_none());
     }
 
     #[test]
@@ -4319,7 +4462,7 @@ white   = '#fdf6e3'
     fn app_js_hides_rsvp_actions_for_cancelled_events() {
         // Cancelled events should hide the RSVP buttons
         let render_fn_pos = APP_JS.find("function renderCalendarCard").unwrap();
-        let render_fn = &APP_JS[render_fn_pos..render_fn_pos + 2000];
+        let render_fn = &APP_JS[render_fn_pos..render_fn_pos + 3000];
         assert!(
             render_fn.contains("actions.style.display = 'none'"),
             "cancelled events should hide RSVP actions"

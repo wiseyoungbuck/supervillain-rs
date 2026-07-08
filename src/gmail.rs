@@ -2129,6 +2129,11 @@ pub(crate) fn calendar_event_to_google_json(event: &CalendarEvent) -> serde_json
     let mut body = serde_json::json!({
         "iCalUID": event.uid,
         "summary": event.summary,
+        // Persist the iCalendar SEQUENCE so a re-imported (overwritten) event
+        // reports the same revision on read-back. Without this, get_calendar_event
+        // would always see sequence 0 and the get_email SEQUENCE-update path would
+        // re-fire on every re-open of a rescheduled invite.
+        "sequence": event.sequence,
         "start": {
             "dateTime": event.dtstart.to_rfc3339(),
             "timeZone": "UTC",
@@ -2243,10 +2248,13 @@ pub(crate) fn parse_google_event(
         organizer_email,
         organizer_name,
         attendees,
-        sequence: 0,
+        // Real revision (round-tripped via calendar_event_to_google_json) so the
+        // get_email SEQUENCE-update decision is idempotent across re-opens.
+        sequence: event_json["sequence"].as_i64().unwrap_or(0) as i32,
         method: "REQUEST".to_string(),
         raw_ics: String::new(),
         user_rsvp_status: None,
+        is_update: false,
     })
 }
 
@@ -4170,6 +4178,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         }
     }
 
@@ -4321,6 +4330,28 @@ mod tests {
         assert_eq!(parsed.organizer_email, "lead@example.com");
         assert_eq!(parsed.organizer_name.as_deref(), Some("Lead"));
         assert!(parsed.dtend.is_some());
+    }
+
+    #[test]
+    fn google_event_sequence_round_trips() {
+        // A rescheduled invite (SEQUENCE=3) must survive the write→read cycle so
+        // the get_email update decision is idempotent on Google. Without the
+        // sequence field on both sides, read-back would report 0 and re-fire the
+        // Update every time the email is re-opened.
+        let mut event = parse_google_event("uid-seq@example.com", &google_event_json()).unwrap();
+        event.sequence = 3;
+        let json = calendar_event_to_google_json(&event);
+        assert_eq!(json["sequence"], 3);
+        let round_tripped = parse_google_event("uid-seq@example.com", &json).unwrap();
+        assert_eq!(round_tripped.sequence, 3);
+    }
+
+    #[test]
+    fn parse_google_event_missing_sequence_defaults_zero() {
+        // Events created before this field (or plain calendar entries) omit
+        // sequence — must default to 0, not panic.
+        let parsed = parse_google_event("uid-noseq", &google_event_json()).unwrap();
+        assert_eq!(parsed.sequence, 0);
     }
 
     #[test]

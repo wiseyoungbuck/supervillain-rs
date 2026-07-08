@@ -249,6 +249,12 @@ pub struct CalendarEvent {
     pub raw_ics: String,
     #[serde(skip_deserializing)]
     pub user_rsvp_status: Option<String>,
+    /// True when this REQUEST supersedes a stored event with a lower SEQUENCE —
+    /// a reschedule from the verified organizer. Signals the client to show an
+    /// "updated — please respond again" banner. Never set by `parse_ics`; only
+    /// `get_email` sets it. Serialized as `isUpdate` (camelCase) for the client.
+    #[serde(rename = "isUpdate", skip_deserializing)]
+    pub is_update: bool,
 }
 
 // =============================================================================
@@ -773,6 +779,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: Some("ACCEPTED".into()),
+            is_update: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -820,6 +827,7 @@ mod tests {
             method: "REQUEST".into(),
             raw_ics: String::new(),
             user_rsvp_status: None,
+            is_update: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
