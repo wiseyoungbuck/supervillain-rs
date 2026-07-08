@@ -4911,9 +4911,12 @@ white   = '#fdf6e3'
             region.contains("abortListLoad()"),
             "reconnect should abort any stale in-flight load first"
         );
+        // Silent off the LIST screen (review follow-up): #status-bar is shell
+        // chrome, not screen-scoped, so a non-silent reconnect refresh would
+        // flash 'Loading...' beneath the detail/compose screen.
         assert!(
-            region.contains("loadEmails()"),
-            "reconnect should trigger a list refresh"
+            region.contains("loadEmails({ silent: state.screen !== Screen.LIST })"),
+            "reconnect should trigger a list refresh, silent off the LIST screen"
         );
     }
 }

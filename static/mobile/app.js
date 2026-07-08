@@ -427,7 +427,12 @@ function abortListLoad() {
     state.loading = false;
 }
 
-async function loadEmails() {
+// `silent` suppresses the #status-bar writes (both the 'Loading...' and the
+// clearing '') for refreshes triggered off the LIST screen — #status-bar is
+// shell chrome, not screen-scoped, so a reconnect refresh mid-detail or
+// mid-compose would otherwise flash 'Loading...' beneath the active screen
+// (see handleOnline, the only silent caller).
+async function loadEmails({ silent = false } = {}) {
     // No account selected yet (e.g. no accounts configured) — nothing to
     // load. Without this guard the call below throws 'state.api is not a
     // function', and the resulting toast wipes the 'No accounts configured'
@@ -441,7 +446,7 @@ async function loadEmails() {
         return;
     }
     state.loading = true;
-    showStatus('Loading...');
+    if (!silent) showStatus('Loading...');
     // Captured up front: if the account changes — or abortListLoad ran; a
     // response landing the same tick as abort() can still resolve — before
     // this settles, the response belongs to a list we've navigated away from.
@@ -452,10 +457,10 @@ async function loadEmails() {
         if (signal?.aborted || state.currentAccount?.id !== acct) return;
         state.emails = emails;
         renderEmailList();
-        showStatus('');
+        if (!silent) showStatus('');
     } catch (err) {
         if (err.name === 'AbortError') return;
-        showStatus('');
+        if (!silent) showStatus('');
         showError('Load emails', err);
     } finally {
         // An aborted request's mutex was already released — and re-taken by
@@ -2108,9 +2113,11 @@ function handleOnline() {
     setOfflineBanner(false);
     // Data loaded (or left stale) while offline needs a refresh. Same
     // abort/reload protocol as selectAccount/selectMailbox/selectSplit
-    // (abortListLoad guards every list switch, kata 1wdy).
+    // (abortListLoad guards every list switch, kata 1wdy). Silent off the
+    // LIST screen: #status-bar is shell chrome, not screen-scoped, so a
+    // non-silent refresh would flash 'Loading...' beneath detail/compose.
     abortListLoad();
-    loadEmails();
+    loadEmails({ silent: state.screen !== Screen.LIST });
 }
 
 // ============================================================================
