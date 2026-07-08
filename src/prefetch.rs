@@ -22,9 +22,19 @@ use tokio::sync::{Mutex, RwLock};
 /// entry would collide on the same slot, so whichever wrote last would
 /// silently serve the wrong order to the other. The background warmer
 /// only ever populates the `DateDesc` slot (see `fetch_inbox` /
-/// `warm_all_mailboxes`); non-default sort requests always miss the warm
-/// cache and fetch live, but still populate — and correctly reuse — their
-/// own slot within a session.
+/// `warm_all_mailboxes`).
+///
+/// As of roborev 291, `list_emails`'s `is_cacheable` gate
+/// (`routes::list_is_cacheable`) additionally requires
+/// `sort == EmailSort::default()` before touching this cache at all — a
+/// non-default sort request never reads *or writes* a slot here anymore.
+/// Letting `DateAsc` populate its own slot (the pre-291 behavior) meant
+/// that slot was never refreshed by the warmer and had no TTL, so a user
+/// sitting in "Oldest first" would never see new mail short of an
+/// unrelated mutation invalidating the whole account. Always fetching
+/// non-default sorts live is the simpler fix. This struct still carries
+/// `sort` so the cache remains correct by construction if that gate is
+/// ever loosened to warm additional sort orders.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct InboxKey {
     pub mailbox_id: String,
@@ -1312,6 +1322,16 @@ mod tests {
         // order served silently rather than the plan's required error/
         // documented-limitation path. `sort` in the key keeps them in
         // separate slots.
+        //
+        // As of roborev 291, `routes::list_is_cacheable` also stops
+        // `list_emails` from ever calling `set_inbox_list`/`get_inbox_list`
+        // with a non-`DateDesc` sort in the first place (see
+        // `routes::list_is_cacheable_false_for_date_asc_sort`), so an
+        // `asc_key` entry can no longer actually appear in production. This
+        // test still pins the raw cache primitive's keying as a
+        // defense-in-depth invariant: *if* something above this layer ever
+        // did write a non-default-sort entry, it still couldn't collide
+        // with or clobber the default-sort one.
         let cache = PrefetchCache::new();
         let desc_key = InboxKey {
             mailbox_id: "inbox".into(),

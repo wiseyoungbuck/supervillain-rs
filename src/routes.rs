@@ -439,6 +439,32 @@ async fn list_mailboxes(
     Ok(Json(serde_json::json!(mailboxes)))
 }
 
+/// Whether a `list_emails` request is eligible for the prefetch cache.
+///
+/// Default-inbox shape (mailbox_id set, no split, no search, no starred,
+/// default offset/limit, **and default sort**) goes through the prefetch
+/// cache. Anything else always fetches live — no cache read, no cache
+/// write:
+///
+/// - mailbox/split/search/starred/offset/limit: cache key would explode,
+///   and the data is per-query anyway.
+/// - sort: the background warmer only ever re-warms the `DateDesc` slot
+///   (see `prefetch::warm_all_mailboxes`), and there's no TTL on cache
+///   entries. If a non-default sort were cacheable, a user sitting in
+///   "Oldest first" would read from a slot the warmer never refreshes and
+///   would never see new mail until some unrelated local mutation
+///   invalidated the whole account's cache (roborev 291). Simplest fix:
+///   non-default sorts just aren't cacheable, full stop.
+fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
+    params.mailbox_id.is_some()
+        && params.split_id.is_none()
+        && params.search.is_none()
+        && params.starred != Some(true)
+        && offset == 0
+        && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT
+        && sort == EmailSort::default()
+}
+
 async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
@@ -488,21 +514,16 @@ async fn list_emails(
         limit
     };
 
-    // Default-inbox shape (mailbox_id set, no split, no search, no
-    // starred, default offset/limit) goes through the prefetch cache.
-    // Anything else bypasses it: cache key would explode and the data
-    // is per-query anyway.
-    let is_cacheable = params.mailbox_id.is_some()
-        && params.split_id.is_none()
-        && params.search.is_none()
-        && params.starred != Some(true)
-        && offset == 0
-        && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT;
+    // See `list_is_cacheable`'s doc comment for the full rationale,
+    // including why non-default sorts are excluded (roborev 291).
+    let is_cacheable = list_is_cacheable(&params, offset, sort);
 
     let mut emails = if is_cacheable {
-        // `sort` joins the cache key so a non-default-sort request can
-        // never collide with (and serve, or be served) the warmer's
-        // always-default-order entry — see `InboxKey`'s doc comment.
+        // `is_cacheable` guarantees `sort == EmailSort::default()` here, so
+        // this key's `sort` is always `DateDesc` — the field still joins
+        // the key (rather than being dropped) so the cache stays correct
+        // by construction if that gating ever loosens. See `InboxKey`'s
+        // doc comment.
         let key = crate::prefetch::InboxKey {
             mailbox_id: params.mailbox_id.clone().unwrap(),
             limit,
@@ -2074,6 +2095,36 @@ mod tests {
     }
 
     #[test]
+    fn render_sort_toggle_flags_gmail_paged_ascending_order() {
+        // Regression test (roborev 291): Gmail's "oldest first" is only
+        // oldest-first *within each fetched page* (see gmail.rs's
+        // apply_sort_order doc comment) — paginating forward still walks
+        // Gmail's underlying pages newest-block-first. Fastmail/Outlook
+        // sort globally, so without a per-provider affordance the desktop
+        // toggle reads identically for a guarantee that's actually weaker
+        // on Gmail. renderSortToggle must call out the Gmail case in both
+        // the visible label and a title attribute.
+        let start = APP_JS
+            .find("function renderSortToggle")
+            .expect("renderSortToggle must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("renderSortToggle must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.currentAccount?.provider === 'gmail'"),
+            "renderSortToggle must special-case the Gmail provider"
+        );
+        assert!(
+            body.contains("(per page)"),
+            "renderSortToggle must append a per-page hint to the label for Gmail ascending order"
+        );
+        assert!(
+            body.contains("els.sortToggle.title"),
+            "renderSortToggle must set a title attribute explaining the per-page limitation"
+        );
+    }
+
+    #[test]
     fn select_account_resets_sort_order_to_default() {
         let start = APP_JS
             .find("function selectAccount")
@@ -2278,6 +2329,70 @@ mod tests {
         assert!(
             result.is_err(),
             "an unrecognized sort value must be a 400, not a silent default"
+        );
+    }
+
+    // =========================================================================
+    // list_is_cacheable sort gating (roborev 291)
+    // =========================================================================
+
+    fn cacheable_shape_params(sort: Option<EmailSort>) -> ListEmailsParams {
+        ListEmailsParams {
+            mailbox_id: Some("inbox".into()),
+            limit: None,
+            offset: None,
+            split_id: None,
+            search: None,
+            account: None,
+            starred: None,
+            sort,
+        }
+    }
+
+    #[test]
+    fn list_is_cacheable_true_for_default_shape_and_sort() {
+        let params = cacheable_shape_params(None);
+        assert!(
+            list_is_cacheable(&params, 0, EmailSort::DateDesc),
+            "default-inbox shape with default sort must remain cacheable"
+        );
+    }
+
+    #[test]
+    fn list_is_cacheable_false_for_date_asc_sort() {
+        // Regression test (roborev 291): a DateAsc request used to populate
+        // its own InboxKey slot, keyed apart from the warmer's DateDesc
+        // entry (kata 09ef). But the background warmer only ever re-warms
+        // the DateDesc slot and there's no TTL, so that DateAsc slot was
+        // never refreshed — a user sitting in "Oldest first" would never
+        // see new mail until some unrelated local mutation invalidated the
+        // whole account's cache. The fix: non-default sorts are no longer
+        // cacheable at all, so they always fetch live (no read, no write).
+        // DateDesc behavior is untouched — see the sibling
+        // `list_is_cacheable_true_for_default_shape_and_sort` test.
+        let params = cacheable_shape_params(Some(EmailSort::DateAsc));
+        assert!(
+            !list_is_cacheable(&params, 0, EmailSort::DateAsc),
+            "a DateAsc request must always bypass the prefetch cache"
+        );
+    }
+
+    #[test]
+    fn list_is_cacheable_still_false_for_non_default_shape() {
+        // Sanity check that extracting `list_is_cacheable` didn't change
+        // the pre-existing (non-sort) gating conditions.
+        let mut params = cacheable_shape_params(None);
+        params.split_id = Some("primary".into());
+        assert!(!list_is_cacheable(&params, 0, EmailSort::DateDesc));
+
+        let mut params = cacheable_shape_params(None);
+        params.starred = Some(true);
+        assert!(!list_is_cacheable(&params, 0, EmailSort::DateDesc));
+
+        let params = cacheable_shape_params(None);
+        assert!(
+            !list_is_cacheable(&params, 10, EmailSort::DateDesc),
+            "non-zero offset must not be cacheable"
         );
     }
 

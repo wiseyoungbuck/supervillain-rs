@@ -1312,7 +1312,21 @@ function toggleStarredOnly() {
 function renderSortToggle() {
     if (!els.sortToggle) return;
     const isAsc = state.sortOrder === 'date_asc';
-    els.sortToggle.textContent = isAsc ? 'Oldest first' : 'Newest first';
+    // Gmail's "oldest first" is only oldest-first *within each page* the
+    // server fetches (documented server-side, see gmail.rs's
+    // apply_sort_order) — a truly-global oldest-first would require
+    // buffering and re-sorting the entire mailbox, which we don't do.
+    // Fastmail/Outlook sort globally, so the toggle otherwise reads
+    // identically across providers even though the guarantee it makes is
+    // weaker for Gmail. Flag it in the label/title (roborev 291) rather
+    // than silently letting a Gmail user assume global ordering.
+    const isGmailPagedAsc = isAsc && state.currentAccount?.provider === 'gmail';
+    els.sortToggle.textContent = isAsc
+        ? (isGmailPagedAsc ? 'Oldest first (per page)' : 'Oldest first')
+        : 'Newest first';
+    els.sortToggle.title = isGmailPagedAsc
+        ? 'Gmail sorts oldest-first within each fetched page only — a newer message can still appear on an earlier page.'
+        : '';
     els.sortToggle.setAttribute('aria-pressed', String(isAsc));
     els.sortToggle.classList.toggle('active', isAsc);
 }

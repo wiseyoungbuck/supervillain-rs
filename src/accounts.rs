@@ -423,9 +423,14 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
 /// Escape a plain-text signature so it fits on the single INI line
 /// `parse_config_str`'s line-based scanner expects. Two concerns:
 ///
-/// * Structure: backslash and newline would corrupt the format (a literal
-///   newline starts a new "line", potentially parsed as a new key or
-///   section header) → `\` becomes `\\`, newline becomes `\n`.
+/// * Structure: backslash, newline, and carriage return would corrupt the
+///   format (a literal newline starts a new "line", potentially parsed as
+///   a new key or section header; a bare `\r` survives the write but
+///   `lines()`/`trim()` strip it back out on the next load-then-save round
+///   trip, silently mutating the signature) → `\` becomes `\\`, newline
+///   becomes `\n`, carriage return becomes `\r`. This also makes a
+///   Windows-style `\r\n` line ending round-trip byte-for-byte instead of
+///   losing the `\r` half.
 /// * Boundaries: the parser trims both the raw line and the value, so a
 ///   space or tab at the very start or end of the encoded value would
 ///   silently vanish on reload → the first and last character, when they
@@ -434,7 +439,10 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
 ///   with a backslash or the escape letter, so trim() can't reach the
 ///   remaining interior whitespace.
 fn escape_ini_multiline(s: &str) -> String {
-    let mut out = s.replace('\\', "\\\\").replace('\n', "\\n");
+    let mut out = s
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     // Leading boundary. The replacements above never produce a leading
     // space/tab that wasn't already there in `s`.
     if let Some(first) = out.chars().next() {
@@ -457,11 +465,12 @@ fn escape_ini_multiline(s: &str) -> String {
     out
 }
 
-/// Inverse of `escape_ini_multiline` (`\n` → newline, `\\` → backslash,
-/// `\s` → space, `\t` → tab — the latter two accepted anywhere even though
-/// the escaper only emits them at the boundaries). Tolerant of a trailing
-/// lone backslash or an unrecognized escape (passes it through literally)
-/// rather than panicking on a hand-edited config.
+/// Inverse of `escape_ini_multiline` (`\n` → newline, `\r` → carriage
+/// return, `\\` → backslash, `\s` → space, `\t` → tab — the latter two
+/// accepted anywhere even though the escaper only emits them at the
+/// boundaries). Tolerant of a trailing lone backslash or an unrecognized
+/// escape (passes it through literally) rather than panicking on a
+/// hand-edited config.
 fn unescape_ini_multiline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -472,6 +481,7 @@ fn unescape_ini_multiline(s: &str) -> String {
         }
         match chars.next() {
             Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
             Some('s') => out.push(' '),
             Some('t') => out.push('\t'),
             Some('\\') => out.push('\\'),
@@ -1593,6 +1603,63 @@ mod tests {
             unescape_ini_multiline(&escaped),
             "C:\\path\\to\\file\nline two"
         );
+    }
+
+    #[test]
+    fn signature_escaping_round_trips_carriage_returns() {
+        // Regression test (roborev 291): escape_ini_multiline escaped `\n`,
+        // `\\`, and boundary space/tab, but not a bare `\r`. A raw `\r`
+        // written into the single-line encoded value survives the write,
+        // but `parse_config_str`'s line-based scanner (`lines()`) and its
+        // `trim()` calls strip `\r` back out on the very next load, so a
+        // signature containing `\r` (a lone CR, or the CR half of a
+        // Windows-style `\r\n`) would silently mutate across a save/load
+        // cycle. `\r` must escape/unescape just like `\n` does.
+        let cases = [
+            "bare\rcarriage\rreturn",
+            "windows\r\nstyle\r\nline endings",
+            "\r",
+            "trailing\r",
+            "\rleading",
+        ];
+        for sig in cases {
+            let escaped = escape_ini_multiline(sig);
+            assert_eq!(
+                unescape_ini_multiline(&escaped),
+                sig,
+                "escape/unescape must round-trip {sig:?}"
+            );
+            // The raw escaped form must never carry a literal \r — it has
+            // to be encoded as the two-character `\r` escape, or a bare CR
+            // would still corrupt the single-line INI format / vanish
+            // under trim() at a boundary.
+            assert!(
+                !escaped.contains('\r'),
+                "encoded value must not contain a literal carriage return: {escaped:?}"
+            );
+
+            // Full config-level round trip, same as the parser would see.
+            let mut accounts = BTreeMap::new();
+            accounts.insert(
+                "fm".to_string(),
+                AccountConfig::Fastmail {
+                    username: "u@fm.com".into(),
+                    api_token: "tok".into(),
+                    signature: Some(sig.into()),
+                },
+            );
+            let cfg = ConfigFile {
+                default_account: None,
+                accounts,
+            };
+            let (parsed, errors) = parse_config_str(&serialize_config(&cfg));
+            assert!(errors.is_empty(), "no parse errors for {sig:?}: {errors:?}");
+            assert_eq!(
+                parsed.accounts.get("fm").unwrap().signature(),
+                Some(sig),
+                "config round trip must preserve carriage returns in {sig:?}"
+            );
+        }
     }
 
     #[test]
