@@ -4919,6 +4919,196 @@ white   = '#fdf6e3'
             "reconnect should trigger a list refresh, silent off the LIST screen"
         );
     }
+
+    // =========================================================================
+    // State persistence across iOS PWA kills (kata mhck, task A13)
+    // =========================================================================
+
+    #[test]
+    fn mobile_app_js_has_state_snapshot_key() {
+        // A single versioned localStorage key holds the resume snapshot.
+        assert!(
+            MOBILE_APP_JS.contains("supervillain_mobile_state_v1"),
+            "app.js should snapshot resume state under a versioned localStorage key"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_persists_on_lifecycle_events() {
+        // iOS only reliably delivers visibilitychange→hidden and pagehide
+        // before killing a backgrounded PWA — snapshot on both.
+        assert!(
+            MOBILE_APP_JS.contains("addEventListener('visibilitychange'"),
+            "should snapshot on visibilitychange (iOS backgrounding)"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("addEventListener('pagehide'"),
+            "should snapshot on pagehide (unload/bfcache)"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("visibilityState === 'hidden'"),
+            "visibilitychange should only snapshot when actually going hidden"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_persist_excludes_ui_state() {
+        // The snapshot is DATA state only. UI state — the open screen, the
+        // current email, cached bodies, the undo stack, in-flight compose
+        // attachments, the send lock — must never be persisted: restore always
+        // lands on the LIST screen, so resurrecting DETAIL/COMPOSE-scoped state
+        // would be both wrong and a way to reopen an email the server may have
+        // moved on from.
+        let start = MOBILE_APP_JS
+            .find("function persistState(")
+            .expect("persistState must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("persistState body must close");
+        let region = &rest[..end];
+        for banned in [
+            "undoStack",
+            "emailCache",
+            "currentEmailId",
+            "pendingAttachments",
+            "sending",
+        ] {
+            assert!(
+                !region.contains(banned),
+                "persistState must not persist UI state ({banned})"
+            );
+        }
+        // …but it MUST carry the data fields restore validates and renders.
+        assert!(
+            region.contains("accountId") && region.contains("savedAt") && region.contains("emails"),
+            "the snapshot must carry accountId, savedAt, and the list rows"
+        );
+        assert!(
+            region.contains("MOBILE_STATE_KEY"),
+            "persistState should write the versioned state key"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_persist_is_write_guarded() {
+        // Quota/private-mode denials must degrade to a console.warn, never a
+        // user-facing toast — a failed background snapshot isn't the user's
+        // problem.
+        let start = MOBILE_APP_JS
+            .find("function persistState(")
+            .expect("persistState must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("persistState body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("try") && region.contains("catch") && region.contains("console.warn"),
+            "the snapshot write must be try/catch-guarded and log, not toast"
+        );
+        assert!(
+            !region.contains("showError") && !region.contains("showToast"),
+            "a failed snapshot must never surface a toast"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_restore_refreshes_silently_and_stays_on_list() {
+        // Restore renders the snapshot list instantly, then refreshes it in the
+        // background via a SILENT load (the list is already on screen — a
+        // non-silent 'Loading...' would flash over it). It NEVER opens detail
+        // or compose, so nothing can be yanked out from under the user.
+        let start = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("loadEmails({ silent: true })"),
+            "restore must refresh the list with a silent load"
+        );
+        assert!(
+            !region.contains("Screen.DETAIL")
+                && !region.contains("Screen.COMPOSE")
+                && !region.contains("navigateTo"),
+            "restore must never enter DETAIL/COMPOSE"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_restore_validity_guards() {
+        // A snapshot is only applied when its account is still connected and it
+        // is fresh (< 24h). Anything else is removed and the app takes its
+        // normal default-account boot.
+        let start = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("connectedAccounts()"),
+            "restore must check the saved account is still connected"
+        );
+        assert!(
+            region.contains("savedAt") && region.contains("STATE_MAX_AGE_MS"),
+            "restore must check snapshot freshness via savedAt against the 24h max age"
+        );
+        assert!(
+            region.contains("removeItem"),
+            "an invalid/corrupt snapshot must be removed, not left to rot"
+        );
+        assert!(
+            region.contains("Refreshing"),
+            "restore should show a refreshing indicator over the stale list"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_restore_runs_after_load_accounts() {
+        // Restore lives in init() after loadAccounts() succeeds (it needs the
+        // connected-account list to validate the snapshot), and the no-snapshot
+        // path falls through to the original default-account boot unchanged.
+        let start = MOBILE_APP_JS
+            .find("async function init(")
+            .expect("init must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("init body must close");
+        let region = &rest[..end];
+        let load_accounts = region
+            .find("await loadAccounts()")
+            .expect("init loads accounts");
+        let restore = region
+            .find("restoreFromSnapshot(")
+            .expect("init attempts restore");
+        assert!(
+            restore > load_accounts,
+            "restore must run after loadAccounts() so the connected-account list is available"
+        );
+        // First-run byte-identical: the default-account selection still runs.
+        assert!(
+            region.contains("selectAccount(defaultAcc)"),
+            "the no-snapshot boot must still select the default account unchanged"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_snapshots_after_successful_load() {
+        // Belt-and-suspenders: keep the snapshot warm after every successful
+        // list load, in case iOS kills us without firing visibilitychange.
+        let start = MOBILE_APP_JS
+            .find("async function loadEmails(")
+            .expect("loadEmails must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("loadEmails body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("persistState()"),
+            "loadEmails should refresh the snapshot after a successful load"
+        );
+    }
 }
 
 // External dep for theme path

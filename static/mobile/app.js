@@ -51,6 +51,11 @@ const CACHE_LIMIT = 200;  // Max emails kept in memory (per Fleury, lower than d
 const BODY_CACHE_LIMIT = 50;
 const UNDO_STACK_LIMIT = 10;
 
+// State-persistence snapshot (kata mhck, task A13): a versioned localStorage
+// key plus the max age past which a snapshot is too stale to resume from.
+const MOBILE_STATE_KEY = 'supervillain_mobile_state_v1';
+const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+
 // ============================================================================
 // Date formatting (reused from desktop app.js)
 // ============================================================================
@@ -382,7 +387,7 @@ function hideAccountPicker() {
 // Data loading
 // ============================================================================
 
-async function loadMailboxes(acct, signal) {
+async function loadMailboxes(acct, signal, preferredRole = 'inbox') {
     const mailboxes = await state.api('GET', '/mailboxes', null, signal);
     // The account may have changed again while this was in flight (a second
     // switch aborts the signal above, but a response that lands in the same
@@ -390,7 +395,12 @@ async function loadMailboxes(acct, signal) {
     // freshly-reset state with data that belongs to the one we left.
     if (state.currentAccount?.id !== acct) return;
     state.mailboxes = mailboxes;
-    state.currentMailbox = state.mailboxes.find(m => m.role === 'inbox') || null;
+    // preferredRole defaults to inbox (the account-switch path, unchanged);
+    // restore passes the saved role so a resumed session lands back on the
+    // mailbox it left, falling back to inbox if that role is gone.
+    state.currentMailbox = state.mailboxes.find(m => m.role === preferredRole)
+        || state.mailboxes.find(m => m.role === 'inbox')
+        || null;
     renderBottomNav();
     // Splits may already have loaded (loadSplits runs in parallel) — render
     // and fetch counts now in case that race landed first; both are no-ops
@@ -457,6 +467,10 @@ async function loadEmails({ silent = false } = {}) {
         if (signal?.aborted || state.currentAccount?.id !== acct) return;
         state.emails = emails;
         renderEmailList();
+        // Belt-and-suspenders snapshot (kata mhck): keep the resume state warm
+        // after every successful load so a kill that skips visibilitychange
+        // still leaves a fresh list to restore. Idempotent and cheap.
+        persistState();
         if (!silent) showStatus('');
     } catch (err) {
         if (err.name === 'AbortError') return;
@@ -2136,6 +2150,136 @@ function setupInfiniteScroll() {
 }
 
 // ============================================================================
+// State persistence across iOS PWA kills (kata mhck, task A13)
+// ============================================================================
+// iOS silently kills backgrounded PWAs; on relaunch the JS heap is gone and
+// the app cold-boots to a blank list. We snapshot only DATA state — never UI
+// state — to localStorage so a relaunch renders the last list instantly, then
+// silently refreshes it. Stale beats blank, and an offline relaunch now shows
+// mail at all instead of nothing.
+//
+// localStorage, not IndexedDB: the snapshot is ~25KB (≤50 bodyless list rows)
+// — trivially under quota — and a synchronous write is exactly what the
+// visibilitychange/pagehide handlers need, since they must complete before iOS
+// suspends us. An async IndexedDB transaction could be cut off mid-flight.
+//
+// Persisted (data only): accountId, mailboxRole (+id for exactness; restore
+// resolves by role so a provider-side id change still lands the right
+// mailbox), splitId, searchQuery, the ≤50 list rows (no bodies), listScrollTop,
+// savedAt. NEVER persisted: screen, currentEmailId, emailCache, undoStack,
+// pendingAttachments, compose fields, the send lock — restore always lands on
+// LIST, so no DETAIL/COMPOSE-scoped state exists to resurrect.
+
+function persistState() {
+    // Nothing worth saving before an account is selected; such a snapshot
+    // could never pass restore's account-validity check anyway.
+    if (!state.currentAccount) return;
+    // The live list scroll only exists while LIST is the visible screen; off
+    // it #email-list-wrap is hidden and reads scrollTop 0, so fall back to the
+    // value navigateTo saved on the way out to detail/compose.
+    const wrap = document.getElementById('email-list-wrap');
+    const listScrollTop = state.screen === Screen.LIST && wrap
+        ? wrap.scrollTop
+        : state.listScrollTop;
+    try {
+        localStorage.setItem(MOBILE_STATE_KEY, JSON.stringify({
+            accountId: state.currentAccount.id,
+            mailboxRole: state.currentMailbox?.role || null,
+            mailboxId: state.currentMailbox?.id || null,
+            splitId: state.currentSplit,
+            searchQuery: state.searchQuery,
+            emails: state.emails.slice(0, PAGE_SIZE),
+            listScrollTop,
+            savedAt: Date.now(),
+        }));
+    } catch (err) {
+        // Quota exceeded or a private-mode storage denial — a warm snapshot is
+        // a best-effort optimization, never a user-facing failure. Log only;
+        // the bottom toast is reserved for user-affecting failures.
+        console.warn('State snapshot failed:', err);
+    }
+}
+
+// Attempt to resume from a snapshot. Returns true when one was applied (the
+// list is rendered and a silent background refresh is armed) so init() can
+// skip its normal default-account boot; false when there's nothing usable, in
+// which case init() boots exactly as it did before this feature existed.
+// Corrupt, stale, or foreign-account snapshots are removed and treated as
+// absent — the normal boot is always the safe fallback.
+function restoreFromSnapshot() {
+    let snapshot;
+    try {
+        const raw = localStorage.getItem(MOBILE_STATE_KEY);
+        if (!raw) return false;
+        snapshot = JSON.parse(raw);
+    } catch (err) {
+        // Corrupt JSON or a storage-access denial — drop it and boot normally.
+        console.warn('State restore failed:', err);
+        try { localStorage.removeItem(MOBILE_STATE_KEY); } catch (_e) { /* ignore */ }
+        return false;
+    }
+
+    // Validity: the saved account must still be connected, the snapshot fresh
+    // (< 24h — a day-old list misleads more than it helps), and the row array
+    // present. Any miss discards the snapshot and falls through to normal boot.
+    const account = connectedAccounts().find(a => a.id === snapshot?.accountId);
+    const fresh = typeof snapshot?.savedAt === 'number'
+        && Date.now() - snapshot.savedAt < STATE_MAX_AGE_MS;
+    if (!account || !fresh || !Array.isArray(snapshot.emails)) {
+        try { localStorage.removeItem(MOBILE_STATE_KEY); } catch (_e) { /* ignore */ }
+        return false;
+    }
+
+    // Apply WITHOUT selectAccount's reload cascade — that resets and re-fetches
+    // everything, blowing away the very list we're restoring. Set the account
+    // and api directly, seed split/search and the saved rows, then render. Arm
+    // a fresh abort controller first (boot leaves state.loadAbort null) so the
+    // background refresh below shares selectAccount's abort/stale protocol.
+    abortListLoad();
+    const acct = account.id;
+    state.currentAccount = account;
+    state.api = makeApi(acct);
+    state.currentSplit = snapshot.splitId || 'all';
+    state.searchQuery = snapshot.searchQuery || '';
+    state.emails = snapshot.emails;
+    state.listScrollTop = snapshot.listScrollTop || 0;
+    renderAccountButton();
+    if (state.searchQuery) document.getElementById('search-input').value = state.searchQuery;
+    renderEmailList();
+    document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
+    // Stale indicator over the snapshot list while the live refresh runs.
+    showStatus('Refreshing…');
+
+    // Identities power the From selector and are account-scoped — selectAccount
+    // fetches them and so must we, since we skipped its cascade.
+    loadIdentities(acct);
+
+    // Background refresh, mirroring selectAccount's loadMailboxes→loadEmails
+    // cascade but resolving the SAVED mailbox role (roles are canonical; ids
+    // aren't) and loading silently — the list is already on screen. List-level
+    // replacement only: restore never opened detail/compose, so nothing can be
+    // yanked. On completion the stale indicator clears; on failure the snapshot
+    // list stays (stale beats blank) and the error surfaces as usual.
+    loadMailboxes(acct, state.loadAbort.signal, snapshot.mailboxRole || 'inbox')
+        .then(() => {
+            if (state.currentAccount?.id !== acct) return;
+            return loadEmails({ silent: true });
+        })
+        .then(() => {
+            if (state.currentAccount?.id === acct) showStatus('');
+        })
+        .catch(err => {
+            if (err.name === 'AbortError') return;
+            showStatus('');
+            showError('Refresh', err);
+        });
+    // Splits are account-scoped tabs, independent of the mailbox fetch — same
+    // fire-and-forget as selectAccount (its own abort/stale-account guard).
+    loadSplits(acct, state.loadAbort.signal);
+    return true;
+}
+
+// ============================================================================
 // Boot
 // ============================================================================
 
@@ -2153,6 +2297,12 @@ async function init() {
         showStatus('Cannot reach server');
         return;
     }
+
+    // Resume from a snapshot when one is valid (kata mhck, task A13): renders
+    // the last list instantly and arms a silent refresh, short-circuiting the
+    // default-account boot. With no usable snapshot this is a no-op and the
+    // original boot below runs unchanged — the first-run path is untouched.
+    if (restoreFromSnapshot()) return;
 
     const connected = connectedAccounts();
     const defaultAcc = connected.find(a => a.isDefault) || connected[0];
@@ -2305,6 +2455,16 @@ window.addEventListener('popstate', (e) => {
 window.addEventListener('online', handleOnline);
 window.addEventListener('offline', handleOffline);
 setOfflineBanner(!navigator.onLine);
+
+// State persistence across iOS PWA kills (kata mhck, task A13): snapshot on
+// the two lifecycle events iOS actually delivers before suspending a
+// backgrounded PWA. Both call the same idempotent write — pagehide covers
+// unload/bfcache, visibilitychange→hidden covers ordinary backgrounding (the
+// event iOS sends most reliably). See restoreFromSnapshot for the boot side.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') persistState();
+});
+window.addEventListener('pagehide', persistState);
 
 // Replace initial history state
 history.replaceState({ screen: Screen.LIST }, '');
