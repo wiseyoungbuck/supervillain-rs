@@ -1148,6 +1148,77 @@ function handleDetailAction(type) {
     }
 }
 
+// ============================================================================
+// Unsubscribe & archive all (kata 6chy, task A11)
+// ============================================================================
+// Entry point: the detail action bar's overflow (⋯) button opens
+// #unsub-sheet (reuses the account-picker's bottom-sheet pattern, see
+// index.html). Tapping its confirm row IS the confirmation — desktop's
+// unsubscribeAndArchiveAll (static/app.js) has no confirm() step either,
+// firing straight off the 'U' keyboard shortcut, so the sheet itself is the
+// mobile equivalent of pressing 'U'. Semantics otherwise mirror desktop:
+// optimistic removal of every list row from that sender, POST the existing
+// /emails/:id/unsubscribe-and-archive-all route (server resolves the sender
+// from emailId — no new endpoint, see brief), open the unsubscribe URL if
+// present, revert + showError on failure. Deliberately NOT integrated with
+// the undo stack (out of scope for the batch — see brief).
+
+let unsubSheetTarget = null; // { emailId, senderEmail } while the sheet is open
+
+function showUnsubSheet() {
+    const emailId = state.currentEmailId;
+    if (!emailId) return;
+    const email = state.emails.find(e => e.id === emailId) || state.emailCache[emailId];
+    const senderEmail = email?.from?.[0]?.email;
+    if (!senderEmail) return;
+
+    unsubSheetTarget = { emailId, senderEmail };
+    document.getElementById('unsub-sheet-confirm').textContent =
+        `Unsubscribe & archive all from ${senderEmail}`;
+    document.getElementById('unsub-sheet').classList.remove('hidden');
+}
+
+function hideUnsubSheet() {
+    document.getElementById('unsub-sheet').classList.add('hidden');
+    unsubSheetTarget = null;
+}
+
+async function unsubscribeAndArchiveAll() {
+    const target = unsubSheetTarget;
+    hideUnsubSheet();
+    if (!target) return;
+    const { emailId, senderEmail } = target;
+
+    // Optimistic: remove every list row from this sender immediately,
+    // mirroring desktop's removeEmailsFromList.
+    const senderLower = senderEmail.toLowerCase();
+    const removedEmails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() === senderLower);
+    if (removedEmails.length > 0) {
+        state.emails = state.emails.filter(e => e.from[0]?.email?.toLowerCase() !== senderLower);
+        if (state.screen === Screen.LIST) renderEmailList();
+    }
+
+    // The triggering email's sender is now gone from the list — back out of
+    // its detail view like archive/trash's auto-advance.
+    if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+        history.back();
+    }
+
+    try {
+        const path = '/emails/' + encodeURIComponent(emailId) + '/unsubscribe-and-archive-all';
+        const result = await state.api('POST', path);
+        if (result.unsubscribeUrl) window.open(result.unsubscribeUrl, '_blank');
+    } catch (err) {
+        // Revert: re-insert the removed emails, same as desktop's catch.
+        if (removedEmails.length > 0) {
+            state.emails = state.emails.concat(removedEmails);
+            state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+            if (state.screen === Screen.LIST) renderEmailList();
+        }
+        showError('Unsubscribe & archive all', err);
+    }
+}
+
 function renderEmailDetail(email) {
     renderEmailDetailPartial(email);
 
@@ -2128,6 +2199,15 @@ document.getElementById('detail-read-btn').addEventListener('click', () => {
 });
 document.getElementById('detail-star-btn').addEventListener('click', () => {
     if (state.currentEmailId) toggleFlag(state.currentEmailId);
+});
+document.getElementById('detail-more-btn').addEventListener('click', showUnsubSheet);
+
+// Unsubscribe & archive all sheet (kata 6chy, task A11): confirm/cancel rows
+// plus backdrop-tap dismiss, mirroring the account picker's overlay wiring.
+document.getElementById('unsub-sheet-confirm').addEventListener('click', unsubscribeAndArchiveAll);
+document.getElementById('unsub-sheet-cancel').addEventListener('click', hideUnsubSheet);
+document.getElementById('unsub-sheet').addEventListener('click', (e) => {
+    if (e.target.id === 'unsub-sheet') hideUnsubSheet();
 });
 
 // Compose entry points: header ✎ (new message) and the detail action bar's

@@ -4734,6 +4734,127 @@ white   = '#fdf6e3'
             "detail-calendar container must remain the mount point for the rendered card"
         );
     }
+
+    // Mobile: unsubscribe & archive all (kata 6chy, task A11)
+
+    #[test]
+    fn mobile_html_has_detail_more_button_and_unsub_sheet() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="detail-more-btn""#),
+            "detail action bar needs an overflow (\u{22ef}) button as the entry point"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="unsub-sheet""#),
+            "needs the unsubscribe confirmation sheet container"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="unsub-sheet-confirm""#),
+            "sheet needs a confirm row ('Unsubscribe & archive all from <sender>')"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="unsub-sheet-cancel""#),
+            "sheet needs a Cancel row"
+        );
+    }
+
+    #[test]
+    fn mobile_html_unsub_sheet_reuses_account_picker_bottom_sheet_pattern() {
+        // Reuse, not a parallel copy: the overlay class the account picker
+        // already uses should be shared, not reinvented per sheet.
+        let overlay_class_start = MOBILE_HTML
+            .find(r#"id="account-picker""#)
+            .expect("account picker must exist");
+        let snippet = &MOBILE_HTML[overlay_class_start..overlay_class_start + 200];
+        let shared_class = if snippet.contains("class=\"sheet-overlay") {
+            "sheet-overlay"
+        } else {
+            panic!("account picker should carry a shared overlay class for other sheets to reuse")
+        };
+        assert!(
+            MOBILE_HTML.match_indices(shared_class).count() >= 2,
+            "unsub-sheet should reuse the same overlay class as account-picker, not duplicate its CSS"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_unsub_entry_point_wired_from_detail_action_bar() {
+        assert!(
+            MOBILE_APP_JS.contains("getElementById('detail-more-btn')"),
+            "the overflow button must be wired up"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function showUnsubSheet("),
+            "needs a function to populate + reveal the sheet with the current email's sender"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_unsub_route_call() {
+        let start = MOBILE_APP_JS
+            .find("async function unsubscribeAndArchiveAll(")
+            .expect("unsubscribeAndArchiveAll must exist");
+        let unsub_fn = &MOBILE_APP_JS[start..start + 1700];
+        assert!(
+            unsub_fn.contains("state.api('POST',"),
+            "should post through state.api, same as every other mobile action"
+        );
+        assert!(
+            unsub_fn.contains("/unsubscribe-and-archive-all"),
+            "must hit the existing route — no new server endpoint (kata 6chy brief)"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_unsub_optimistic_removal_reverts_on_failure() {
+        let start = MOBILE_APP_JS
+            .find("async function unsubscribeAndArchiveAll(")
+            .expect("unsubscribeAndArchiveAll must exist");
+        let unsub_fn = &MOBILE_APP_JS[start..start + 1700];
+        assert!(
+            unsub_fn.contains("state.emails.filter("),
+            "should optimistically filter all of the sender's rows out of the list"
+        );
+        assert!(unsub_fn.contains("catch"), "should handle request failure");
+        assert!(
+            unsub_fn.contains("state.emails.concat(removedEmails)")
+                || unsub_fn.contains("state.emails = state.emails.concat("),
+            "failure should revert by re-inserting the removed emails, mirroring desktop"
+        );
+        assert!(
+            unsub_fn.contains("showError("),
+            "should report failures through showError, the only failure sink"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_unsub_opens_unsubscribe_url_when_present() {
+        let start = MOBILE_APP_JS
+            .find("async function unsubscribeAndArchiveAll(")
+            .expect("unsubscribeAndArchiveAll must exist");
+        let unsub_fn = &MOBILE_APP_JS[start..start + 1700];
+        assert!(
+            unsub_fn.contains("result.unsubscribeUrl"),
+            "should check for an unsubscribe URL on the response"
+        );
+        assert!(
+            unsub_fn.contains("window.open(result.unsubscribeUrl, '_blank')"),
+            "should open it in a new tab, mirroring desktop"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_unsub_batch_has_no_undo_stack_entry() {
+        // Explicitly out of scope per the brief — the batch bypasses
+        // pushUndo/undoStack entirely, unlike single archive/trash.
+        let start = MOBILE_APP_JS
+            .find("async function unsubscribeAndArchiveAll(")
+            .expect("unsubscribeAndArchiveAll must exist");
+        let unsub_fn = &MOBILE_APP_JS[start..start + 1700];
+        assert!(
+            !unsub_fn.contains("pushUndo("),
+            "batch unsubscribe/archive must not push an undo-stack entry (out of scope, see brief)"
+        );
+    }
 }
 
 // External dep for theme path

@@ -213,8 +213,11 @@
             color: var(--text-muted);
         }
 
-        /* Account picker overlay */
-        #account-picker {
+        /* Bottom-sheet overlay pattern — originally the account picker, now
+           shared: any full-screen backdrop sheet (e.g. #unsub-sheet, kata
+           6chy task A11) adds class="sheet-overlay hidden" and toggles
+           .hidden, rather than duplicating this CSS per sheet. */
+        .sheet-overlay {
             position: fixed;
             inset: 0;
             background: rgba(0, 0, 0, 0.5);
@@ -224,22 +227,22 @@
             z-index: 30;
         }
 
-        #account-picker.hidden { display: none; }
+        .sheet-overlay.hidden { display: none; }
 
-        #account-picker .picker-sheet {
+        .picker-sheet {
             background: var(--bg);
             border-top: 1px solid var(--border);
             border-radius: 12px 12px 0 0;
             padding: 8px 0 calc(8px + var(--safe-bottom));
         }
 
-        #account-picker .picker-title {
+        .picker-title {
             font-size: 13px;
             color: var(--text-muted);
             padding: 8px 16px;
         }
 
-        #account-picker .account-row {
+        .account-row {
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -253,15 +256,15 @@
             cursor: pointer;
         }
 
-        #account-picker .account-row.current {
+        .account-row.current {
             color: var(--accent);
         }
 
-        #account-picker .account-row.pending {
+        .account-row.pending {
             color: var(--text-muted);
         }
 
-        #account-picker .account-provider {
+        .account-provider {
             font-size: 11px;
             color: var(--text-muted);
             text-transform: uppercase;
@@ -1134,6 +1137,11 @@
                 <button id="detail-trash-btn" class="detail-action-btn" aria-label="Trash">&#128465;</button>
                 <button id="detail-read-btn" class="detail-action-btn" aria-label="Toggle read status">&#9679;</button>
                 <button id="detail-star-btn" class="detail-action-btn" aria-label="Toggle star">&#9734;</button>
+                <!-- Overflow menu (kata 6chy, task A11): opens #unsub-sheet.
+                     Long-press on list rows was ruled out (conflicts with the
+                     swipe recognizers), so this detail-view button is the
+                     sole entry point. -->
+                <button id="detail-more-btn" class="detail-action-btn" aria-label="More actions">&#8943;</button>
             </div>
         </div>
         <!-- Compose (kata ryzd, task A6): new / reply / reply-all / forward.
@@ -1217,10 +1225,22 @@
     </div>
 
     <!-- Account picker (bottom sheet) -->
-    <div id="account-picker" class="hidden">
+    <div id="account-picker" class="sheet-overlay hidden">
         <div class="picker-sheet">
             <div class="picker-title">Accounts</div>
             <div id="account-picker-list"></div>
+        </div>
+    </div>
+
+    <!-- Unsubscribe & archive all (kata 6chy, task A11): reuses the account
+         picker's bottom-sheet pattern above. Tapping the confirm row IS the
+         confirmation — no separate confirm() dialog, mirroring desktop's
+         unsubscribeAndArchiveAll (static/app.js), which fires straight off
+         the 'U' keyboard shortcut with no confirm step of its own. -->
+    <div id="unsub-sheet" class="sheet-overlay hidden">
+        <div class="picker-sheet">
+            <button id="unsub-sheet-confirm" class="account-row"></button>
+            <button id="unsub-sheet-cancel" class="account-row">Cancel</button>
         </div>
     </div>
 
