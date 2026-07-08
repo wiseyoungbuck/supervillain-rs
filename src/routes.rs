@@ -4568,6 +4568,172 @@ white   = '#fdf6e3'
             );
         }
     }
+
+    // Mobile: calendar RSVP card (kata nhxd, task A10)
+
+    #[test]
+    fn mobile_app_js_replaces_calendar_indicator_with_card() {
+        // The old one-line indicator (pre-A10) is gone — detail now renders
+        // the full calendarEvent that GET /emails/:id already returns.
+        assert!(
+            !MOBILE_APP_JS.contains("calendar-indicator"),
+            "mobile should render the full calendar card, not the old indicator"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function renderCalendarCard("),
+            "mobile needs a renderCalendarCard function, mirroring desktop's semantics"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_calendar_card_shows_desktop_parity_fields() {
+        let start = MOBILE_APP_JS
+            .find("function renderCalendarCard(")
+            .expect("renderCalendarCard must exist");
+        let render_fn = &MOBILE_APP_JS[start..start + 2600];
+        for field in [
+            "event.summary",
+            "event.location",
+            "organizer",
+            "event.attendees",
+        ] {
+            assert!(
+                render_fn.contains(field),
+                "renderCalendarCard should render {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_app_js_calendar_card_escapes_attacker_controlled_fields() {
+        // summary/location/organizer come straight from the ICS payload
+        // (src/types.rs CalendarEvent) — attacker-controlled, must be escaped.
+        let start = MOBILE_APP_JS
+            .find("function renderCalendarCard(")
+            .expect("renderCalendarCard must exist");
+        let render_fn = &MOBILE_APP_JS[start..start + 2600];
+        assert!(
+            render_fn.contains("escapeHtml(event.summary"),
+            "summary must be escaped"
+        );
+        assert!(
+            render_fn.contains("escapeHtml(event.location"),
+            "location must be escaped"
+        );
+        assert!(
+            render_fn.contains("escapeHtml(organizerLabel"),
+            "organizer must be escaped"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_calendar_card_hides_actions_for_cancelled_and_publish() {
+        let start = MOBILE_APP_JS
+            .find("function renderCalendarCard(")
+            .expect("renderCalendarCard must exist");
+        let render_fn = &MOBILE_APP_JS[start..start + 2600];
+        assert!(
+            render_fn.contains("=== 'CANCEL'"),
+            "cancelled events must hide RSVP actions, mirroring desktop"
+        );
+        assert!(
+            render_fn.contains("!== 'PUBLISH'"),
+            "PUBLISH events (no attendee to respond as — server never sets \
+             user_rsvp_status for them, see routes.rs get_email) must also hide RSVP actions"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_calendar_card_highlights_current_status() {
+        let start = MOBILE_APP_JS
+            .find("function renderCalendarCard(")
+            .expect("renderCalendarCard must exist");
+        let render_fn = &MOBILE_APP_JS[start..start + 2600];
+        for status in ["ACCEPTED", "TENTATIVE", "DECLINED"] {
+            assert!(
+                render_fn.contains(&format!("userStatus === '{status}'")),
+                "should highlight the active RSVP button for {status}"
+            );
+        }
+        assert!(
+            render_fn.contains("You responded"),
+            "should render the 'You responded X' label"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_rsvp_route_call() {
+        let start = MOBILE_APP_JS
+            .find("async function rsvpToEvent(")
+            .expect("rsvpToEvent must exist");
+        let rsvp_fn = &MOBILE_APP_JS[start..start + 1000];
+        assert!(
+            rsvp_fn.contains("state.api('POST',"),
+            "rsvpToEvent should post through state.api"
+        );
+        assert!(
+            rsvp_fn.contains("/rsvp'"),
+            "rsvpToEvent should hit the /emails/:id/rsvp route"
+        );
+        assert!(
+            rsvp_fn.contains("{ status }"),
+            "rsvpToEvent should send {{ status }} as the request body"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_rsvp_optimistic_flip_reverts_on_failure() {
+        let start = MOBILE_APP_JS
+            .find("async function rsvpToEvent(")
+            .expect("rsvpToEvent must exist");
+        let rsvp_fn = &MOBILE_APP_JS[start..start + 1000];
+        assert!(
+            rsvp_fn.contains("event.user_rsvp_status = status"),
+            "should optimistically set user_rsvp_status before the request"
+        );
+        assert!(rsvp_fn.contains("catch"), "should handle request failure");
+        assert!(
+            rsvp_fn.contains("event.user_rsvp_status = prevStatus"),
+            "should revert user_rsvp_status on failure"
+        );
+        assert!(
+            rsvp_fn.contains("showError("),
+            "should report RSVP failures through showError, the only failure sink"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_rsvp_buttons_delegated_from_detail_calendar() {
+        // Delegated like detail-attachments — a fresh innerHTML per render
+        // never needs its own rebind.
+        assert!(
+            MOBILE_APP_JS.contains("getElementById('detail-calendar').addEventListener('click'"),
+            "RSVP buttons must be wired via delegation on #detail-calendar"
+        );
+        assert!(
+            MOBILE_APP_JS.contains(".closest('.rsvp-btn')"),
+            "click delegation should target .rsvp-btn"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_no_manual_add_to_calendar_button() {
+        // Desktop never calls POST /emails/:id/add-to-calendar either —
+        // REQUEST events are auto-added server-side (get_email). A manual
+        // button would be redundant chrome (kata nhxd, task A10 parity check).
+        assert!(
+            !MOBILE_APP_JS.contains("add-to-calendar"),
+            "mobile should not add a manual add-to-calendar action — server auto-adds on REQUEST"
+        );
+    }
+
+    #[test]
+    fn mobile_html_still_has_detail_calendar_container() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="detail-calendar""#),
+            "detail-calendar container must remain the mount point for the rendered card"
+        );
+    }
 }
 
 // External dep for theme path

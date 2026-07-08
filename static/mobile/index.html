@@ -664,12 +664,78 @@
         .att-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
         .att-size { color: var(--text-muted); font-size: 12px; flex-shrink: 0; }
 
-        /* Calendar indicator */
-        .calendar-indicator {
-            padding: 10px 16px;
-            font-size: 13px;
-            color: var(--accent);
+        /* Calendar event card (kata nhxd, task A10): full-width, edge-to-edge
+           like the attachments header/rows above it — no floating card
+           chrome, just a left accent border like desktop's .calendar-card. */
+        .calendar-card {
+            padding: 12px 16px;
             border-bottom: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+        }
+
+        .calendar-card.cancelled {
+            opacity: 0.75;
+        }
+
+        .cal-cancelled {
+            color: var(--accent);
+            font-weight: 700;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .cal-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .cal-icon { font-size: 16px; }
+
+        .cal-title { font-weight: 600; font-size: 14px; }
+
+        .cal-datetime {
+            color: var(--accent);
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .cal-location, .cal-organizer, .cal-attendee-count {
+            color: var(--text-muted);
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .calendar-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .rsvp-btn {
+            flex: 1;
+            min-height: 44px;
+            border: 1px solid var(--border);
+            background: var(--surface-hover);
+            color: var(--text);
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+
+        .rsvp-btn:active { opacity: 0.7; }
+
+        .rsvp-btn.accept.active { background: var(--success); border-color: var(--success); color: #fff; }
+        .rsvp-btn.maybe.active { background: #f5a623; border-color: #f5a623; color: #fff; }
+        .rsvp-btn.decline.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+        .rsvp-status-label {
+            margin-top: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
         }
 
         /* Email body */

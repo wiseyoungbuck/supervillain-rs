@@ -1159,13 +1159,10 @@ function renderEmailDetail(email) {
         document.getElementById('detail-attachments').innerHTML = '';
     }
 
-    // Calendar indicator
-    if (email.hasCalendar) {
-        document.getElementById('detail-calendar').innerHTML =
-            '<div class="calendar-indicator">This email contains a calendar invitation</div>';
-    } else {
-        document.getElementById('detail-calendar').innerHTML = '';
-    }
+    // Calendar event card (kata nhxd, task A10)
+    document.getElementById('detail-calendar').innerHTML = email.calendarEvent
+        ? renderCalendarCard(email.calendarEvent)
+        : '';
 
     // Body
     const bodyEl = document.getElementById('email-body');
@@ -1234,6 +1231,115 @@ function formatRecipients(email) {
         parts.push('Cc: ' + email.cc.map(a => escapeHtml(a.name || a.email)).join(', '));
     }
     return parts.join('<br>');
+}
+
+// ============================================================================
+// Calendar event card (kata nhxd, task A10)
+// ============================================================================
+// GET /emails/:id (routes.rs get_email) returns a full calendarEvent
+// alongside the body — this renders it as a full-width card above
+// #email-body, replacing the old one-line "contains a calendar invitation"
+// indicator. Desktop's renderCalendarCard/getUserRsvpStatus/rsvpToEvent
+// (static/app.js) are the semantic reference: CANCELLED banner, hidden RSVP
+// actions, active-button highlight, "You responded X" label, optimistic
+// flip with revert on failure via showError. Two mobile-only calls: actions
+// are also hidden for METHOD:PUBLISH (an FYI event with no attendee to
+// respond as — the server only ever sets user_rsvp_status for
+// METHOD:REQUEST, see determine_attendee_email in routes.rs), and there's no
+// manual "add to calendar" button, since REQUEST events are already
+// auto-added server-side on open (get_email) and desktop never exposes one
+// either.
+
+const RSVP_LABELS = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' };
+
+// No timezone selector on mobile (unlike desktop's formatEventTimeMultiTz) —
+// always the device's local time.
+function formatEventTimeRange(dtstart, dtend) {
+    if (!dtstart) return '';
+    const opts = { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
+    const start = new Date(dtstart);
+    let result = start.toLocaleString([], opts);
+    if (dtend) {
+        const end = new Date(dtend);
+        result += start.toDateString() === end.toDateString()
+            ? ' – ' + end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+            : ' – ' + end.toLocaleString([], opts);
+    }
+    return result;
+}
+
+// Redraws from scratch on every call (like renderAttachments, renderEmailList)
+// rather than mutating persistent DOM nodes the way desktop does. summary/
+// location/organizer are attacker-controlled ICS fields, so every one is
+// escapeHtml'd.
+function renderCalendarCard(event) {
+    const cancelled = event.method === 'CANCEL';
+    const showActions = !cancelled && event.method !== 'PUBLISH';
+    const userStatus = event.user_rsvp_status;
+
+    const banner = cancelled ? '<div class="cal-cancelled">CANCELLED</div>' : '';
+    const location = event.location
+        ? '<div class="cal-location">' + escapeHtml(event.location) + '</div>'
+        : '';
+    const organizerLabel = event.organizer_name || event.organizer_email;
+    const organizer = organizerLabel
+        ? '<div class="cal-organizer">' + escapeHtml(organizerLabel) + '</div>'
+        : '';
+    const count = (event.attendees || []).length;
+    const attendeeCount = count
+        ? '<div class="cal-attendee-count">' + count + (count === 1 ? ' attendee' : ' attendees') + '</div>'
+        : '';
+    const actions = showActions
+        ? '<div class="calendar-actions">'
+            + '<button type="button" class="rsvp-btn accept' + (userStatus === 'ACCEPTED' ? ' active' : '') + '" data-status="ACCEPTED">Accept</button>'
+            + '<button type="button" class="rsvp-btn maybe' + (userStatus === 'TENTATIVE' ? ' active' : '') + '" data-status="TENTATIVE">Maybe</button>'
+            + '<button type="button" class="rsvp-btn decline' + (userStatus === 'DECLINED' ? ' active' : '') + '" data-status="DECLINED">Decline</button>'
+            + '</div>'
+        : '';
+    const statusLabel = userStatus && userStatus !== 'NEEDS-ACTION' && RSVP_LABELS[userStatus]
+        ? '<div class="rsvp-status-label">You responded ' + RSVP_LABELS[userStatus] + '</div>'
+        : '';
+
+    return '<div class="calendar-card' + (cancelled ? ' cancelled' : '') + '">'
+        + '<div class="cal-header"><span class="cal-icon">📅</span>'
+        + '<span class="cal-title">' + escapeHtml(event.summary || 'Calendar Event') + '</span></div>'
+        + banner
+        + '<div class="cal-datetime">' + escapeHtml(formatEventTimeRange(event.dtstart, event.dtend)) + '</div>'
+        + location + organizer + attendeeCount + actions + statusLabel
+        + '</div>';
+}
+
+// Re-renders in place only if the user hasn't navigated away from this email
+// while an RSVP request was in flight — same guard as toggleUnread/toggleFlag.
+function updateCalendarCard(emailId, event) {
+    if (state.screen === Screen.DETAIL && state.currentEmailId === emailId) {
+        document.getElementById('detail-calendar').innerHTML = renderCalendarCard(event);
+    }
+}
+
+// Optimistic active-state flip → POST /rsvp → revert + showError on failure
+// (showError is the only failure sink on a phone without devtools).
+async function rsvpToEvent(status) {
+    const emailId = state.currentEmailId;
+    const email = state.emailCache[emailId];
+    const event = email && email.calendarEvent;
+    if (!event || event.user_rsvp_status === status) return;
+
+    const prevStatus = event.user_rsvp_status;
+    event.user_rsvp_status = status;
+    updateCalendarCard(emailId, event);
+
+    try {
+        const result = await state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/rsvp', { status });
+        if (result.calendarEvent) {
+            email.calendarEvent = result.calendarEvent;
+            updateCalendarCard(emailId, email.calendarEvent);
+        }
+    } catch (err) {
+        event.user_rsvp_status = prevStatus;
+        updateCalendarCard(emailId, event);
+        showError('RSVP', err);
+    }
 }
 
 function prefetchAdjacentEmails(emailId) {
@@ -2058,6 +2164,14 @@ document.getElementById('compose-attachments-list').addEventListener('click', ha
 // never need their own rebind.
 document.getElementById('detail-attachments').addEventListener('click', (e) => {
     if (e.target.closest('.att-download-all')) downloadAllAttachments();
+});
+
+// Calendar RSVP buttons (kata nhxd, task A10): delegated for the same reason
+// as detail-attachments above — renderCalendarCard redraws the card from
+// scratch on every RSVP and re-render.
+document.getElementById('detail-calendar').addEventListener('click', (e) => {
+    const btn = e.target.closest('.rsvp-btn');
+    if (btn) rsvpToEvent(btn.dataset.status);
 });
 
 // Undo toast — tap anywhere on it to undo (no keyboard shortcut on a phone).
