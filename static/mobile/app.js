@@ -40,6 +40,7 @@ const state = {
     replyContext: null,        // { inReplyTo?, quotedHtml, quotedText } appended at send time
     sending: false,            // in-flight send lock (disables Send, ignores re-taps)
     pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
+    searchQuery: '',           // active search string, or '' when inactive; combines with currentSplit (kata p80m)
 };
 
 // Unscoped instance for global routes (/accounts).
@@ -307,6 +308,12 @@ function selectAccount(account) {
     state.emailCache = {};
     state.lastRenderedGroup = null;
     state.listScrollTop = 0;
+    // A search is scoped to the account it ran in — mirrors desktop, where
+    // selectMailbox (reached via loadMailboxes on account switch) resets
+    // state.searchTokens.
+    state.searchQuery = '';
+    document.getElementById('search-input').value = '';
+    closeSearchBar();
     // Identities are account-scoped; drop the previous account's set and
     // re-fetch for the From selector. A failure only disables the selector
     // (compose still works), so it's fire-and-forget with its own error sink.
@@ -392,6 +399,11 @@ async function loadMailboxes(acct, signal) {
     loadSplitCounts();
 }
 
+// Mirrors desktop's buildEmailListUrl (static/app.js): split_id and search
+// are independent appends, not mutually exclusive — a search runs scoped to
+// whichever split tab is active, same as the server does when both params
+// are present (src/routes.rs list_emails applies the search query to the
+// fetch, then split-filters the results).
 function emailListPath(offset) {
     let path = '/emails?limit=' + PAGE_SIZE;
     if (state.currentMailbox) path += '&mailbox_id=' + encodeURIComponent(state.currentMailbox.id);
@@ -399,6 +411,7 @@ function emailListPath(offset) {
     if (state.currentMailbox?.role === 'inbox' && state.currentSplit && state.currentSplit !== 'all' && state.splits.length > 0) {
         path += '&split_id=' + encodeURIComponent(state.currentSplit);
     }
+    if (state.searchQuery) path += '&search=' + encodeURIComponent(state.searchQuery);
     return path;
 }
 
@@ -567,10 +580,64 @@ function selectMailbox(mailbox) {
     state.emails = [];
     state.lastRenderedGroup = null;
     state.listScrollTop = 0;
+    // Mirrors desktop's selectMailbox, which resets state.searchTokens — a
+    // search is scoped to the mailbox it ran in.
+    state.searchQuery = '';
+    document.getElementById('search-input').value = '';
+    closeSearchBar();
     renderBottomNav();
     renderSplitTabs();
     loadEmails();
     if (mailbox.role === 'inbox') loadSplitCounts();
+}
+
+// ============================================================================
+// Search (kata p80m, task A9)
+// ============================================================================
+// Plain query box, no token chips — from:/is:/has:/before:/after: and plain
+// terms are all parsed server-side (src/search.rs). Enter commits the query
+// (no debounce: a single explicit trigger keeps this simple and avoids
+// firing a request per keystroke on a phone connection). Unlike selectSplit
+// above, submitSearch/clearSearch do NOT touch currentSplit — search and
+// split combine, mirroring desktop's buildEmailListUrl exactly (see
+// emailListPath).
+
+function openSearch() {
+    document.getElementById('app-header').classList.add('searching');
+    document.getElementById('search-input').focus();
+}
+
+// Visibility-only: hides the search bar and restores the normal header row.
+// Never sets an inline display style — the setScreen display-ownership
+// invariant only governs screen-level (LIST/DETAIL/COMPOSE) toggles, and
+// this is a same-screen row toggle done entirely via the .searching class
+// (CSS), so it stays outside setScreen without tripping that check.
+function closeSearchBar() {
+    document.getElementById('app-header').classList.remove('searching');
+}
+
+// Same abort/reload protocol as selectAccount/selectMailbox/selectSplit
+// (abortListLoad guards every list switch, kata 1wdy). No-ops the reload
+// when there was nothing active to clear (e.g. tapping ✕ on an empty box).
+function clearSearch() {
+    document.getElementById('search-input').value = '';
+    closeSearchBar();
+    if (!state.searchQuery) return;
+    abortListLoad();
+    state.searchQuery = '';
+    loadEmails();
+}
+
+function submitSearch() {
+    const raw = document.getElementById('search-input').value.trim();
+    if (!raw) {
+        clearSearch();
+        return;
+    }
+    if (raw === state.searchQuery) return;
+    abortListLoad();
+    state.searchQuery = raw;
+    loadEmails();
 }
 
 // ============================================================================
@@ -1922,6 +1989,18 @@ document.getElementById('split-tabs').addEventListener('click', (e) => {
     const tab = e.target.closest('.split-tab');
     if (tab) selectSplit(tab.dataset.split);
 });
+
+// Search (kata p80m): tap the icon to reveal the bar, Enter to commit, ✕ to
+// clear and restore the normal list.
+document.getElementById('search-btn').addEventListener('click', openSearch);
+document.getElementById('search-clear-btn').addEventListener('click', clearSearch);
+document.getElementById('search-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitSearch();
+});
+// type="search" fires its own 'search' event on Enter/Go and on the
+// platform's native clear-x (WebKit) — submitSearch's empty-input branch
+// already routes that into clearSearch, so one handler covers both.
+document.getElementById('search-input').addEventListener('search', submitSearch);
 
 // Back button (detail → list) — use history.back() to pop the pushState entry
 document.getElementById('back-btn').addEventListener('click', () => history.back());

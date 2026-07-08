@@ -124,6 +124,56 @@
             white-space: nowrap;
         }
 
+        /* Search bar (kata p80m, task A9): overlays/replaces the normal
+           header row while active. Visibility is driven entirely by the
+           #app-header.searching class (openSearch/closeSearchBar toggle it
+           via classList, never .style.display) so this stays outside
+           setScreen's display-ownership without tripping the invariant that
+           every .style.display toggle lives inside setScreen. */
+        #search-bar {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+            min-width: 0;
+        }
+
+        #app-header.searching .title,
+        #app-header.searching .header-right {
+            display: none;
+        }
+
+        #app-header.searching #search-bar {
+            display: flex;
+        }
+
+        #search-bar input[type="search"] {
+            flex: 1;
+            min-width: 0;
+            font-size: 16px;
+            padding: 8px 10px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        #search-clear-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 20px;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+            min-width: 32px;
+            min-height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
         /* Split tabs (kata 1wdy): horizontally scrollable, inbox-only. Hidden
            by default; .visible (renderSplitTabs) shows it, setScreen's own
            display toggle hides it entirely outside Screen.LIST. */
@@ -972,8 +1022,16 @@
         <div id="app-header">
             <span class="title">Supervillain</span>
             <div class="header-right">
+                <button class="icon-btn" id="search-btn" aria-label="Search">&#128269;</button>
                 <button class="icon-btn" id="compose-btn" aria-label="New message">&#9998;</button>
                 <button class="account-btn" id="account-btn" aria-label="Switch account"></button>
+            </div>
+            <!-- Search bar (kata p80m, task A9): plain query box, no token
+                 chips — operators (from:/is:/has:/before:/after:) are parsed
+                 fully server-side (src/search.rs). -->
+            <div id="search-bar">
+                <input type="search" id="search-input" placeholder="Search (from: is: has: before: after:)" enterkeyhint="search" aria-label="Search mail">
+                <button id="search-clear-btn" aria-label="Clear search">&#10005;</button>
             </div>
         </div>
         <!-- Split tabs (kata 1wdy, task A8): inbox-only, hidden via the

@@ -4450,6 +4450,124 @@ white   = '#fdf6e3'
             "v1 bottom nav excludes spam and role-less custom folders"
         );
     }
+
+    #[test]
+    fn mobile_html_has_search_input() {
+        assert!(
+            MOBILE_HTML.contains(r#"id="search-btn""#),
+            "mobile html must have a header search icon button"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="search-input""#),
+            "mobile html must have a search input"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"type="search""#),
+            "search input must use type=search for the mobile keyboard's search affordance"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"enterkeyhint="search""#),
+            "search input must set enterkeyhint=search so the keyboard's action key reads Search"
+        );
+        assert!(
+            MOBILE_HTML.contains(r#"id="search-clear-btn""#),
+            "mobile html must have a clear (\u{2715}) affordance in the search bar"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_has_search_state_and_wiring() {
+        assert!(
+            MOBILE_APP_JS.contains("searchQuery:"),
+            "state must track the active search query"
+        );
+        for func in [
+            "function openSearch(",
+            "function closeSearchBar(",
+            "function clearSearch(",
+            "function submitSearch(",
+        ] {
+            assert!(
+                MOBILE_APP_JS.contains(func),
+                "mobile app.js must define {func}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_app_js_email_list_path_combines_search_with_split() {
+        // Desktop's buildEmailListUrl (static/app.js) appends split_id and
+        // search independently — both can be present on the same request,
+        // they are not mutually exclusive. Mobile must mirror that exactly,
+        // not the task brief's initial (incorrect) assumption that search
+        // suppresses the split filter.
+        let start = MOBILE_APP_JS
+            .find("function emailListPath(")
+            .expect("emailListPath must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("emailListPath must close");
+        let body = &rest[..end];
+        assert!(
+            body.contains("state.searchQuery"),
+            "emailListPath must append the active search query"
+        );
+        assert!(
+            body.contains("&search="),
+            "emailListPath must append &search= like desktop's buildEmailListUrl"
+        );
+        let split_idx = body.find("split_id").expect("split_id branch must exist");
+        let search_idx = body.find("&search=").expect("search branch must exist");
+        assert!(
+            split_idx < search_idx,
+            "split_id must be appended before search, mirroring desktop's ordering"
+        );
+        assert!(
+            !body[split_idx..search_idx].contains("else"),
+            "split_id and search must not be mutually exclusive branches — desktop combines them"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_search_clears_on_mailbox_and_account_switch_only() {
+        // Desktop clears state.searchTokens in selectMailbox (and
+        // selectAccount funnels through a mailbox reset); selectSplit does
+        // NOT clear search — search persists across split tabs, only a
+        // mailbox/account switch drops it.
+        for func in ["function selectAccount(", "function selectMailbox("] {
+            let start = MOBILE_APP_JS.find(func).expect("function must exist");
+            let rest = &MOBILE_APP_JS[start..];
+            let end = rest.find("\n}").expect("function must close");
+            assert!(
+                rest[..end].contains("state.searchQuery = ''"),
+                "{func} must clear the active search query"
+            );
+        }
+        let start = MOBILE_APP_JS
+            .find("function selectSplit(")
+            .expect("selectSplit must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("selectSplit must close");
+        assert!(
+            !rest[..end].contains("searchQuery"),
+            "selectSplit must not clear search — split and search combine, mirroring desktop"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_search_actions_use_abort_list_load() {
+        // Same abort/reload protocol as selectAccount/selectMailbox/
+        // selectSplit (abortListLoad guards every list switch, kata 1wdy) —
+        // a committed or cleared search reloads the list the same way.
+        for func in ["function submitSearch(", "function clearSearch("] {
+            let start = MOBILE_APP_JS.find(func).expect("function must exist");
+            let rest = &MOBILE_APP_JS[start..];
+            let end = rest.find("\n}").expect("function must close");
+            assert!(
+                rest[..end].contains("abortListLoad()"),
+                "{func} must guard its reload with abortListLoad()"
+            );
+        }
+    }
 }
 
 // External dep for theme path
