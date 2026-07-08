@@ -322,9 +322,21 @@ pub async fn add_to_calendar(
                 // For auto-add on email open, just add if missing (add_to_calendar checks)
                 outlook::add_to_calendar(s, ics_data, &event).await
             } else {
-                // Explicit add — remove first then re-add to handle updates
+                // Explicit add — remove first then re-add to handle updates.
+                // If the re-add fails right after a successful remove, the
+                // calendar would silently lack the meeting until the next
+                // email open — retry the add once immediately before giving
+                // up (roborev 292 #3).
                 let _ = outlook::remove_from_calendar(s, uid).await;
-                outlook::add_to_calendar(s, ics_data, &event).await
+                let first = outlook::add_to_calendar(s, ics_data, &event).await;
+                if matches!(first, Ok(true)) {
+                    first
+                } else {
+                    tracing::warn!(
+                        "Outlook add-after-remove did not succeed for {uid} ({first:?}); retrying once"
+                    );
+                    outlook::add_to_calendar(s, ics_data, &event).await
+                }
             }
         }
         ProviderSession::Gmail(s) => {
@@ -339,7 +351,19 @@ pub async fn add_to_calendar(
                 // existence check and short-circuits to Ok(true), leaving the
                 // user thinking the update landed while the content is stale.
                 gmail::remove_from_calendar(s, uid).await?;
-                gmail::add_to_calendar(s, ics_data, &event).await
+                // If the import fails right after a successful remove, the
+                // calendar would silently lack the meeting until the next
+                // email open — retry once immediately before giving up
+                // (roborev 292 #3).
+                let first = gmail::add_to_calendar(s, ics_data, &event).await;
+                if matches!(first, Ok(true)) {
+                    first
+                } else {
+                    tracing::warn!(
+                        "Gmail add-after-remove did not succeed for {uid} ({first:?}); retrying once"
+                    );
+                    gmail::add_to_calendar(s, ics_data, &event).await
+                }
             }
         }
     }
@@ -618,5 +642,77 @@ mod tests {
             .await
             .expect_err("gmail must reject draft destroy in v1");
         assert_drafts_unsupported(err, "gmail");
+    }
+
+    // --- calendar remove-then-add retry (roborev 292 #3) ---
+    //
+    // Outlook/Gmail's only_if_new=false path is remove-then-import; if the
+    // import half fails right after a successful remove, the calendar would
+    // silently lack the meeting until the next email open. Both provider
+    // arms must retry the add once before giving up. This can't be
+    // exercised with real HTTP without a mock server (none is wired up in
+    // this codebase), so — following the existing pattern for untestable
+    // async wiring elsewhere in this codebase (e.g. accounts.rs's
+    // `every_app_config_write_site_resets_the_baseline` and routes.rs's
+    // `get_email_reaches_only_if_new_false_on_update`) — assert on the
+    // source shape instead. `mod tests` is sliced off first so this test's
+    // own literal strings can't inflate the counts.
+    /// Slice out the body of `pub async fn add_to_calendar` from this file's
+    /// own source, so the scan below only sees that one dispatch function
+    /// (there are several other `match s { ProviderSession::Outlook... }`
+    /// dispatchers in this file that must not be counted).
+    fn add_to_calendar_fn_src() -> String {
+        let src = include_str!("provider.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        let after_start = handler_src
+            .split("pub async fn add_to_calendar(")
+            .nth(1)
+            .expect("add_to_calendar fn must exist");
+        after_start
+            .split("pub async fn remove_from_calendar(")
+            .next()
+            .expect("remove_from_calendar fn must follow add_to_calendar")
+            .to_string()
+    }
+
+    #[test]
+    fn add_to_calendar_retries_outlook_add_after_remove_failure() {
+        let fn_src = add_to_calendar_fn_src();
+        let outlook_block = fn_src
+            .split("ProviderSession::Outlook(s) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("ProviderSession::Gmail(s) => {").next())
+            .expect("Outlook arm of add_to_calendar dispatch must exist");
+        assert!(
+            outlook_block
+                .matches("outlook::add_to_calendar(s, ics_data, &event).await")
+                .count()
+                >= 2,
+            "the only_if_new=false Outlook branch must retry add_to_calendar once after a failed attempt"
+        );
+        assert!(
+            outlook_block.contains("outlook::remove_from_calendar(s, uid).await"),
+            "the Outlook branch must still remove before re-adding"
+        );
+    }
+
+    #[test]
+    fn add_to_calendar_retries_gmail_add_after_remove_failure() {
+        let fn_src = add_to_calendar_fn_src();
+        let gmail_block = fn_src
+            .split("ProviderSession::Gmail(s) => {")
+            .nth(1)
+            .expect("Gmail arm of add_to_calendar dispatch must exist");
+        assert!(
+            gmail_block
+                .matches("gmail::add_to_calendar(s, ics_data, &event).await")
+                .count()
+                >= 2,
+            "the only_if_new=false Gmail branch must retry add_to_calendar once after a failed attempt"
+        );
+        assert!(
+            gmail_block.contains("gmail::remove_from_calendar(s, uid).await?"),
+            "the Gmail branch must still propagate remove errors before re-adding"
+        );
     }
 }

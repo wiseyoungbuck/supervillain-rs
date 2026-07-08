@@ -134,6 +134,75 @@ pub fn invite_update_decision(
     }
 }
 
+/// True when the stored event's user-visible fields already match the
+/// incoming ICS event — nothing has actually changed, even if the incoming
+/// SEQUENCE claims otherwise.
+///
+/// Some providers can't round-trip SEQUENCE faithfully: Outlook's Graph API
+/// has no SEQUENCE field at all, so `parse_graph_event` always reports 0 —
+/// meaning any invite with ICS SEQUENCE >= 1 hits `InviteAction::Update` on
+/// *every* re-open, and the remove+re-add path wipes the user's
+/// `responseStatus` each time. A Gmail event stored before SEQUENCE
+/// round-tripping was added has the same problem, just as a one-time
+/// artifact rather than a recurring one. Before honoring an `Update`
+/// decision, callers should check this: if the content is unchanged, there's
+/// nothing to update — downgrade to `Unchanged` instead.
+///
+/// Compares DTSTART/DTEND/SUMMARY/LOCATION only (the fields that matter for
+/// "did this actually get rescheduled"); a real reschedule changes at least
+/// one of them and still triggers `Update`.
+pub fn events_content_match(stored: &CalendarEvent, incoming: &CalendarEvent) -> bool {
+    stored.dtstart == incoming.dtstart
+        && stored.dtend == incoming.dtend
+        && stored.summary == incoming.summary
+        && stored.location == incoming.location
+}
+
+// =============================================================================
+// Cancel decision (anti-spoof gate for METHOD:CANCEL)
+// =============================================================================
+
+/// Outcome of validating an incoming `METHOD:CANCEL` against the event
+/// already stored in the user's calendar for the same UID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelAction {
+    /// No stored event for this UID — nothing to remove either way.
+    NoStored,
+    /// Sender matches the stored organizer — safe to remove.
+    Remove,
+    /// Sender doesn't match the stored organizer (or organizer/sender is
+    /// missing) — a possible spoofed cancellation. Leave the calendar
+    /// untouched.
+    RejectSpoof,
+}
+
+/// Decide whether an incoming `METHOD:CANCEL` may remove the stored calendar
+/// event for its UID.
+///
+/// Mirrors the anti-spoof check in `invite_update_decision`: without it,
+/// anyone who learns a UID could delete a user's calendar entry by mailing a
+/// spoofed `METHOD:CANCEL` ICS — the CANCEL arm has no SEQUENCE to compare,
+/// so it must gate on sender identity alone. We only honor the removal when
+/// the message sender matches the *stored* event's organizer
+/// (case-insensitively).
+///
+/// `stored_organizer_email` is `None` when there's no stored event for this
+/// UID at all (nothing to remove either way, so this isn't treated as
+/// suspicious). An empty organizer on a stored event counts as missing and
+/// rejects the removal.
+pub fn cancel_decision(
+    stored_organizer_email: Option<&str>,
+    sender_email: Option<&str>,
+) -> CancelAction {
+    let Some(org) = stored_organizer_email else {
+        return CancelAction::NoStored;
+    };
+    match sender_email {
+        Some(sender) if !org.is_empty() && org.eq_ignore_ascii_case(sender) => CancelAction::Remove,
+        _ => CancelAction::RejectSpoof,
+    }
+}
+
 fn unfold_lines(s: &str) -> String {
     // ICS line folding: CRLF followed by single whitespace = continuation
     let s = s.replace("\r\n ", "").replace("\r\n\t", "");
@@ -1555,6 +1624,136 @@ END:VCALENDAR";
         assert_eq!(
             invite_update_decision(Some(0), 1, Some("alice@example.com"), None),
             InviteAction::RejectSpoof
+        );
+    }
+
+    // --- events_content_match tests (roborev 292: content-idempotence guard) ---
+    //
+    // Outlook's parse_graph_event always reports sequence: 0 (Graph has no
+    // SEQUENCE field), and a Gmail event stored before SEQUENCE round-tripping
+    // was added does the same. Either way, invite_update_decision sees every
+    // re-open of a SEQUENCE>=1 invite as a claimed Update even when nothing
+    // changed. events_content_match lets the caller downgrade a no-op "Update"
+    // to Unchanged so the destructive remove+re-add doesn't fire for nothing.
+
+    fn base_event() -> CalendarEvent {
+        parse_ics(SAMPLE_ICS).unwrap()
+    }
+
+    #[test]
+    fn content_match_true_for_identical_events() {
+        let stored = base_event();
+        let incoming = base_event();
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_dtstart_differs() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.dtstart += chrono::Duration::hours(1);
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_dtend_differs() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.dtend = incoming.dtend.map(|dt| dt + chrono::Duration::hours(1));
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_summary_differs() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.summary = "Rescheduled Standup".into();
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_location_differs() {
+        let stored = base_event();
+        let mut incoming = base_event();
+        incoming.location = Some("Conference Room C".into());
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_true_when_both_missing_optional_fields() {
+        // Neither side has LOCATION/DTEND — the None/None case must count as
+        // a match, not a mismatch.
+        let stored = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
+        let incoming = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_only_one_side_missing_dtend() {
+        let stored = base_event(); // has DTEND
+        let mut incoming = base_event();
+        incoming.dtend = None;
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_only_one_side_missing_location() {
+        let stored = base_event(); // has LOCATION
+        let mut incoming = base_event();
+        incoming.location = None;
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    // --- cancel_decision tests (roborev 292: CANCEL anti-spoof gate) ---
+
+    #[test]
+    fn cancel_decision_no_stored_event() {
+        // Nothing stored — nothing to remove either way.
+        assert_eq!(
+            cancel_decision(None, Some("alice@example.com")),
+            CancelAction::NoStored
+        );
+    }
+
+    #[test]
+    fn cancel_decision_removes_when_sender_matches_organizer() {
+        assert_eq!(
+            cancel_decision(Some("alice@example.com"), Some("alice@example.com")),
+            CancelAction::Remove
+        );
+    }
+
+    #[test]
+    fn cancel_decision_organizer_match_is_case_insensitive() {
+        assert_eq!(
+            cancel_decision(Some("Alice@Example.COM"), Some("alice@example.com")),
+            CancelAction::Remove
+        );
+    }
+
+    #[test]
+    fn cancel_decision_reject_spoof_on_sender_mismatch() {
+        // A sender who knows the UID but isn't the organizer must not be
+        // able to delete the stored event.
+        assert_eq!(
+            cancel_decision(Some("alice@example.com"), Some("mallory@evil.example")),
+            CancelAction::RejectSpoof
+        );
+    }
+
+    #[test]
+    fn cancel_decision_reject_spoof_on_missing_organizer() {
+        assert_eq!(
+            cancel_decision(Some(""), Some("alice@example.com")),
+            CancelAction::RejectSpoof
+        );
+    }
+
+    #[test]
+    fn cancel_decision_reject_spoof_on_missing_sender() {
+        assert_eq!(
+            cancel_decision(Some("alice@example.com"), None),
+            CancelAction::RejectSpoof
         );
     }
 

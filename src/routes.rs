@@ -680,6 +680,25 @@ async fn get_email(
                 stored_event.as_ref().map(|e| e.organizer_email.as_str()),
                 sender_email,
             );
+            // Content-idempotence guard (roborev 292): Outlook's parse_graph_event
+            // always reports sequence: 0 (Graph has no SEQUENCE field), so any
+            // invite with ICS SEQUENCE >= 1 hits this Update arm on *every*
+            // re-open — and remove+re-add wipes the user's stored responseStatus
+            // each time. A Gmail event stored before SEQUENCE round-tripping was
+            // added has the same issue as a one-time artifact. If the stored
+            // event's user-visible fields already match the incoming ICS,
+            // nothing actually changed — downgrade to Unchanged so we don't fire
+            // the destructive rewrite. A real reschedule (content differs) still
+            // Updates on all providers.
+            let decision = if decision == calendar::InviteAction::Update
+                && stored_event
+                    .as_ref()
+                    .is_some_and(|stored| calendar::events_content_match(stored, &event))
+            {
+                calendar::InviteAction::Unchanged
+            } else {
+                decision
+            };
             match decision {
                 // First-time add or idempotent re-receipt: today's behavior —
                 // add if missing, never overwrite (only_if_new = true).
@@ -733,17 +752,41 @@ async fn get_email(
                 }
             }
         } else if event.method == "CANCEL" {
-            let state_clone = state.clone();
-            let uid = event.uid.clone();
-            let acct = account_key.clone();
-            tokio::spawn(async move {
-                if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
-                    let s = s_lock.read().await;
-                    if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
-                        tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
-                    }
+            // Anti-spoof gate (roborev 292): the CANCEL arm has no SEQUENCE to
+            // compare, so without this check anyone who learns a UID could
+            // delete a stored event by mailing a spoofed METHOD:CANCEL ICS.
+            // Only remove when the sender matches the stored event's
+            // organizer — the same check used for REQUEST updates above. The
+            // cancelled banner still renders regardless (display isn't the
+            // attack surface; the calendar write is).
+            let sender_email = email.from.first().map(|a| a.email.as_str());
+            let stored_organizer_email = stored_event.as_ref().map(|e| e.organizer_email.as_str());
+            match calendar::cancel_decision(stored_organizer_email, sender_email) {
+                calendar::CancelAction::Remove => {
+                    let state_clone = state.clone();
+                    let uid = event.uid.clone();
+                    let acct = account_key.clone();
+                    tokio::spawn(async move {
+                        if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
+                            let s = s_lock.read().await;
+                            if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
+                                tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
+                            }
+                        }
+                    });
                 }
-            });
+                calendar::CancelAction::NoStored => {
+                    tracing::debug!("Event {} not in calendar yet, nothing to cancel", event.uid);
+                }
+                calendar::CancelAction::RejectSpoof => {
+                    tracing::warn!(
+                        "Rejected spoofed calendar cancellation for {} (sender {:?} != organizer {:?})",
+                        event.uid,
+                        sender_email,
+                        stored_organizer_email,
+                    );
+                }
+            }
         }
 
         // Merge current PARTSTAT from the stored calendar event so the UI
@@ -5106,6 +5149,61 @@ white   = '#fdf6e3'
         assert!(
             src.contains("calendar::InviteAction::RejectSpoof =>"),
             "get_email must handle the RejectSpoof arm"
+        );
+    }
+
+    #[test]
+    fn get_email_content_idempotence_guard_downgrades_noop_update_to_unchanged() {
+        // roborev 292 #1: Outlook's parse_graph_event always reports
+        // sequence: 0 (Graph has no SEQUENCE field), so any invite with ICS
+        // SEQUENCE >= 1 hits the Update arm on *every* re-open even when
+        // nothing changed — and the remove+re-add wipes the user's stored
+        // responseStatus each time. A legacy Gmail event (stored before
+        // SEQUENCE round-tripping was added) hits the same bug once. Verify
+        // the content check runs before the match and can downgrade a no-op
+        // Update to Unchanged (no write, no reset, no banner), while a real
+        // reschedule (content differs) still reaches the Update arm.
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            handler_src.contains("calendar::events_content_match(stored, &event)"),
+            "get_email must call the content-idempotence guard against the stored event"
+        );
+        assert!(
+            handler_src.contains("decision == calendar::InviteAction::Update"),
+            "the guard must gate specifically on an Update decision"
+        );
+        assert!(
+            handler_src.contains("calendar::InviteAction::Unchanged"),
+            "the guard must downgrade a no-op Update to Unchanged"
+        );
+    }
+
+    #[test]
+    fn get_email_cancel_arm_gates_removal_on_organizer_match() {
+        // roborev 292 #2: the CANCEL arm must not remove the stored event
+        // just because someone mailed a METHOD:CANCEL ICS referencing a
+        // known UID — only when the sender matches the stored event's
+        // organizer (the same anti-spoof check used for REQUEST updates).
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            handler_src.contains("calendar::cancel_decision("),
+            "get_email must call the CANCEL anti-spoof decision helper"
+        );
+        assert!(
+            handler_src.contains("calendar::CancelAction::Remove =>"),
+            "get_email must handle the Remove arm"
+        );
+        assert!(
+            handler_src.contains("calendar::CancelAction::RejectSpoof =>"),
+            "get_email must handle the RejectSpoof arm (skip removal + warn)"
+        );
+        // The cancelled banner must still render regardless of the removal
+        // decision — display isn't the attack surface, the calendar write is.
+        assert!(
+            handler_src.contains("calendar_event = Some(event);"),
+            "the parsed CANCEL event must still be returned for the banner"
         );
     }
 
