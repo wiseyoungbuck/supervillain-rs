@@ -1713,6 +1713,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn app_js_signature_prefilled_via_clear_compose() {
+        // clearCompose is the single choke point startCompose/startReply/
+        // startForward all call first, so prefilling there covers new,
+        // reply, and forward uniformly — this pins that the prefill lives
+        // there rather than being duplicated (or, worse, injected at send
+        // time, which the design explicitly forbids: the user must see
+        // exactly what sends).
+        let start = APP_JS
+            .find("function clearCompose()")
+            .expect("clearCompose must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("clearCompose must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("composeSignaturePrefill()"),
+            "clearCompose must prefill the body via composeSignaturePrefill()"
+        );
+        assert!(
+            block.contains("setSelectionRange(0, 0)"),
+            "clearCompose must place the cursor at position 0 after prefilling"
+        );
+        assert!(
+            APP_JS.contains("function composeSignaturePrefill"),
+            "composeSignaturePrefill helper must exist"
+        );
+        assert!(
+            APP_JS.contains("-- \\n"),
+            "signature prefill must use the RFC 3676 delimiter '-- ' \
+             (trailing space significant) before a newline"
+        );
+    }
+
     // ====================================================================
     // Settings view (account management) regression sentinels
     // ====================================================================
@@ -2009,6 +2042,7 @@ mod tests {
                 accounts::AccountConfig::Fastmail {
                     username: format!("{id}@example.com"),
                     api_token: "tok".into(),
+                    signature: None,
                 },
             );
         }
@@ -2219,6 +2253,36 @@ mod tests {
             block.contains("cacheHit"),
             "the mark-read call must be gated to the cache-hit path only — \
              the network-fetch path's GET already auto-marks read server-side"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_signature_prefilled_via_clear_compose_fields() {
+        // Mirrors app_js_signature_prefilled_via_clear_compose: mobile's
+        // startCompose/startReply/startForward all call clearComposeFields
+        // first, so that's the single place to prefill from.
+        let start = MOBILE_APP_JS
+            .find("function clearComposeFields()")
+            .expect("clearComposeFields must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("clearComposeFields must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("composeSignaturePrefill()"),
+            "clearComposeFields must prefill the body via composeSignaturePrefill()"
+        );
+        assert!(
+            block.contains("setSelectionRange(0, 0)"),
+            "clearComposeFields must place the cursor at position 0 after prefilling"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("function composeSignaturePrefill"),
+            "composeSignaturePrefill helper must exist"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("-- \\n"),
+            "signature prefill must use the RFC 3676 delimiter '-- ' \
+             (trailing space significant) before a newline"
         );
     }
 

@@ -1707,13 +1707,27 @@ function clearPendingAttachments() {
     renderComposeAttachments();
 }
 
+// Per-account plain-text signature, prefilled into a fresh compose body.
+// Mirrors desktop's composeSignaturePrefill: clearComposeFields is the single
+// choke point for new/reply/forward (all three call it first), so prefilling
+// here covers all of them uniformly. Never re-injected at send time —
+// sendComposedEmail sends exactly what's left in the textarea after the user
+// edits/deletes freely. Per-account, not per-identity — there's no compose-
+// from account switch to worry about (accounts can't change mid-compose).
+function composeSignaturePrefill() {
+    const sig = state.currentAccount?.signature;
+    return sig ? `\n\n-- \n${sig}` : '';
+}
+
 // Reset every field to empty and drop any reply/forward context. Field-only:
 // the screen show/hide stays in setScreen.
 function clearComposeFields() {
     composeEl('compose-to').value = '';
     composeEl('compose-cc').value = '';
     composeEl('compose-subject').value = '';
-    composeEl('compose-body').value = '';
+    const body = composeEl('compose-body');
+    body.value = composeSignaturePrefill();
+    body.setSelectionRange(0, 0);
     autosizeComposeBody();
     const quote = composeEl('compose-quote');
     quote.classList.add('hidden');

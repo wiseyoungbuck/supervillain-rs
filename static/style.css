@@ -1614,7 +1614,8 @@ body:not(.light-theme) .compose-quote a * {
     color: var(--fg-muted);
 }
 .account-form .modal-field input,
-.account-form .modal-field select {
+.account-form .modal-field select,
+.account-form .modal-field textarea {
     flex: 1;
     padding: 6px 8px;
     background: var(--bg-secondary);
@@ -1622,6 +1623,16 @@ body:not(.light-theme) .compose-quote a * {
     color: var(--fg);
     font-family: var(--font-mono);
     font-size: 13px;
+}
+.account-form .modal-field textarea {
+    resize: vertical;
+    min-height: 60px;
+}
+/* Top-align the label with a multi-row control (e.g. the signature
+   textarea) instead of the default vertical-center used for single-line
+   inputs. */
+.account-form .modal-field-top {
+    align-items: flex-start;
 }
 .account-form .modal-field input:focus,
 .account-form .modal-field select:focus {

@@ -30,12 +30,19 @@ pub enum AccountConfig {
         username: String,
         #[serde(rename = "api-token")]
         api_token: String,
+        /// Per-account plain-text signature, prefilled into compose (never
+        /// re-injected at send time). `None`/empty both mean "no signature" —
+        /// see `AccountConfig::signature()`.
+        #[serde(default)]
+        signature: Option<String>,
     },
     Outlook {
         #[serde(rename = "client-id")]
         client_id: String,
         #[serde(default)]
         email: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
     Gmail {
         #[serde(rename = "client-id")]
@@ -44,6 +51,8 @@ pub enum AccountConfig {
         client_secret: String,
         #[serde(default)]
         email: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
 }
 
@@ -71,6 +80,17 @@ impl AccountConfig {
         match self {
             Self::Outlook { client_id, .. } | Self::Gmail { client_id, .. } => Some(client_id),
             Self::Fastmail { .. } => None,
+        }
+    }
+
+    /// The account's plain-text signature, or `None` if unset. Normalizes
+    /// an explicit empty string (e.g. a cleared settings textarea) to `None`
+    /// so "absent" and "empty" read the same on the wire and on disk.
+    pub fn signature(&self) -> Option<&str> {
+        match self {
+            Self::Fastmail { signature, .. }
+            | Self::Outlook { signature, .. }
+            | Self::Gmail { signature, .. } => signature.as_deref().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -304,10 +324,15 @@ fn account_from_props(
             .cloned()
             .ok_or_else(|| format!("missing required field `{key}`"))
     };
+    // Unescape happens at parse time; `AccountConfig::signature()` also
+    // normalizes an empty string to `None`, so a hand-edited `signature = `
+    // (empty value) round-trips as "no signature" same as an omitted key.
+    let signature = props.get("signature").map(|s| unescape_ini_multiline(s));
     match provider {
         "fastmail" => Ok(AccountConfig::Fastmail {
             username: require("username")?,
             api_token: require("api-token")?,
+            signature,
         }),
         "outlook" => Ok(AccountConfig::Outlook {
             client_id: require("client-id")?,
@@ -318,11 +343,13 @@ fn account_from_props(
                 .get("email")
                 .or_else(|| props.get("username"))
                 .cloned(),
+            signature,
         }),
         "gmail" => Ok(AccountConfig::Gmail {
             client_id: require("client-id")?,
             client_secret: require("client-secret")?,
             email: props.get("email").cloned(),
+            signature,
         }),
         other => Err(format!("unknown provider `{other}`")),
     }
@@ -359,11 +386,14 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
         AccountConfig::Fastmail {
             username,
             api_token,
+            ..
         } => {
             lines.push(format!("username = {username}"));
             lines.push(format!("api-token = {api_token}"));
         }
-        AccountConfig::Outlook { client_id, email } => {
+        AccountConfig::Outlook {
+            client_id, email, ..
+        } => {
             lines.push(format!("client-id = {client_id}"));
             if let Some(e) = email {
                 lines.push(format!("email = {e}"));
@@ -373,6 +403,7 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
             client_id,
             client_secret,
             email,
+            ..
         } => {
             lines.push(format!("client-id = {client_id}"));
             lines.push(format!("client-secret = {client_secret}"));
@@ -381,7 +412,45 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
             }
         }
     }
+    // Signature is common to every provider, so it's handled once here via
+    // the normalizing accessor rather than duplicated in each match arm.
+    if let Some(sig) = acct.signature() {
+        lines.push(format!("signature = {}", escape_ini_multiline(sig)));
+    }
     lines
+}
+
+/// Escape a plain-text signature so it fits on the single INI line
+/// `parse_config_str`'s line-based scanner expects: backslash and newline
+/// are the only two characters that would otherwise corrupt the format
+/// (a literal newline would start a new "line", potentially parsed as a new
+/// key or section header).
+fn escape_ini_multiline(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Inverse of `escape_ini_multiline`. Tolerant of a trailing lone backslash
+/// or an unrecognized escape (passes it through literally) rather than
+/// panicking on a hand-edited config.
+fn unescape_ini_multiline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -615,6 +684,7 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
         AccountConfig::Fastmail {
             username,
             api_token,
+            ..
         } => {
             if let Err(e) = validate_email(username) {
                 errs.push(FieldError::new(FieldId::Username, e));
@@ -626,7 +696,9 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
                 ));
             }
         }
-        AccountConfig::Outlook { client_id, email } => {
+        AccountConfig::Outlook {
+            client_id, email, ..
+        } => {
             if client_id.trim().is_empty() {
                 errs.push(FieldError::new(
                     FieldId::ClientId,
@@ -645,6 +717,7 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
             client_id,
             client_secret,
             email,
+            ..
         } => {
             if client_id.trim().is_empty() {
                 errs.push(FieldError::new(
@@ -765,6 +838,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
             AccountConfig::Fastmail {
                 username,
                 api_token: incoming,
+                signature,
             },
         ) => AccountConfig::Fastmail {
             username,
@@ -773,6 +847,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
             } else {
                 incoming
             },
+            signature,
         },
         (
             AccountConfig::Gmail {
@@ -782,6 +857,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 client_id,
                 client_secret: incoming,
                 email,
+                signature,
             },
         ) => AccountConfig::Gmail {
             client_id,
@@ -791,6 +867,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 incoming
             },
             email,
+            signature,
         },
         (_, new) => new,
     }
@@ -842,6 +919,7 @@ pub fn wire_account_list(
                 "isDefault": id == default_account,
                 "authStatus": if session.is_some() { "ok" } else { "pending" },
                 "clientId": acct.oauth_client_id(),
+                "signature": acct.signature(),
             })
         })
         .collect()
@@ -1049,6 +1127,7 @@ async fn upsert_account(
             AccountConfig::Fastmail {
                 username,
                 api_token,
+                ..
             } => {
                 let mut sess =
                     crate::jmap::JmapSession::new(username, &format!("Bearer {api_token}"));
@@ -1271,14 +1350,23 @@ pub fn update_email_from_session(
     email_from_session: Option<String>,
 ) -> AccountConfig {
     match (account, email_from_session) {
-        (AccountConfig::Outlook { client_id, .. }, Some(email)) => AccountConfig::Outlook {
+        (
+            AccountConfig::Outlook {
+                client_id,
+                signature,
+                ..
+            },
+            Some(email),
+        ) => AccountConfig::Outlook {
             client_id,
             email: Some(email),
+            signature,
         },
         (
             AccountConfig::Gmail {
                 client_id,
                 client_secret,
+                signature,
                 ..
             },
             Some(email),
@@ -1286,6 +1374,7 @@ pub fn update_email_from_session(
             client_id,
             client_secret,
             email: Some(email),
+            signature,
         },
         (other, _) => other,
     }
@@ -1336,12 +1425,14 @@ mod tests {
         AccountConfig::Fastmail {
             username: username.into(),
             api_token: token.into(),
+            signature: None,
         }
     }
     fn outlook(client_id: &str, email: Option<&str>) -> AccountConfig {
         AccountConfig::Outlook {
             client_id: client_id.into(),
             email: email.map(String::from),
+            signature: None,
         }
     }
     fn gmail(client_id: &str, secret: &str, email: Option<&str>) -> AccountConfig {
@@ -1349,6 +1440,7 @@ mod tests {
             client_id: client_id.into(),
             client_secret: secret.into(),
             email: email.map(String::from),
+            signature: None,
         }
     }
 
@@ -1379,6 +1471,7 @@ mod tests {
             AccountConfig::Fastmail {
                 username,
                 api_token,
+                ..
             } => {
                 assert_eq!(username, "alice@fm.com");
                 assert_eq!(api_token, "fmu1-tok");
@@ -1386,7 +1479,9 @@ mod tests {
             _ => panic!("expected fastmail"),
         }
         match parsed.accounts.get("ms").unwrap() {
-            AccountConfig::Outlook { client_id, email } => {
+            AccountConfig::Outlook {
+                client_id, email, ..
+            } => {
                 assert_eq!(client_id, "client-abc");
                 assert_eq!(email.as_deref(), Some("alice@outlook.com"));
             }
@@ -1397,6 +1492,7 @@ mod tests {
                 client_id,
                 client_secret,
                 email,
+                ..
             } => {
                 assert_eq!(client_id, "cid");
                 assert_eq!(client_secret, "cs");
@@ -1404,6 +1500,85 @@ mod tests {
             }
             _ => panic!("expected gmail"),
         }
+    }
+
+    #[test]
+    fn signature_round_trips_present_absent_and_multiline() {
+        // Present (single line), absent, and multiline signatures must all
+        // survive a serialize → parse round trip. Multiline is the
+        // interesting case: parse_config_str is line-oriented, so a literal
+        // newline in the value would corrupt the file unless escaped.
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "fm".to_string(),
+            AccountConfig::Fastmail {
+                username: "alice@fm.com".into(),
+                api_token: "tok".into(),
+                signature: Some("Best,\nAlice\nAcme Inc.".into()),
+            },
+        );
+        accounts.insert("ms".to_string(), outlook("client-abc", None)); // absent
+        accounts.insert(
+            "gm".to_string(),
+            AccountConfig::Gmail {
+                client_id: "cid".into(),
+                client_secret: "cs".into(),
+                email: Some("bob@gmail.com".into()),
+                signature: Some("Sent from my phone".into()),
+            },
+        );
+        let cfg = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        // The serialized INI must not contain a raw embedded newline inside
+        // the signature value — it should be escaped to `\n` on one line.
+        assert!(
+            s.contains("signature = Best,\\nAlice\\nAcme Inc."),
+            "multiline signature must be escaped onto a single INI line:\n{s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(
+            errors.is_empty(),
+            "round trip must not produce parse errors: {errors:?}"
+        );
+        assert_eq!(
+            parsed.accounts.get("fm").unwrap().signature(),
+            Some("Best,\nAlice\nAcme Inc.")
+        );
+        assert_eq!(parsed.accounts.get("ms").unwrap().signature(), None);
+        assert_eq!(
+            parsed.accounts.get("gm").unwrap().signature(),
+            Some("Sent from my phone")
+        );
+    }
+
+    #[test]
+    fn signature_escaping_round_trips_literal_backslash() {
+        let escaped = escape_ini_multiline("C:\\path\\to\\file\nline two");
+        assert_eq!(
+            unescape_ini_multiline(&escaped),
+            "C:\\path\\to\\file\nline two"
+        );
+    }
+
+    #[test]
+    fn signature_empty_string_normalizes_to_none() {
+        // A cleared settings textarea sends "" (not omitted); storage and the
+        // wire must both read that the same as "no signature".
+        let acct = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: "tok".into(),
+            signature: Some(String::new()),
+        };
+        assert_eq!(acct.signature(), None);
+        // ...and the INI writer must not emit an empty `signature =` line.
+        assert!(
+            !account_to_ini_lines("fm", &acct)
+                .iter()
+                .any(|l| l.starts_with("signature"))
+        );
     }
 
     #[test]
@@ -1834,6 +2009,41 @@ api-token = tok
     }
 
     #[test]
+    fn wire_list_includes_signature_when_present_and_null_when_absent() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "fm".into(),
+            AccountConfig::Fastmail {
+                username: "u@fm.com".into(),
+                api_token: "tok".into(),
+                signature: Some("Best,\nAlice".into()),
+            },
+        );
+        configs.insert(
+            "ms".into(),
+            outlook("0e86662a-14b9-4e95-97d6-e91972f91d48", None),
+        );
+        let list = wire_account_list(&configs, &live(&[]), "fm");
+        assert_eq!(list[0]["signature"], "Best,\nAlice");
+        assert!(list[1]["signature"].is_null());
+    }
+
+    #[test]
+    fn wire_list_empty_signature_reads_as_null() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "fm".into(),
+            AccountConfig::Fastmail {
+                username: "u@fm.com".into(),
+                api_token: "tok".into(),
+                signature: Some(String::new()),
+            },
+        );
+        let list = wire_account_list(&configs, &live(&[]), "fm");
+        assert!(list[0]["signature"].is_null());
+    }
+
+    #[test]
     fn wire_list_exposes_client_id_for_oauth_only() {
         // The settings edit form reads clientId from this list; Fastmail has
         // none and must not grow a null field the UI trips on.
@@ -2122,6 +2332,69 @@ api-token = tok
             AccountConfig::Gmail { client_secret, .. } => assert_eq!(client_secret, "secret"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// `POST /api/accounts/{id}` on an already-configured account must
+    /// persist a new signature both in the in-memory registry and on disk.
+    /// Uses an existing account (update path) so the handler never tries a
+    /// live JMAP connect, which only happens on the create path.
+    #[tokio::test]
+    async fn upsert_account_update_persists_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "tok"));
+        reg.default_account = "fm".into();
+
+        let state = Arc::new(crate::types::AppState {
+            accounts: tokio::sync::RwLock::new(reg),
+            account_errors: tokio::sync::RwLock::new(Vec::new()),
+            splits_config_path: PathBuf::from("/tmp/nonexistent-splits.json"),
+            timezone_config_path: PathBuf::from("/tmp/nonexistent-timezone.json"),
+            timezone_write_lock: tokio::sync::Mutex::new(()),
+            config_path: config_path.clone(),
+            tokens_dir: tokens_dir.clone(),
+            token_store: std::sync::Arc::new(crate::platform::FsTokenStore::new(tokens_dir)),
+            authorizing: AuthorizingSlot::default(),
+            config_error_baseline: std::sync::RwLock::new(Vec::new()),
+            prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+        });
+
+        let incoming = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            // Empty api-token: merge_secrets must preserve the existing one.
+            api_token: String::new(),
+            signature: Some("Cheers,\nBob".into()),
+        };
+
+        let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
+            .await
+            .expect("update of an existing account must succeed");
+
+        {
+            let reg = state.accounts.read().await;
+            match reg.account_configs.get("fm").unwrap() {
+                AccountConfig::Fastmail {
+                    signature,
+                    api_token,
+                    ..
+                } => {
+                    assert_eq!(signature.as_deref(), Some("Cheers,\nBob"));
+                    assert_eq!(api_token, "tok", "empty api-token must preserve the secret");
+                }
+                other => panic!("expected fastmail, got {other:?}"),
+            }
+        }
+
+        // Persisted to disk too, not just the in-memory registry.
+        let (parsed, _) = parse_config(&config_path);
+        assert_eq!(
+            parsed.accounts.get("fm").unwrap().signature(),
+            Some("Cheers,\nBob")
+        );
     }
 
     #[test]

@@ -178,6 +178,7 @@ function init() {
     els.acctApiToken = document.getElementById('acct-api-token');
     els.acctClientId = document.getElementById('acct-client-id');
     els.acctClientSecret = document.getElementById('acct-client-secret');
+    els.acctSignature = document.getElementById('acct-signature');
     els.acctAuthPill = document.getElementById('acct-auth-pill');
     els.acctAuthorizeBtn = document.getElementById('acct-authorize-btn');
     els.acctDefaultMarker = document.getElementById('acct-default-marker');
@@ -1601,6 +1602,9 @@ function renderSettings() {
         // client-id is not a secret — backend returns it on the existing record.
         els.acctClientId.value = existing.clientId || '';
         els.acctClientId.placeholder = '';
+        // Signature isn't a secret either — the backend echoes it back, so
+        // (unlike api-token/client-secret) it's safe to prefill for editing.
+        els.acctSignature.value = existing.signature || '';
         els.acctDefaultMarker.textContent = existing.isDefault ? 'yes ★' : 'no';
         const pending = existing.authStatus === 'pending';
         els.acctAuthPill.className = 'auth-status-pill ' + (pending ? 'failed' : 'authorized');
@@ -1617,6 +1621,7 @@ function renderSettings() {
         els.acctClientId.placeholder = '';
         els.acctClientSecret.value = '';
         els.acctClientSecret.placeholder = '';
+        els.acctSignature.value = '';
         els.acctDefaultMarker.textContent = 'no';
         els.acctAuthPill.className = 'auth-status-pill idle';
         els.acctAuthPill.textContent = 'IDLE';
@@ -1660,6 +1665,10 @@ async function saveAccount() {
             'client-secret': els.acctClientSecret.value,
         };
     }
+    // Signature isn't a secret (unlike api-token/client-secret above): the
+    // textarea always holds the value to save, so an empty box means "clear
+    // the signature", not "leave it unchanged".
+    payload.signature = els.acctSignature.value;
     const id = (els.acctName.value || state.selectedAccountId || '').trim();
     if (!id) {
         showFormError('Name is required');
@@ -2875,11 +2884,24 @@ function startForward() {
     showView('compose');
 }
 
+// Per-account plain-text signature, prefilled into a fresh compose body.
+// clearCompose is the single choke point for new/reply/forward (all three
+// call it before anything else), so prefilling here covers all of them
+// uniformly. Never re-injected at send time — sendEmail sends exactly
+// what's left in the textarea after the user edits/deletes freely. The
+// account is per-account, not per-identity: switching compose-from does
+// NOT swap this (accounts can't be switched mid-compose anyway).
+function composeSignaturePrefill() {
+    const sig = state.currentAccount?.signature;
+    return sig ? `\n\n-- \n${sig}` : '';
+}
+
 function clearCompose() {
     els.composeTo.value = '';
     els.composeCc.value = '';
     els.composeSubject.value = '';
-    els.composeBody.value = '';
+    els.composeBody.value = composeSignaturePrefill();
+    els.composeBody.setSelectionRange(0, 0);
     els.composeQuote.innerHTML = '';
     els.composeQuote.classList.add('hidden');
     if (els.composeFrom && state.identities.length) {

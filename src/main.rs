@@ -199,6 +199,7 @@ async fn load_session(
         AccountConfig::Fastmail {
             username,
             api_token,
+            ..
         } => {
             let mut session = jmap::JmapSession::new(username, &format!("Bearer {api_token}"));
             jmap::connect(&mut session)
