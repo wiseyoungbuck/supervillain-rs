@@ -2125,6 +2125,18 @@ function handleOffline() {
 
 function handleOnline() {
     setOfflineBanner(false);
+    // A degraded offline boot (kata mhck — loadAccounts failed; the SW never
+    // caches /api/*) has no account list, and therefore no mailboxes, splits,
+    // or identities either. A bare list refresh against that half-initialized
+    // state can't recover it — re-run the whole boot instead: init() fetches
+    // accounts again and restoreFromSnapshot picks up the same snapshot in
+    // full online mode, refresh cascade armed. Also covers the snapshot-less
+    // 'Cannot reach server' boot, which previously stayed stuck until a
+    // manual reload.
+    if (!state.accounts.length) {
+        init();
+        return;
+    }
     // Data loaded (or left stale) while offline needs a refresh. Same
     // abort/reload protocol as selectAccount/selectMailbox/selectSplit
     // (abortListLoad guards every list switch, kata 1wdy). Silent off the
@@ -2155,8 +2167,11 @@ function setupInfiniteScroll() {
 // iOS silently kills backgrounded PWAs; on relaunch the JS heap is gone and
 // the app cold-boots to a blank list. We snapshot only DATA state — never UI
 // state — to localStorage so a relaunch renders the last list instantly, then
-// silently refreshes it. Stale beats blank, and an offline relaunch now shows
-// mail at all instead of nothing.
+// silently refreshes it. Stale beats blank. An offline relaunch can't reach
+// /api/accounts at all (the SW never caches /api/*), so it takes a DEGRADED
+// restore instead: same snapshot list, account synthesized from the snapshot
+// itself, no refresh cascade — handleOnline re-runs the full boot on
+// reconnect. See restoreFromSnapshot's offline flag.
 //
 // localStorage, not IndexedDB: the snapshot is ~25KB (≤50 bodyless list rows)
 // — trivially under quota — and a synchronous write is exactly what the
@@ -2181,11 +2196,30 @@ function persistState() {
     const listScrollTop = state.screen === Screen.LIST && wrap
         ? wrap.scrollTop
         : state.listScrollTop;
+    // The restore window (and a whole degraded offline session) runs with
+    // currentMailbox still null — mailboxes haven't been fetched. Writing
+    // mailboxRole: null then would lose the saved mailbox on the NEXT resume,
+    // so preserve the previous snapshot's mailbox fields (same account only —
+    // a cross-account carry would pin a foreign mailbox id).
+    let mailboxRole = state.currentMailbox?.role || null;
+    let mailboxId = state.currentMailbox?.id || null;
+    if (!state.currentMailbox) {
+        try {
+            const prev = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null');
+            if (prev?.accountId === state.currentAccount.id) {
+                mailboxRole = prev.mailboxRole || null;
+                mailboxId = prev.mailboxId || null;
+            }
+        } catch (_e) { /* unreadable previous snapshot — null is the honest value */ }
+    }
     try {
         localStorage.setItem(MOBILE_STATE_KEY, JSON.stringify({
             accountId: state.currentAccount.id,
-            mailboxRole: state.currentMailbox?.role || null,
-            mailboxId: state.currentMailbox?.id || null,
+            // Lets the degraded offline restore label the account button
+            // without an account list to look the id up in.
+            accountEmail: state.currentAccount.email || null,
+            mailboxRole,
+            mailboxId,
             splitId: state.currentSplit,
             searchQuery: state.searchQuery,
             emails: state.emails.slice(0, PAGE_SIZE),
@@ -2201,12 +2235,17 @@ function persistState() {
 }
 
 // Attempt to resume from a snapshot. Returns true when one was applied (the
-// list is rendered and a silent background refresh is armed) so init() can
-// skip its normal default-account boot; false when there's nothing usable, in
-// which case init() boots exactly as it did before this feature existed.
-// Corrupt, stale, or foreign-account snapshots are removed and treated as
-// absent — the normal boot is always the safe fallback.
-function restoreFromSnapshot() {
+// list is rendered and, online, a silent background refresh is armed) so
+// init() can skip its normal default-account boot; false when there's nothing
+// usable, in which case init() boots exactly as it did before this feature
+// existed. Corrupt, stale, or foreign-account snapshots are removed and
+// treated as absent — the normal boot is always the safe fallback.
+//
+// offline: taken from init()'s loadAccounts catch, where there is no account
+// list to validate against — the account is synthesized from the snapshot
+// itself (freshness gate only) and the refresh cascade is skipped entirely;
+// handleOnline re-runs init() on reconnect for the full boot.
+function restoreFromSnapshot({ offline = false } = {}) {
     let snapshot;
     try {
         const raw = localStorage.getItem(MOBILE_STATE_KEY);
@@ -2219,10 +2258,15 @@ function restoreFromSnapshot() {
         return false;
     }
 
-    // Validity: the saved account must still be connected, the snapshot fresh
-    // (< 24h — a day-old list misleads more than it helps), and the row array
-    // present. Any miss discards the snapshot and falls through to normal boot.
-    const account = connectedAccounts().find(a => a.id === snapshot?.accountId);
+    // Validity: the saved account must still be connected (skipped offline —
+    // no account list exists to check against), the snapshot fresh (< 24h — a
+    // day-old list misleads more than it helps), and the row array present.
+    // Any miss discards the snapshot and falls through to normal boot.
+    const account = offline
+        ? (snapshot?.accountId
+            ? { id: snapshot.accountId, email: snapshot.accountEmail || snapshot.accountId }
+            : null)
+        : connectedAccounts().find(a => a.id === snapshot?.accountId);
     const fresh = typeof snapshot?.savedAt === 'number'
         && Date.now() - snapshot.savedAt < STATE_MAX_AGE_MS;
     if (!account || !fresh || !Array.isArray(snapshot.emails)) {
@@ -2247,6 +2291,14 @@ function restoreFromSnapshot() {
     if (state.searchQuery) document.getElementById('search-input').value = state.searchQuery;
     renderEmailList();
     document.getElementById('email-list-wrap').scrollTop = state.listScrollTop;
+
+    // Degraded offline restore stops here: the server is unreachable, so no
+    // refresh cascade and no 'Refreshing…' indicator — the offline banner is
+    // the state surface. currentMailbox stays null (persistState preserves the
+    // saved mailbox fields through that); handleOnline re-runs init() on
+    // reconnect, which lands back here in full online mode.
+    if (offline) return true;
+
     // Stale indicator over the snapshot list while the live refresh runs.
     showStatus('Refreshing…');
 
@@ -2260,7 +2312,17 @@ function restoreFromSnapshot() {
     // replacement only: restore never opened detail/compose, so nothing can be
     // yanked. On completion the stale indicator clears; on failure the snapshot
     // list stays (stale beats blank) and the error surfaces as usual.
+    //
+    // Splits are kicked off in parallel (own abort/stale-account guard, errors
+    // sunk inside loadSplits — it never rejects), but a saved split filter must
+    // wait for them: emailListPath only appends split_id once state.splits is
+    // non-empty, so a refresh that outran the split definitions would fetch the
+    // UNFILTERED inbox and nothing would re-fetch.
+    const splitsPromise = loadSplits(acct, state.loadAbort.signal);
     loadMailboxes(acct, state.loadAbort.signal, snapshot.mailboxRole || 'inbox')
+        .then(() => {
+            if (snapshot.splitId && snapshot.splitId !== 'all') return splitsPromise;
+        })
         .then(() => {
             if (state.currentAccount?.id !== acct) return;
             return loadEmails({ silent: true });
@@ -2273,9 +2335,6 @@ function restoreFromSnapshot() {
             showStatus('');
             showError('Refresh', err);
         });
-    // Splits are account-scoped tabs, independent of the mailbox fetch — same
-    // fire-and-forget as selectAccount (its own abort/stale-account guard).
-    loadSplits(acct, state.loadAbort.signal);
     return true;
 }
 
@@ -2293,6 +2352,14 @@ async function init() {
     try {
         await loadAccounts();
     } catch (err) {
+        // Server unreachable (offline relaunch — the SW never caches /api/*,
+        // so there's no cached account list either). A DEGRADED restore still
+        // beats a dead end: render the snapshot list with the account
+        // synthesized from the snapshot itself and skip the refresh cascade —
+        // the offline banner covers the state, and handleOnline re-runs
+        // init() on reconnect for the full boot. With no usable snapshot,
+        // keep today's error path.
+        if (restoreFromSnapshot({ offline: true })) return;
         showError('Load accounts', err);
         showStatus('Cannot reach server');
         return;

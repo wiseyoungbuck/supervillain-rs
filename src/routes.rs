@@ -5109,6 +5109,107 @@ white   = '#fdf6e3'
             "loadEmails should refresh the snapshot after a successful load"
         );
     }
+
+    #[test]
+    fn mobile_app_js_offline_boot_attempts_degraded_restore() {
+        // The SW never caches /api/*, so an offline relaunch fails
+        // loadAccounts — init()'s catch must attempt a DEGRADED restore
+        // (freshness gate only; connectedness can't be checked without an
+        // account list) instead of dead-ending on 'Cannot reach server'.
+        let start = MOBILE_APP_JS
+            .find("async function init(")
+            .expect("init must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("init body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("restoreFromSnapshot({ offline: true })"),
+            "init's loadAccounts catch must attempt a degraded offline restore"
+        );
+        assert!(
+            region.contains("Cannot reach server"),
+            "with no usable snapshot the offline boot must keep today's error path"
+        );
+        // The degraded path synthesizes the account from the snapshot alone,
+        // so the snapshot must carry the account email for the header button.
+        let pstart = MOBILE_APP_JS
+            .find("function persistState(")
+            .expect("persistState must exist");
+        let prest = &MOBILE_APP_JS[pstart..];
+        let pend = prest.find("\n}").expect("persistState body must close");
+        assert!(
+            prest[..pend].contains("accountEmail"),
+            "the snapshot must carry accountEmail for the degraded offline restore"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_reconnect_recovers_degraded_boot() {
+        // A degraded offline boot has no account list, mailboxes, splits, or
+        // identities — reconnecting must re-run the whole boot (init(): fresh
+        // loadAccounts, then the same snapshot restores in full online mode
+        // with the refresh cascade armed), not just refresh the list against
+        // half-initialized state.
+        let start = MOBILE_APP_JS
+            .find("function handleOnline(")
+            .expect("handleOnline must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("handleOnline body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("state.accounts.length") && region.contains("init()"),
+            "handleOnline must re-run init() when the account list never loaded"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_restore_awaits_splits_before_filtered_refresh() {
+        // emailListPath only appends split_id once state.splits is non-empty —
+        // a refresh that runs before the split definitions land would fetch
+        // the UNFILTERED inbox and nothing would re-fetch. With a saved split
+        // filter, the splits fetch must settle before the loadEmails leg.
+        let start = MOBILE_APP_JS
+            .find("function restoreFromSnapshot(")
+            .expect("restoreFromSnapshot must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("restoreFromSnapshot body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("splitsPromise"),
+            "restore must hold a handle to the in-flight splits fetch"
+        );
+        let split_gate = region
+            .find("snapshot.splitId !== 'all'")
+            .expect("restore must gate on a saved split filter");
+        let load = region
+            .find("loadEmails({ silent: true })")
+            .expect("restore must refresh silently");
+        assert!(
+            split_gate < load,
+            "the saved-split gate must sequence the splits fetch before the refresh"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_persist_preserves_mailbox_during_restore_window() {
+        // persistState can fire while currentMailbox is still null (the
+        // restore window before mailboxes land, or a whole degraded offline
+        // session) — writing mailboxRole: null would lose the saved mailbox
+        // on the NEXT resume. The previous snapshot's mailbox fields must be
+        // preserved instead.
+        let start = MOBILE_APP_JS
+            .find("function persistState(")
+            .expect("persistState must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("persistState body must close");
+        let region = &rest[..end];
+        assert!(
+            region.contains("prev.mailboxRole"),
+            "a null currentMailbox must fall back to the previous snapshot's mailbox"
+        );
+    }
 }
 
 // External dep for theme path
