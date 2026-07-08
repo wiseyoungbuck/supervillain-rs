@@ -3324,7 +3324,11 @@ async function unsubscribeAndArchiveAll() {
         // Revert: re-insert the removed emails
         if (removedEmails.length > 0) {
             state.emails = state.emails.concat(removedEmails);
-            state.emails.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
+            // Re-sort respecting the active sort order (kata review
+            // follow-up) — a hardcoded descending re-sort here would scramble
+            // the list under date_asc instead of restoring it.
+            const dir = state.sortOrder === 'date_asc' ? 1 : -1;
+            state.emails.sort((a, b) => dir * (new Date(a.receivedAt) - new Date(b.receivedAt)));
             // Re-registration is idempotent (ids were never pruned from the
             // append-only groups), but keep it explicit for the revert path.
             extendThreadGroups(removedEmails);
@@ -3515,6 +3519,24 @@ let autosaveTimer = null;
 // orphaning a ghost draft.
 let saveInFlight = null;
 
+// Autosave-owned identity for the draft the save chain is currently tracking,
+// tagged with the composeSession it belongs to. Deliberately separate from
+// state.draftId/state.composeSession (review follow-up): every leave-compose
+// path calls flushAutosave() immediately followed by clearCompose(), both
+// synchronously — clearCompose nulls state.draftId and bumps composeSession
+// before the flushed save's queued `.then()` callback (in doAutosave) ever
+// gets a turn to run. If that callback read state.draftId directly at that
+// point it would see null and POST a brand-new draft instead of PUTting the
+// one being left, duplicating it. trackedDraftId/trackedDraftSession are
+// written only by doAutosave (on a successful save) and openDraftInCompose
+// (on restore) — clearCompose never touches them — so a queued save always
+// PUTs against the id that was live when it was scheduled, regardless of
+// what runs after flushAutosave() returns. The session tag is what
+// invalidates a stale id for a *later* compose (see doAutosave below)
+// instead of a synchronous null-out.
+let trackedDraftId = null;
+let trackedDraftSession = -1;
+
 function draftsEnabled() {
     return state.currentAccount?.provider === 'fastmail';
 }
@@ -3543,6 +3565,18 @@ function scheduleAutosave() {
 
 // Immediately fire any pending autosave (used when leaving compose so the last
 // few seconds of typing aren't lost). No-op when nothing is pending.
+//
+// Microtask ordering (review follow-up): every leave-compose call site runs
+// this then clearCompose() back to back, synchronously — e.g. the Escape
+// handler does `flushAutosave(); clearCompose();` with nothing awaited in
+// between. runAutosave()'s synchronous prologue (session/payload capture,
+// chaining onto saveInFlight) fully completes before control returns here and
+// clearCompose() runs, but the chained doAutosave() call itself is a
+// microtask that only fires afterward — by then clearCompose has already
+// nulled state.draftId and bumped composeSession. doAutosave reads the id to
+// save against from trackedDraftId/trackedDraftSession (module state
+// clearCompose never touches) rather than state.draftId, precisely so this
+// ordering can't turn a "save the last edits" flush into a duplicate-POST.
 function flushAutosave() {
     if (!autosaveTimer) return;
     cancelAutosave();
@@ -3577,12 +3611,23 @@ async function runAutosave() {
 }
 
 async function doAutosave(session, payload) {
+    // Only reuse the tracked id if it was left by this exact compose session
+    // — a mismatch means clearCompose already moved on to a new session (the
+    // leave-path flush case documented at flushAutosave), so this save must
+    // create a fresh draft rather than resurrecting — and overwriting —
+    // whatever the old session was tracking.
+    const draftId = trackedDraftSession === session ? trackedDraftId : null;
     try {
-        const res = state.draftId
-            ? await api('PUT', `/drafts/${encodeURIComponent(state.draftId)}`, payload)
+        const res = draftId
+            ? await api('PUT', `/drafts/${encodeURIComponent(draftId)}`, payload)
             : await api('POST', '/drafts', payload);
-        // Adopt the (possibly changed) id only while this is still the active
-        // compose — a newer draft must not inherit this save's id.
+        if (res?.id) {
+            trackedDraftId = res.id;
+            trackedDraftSession = session;
+        }
+        // Adopt the (possibly changed) id into the visible state only while
+        // this is still the active compose — a newer draft must not inherit
+        // this save's id.
         if (state.composeSession === session && res?.id) {
             adoptDraftId(res.id);
             showStatus('Draft saved', 'info');
@@ -3662,8 +3707,14 @@ async function openDraftInCompose(emailId) {
         els.composeFrom.value = fromEmail;
     }
     // Track the existing draft and baseline the restored body so simply
-    // opening it (no edit) doesn't trigger a redundant save.
+    // opening it (no edit) doesn't trigger a redundant save. Seed the
+    // autosave module's own tracked id/session too (see trackedDraftId
+    // above) — doAutosave reads those, not state.draftId, so without this an
+    // edit-then-leave on a restored draft would autosave as a fresh POST
+    // instead of a PUT against the restored id.
     state.draftId = emailId;
+    trackedDraftId = emailId;
+    trackedDraftSession = state.composeSession;
     state.composeBaseline = els.composeBody.value;
     showView('compose');
 }

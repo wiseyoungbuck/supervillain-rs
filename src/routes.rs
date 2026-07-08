@@ -1061,15 +1061,20 @@ async fn create_draft_handler(
     Query(params): Query<AccountParam>,
     Json(body): Json<DraftBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let from_addr = body
         .from_address
         .clone()
         .unwrap_or_else(|| session.username().to_string());
     let submission = draft_submission(body);
-    let id = provider::create_draft(&session, &submission, &from_addr).await?;
-    Ok(Json(serde_json::json!({ "id": id })))
+    let draft_id = provider::create_draft(&session, &submission, &from_addr).await?;
+    drop(session);
+    // A newly created draft belongs in a warmed Drafts-list cache too — without
+    // this a prefetched list can hide it for up to 5 minutes (review follow-up).
+    state.prefetch.invalidate(&id).await;
+    Ok(Json(serde_json::json!({ "id": draft_id })))
 }
 
 async fn update_draft_handler(
@@ -1078,7 +1083,8 @@ async fn update_draft_handler(
     Query(params): Query<AccountParam>,
     Json(body): Json<DraftBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let from_addr = body
         .from_address
@@ -1087,8 +1093,13 @@ async fn update_draft_handler(
     let submission = draft_submission(body);
     // Editing a draft is destroy+recreate (JMAP bodies aren't patchable), so
     // this returns a NEW id the client must adopt.
-    let id = provider::update_draft(&session, &draft_id, &submission, &from_addr).await?;
-    Ok(Json(serde_json::json!({ "id": id })))
+    let new_id = provider::update_draft(&session, &draft_id, &submission, &from_addr).await?;
+    drop(session);
+    // The destroy+recreate rotates the draft's id — a warmed Drafts list must
+    // be invalidated or it keeps serving the now-destroyed old id (review
+    // follow-up; same gap as create/delete below).
+    state.prefetch.invalidate(&id).await;
+    Ok(Json(serde_json::json!({ "id": new_id })))
 }
 
 async fn delete_draft_handler(
@@ -1096,9 +1107,14 @@ async fn delete_draft_handler(
     Path(draft_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&id)).await?;
     let session = session_lock.read().await;
     let success = provider::destroy_draft(&session, &draft_id).await?;
+    drop(session);
+    // Without this a warmed Drafts list keeps serving the destroyed id for up
+    // to 5 minutes (review follow-up), same as every other mutation route.
+    state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({ "success": success })))
 }
 
@@ -4374,6 +4390,41 @@ white   = '#fdf6e3'
         assert!(sub.bcc.is_none());
     }
 
+    // Review follow-up: every other mutation route (archive/trash/mark_read/
+    // mark_unread/toggle_flag/move — see e.g. archive_email above) invalidates
+    // state.prefetch after its write, so a warmed list cache never serves a
+    // now-stale row. The drafts CRUD handlers mutate the Drafts mailbox just
+    // as much (create adds a row, update rotates its id via destroy+recreate,
+    // delete removes it) but were missing the same call — a prefetched Drafts
+    // list could keep serving destroyed ids for up to the cache's TTL.
+    #[test]
+    fn draft_mutations_invalidate_prefetch_cache() {
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        for func in [
+            "async fn create_draft_handler(",
+            "async fn update_draft_handler(",
+            "async fn delete_draft_handler(",
+        ] {
+            let start = handler_src
+                .find(func)
+                .unwrap_or_else(|| panic!("{func} must exist"));
+            let rest = &handler_src[start..];
+            let end = rest.find("\n}").expect("draft handler must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("resolve_account_id(&state, params.account.as_deref())"),
+                "{func} must resolve the account id (matching archive_email et al.) \
+                 so the invalidation is scoped to the right account"
+            );
+            assert!(
+                block.contains("state.prefetch.invalidate(&id).await"),
+                "{func} must invalidate the prefetch cache after mutating drafts, \
+                 or a warmed Drafts list keeps serving destroyed/rotated ids"
+            );
+        }
+    }
+
     // Both clients must wire the same draft contract: a debounced autosave that
     // POSTs then PUTs, a tracked draftId deleted on send, and the
     // drafts-mailbox-opens-compose restore — all gated on the fastmail provider.
@@ -4594,6 +4645,78 @@ white   = '#fdf6e3'
             assert!(
                 doautosave_block.contains("adoptDraftId(res.id)"),
                 "{bundle} doAutosave must adopt a rotated id through adoptDraftId"
+            );
+        }
+    }
+
+    // Review follow-up: every leave-compose path runs flushAutosave() then
+    // clearCompose()/clearComposeFields() back to back, synchronously.
+    // clearCompose nulls state.draftId (and, on desktop, bumps composeSession)
+    // before the flushed save's queued microtask (inside doAutosave) ever gets
+    // a turn to run — a live read of state.draftId there would see null and
+    // POST a brand-new draft instead of PUTting the one being left,
+    // duplicating it. doAutosave must instead decide PUT vs POST off a
+    // draft-id/session pair that clearCompose/clearComposeFields never touch.
+    #[test]
+    fn draft_autosave_targets_tracked_id_immune_to_clear_compose() {
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            assert!(
+                js.contains("let trackedDraftId"),
+                "{bundle} must track the autosave draft id at module scope, \
+                 separate from state.draftId"
+            );
+            assert!(
+                js.contains("let trackedDraftSession"),
+                "{bundle} must tag the tracked draft id with the compose \
+                 session it belongs to, so a later compose can't inherit a \
+                 stale id left by a leave-path flush"
+            );
+            let start = js
+                .find("async function doAutosave(")
+                .unwrap_or_else(|| panic!("{bundle} doAutosave must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("doAutosave must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("trackedDraftSession === session"),
+                "{bundle} doAutosave must gate id reuse on the tracked \
+                 session matching this save's captured session"
+            );
+            assert!(
+                !block.contains("state.draftId ?"),
+                "{bundle} doAutosave must not decide PUT vs POST off a live \
+                 read of state.draftId — clearCompose/clearComposeFields can \
+                 null it before this microtask runs"
+            );
+        }
+    }
+
+    // openDraftInCompose/startDraftCompose set state.draftId directly
+    // (restoring a draft bypasses doAutosave's normal adoption path) — they
+    // must seed trackedDraftId/trackedDraftSession too, or the very next
+    // autosave on the restored draft would see a session mismatch and POST a
+    // fresh duplicate instead of PUTting the restored draft.
+    #[test]
+    fn draft_restore_seeds_tracked_autosave_id() {
+        for (js, bundle, func) in [
+            (APP_JS, "desktop", "async function openDraftInCompose("),
+            (MOBILE_APP_JS, "mobile", "async function startDraftCompose("),
+        ] {
+            let start = js
+                .find(func)
+                .unwrap_or_else(|| panic!("{bundle} {func} must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("restore fn must close");
+            let block = &rest[..end];
+            assert!(
+                block.contains("trackedDraftId = emailId"),
+                "{bundle} restore must seed trackedDraftId with the restored \
+                 draft's id"
+            );
+            assert!(
+                block.contains("trackedDraftSession = state.composeSession"),
+                "{bundle} restore must tag the seeded id with the current \
+                 compose session"
             );
         }
     }
@@ -6127,6 +6250,26 @@ white   = '#fdf6e3'
         }
     }
 
+    // Review follow-up: mirrors mobile_app_js_mailbox_and_split_switches_
+    // hide_undo_toast — a search transition splices in a different result
+    // set just like a mailbox/split switch does, so an undo toast left over
+    // from before the search invites tapping Undo into a list it no longer
+    // describes (or splicing into the new results at a stale index).
+    // submitSearch/clearSearch already guard their reload with
+    // abortListLoad(); they must hide the pending toast too.
+    #[test]
+    fn mobile_app_js_search_actions_hide_undo_toast() {
+        for func in ["function submitSearch(", "function clearSearch("] {
+            let start = MOBILE_APP_JS.find(func).expect("function must exist");
+            let rest = &MOBILE_APP_JS[start..];
+            let end = rest.find("\n}").expect("function must close");
+            assert!(
+                rest[..end].contains("hideUndoToast(undoToastEntry)"),
+                "{func} must hide any pending undo toast on a search transition"
+            );
+        }
+    }
+
     // Mobile: calendar RSVP card (kata nhxd, task A10)
 
     #[test]
@@ -6395,6 +6538,30 @@ white   = '#fdf6e3'
         assert!(
             !unsub_fn.contains("pushUndo("),
             "batch unsubscribe/archive must not push an undo-stack entry (out of scope, see brief)"
+        );
+    }
+
+    // Review follow-up: desktop's failure-path re-insert used to hardcode a
+    // descending re-sort (`new Date(b...) - new Date(a...)`) regardless of
+    // state.sortOrder — under date_asc that scrambled the list instead of
+    // restoring it.
+    #[test]
+    fn app_js_unsub_revert_resort_respects_sort_order() {
+        let start = APP_JS
+            .find("async function unsubscribeAndArchiveAll(")
+            .expect("unsubscribeAndArchiveAll must exist");
+        let rest = &APP_JS[start..];
+        let end = rest
+            .find("\n}")
+            .expect("unsubscribeAndArchiveAll must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("state.sortOrder"),
+            "desktop unsubscribeAndArchiveAll's revert must consult state.sortOrder"
+        );
+        assert!(
+            !block.contains("new Date(b.receivedAt) - new Date(a.receivedAt)"),
+            "must not hardcode a descending comparator regardless of sort order"
         );
     }
 

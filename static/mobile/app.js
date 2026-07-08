@@ -700,6 +700,11 @@ function clearSearch({ close = true } = {}) {
     if (close) closeSearchBar();
     if (!state.searchQuery) return;
     abortListLoad();
+    // An undo toast from the pre-search list no longer describes what's
+    // about to render — same reasoning as selectMailbox/selectSplit's guard
+    // (kata 1wdy, review follow-up): without this, tapping Undo after
+    // clearing a search can splice into the restored list at a stale index.
+    hideUndoToast(undoToastEntry);
     state.searchQuery = '';
     loadEmails();
 }
@@ -716,6 +721,9 @@ function submitSearch() {
     }
     if (raw === state.searchQuery) return;
     abortListLoad();
+    // Same reasoning as clearSearch above — a new search's results aren't
+    // the list the pending undo describes.
+    hideUndoToast(undoToastEntry);
     state.searchQuery = raw;
     loadEmails();
 }
@@ -2103,6 +2111,26 @@ let autosaveTimer = null;
 // deleted, orphaning a ghost draft.
 let saveInFlight = null;
 
+// Autosave-owned identity for the draft the save chain is currently tracking,
+// tagged with the composeSession it belongs to. Deliberately separate from
+// state.draftId/state.composeSession (review follow-up): setScreen's
+// leave-compose branch calls flushAutosave() immediately followed by
+// clearComposeFields(), both synchronously — clearComposeFields nulls
+// state.draftId before the flushed save's queued `.then()` callback (in
+// doAutosave) ever gets a turn to run, and (via startCompose/startReply/
+// startForward/startDraftCompose) composeSession has typically moved on too
+// by the time it does. If that callback read state.draftId directly at that
+// point it would see null and POST a brand-new draft instead of PUTting the
+// one being left, duplicating it. trackedDraftId/trackedDraftSession are
+// written only by doAutosave (on a successful save) and startDraftCompose
+// (on restore) — clearComposeFields never touches them — so a queued save
+// always PUTs against the id that was live when it was scheduled, regardless
+// of what runs after flushAutosave() returns. The session tag is what
+// invalidates a stale id for a *later* compose (see doAutosave below)
+// instead of a synchronous null-out.
+let trackedDraftId = null;
+let trackedDraftSession = -1;
+
 function draftsEnabled() {
     return state.currentAccount?.provider === 'fastmail';
 }
@@ -2119,6 +2147,18 @@ function scheduleAutosave() {
 
 // Immediately fire any pending autosave (used when leaving compose so the last
 // few seconds of typing aren't lost). No-op when nothing is pending.
+//
+// Microtask ordering (review follow-up): setScreen's leave-compose branch
+// runs this then clearComposeFields() back to back, synchronously, with
+// nothing awaited in between. runAutosave()'s synchronous prologue (session/
+// payload capture, chaining onto saveInFlight) fully completes before
+// control returns to setScreen and clearComposeFields() runs, but the
+// chained doAutosave() call itself is a microtask that only fires afterward
+// — by then clearComposeFields has already nulled state.draftId. doAutosave
+// reads the id to save against from trackedDraftId/trackedDraftSession
+// (module state clearComposeFields never touches) rather than state.draftId,
+// precisely so this ordering can't turn a "save the last edits" flush into a
+// duplicate-POST.
 function flushAutosave() {
     if (!autosaveTimer) return;
     cancelAutosave();
@@ -2150,12 +2190,23 @@ async function runAutosave() {
 }
 
 async function doAutosave(session, payload) {
+    // Only reuse the tracked id if it was left by this exact compose session
+    // — a mismatch means the compose has moved on to a new session (the
+    // leave-path flush case documented at flushAutosave), so this save must
+    // create a fresh draft rather than resurrecting — and overwriting —
+    // whatever the old session was tracking.
+    const draftId = trackedDraftSession === session ? trackedDraftId : null;
     try {
-        const res = state.draftId
-            ? await state.api('PUT', '/drafts/' + encodeURIComponent(state.draftId), payload)
+        const res = draftId
+            ? await state.api('PUT', '/drafts/' + encodeURIComponent(draftId), payload)
             : await state.api('POST', '/drafts', payload);
-        // Adopt the (possibly changed) id only while this is still the active
-        // compose — a newer draft must not inherit this save's id.
+        if (res?.id) {
+            trackedDraftId = res.id;
+            trackedDraftSession = session;
+        }
+        // Adopt the (possibly changed) id into the visible state only while
+        // this is still the active compose — a newer draft must not inherit
+        // this save's id.
         if (state.composeSession === session && res?.id) {
             adoptDraftId(res.id);
             showToast('Draft saved', 1500);
@@ -2238,7 +2289,13 @@ async function startDraftCompose(emailId) {
     if (fromEmail && state.identities.some(i => i.email === fromEmail)) {
         composeEl('compose-from').value = fromEmail;
     }
+    // Track the existing draft. Seed the autosave module's own tracked
+    // id/session too (see trackedDraftId above) — doAutosave reads those, not
+    // state.draftId, so without this an edit-then-leave on a restored draft
+    // would autosave as a fresh POST instead of a PUT against the restored id.
     state.draftId = emailId;
+    trackedDraftId = emailId;
+    trackedDraftSession = state.composeSession;
     navigateTo(Screen.COMPOSE);
 }
 
