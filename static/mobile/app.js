@@ -1162,28 +1162,21 @@ async function renderScreenDetail(emailId) {
     // network-fetch path above (whose GET auto-marks read server-side), we
     // have to ask explicitly. Already-read cache entries (isUnread already
     // false, e.g. reopening something already viewed) don't fire this.
-    // Optimistic, matching toggleUnread: flip everywhere the email is held,
+    // Optimistic, matching toggleUnread: flip everywhere the email is held
+    // immediately, before the POST below even fires (roborev 302, fix 4) —
     // revert alongside showError on failure — otherwise a failed POST would
     // leave the row rendered read while the server still has it unread.
-    if (cacheHit && full.isUnread) {
+    const needsMarkRead = cacheHit && full.isUnread;
+    if (needsMarkRead) {
         full.isUnread = false;
         if (listEmail) listEmail.isUnread = false;
-        try {
-            await state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/mark-read');
-        } catch (err) {
-            full.isUnread = true;
-            if (listEmail) listEmail.isUnread = true;
-            showError('Mark read', err);
-        }
-        if (state.currentEmailId !== emailId) return;
     }
 
     renderEmailDetail(full);
 
     // Network path only: the server auto-marked read on the GET above, so
-    // mirror it locally. (The cache-hit path reconciled its own flags around
-    // the explicit mark-read POST — flattening them here would clobber its
-    // failure revert.)
+    // mirror it locally. (The cache-hit path already reconciled its flags
+    // above, ahead of the explicit mark-read POST below.)
     if (!cacheHit) {
         if (listEmail?.isUnread) listEmail.isUnread = false;
         if (full.isUnread) full.isUnread = false;
@@ -1195,6 +1188,24 @@ async function renderScreenDetail(emailId) {
 
     // Prefetch next emails
     prefetchAdjacentEmails(emailId);
+
+    // Fire the explicit mark-read POST only after the detail has already
+    // painted (roborev 302, fix 4) — it must not delay renderEmailDetail.
+    // Not awaited: only the action bar needs a second redraw once it
+    // settles, and only if the user hasn't since navigated away; the
+    // failure revert (mirroring toggleUnread) stays.
+    if (needsMarkRead) {
+        state.api('POST', '/emails/' + encodeURIComponent(emailId) + '/mark-read')
+            .catch(err => {
+                full.isUnread = true;
+                if (listEmail) listEmail.isUnread = true;
+                showError('Mark read', err);
+            })
+            .then(() => {
+                if (state.currentEmailId !== emailId) return;
+                renderDetailActionBar(full);
+            });
+    }
 }
 
 function renderEmailDetailPartial(email) {
@@ -1943,8 +1954,13 @@ function setComposeSending(sending) {
 async function sendComposedEmail() {
     if (state.sending) return;
 
-    // A save already in flight keeps running even though nothing here cancels
-    // its debounce timer — without waiting for it, its created/updated id
+    // A pending autosave firing mid-send would persist a fresh draft of the
+    // very mail being sent — un-adopted (clearComposeFields doesn't bump
+    // composeSession here) and never deleted. Kill the debounce up front,
+    // mirroring desktop sendEmail (roborev 302, fix 1).
+    cancelAutosave();
+    // cancelAutosave() only kills the pending TIMER — a save already in
+    // flight keeps running. Without waiting for it, its created/updated id
     // would land after the tracked draft is already deleted below and never
     // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
     // never rejects, but settle either way defensively.

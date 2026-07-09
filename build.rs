@@ -43,4 +43,20 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
+    // In a worktree, <gitdir>/HEAD above is this worktree's own symbolic ref
+    // file — it only changes on a branch switch, not on every commit — and
+    // refs/heads lives in the COMMON git dir shared across all worktrees, so
+    // consecutive commits made in THIS worktree touch neither path and cargo
+    // keeps serving a stale SUPERVILLAIN_BUILD_ID (roborev 302, fix 3).
+    // logs/HEAD is the per-worktree reflog: git appends to it on every
+    // commit, checkout, and ref update made in this specific worktree, so
+    // watching it too means a fresh commit here always gets a fresh build
+    // id. Emitted unconditionally — a rerun-if-changed for a path that
+    // doesn't exist yet (e.g. a fresh repo with reflogs disabled via
+    // core.logAllRefUpdates=false) is harmless, cargo just starts watching
+    // it once it appears, so there's nothing to guard against crashing.
+    println!(
+        "cargo:rerun-if-changed={}",
+        git_dir.join("logs").join("HEAD").display()
+    );
 }

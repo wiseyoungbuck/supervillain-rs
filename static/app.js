@@ -1343,6 +1343,32 @@ async function loadEmailDetail(emailId) {
         els.emailBody.scrollTop = scrollPositions[key] || 0;
         showView('detail');
         prefetchAdjacentEmails();
+
+        // Cache-hit opens skip the network GET entirely — prefetchAdjacentEmails
+        // fetches with mark_read=false (roborev 302, fix 2) so background
+        // warm-up never silently consumes unread state for emails the user
+        // hasn't opened. That means the server was never told THIS email is
+        // now read; unlike the network-fetch path below (whose GET
+        // auto-marks read server-side), we have to ask explicitly.
+        // Optimistic, matching toggleUnread: flip the cached email and its
+        // list row immediately, and keep the split-tab counts in sync, all
+        // without blocking the render above; revert everything alongside
+        // showStatus on failure.
+        const email = state.currentEmail;
+        const listItem = state.emails.find(e => e.id === emailId);
+        if (email.isUnread) {
+            email.isUnread = false;
+            if (listItem) listItem.isUnread = false;
+            adjustSplitCounts(-1);
+            renderEmailList();
+            api('POST', `/emails/${emailId}/mark-read`).catch(err => {
+                email.isUnread = true;
+                if (listItem) listItem.isUnread = true;
+                adjustSplitCounts(+1);
+                renderEmailList();
+                showStatus('Failed to mark read: ' + err.message, 'error');
+            });
+        }
         return;
     }
 
@@ -1402,12 +1428,15 @@ function prefetchAdjacentEmails() {
     const idx = rows.findIndex(r => r.emailId === state.currentEmail?.id);
     if (idx < 0) return;
 
-    // Prefetch next 3 emails (the ones you'll hit when archiving repeatedly)
+    // Prefetch next 3 emails (the ones you'll hit when archiving repeatedly).
+    // mark_read=false (roborev 302, fix 2): a bare GET auto-marks read
+    // server-side, and background warm-up must never silently consume
+    // unread state for an email the user hasn't actually opened.
     for (let i = 1; i <= 3; i++) {
         const target = rows[idx + i];
         if (target && !emailCache[cacheKey(target.emailId)]) {
             const key = cacheKey(target.emailId);
-            api('GET', `/emails/${target.emailId}`)
+            api('GET', `/emails/${target.emailId}?mark_read=false`)
                 .then(email => { emailCache[key] = email; })
                 .catch(() => {}); // Swallow — prefetch is best-effort
         }

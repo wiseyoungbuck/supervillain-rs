@@ -1379,6 +1379,67 @@ fn draft_destroy_request(account_id: &str, draft_id: &str) -> Vec<serde_json::Va
     ])]
 }
 
+/// Email/get fetching just enough to decide whether `draft_id` is safe to
+/// destroy — the guard destroy_draft runs before issuing the raw (Trash-
+/// bypassing) Email/set destroy above (roborev 302, fix 5).
+fn draft_verify_request(account_id: &str, draft_id: &str) -> Vec<serde_json::Value> {
+    vec![serde_json::json!([
+        "Email/get",
+        {
+            "accountId": account_id,
+            "ids": [draft_id],
+            "properties": ["id", "mailboxIds", "keywords"]
+        },
+        "0"
+    ])]
+}
+
+/// Decides, from a `draft_verify_request` response, whether `draft_id` is
+/// safe to destroy: it must carry the `$draft` keyword or sit in the
+/// Drafts mailbox. Email/set destroy has no Trash round-trip — it's
+/// permanent — so a mismatch (an email that exists but is neither) is
+/// refused with a `notFound`-style error rather than silently destroyed.
+///
+/// A target that no longer exists (absent from the response `list`) is
+/// NOT a mismatch — that's left to the destroy call's own `notFound`
+/// handling, which already treats "already gone" as idempotent success
+/// (e.g. discarding a draft the send flow already deleted). Pure so the
+/// decision logic is unit-testable without a network round-trip.
+fn verify_is_draft_response(
+    resp: &serde_json::Value,
+    draft_id: &str,
+    drafts_mailbox_id: &str,
+) -> Result<(), Error> {
+    let found = resp["methodResponses"][0][1]["list"]
+        .as_array()
+        .and_then(|list| list.iter().find(|e| e["id"].as_str() == Some(draft_id)));
+    let Some(found) = found else {
+        return Ok(());
+    };
+    let has_draft_keyword = found["keywords"]["$draft"].as_bool().unwrap_or(false);
+    let in_drafts_mailbox = found["mailboxIds"]
+        .as_object()
+        .is_some_and(|m| m.contains_key(drafts_mailbox_id));
+    if has_draft_keyword || in_drafts_mailbox {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!(
+            "{draft_id} is not a draft; refusing to destroy"
+        )))
+    }
+}
+
+/// Guard shared by every destroy_draft caller (the DELETE handler via
+/// provider::destroy_draft, and update_draft's destroy-the-old-copy step —
+/// both funnel through destroy_draft itself, so this one check covers
+/// both) — see verify_is_draft_response for the rationale.
+async fn verify_is_draft(s: &JmapSession, draft_id: &str) -> Result<(), Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let drafts_id = drafts_mailbox_id(s)?;
+    let resp = jmap_call(s, draft_verify_request(account_id, draft_id)).await?;
+    verify_is_draft_response(&resp, draft_id, &drafts_id)
+}
+
 /// Pull the created draft's id out of an Email/set response, or build an error
 /// carrying the server's `notCreated` detail.
 fn created_draft_id(resp: &serde_json::Value, action: &str) -> Result<String, Error> {
@@ -1458,7 +1519,15 @@ pub async fn update_draft(
 /// Destroy a draft. Idempotent: a `notFound` (already gone) counts as success
 /// so the fire-and-forget delete on send/discard never surfaces a spurious
 /// error for a draft the send flow already removed.
+///
+/// Guarded by verify_is_draft (roborev 302, fix 5): Email/set destroy is
+/// permanent, with no Trash round-trip, so before issuing it we confirm the
+/// target actually carries the `$draft` keyword or sits in the Drafts
+/// mailbox. Both destroy_draft call sites (the DELETE handler and
+/// update_draft's destroy-the-old-copy step) go through this one function,
+/// so the guard covers both.
 pub async fn destroy_draft(s: &JmapSession, draft_id: &str) -> Result<bool, Error> {
+    verify_is_draft(s, draft_id).await?;
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
     let resp = jmap_call(s, draft_destroy_request(account_id, draft_id)).await?;
     let destroyed = resp["methodResponses"][0][1]["destroyed"]
@@ -2473,6 +2542,75 @@ END:VCALENDAR";
         assert_eq!(args["accountId"], "acct-1");
         assert_eq!(args["destroy"], serde_json::json!(["draft-xyz"]));
         assert!(args.get("create").is_none());
+    }
+
+    // --- destroy_draft $draft guard (roborev 302, fix 5) ---
+
+    #[test]
+    fn draft_verify_request_fetches_id_and_guard_properties() {
+        let calls = draft_verify_request("acct-1", "draft-xyz");
+        assert_eq!(calls.len(), 1, "verify is a single method call");
+        assert_eq!(calls[0][0], "Email/get");
+        let args = &calls[0][1];
+        assert_eq!(args["accountId"], "acct-1");
+        assert_eq!(args["ids"], serde_json::json!(["draft-xyz"]));
+        let props = args["properties"].as_array().expect("properties array");
+        for want in ["id", "mailboxIds", "keywords"] {
+            assert!(
+                props.iter().any(|p| p == want),
+                "properties must include {want}"
+            );
+        }
+    }
+
+    fn email_get_list_response(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "methodResponses": [["Email/get", { "list": items, "notFound": [] }, "0"]]
+        })
+    }
+
+    #[test]
+    fn verify_is_draft_response_allows_draft_keyword() {
+        let resp = email_get_list_response(vec![serde_json::json!({
+            "id": "draft-xyz",
+            "mailboxIds": {"mb-inbox": true},
+            "keywords": {"$draft": true}
+        })]);
+        assert!(verify_is_draft_response(&resp, "draft-xyz", "mb-drafts").is_ok());
+    }
+
+    #[test]
+    fn verify_is_draft_response_allows_drafts_mailbox_without_keyword() {
+        // Some servers may not round-trip the $draft keyword faithfully;
+        // sitting in the Drafts mailbox is an equally valid signal.
+        let resp = email_get_list_response(vec![serde_json::json!({
+            "id": "draft-xyz",
+            "mailboxIds": {"mb-drafts": true},
+            "keywords": {}
+        })]);
+        assert!(verify_is_draft_response(&resp, "draft-xyz", "mb-drafts").is_ok());
+    }
+
+    #[test]
+    fn verify_is_draft_response_rejects_non_draft_mismatch() {
+        // Neither the keyword nor Drafts-mailbox membership — this is the
+        // scenario the guard exists to catch: a raw destroy would otherwise
+        // permanently delete an arbitrary, non-draft email.
+        let resp = email_get_list_response(vec![serde_json::json!({
+            "id": "inbox-email-1",
+            "mailboxIds": {"mb-inbox": true},
+            "keywords": {"$seen": true}
+        })]);
+        let err = verify_is_draft_response(&resp, "inbox-email-1", "mb-drafts").unwrap_err();
+        assert!(matches!(err, Error::NotFound(ref m) if m.contains("inbox-email-1")));
+    }
+
+    #[test]
+    fn verify_is_draft_response_allows_already_gone_target() {
+        // Absent from `list` entirely — left to the destroy call's own
+        // idempotent notFound handling, not a mismatch.
+        let resp = email_get_list_response(vec![]);
+        assert!(verify_is_draft_response(&resp, "already-gone", "mb-drafts").is_ok());
     }
 
     #[test]

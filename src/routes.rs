@@ -2986,6 +2986,44 @@ mod tests {
     }
 
     #[test]
+    fn app_js_prefetch_requests_mark_read_false() {
+        // Desktop counterpart to mobile_app_js_prefetch_requests_mark_read_false
+        // (roborev 302, fix 2): the bare GET auto-marks read server-side, so
+        // background warm-up must never silently consume unread state for an
+        // email the user hasn't actually opened.
+        let start = APP_JS
+            .find("function prefetchAdjacentEmails")
+            .expect("prefetchAdjacentEmails must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("prefetchAdjacentEmails must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("mark_read=false"),
+            "prefetching adjacent emails must not silently mark them read \
+             (pass ?mark_read=false on the GET)"
+        );
+    }
+
+    #[test]
+    fn app_js_cache_hit_detail_marks_read_on_server() {
+        // Desktop counterpart to mobile_app_js_cache_hit_detail_marks_read_on_server
+        // (roborev 302, fix 2): opening a prefetched (mark_read=false) email
+        // from cache issues no GET, so nothing tells the server it's now read
+        // unless loadEmailDetail's cache-hit branch does so explicitly.
+        let start = APP_JS
+            .find("async function loadEmailDetail")
+            .expect("loadEmailDetail must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("loadEmailDetail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("/mark-read"),
+            "loadEmailDetail's cache-hit path must explicitly mark the email \
+             read on the server"
+        );
+    }
+
+    #[test]
     fn mobile_app_js_signature_prefilled_via_clear_compose_fields() {
         // Mirrors app_js_signature_prefilled_via_clear_compose: mobile's
         // startCompose/startReply/startForward all call clearComposeFields
@@ -4531,6 +4569,31 @@ white   = '#fdf6e3'
         assert!(
             block.contains("state.sending = false"),
             "desktop sendEmail must clear the sending lock when the send settles"
+        );
+
+        // Mobile additionally must kill the pending debounce before its await
+        // (roborev 302, fix 1) — a debounce firing mid-send while sendComposedEmail
+        // only awaits the previous saveInFlight would chain a fresh doAutosave that
+        // lands after deleteTrackedDraft, re-adopting a ghost draft of the sent
+        // mail. It already holds the sending lock across the send via
+        // setComposeSending.
+        let start = MOBILE_APP_JS
+            .find("async function sendComposedEmail(")
+            .expect("mobile sendComposedEmail must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("cancelAutosave()"),
+            "mobile sendComposedEmail must cancel the pending autosave debounce up front"
+        );
+        assert!(
+            block.contains("setComposeSending(true)"),
+            "mobile sendComposedEmail must set the sending lock runAutosave bails on"
+        );
+        assert!(
+            block.contains("setComposeSending(false)"),
+            "mobile sendComposedEmail must clear the sending lock when the send settles"
         );
     }
 
