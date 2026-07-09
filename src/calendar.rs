@@ -75,10 +75,14 @@ const INLINE_SAFE_TAGS: &[&str] = &[
 /// wrongly calls this faithful, even though the strip actually deleted
 /// visible text. Anchoring with `^` and matching only within one already-
 /// isolated `HTML_TAG_RE` span closes that gap: the `< 6</b>` span has no
-/// letter immediately after its leading `<` (just a space then a digit), so
-/// it fails to parse as a tag name at all and is correctly rejected.
-static TAG_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^<\s*/?\s*([a-zA-Z]+)").unwrap());
+/// letter immediately after its leading `<`, so it fails to parse as a tag
+/// name at all and is correctly rejected.
+///
+/// roborev 300: no whitespace allowances — HTML permits none after `<` (a
+/// browser renders `< b` as literal text and treats `</ b>` as a bogus
+/// comment), so skipping spaces here would rescue a tag name out of a span
+/// whose deletion actually destroyed visible content.
+static TAG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^</?([a-zA-Z]+)").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -2257,6 +2261,18 @@ END:VCALENDAR";
         // parse as an allowlisted tag and the value is correctly rejected.
         assert!(!description_channel_is_faithful(&Some(
             "<b>5 < 6</b>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_for_space_letter_after_angle_bracket() {
+        // roborev 300: the space-then-LETTER variant of the raw-`<` case. A
+        // browser renders "< b" as literal text (tag-open requires a letter
+        // immediately after `<`), so the strip deleting the "< b</b>" span
+        // destroys visible content — the tag-name parse must not skip
+        // whitespace and rescue "b" from inside it.
+        assert!(!description_channel_is_faithful(&Some(
+            "<b>5 < b</b>".into()
         )));
     }
 
