@@ -60,13 +60,25 @@ const INLINE_SAFE_TAGS: &[&str] = &[
     "html", "body", "span", "b", "i", "em", "strong", "a", "font",
 ];
 
-/// Matches an HTML tag's name (opening, closing, or self-closing) so
-/// `description_channel_is_faithful` can check it against
-/// `INLINE_SAFE_TAGS`. Deliberately looser than `HTML_TAG_RE` — it only needs
-/// the leading `<[/]NAME` and ignores attributes/self-closing markers, which
-/// `captures_iter` skips over along with everything else outside a match.
+/// Matches an HTML tag's name (opening, closing, or self-closing) at the
+/// START of a string. `description_channel_is_faithful` applies this to each
+/// individual `HTML_TAG_RE` match (not to the whole original text) so it
+/// vets the *exact* span the strip deletes rather than scanning the text
+/// independently for tag-shaped substrings.
+///
+/// roborev 299: scanning `trimmed` on its own (the old behavior) could find
+/// an allowlisted name anywhere in the text even when the span `HTML_TAG_RE`
+/// actually deleted wasn't a well-formed `</?name...>` tag at all — e.g.
+/// `<b>5 < 6</b>` strips as two matches, `<b>` and `< 6</b>` (the bare `<`
+/// before `6` greedily eats up to the next `>`), deleting `< 6</b>` as
+/// content. A whole-text scan for `<letters` still finds `<b`/`</b` and
+/// wrongly calls this faithful, even though the strip actually deleted
+/// visible text. Anchoring with `^` and matching only within one already-
+/// isolated `HTML_TAG_RE` span closes that gap: the `< 6</b>` span has no
+/// letter immediately after its leading `<` (just a space then a digit), so
+/// it fails to parse as a tag name at all and is correctly rejected.
 static TAG_NAME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<\s*/?\s*([a-zA-Z]+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^<\s*/?\s*([a-zA-Z]+)").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -340,6 +352,19 @@ fn normalize_stored_description(description: &Option<String>) -> String {
 /// (`events_content_match` still compares every other tracked field), while
 /// a false "faithful" resurrects the destructive-rewrite loop.
 ///
+/// roborev 299: the allowlist check must vet the exact spans `HTML_TAG_RE`
+/// deletes, not scan the original text independently for tag-shaped
+/// substrings — those can disagree. E.g. `<b>5 < 6</b>` strips as two
+/// `HTML_TAG_RE` matches, `<b>` and `< 6</b>` (a bare `<` greedily consumes
+/// up to the next `>`), so the strip deletes real content (`< 6`). A
+/// whole-text scan for `<letters` still finds `<b`/`</b` in there and would
+/// wrongly call this faithful even though visible text was destroyed.
+/// Iterating `HTML_TAG_RE`'s own matches and requiring each one to parse as
+/// an allowlisted `</?name...>` tag catches this: `< 6</b>` has no letter
+/// immediately after its leading `<`, so it isn't a tag at all and the value
+/// is correctly rejected. This also folds in comments and other malformed
+/// `<...>` spans, which likewise can't parse as a name.
+///
 /// When this returns `false`, `events_content_match` skips the description
 /// clause entirely rather than let a lossy provider round-trip block a
 /// legitimate no-op downgrade to `Unchanged`; this can't mask a real content
@@ -359,9 +384,11 @@ fn description_channel_is_faithful(stored: &Option<String>) -> bool {
     if ENTITY_REF_RE.is_match(&stripped) {
         return false;
     }
-    TAG_NAME_RE
-        .captures_iter(trimmed)
-        .all(|cap| INLINE_SAFE_TAGS.contains(&cap[1].to_lowercase().as_str()))
+    HTML_TAG_RE.find_iter(trimmed).all(|m| {
+        TAG_NAME_RE
+            .captures(m.as_str())
+            .is_some_and(|cap| INLINE_SAFE_TAGS.contains(&cap[1].to_lowercase().as_str()))
+    })
 }
 
 /// Normalize an attendee list to a lowercased, sorted, deduplicated set of
@@ -2215,6 +2242,21 @@ END:VCALENDAR";
         // allowlist rejects it because <ul>/<li> aren't inline-safe tags.
         assert!(!description_channel_is_faithful(&Some(
             "<ul><li>one</li><li>two</li></ul>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_for_raw_angle_bracket_in_text() {
+        // roborev 299: a whole-text scan for `<letters` (the old TAG_NAME_RE
+        // behavior) finds "<b" and "</b" here and would wrongly call this
+        // faithful — but HTML_TAG_RE's own matches are "<b>" and "< 6</b>"
+        // (the bare `<` before `6` greedily eats up to the next `>`), so the
+        // strip actually deletes real content ("< 6") while leaving "5 "
+        // behind. Vetting the exact deleted spans catches this: "< 6</b>"
+        // has no letter immediately after its leading `<`, so it can't
+        // parse as an allowlisted tag and the value is correctly rejected.
+        assert!(!description_channel_is_faithful(&Some(
+            "<b>5 < 6</b>".into()
         )));
     }
 

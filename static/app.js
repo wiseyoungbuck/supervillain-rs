@@ -3638,17 +3638,19 @@ async function doAutosave(session, payload) {
             trackedDraftId = res.id;
             trackedDraftSession = session;
         } else if (res?.id && !draftId) {
-            // roborev 298 #3: this completion was rejected above (a later
-            // openDraftInCompose already tracked a fresher id/session while
-            // this save was in flight) — nothing adopted res.id. If this
-            // save also POSTed a brand-new draft (draftId was null at
-            // request time, i.e. not a PUT rotating an existing draft's id),
-            // the server now has an orphaned draft nothing points to.
-            // Fire-and-forget cleanup; a failure here just leaves a stray
-            // draft, not worth surfacing to the user.
-            api('DELETE', `/drafts/${encodeURIComponent(res.id)}`).catch((err) =>
-                console.warn('Failed to delete orphaned draft:', err)
-            );
+            // roborev 299 (reverts roborev 298 #3): this completion was
+            // rejected above (a later openDraftInCompose already tracked a
+            // fresher id/session while this save was in flight), and this
+            // save POSTed a brand-new draft — so the server now holds a
+            // stray draft nothing points to. Deliberately NOT deleted: this
+            // branch is only reachable when the save carried real user
+            // content (the composeDirty gate means autosave never fires on a
+            // pristine compose), so that "orphan" is a real Drafts message
+            // holding the abandoned compose's final edits, stored nowhere
+            // else. Destroying the only copy of the user's text in a timing
+            // race is strictly worse than the stray-but-real, visible,
+            // recoverable draft it would tidy away — never delete user
+            // content to clean up client tracking state.
         }
         // Adopt the (possibly changed) id into the visible state only while
         // this is still the active compose — a newer draft must not inherit
