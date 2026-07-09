@@ -11,12 +11,30 @@ use std::sync::LazyLock;
 static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
 
 /// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
-/// DESCRIPTION we didn't expect to be HTML (see `normalize_description`).
+/// STORED DESCRIPTION we didn't expect to be HTML (see
+/// `normalize_stored_description`). Never applied to the incoming ICS side —
+/// DESCRIPTION there is plain TEXT per RFC 5545, so a value that happens to
+/// start with `<` is genuine content, not markup.
+///
 /// Not a real HTML parser: doesn't decode entities, doesn't handle
-/// unterminated tags. That's fine here — worst case a still-HTML-ish result
-/// fails `description_channel_is_faithful` and the caller skips the
-/// comparison instead of trusting a garbled string.
+/// unterminated tags, and — worse than just leaving a residual `<`/`>`
+/// behind — silently deletes line-break-encoding tags (`<br>`, `</p>`,
+/// `</div>`) without inserting the whitespace they represented, which can
+/// join words that were on separate lines into one. So the worst case isn't
+/// a garbled result that trips the residual-syntax check; it's a
+/// clean-looking result that quietly altered the content anyway.
+/// `description_channel_is_faithful` checks for both failure modes before
+/// trusting the stripped text.
 static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]*>").unwrap());
+
+/// Entity references (`&amp;`, `&#39;`, etc.) that can survive
+/// `HTML_TAG_RE`'s tag-only strip untouched — it has no entity-decoding
+/// logic, so `&amp;` stays `&amp;` instead of becoming `&`. A stored value
+/// that still contains one after stripping is not a faithful rendering of
+/// the original even though no tag syntax remains (see
+/// `description_channel_is_faithful`).
+static ENTITY_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"&[a-zA-Z]+;|&#\d+;").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -177,8 +195,8 @@ pub fn events_content_match(stored: &CalendarEvent, incoming: &CalendarEvent) ->
         && stored.summary == incoming.summary
         && stored.location == incoming.location
         && (!description_channel_is_faithful(&stored.description)
-            || normalize_description(&stored.description)
-                == normalize_description(&incoming.description))
+            || normalize_stored_description(&stored.description)
+                == normalize_incoming_description(&incoming.description))
         && attendee_email_set(&stored.attendees) == attendee_email_set(&incoming.attendees)
 }
 
@@ -212,26 +230,45 @@ fn dtend_matches_normalized(stored: &CalendarEvent, incoming: &CalendarEvent) ->
     }
 }
 
-/// Normalize DESCRIPTION for comparison: `None` and an empty string mean the
-/// same thing ("no description").
+/// Normalize an INCOMING ICS DESCRIPTION for comparison: `None` and an empty
+/// string mean the same thing ("no description").
 ///
 /// roborev 296 #1: whitespace-robust so a text-mode Graph body (which can
 /// carry a trailing `\r\n` even when `Prefer: outlook.body-content-type="text"`
 /// is honored) still compares equal to an ICS DESCRIPTION with no trailing
-/// whitespace — collapse CRLF to LF, then trim. As defense-in-depth against a
-/// body that came back HTML-wrapped anyway (e.g. the Prefer header wasn't
-/// honored), a value that still starts with `<` after trimming gets a crude
-/// tag-strip pass. Whether that pass actually produced clean plain text is
-/// judged separately by `description_channel_is_faithful` — callers must
-/// consult that before trusting this normalization to mean anything.
-fn normalize_description(description: &Option<String>) -> String {
+/// whitespace — collapse CRLF to LF, then trim.
+///
+/// roborev 297 #3: no HTML tag-stripping here, unlike
+/// `normalize_stored_description` — the incoming DESCRIPTION is plain TEXT
+/// per RFC 5545, always, regardless of what a provider chose to store. A
+/// value that happens to start with `<` (e.g. an update note like
+/// `<update> room moved`) is genuine content, not a markup wrapper; stripping
+/// it would delete real text and could mask an actual change as a no-op
+/// match.
+fn normalize_incoming_description(description: &Option<String>) -> String {
     let raw = description.as_deref().unwrap_or("");
     let collapsed = raw.replace("\r\n", "\n");
-    let trimmed = collapsed.trim();
+    collapsed.trim().to_string()
+}
+
+/// Normalize a STORED DESCRIPTION for comparison against
+/// `normalize_incoming_description`'s output.
+///
+/// As defense-in-depth against a body that came back HTML-wrapped despite a
+/// text-mode request (e.g. the `Prefer` header wasn't honored), a value that
+/// still starts with `<` after trimming/CRLF-collapsing gets a crude
+/// tag-strip pass. Whether that pass actually produced a faithful rendering
+/// of the original is judged separately by `description_channel_is_faithful`
+/// — callers must consult that before trusting this normalization to mean
+/// anything. Only ever call this on the STORED side; the incoming ICS side
+/// must go through `normalize_incoming_description` instead (roborev 297
+/// #3) — see that function's doc for why.
+fn normalize_stored_description(description: &Option<String>) -> String {
+    let trimmed = normalize_incoming_description(description);
     if trimmed.starts_with('<') {
-        HTML_TAG_RE.replace_all(trimmed, "").trim().to_string()
+        HTML_TAG_RE.replace_all(&trimmed, "").trim().to_string()
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 
@@ -243,15 +280,29 @@ fn normalize_description(description: &Option<String>) -> String {
 /// Graph can return an HTML-wrapped body for a calendar event — the stored
 /// side then never equals the incoming plain-text DESCRIPTION even when the
 /// visible content is identical, permanently defeating the content-match
-/// guard. `normalize_description` crude-strips an HTML wrapper, but a crude
-/// strip can leave stray `<`/`>` behind (e.g. an unterminated tag) if the
-/// value wasn't well-formed HTML to begin with, or wasn't HTML at all — in
-/// either case we can't trust the leftover text as a faithful rendering of
-/// the original. When this returns `false`, `events_content_match` skips the
-/// description clause entirely rather than let a lossy provider round-trip
-/// block a legitimate no-op downgrade to `Unchanged`; this can't mask a real
-/// content change on other tracked fields (DTSTART/DTEND/SUMMARY/LOCATION/
-/// attendees), which still participate in the comparison.
+/// guard. `normalize_stored_description` crude-strips an HTML wrapper, but a
+/// crude strip can leave stray `<`/`>` behind (e.g. an unterminated tag) if
+/// the value wasn't well-formed HTML to begin with, or wasn't HTML at all —
+/// in either case we can't trust the leftover text as a faithful rendering
+/// of the original.
+///
+/// roborev 297 #2: residual tag syntax isn't the only failure mode. Two
+/// things can strip "clean" (no leftover `<`/`>`) while still altering the
+/// content: an entity reference (`&amp;`) that `HTML_TAG_RE` has no logic to
+/// decode, and a line-break/block tag (`<br>`, `</p>`, `</div>`) that gets
+/// deleted without inserting the whitespace it represented, which can join
+/// two lines into one run-on. Either produces a stripped value that looks
+/// well-formed but no longer matches the visible content it came from — if
+/// we declared that "faithful", the comparison against the incoming
+/// plain-text DESCRIPTION would permanently fail (a mismatch that can never
+/// resolve to equal) and keep resurrecting the per-open destructive rewrite.
+/// Treat both as unfaithful too.
+///
+/// When this returns `false`, `events_content_match` skips the description
+/// clause entirely rather than let a lossy provider round-trip block a
+/// legitimate no-op downgrade to `Unchanged`; this can't mask a real content
+/// change on other tracked fields (DTSTART/DTEND/SUMMARY/LOCATION/attendees),
+/// which still participate in the comparison.
 fn description_channel_is_faithful(stored: &Option<String>) -> bool {
     let raw = stored.as_deref().unwrap_or("");
     let collapsed = raw.replace("\r\n", "\n");
@@ -260,7 +311,14 @@ fn description_channel_is_faithful(stored: &Option<String>) -> bool {
         return true;
     }
     let stripped = HTML_TAG_RE.replace_all(trimmed, "");
-    !stripped.contains('<') && !stripped.contains('>')
+    if stripped.contains('<') || stripped.contains('>') {
+        return false;
+    }
+    if ENTITY_REF_RE.is_match(&stripped) {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    !lower.contains("<br") && !lower.contains("</p") && !lower.contains("</div")
 }
 
 /// Normalize an attendee list to a lowercased, sorted, deduplicated set of
@@ -1915,10 +1973,13 @@ END:VCALENDAR";
     fn content_match_true_when_stored_description_is_html_wrapped_but_content_equal() {
         // Without the Prefer header, Graph can return the body HTML-wrapped
         // even though the incoming ICS DESCRIPTION is plain text. If the
-        // crude tag-strip recovers the identical plain text, it's still a
+        // crude tag-strip recovers the identical plain text — and the
+        // wrapper carries no entities or line-break/block tags that would
+        // make the strip lossy (roborev 297 #2) — it's still a genuine
         // match, not a permanent Update.
         let mut stored = base_event();
-        stored.description = Some("<html><body><p>Daily standup meeting</p></body></html>".into());
+        stored.description =
+            Some("<html><body><span>Daily standup meeting</span></body></html>".into());
         let incoming = base_event(); // description: "Daily standup meeting"
         assert!(events_content_match(&stored, &incoming));
     }
@@ -1948,15 +2009,73 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn normalize_description_trims_and_collapses_crlf() {
-        assert_eq!(normalize_description(&Some("Hello\r\n".into())), "Hello");
-        assert_eq!(normalize_description(&Some("  Hello  \n".into())), "Hello");
+    fn content_match_true_when_stored_description_has_entity_reference() {
+        // roborev 297 #2: an entity reference (`&amp;`) survives the crude
+        // tag-strip untouched — it decodes to different text than its
+        // source, so declaring this "faithful" would permanently mismatch
+        // against the incoming plain-text DESCRIPTION and keep resurrecting
+        // the per-open destructive rewrite. Must skip the clause instead.
+        let mut stored = base_event();
+        stored.description = Some("<span>Meeting &amp; snacks</span>".into());
+        let incoming = base_event(); // description: "Daily standup meeting" — differs
+        assert!(events_content_match(&stored, &incoming));
     }
 
     #[test]
-    fn normalize_description_strips_well_formed_html_wrapper() {
+    fn content_match_true_when_stored_description_has_line_break_tag() {
+        // roborev 297 #2: <br> (and </p>, </div>) are deleted by the crude
+        // strip without inserting the whitespace they represented, silently
+        // joining two lines into one run-on. Must skip the clause rather
+        // than trust the collapsed text as faithful.
+        let mut stored = base_event();
+        stored.description = Some("<p>Line one<br>Line two</p>".into());
+        let incoming = base_event(); // description: "Daily standup meeting" — differs
+        assert!(events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn content_match_false_when_incoming_description_is_plain_text_starting_with_angle_bracket() {
+        // roborev 297 #3: incoming ICS DESCRIPTION is plain text per RFC
+        // 5545, always — a value like "<update> room moved" is genuine
+        // content, not an HTML wrapper. The old shared normalize_description
+        // ran BOTH sides through the tag-strip, so this incoming value would
+        // have been stripped down to "room moved" and could spuriously equal
+        // a stored "room moved", masking a real change as Unchanged. The
+        // incoming side must not be tag-stripped, so this must NOT match —
+        // Update proceeds.
+        let mut stored = base_event();
+        stored.description = Some("room moved".into());
+        let mut incoming = base_event();
+        incoming.description = Some("<update> room moved".into());
+        assert!(!events_content_match(&stored, &incoming));
+    }
+
+    #[test]
+    fn normalize_incoming_description_trims_and_collapses_crlf() {
         assert_eq!(
-            normalize_description(&Some("<html><body><p>Hi</p></body></html>".into())),
+            normalize_incoming_description(&Some("Hello\r\n".into())),
+            "Hello"
+        );
+        assert_eq!(
+            normalize_incoming_description(&Some("  Hello  \n".into())),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn normalize_incoming_description_does_not_strip_html_looking_text() {
+        // roborev 297 #3: the incoming side is plain text per RFC 5545, so a
+        // leading '<' is content, not markup, and must survive untouched.
+        assert_eq!(
+            normalize_incoming_description(&Some("<update> room moved".into())),
+            "<update> room moved"
+        );
+    }
+
+    #[test]
+    fn normalize_stored_description_strips_well_formed_html_wrapper() {
+        assert_eq!(
+            normalize_stored_description(&Some("<html><body><p>Hi</p></body></html>".into())),
             "Hi"
         );
     }
@@ -1970,14 +2089,51 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn description_channel_faithful_for_well_formed_html_wrapper() {
-        assert!(description_channel_is_faithful(&Some("<p>Hi</p>".into())));
+    fn description_channel_faithful_for_well_formed_html_wrapper_without_block_tags() {
+        // No entities, no line-break/block tags — nothing is lost by the
+        // crude strip, so this is a genuinely faithful rendering.
+        assert!(description_channel_is_faithful(&Some(
+            "<span>Hi</span>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_for_paragraph_wrapped_html() {
+        // roborev 297 #2: even a single, well-formed <p>...</p> wrapper is
+        // untrustworthy — </p> is deleted by the crude strip without
+        // inserting the paragraph break it represented.
+        assert!(!description_channel_is_faithful(&Some("<p>Hi</p>".into())));
     }
 
     #[test]
     fn description_channel_unfaithful_when_html_residue_remains() {
         assert!(!description_channel_is_faithful(&Some(
             "<p>Meeting notes < important".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_when_entity_reference_remains() {
+        // roborev 297 #2: `&amp;` leaves no residual '<'/'>' but still
+        // decodes to different text than its source.
+        assert!(!description_channel_is_faithful(&Some(
+            "<span>Meeting &amp; snacks</span>".into()
+        )));
+        assert!(!description_channel_is_faithful(&Some(
+            "<span>Caf&#233; meeting</span>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_when_line_break_tag_present() {
+        // roborev 297 #2: <br>, </p>, </div> are all silently deleted by the
+        // crude strip without inserting the line/paragraph break they
+        // represented.
+        assert!(!description_channel_is_faithful(&Some(
+            "<p>Line one<br>Line two</p>".into()
+        )));
+        assert!(!description_channel_is_faithful(&Some(
+            "<div>Room moved</div>".into()
         )));
     }
 

@@ -4688,6 +4688,18 @@ white   = '#fdf6e3'
                  read of state.draftId — clearCompose/clearComposeFields can \
                  null it before this microtask runs"
             );
+            // roborev 297: sessions only increase, so a stale (older-session)
+            // save that completes AFTER a newer restore has already seeded
+            // trackedDraftId/trackedDraftSession must not clobber that seed —
+            // otherwise the restored draft's next autosave session-mismatches
+            // and POSTs a duplicate instead of PUTting the restored id.
+            assert!(
+                block.contains("session >= trackedDraftSession"),
+                "{bundle} doAutosave must guard the trackedDraftId/\
+                 trackedDraftSession write on the save's session being at \
+                 least as new as the currently tracked one, so an in-flight \
+                 stale save can't clobber a newer restore's seed"
+            );
         }
     }
 

@@ -2127,7 +2127,14 @@ let saveInFlight = null;
 // always PUTs against the id that was live when it was scheduled, regardless
 // of what runs after flushAutosave() returns. The session tag is what
 // invalidates a stale id for a *later* compose (see doAutosave below)
-// instead of a synchronous null-out.
+// instead of a synchronous null-out. composeSession only ever increments
+// (see state.composeSession++ in startCompose/startReply/startForward/
+// startDraftCompose), so doAutosave's write to these two is additionally
+// guarded on `session >= trackedDraftSession`: without that, an older
+// session's save completing after a newer restore has already seeded
+// trackedDraftId/trackedDraftSession would clobber that seed, and the
+// restored draft's next autosave would then session-mismatch and POST a
+// duplicate instead of PUTting the restored id.
 let trackedDraftId = null;
 let trackedDraftSession = -1;
 
@@ -2200,7 +2207,13 @@ async function doAutosave(session, payload) {
         const res = draftId
             ? await state.api('PUT', '/drafts/' + encodeURIComponent(draftId), payload)
             : await state.api('POST', '/drafts', payload);
-        if (res?.id) {
+        // Guard against a stale (older-session) completion clobbering a
+        // newer restore's seed: sessions only increase, so `session <
+        // trackedDraftSession` means a later startDraftCompose already
+        // wrote a fresher id/session while this save was in flight. Adopting
+        // this one's id anyway would make the restored draft's next autosave
+        // session-mismatch and POST a duplicate instead of PUTting it.
+        if (res?.id && session >= trackedDraftSession) {
             trackedDraftId = res.id;
             trackedDraftSession = session;
         }
