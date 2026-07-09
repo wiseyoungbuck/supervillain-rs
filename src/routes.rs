@@ -4703,6 +4703,76 @@ white   = '#fdf6e3'
         }
     }
 
+    // roborev 298 fix 3: when the session-recency guard above rejects a stale
+    // completion (a later restore already tracked a fresher id/session), and
+    // that stale save took the POST path (draftId resolved to null at
+    // request time, so nothing rotated an existing draft), the server draft
+    // it just created is never adopted anywhere — an orphan. doAutosave must
+    // fire-and-forget DELETE it in that rejected branch. It must NOT do so on
+    // the PUT path (draftId truthy): there res.id is the rotated id of a
+    // real, still-wanted draft, not an extra one to clean up.
+    #[test]
+    fn draft_autosave_deletes_orphaned_draft_from_rejected_stale_post() {
+        for (js, bundle) in [(APP_JS, "desktop"), (MOBILE_APP_JS, "mobile")] {
+            let start = js
+                .find("async function doAutosave(")
+                .unwrap_or_else(|| panic!("{bundle} doAutosave must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("doAutosave must close");
+            let block = &rest[..end];
+            // The cleanup must live in the `else` of the accept-guard (i.e.
+            // only run when that guard rejected the completion), and must be
+            // additionally gated on `!draftId` so a PUT (draftId truthy)
+            // never reaches it.
+            let branch_start = block
+                .find("else if (res?.id && !draftId)")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{bundle} doAutosave must have a rejected-branch gated \
+                         on !draftId for orphan cleanup"
+                    )
+                });
+            let branch_rest = &block[branch_start..];
+            let branch_end = branch_rest
+                .find("\n        }")
+                .expect("rejected branch must close");
+            let branch_block = &branch_rest[..branch_end];
+            assert!(
+                branch_block.contains("'DELETE'"),
+                "{bundle} doAutosave's rejected-POST branch must DELETE the \
+                 orphaned server draft"
+            );
+            assert!(
+                branch_block.contains("res.id"),
+                "{bundle} doAutosave must delete the orphan by the id the \
+                 rejected save's response actually returned"
+            );
+            assert!(
+                branch_block.contains(".catch("),
+                "{bundle} the orphan cleanup DELETE must be fire-and-forget \
+                 (caught, not awaited/propagated)"
+            );
+            // The accept branch (PUT-path-inclusive id adoption) must come
+            // first and must not itself contain the DELETE — otherwise a PUT
+            // could trigger the cleanup too.
+            let accept_start = block
+                .find("if (res?.id && session >= trackedDraftSession)")
+                .unwrap_or_else(|| panic!("{bundle} doAutosave must have the accept guard"));
+            assert!(
+                accept_start < branch_start,
+                "{bundle} the rejected-POST cleanup must be the `else` of the \
+                 accept guard, not a separate earlier branch"
+            );
+            let accept_rest = &block[accept_start..branch_start];
+            assert!(
+                !accept_rest.contains("'DELETE'"),
+                "{bundle} the accept (session-ok) branch must not itself \
+                 issue the orphan-cleanup DELETE — a PUT's res.id must never \
+                 be deleted"
+            );
+        }
+    }
+
     // openDraftInCompose/startDraftCompose set state.draftId directly
     // (restoring a draft bypasses doAutosave's normal adoption path) — they
     // must seed trackedDraftId/trackedDraftSession too, or the very next

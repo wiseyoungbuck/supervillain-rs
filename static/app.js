@@ -3637,6 +3637,18 @@ async function doAutosave(session, payload) {
         if (res?.id && session >= trackedDraftSession) {
             trackedDraftId = res.id;
             trackedDraftSession = session;
+        } else if (res?.id && !draftId) {
+            // roborev 298 #3: this completion was rejected above (a later
+            // openDraftInCompose already tracked a fresher id/session while
+            // this save was in flight) — nothing adopted res.id. If this
+            // save also POSTed a brand-new draft (draftId was null at
+            // request time, i.e. not a PUT rotating an existing draft's id),
+            // the server now has an orphaned draft nothing points to.
+            // Fire-and-forget cleanup; a failure here just leaves a stray
+            // draft, not worth surfacing to the user.
+            api('DELETE', `/drafts/${encodeURIComponent(res.id)}`).catch((err) =>
+                console.warn('Failed to delete orphaned draft:', err)
+            );
         }
         // Adopt the (possibly changed) id into the visible state only while
         // this is still the active compose — a newer draft must not inherit

@@ -27,14 +27,46 @@ static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[
 /// trusting the stripped text.
 static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]*>").unwrap());
 
-/// Entity references (`&amp;`, `&#39;`, etc.) that can survive
+/// Entity references (`&amp;`, `&#39;`, `&#x27;`, etc.) that can survive
 /// `HTML_TAG_RE`'s tag-only strip untouched — it has no entity-decoding
 /// logic, so `&amp;` stays `&amp;` instead of becoming `&`. A stored value
 /// that still contains one after stripping is not a faithful rendering of
 /// the original even though no tag syntax remains (see
 /// `description_channel_is_faithful`).
+///
+/// roborev 298 #1: the decimal alternative (`&#\d+;`) doesn't match hex
+/// character references (`&#x27;`, `&#X2019;`) — those survived the strip
+/// undetected, so e.g. a stored `<span>It&#x27;s at 3</span>` was wrongly
+/// declared faithful and could never equal the incoming plain-text
+/// `It's at 3`, permanently defeating the content-match guard. Add an
+/// explicit hex alternative (case-insensitive `x`/`X` marker).
 static ENTITY_REF_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"&[a-zA-Z]+;|&#\d+;").unwrap());
+    LazyLock::new(|| Regex::new(r"&[a-zA-Z]+;|&#[0-9]+;|&#[xX][0-9a-fA-F]+;").unwrap());
+
+/// Tags that `description_channel_is_faithful` trusts a crude strip to
+/// remove without altering the visible line structure — no line break or
+/// paragraph boundary is encoded by any of these, so deleting them (as
+/// `HTML_TAG_RE` does, with no whitespace insertion) loses nothing.
+///
+/// roborev 298 #2: this used to be a denylist of known-lossy tags (`<br`,
+/// `</p`, `</div`), which meant anything NOT on that short list — `<ul>`,
+/// `<li>`, `<table>`, `<tr>`, etc. — was implicitly trusted. E.g.
+/// `<ul><li>one</li><li>two</li></ul>` strips clean to `onetwo`, no residual
+/// syntax, no listed block tag present, and was wrongly declared faithful
+/// despite joining two list items into one run-on. Inverting to an allowlist
+/// means an unenumerated tag fails safe (unfaithful) instead of silently
+/// passing.
+const INLINE_SAFE_TAGS: &[&str] = &[
+    "html", "body", "span", "b", "i", "em", "strong", "a", "font",
+];
+
+/// Matches an HTML tag's name (opening, closing, or self-closing) so
+/// `description_channel_is_faithful` can check it against
+/// `INLINE_SAFE_TAGS`. Deliberately looser than `HTML_TAG_RE` — it only needs
+/// the leading `<[/]NAME` and ignores attributes/self-closing markers, which
+/// `captures_iter` skips over along with everything else outside a match.
+static TAG_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<\s*/?\s*([a-zA-Z]+)").unwrap());
 
 // =============================================================================
 // ICS Parsing (hand-rolled)
@@ -288,15 +320,25 @@ fn normalize_stored_description(description: &Option<String>) -> String {
 ///
 /// roborev 297 #2: residual tag syntax isn't the only failure mode. Two
 /// things can strip "clean" (no leftover `<`/`>`) while still altering the
-/// content: an entity reference (`&amp;`) that `HTML_TAG_RE` has no logic to
-/// decode, and a line-break/block tag (`<br>`, `</p>`, `</div>`) that gets
-/// deleted without inserting the whitespace it represented, which can join
-/// two lines into one run-on. Either produces a stripped value that looks
+/// content: an entity reference (`&amp;`, `&#39;`, `&#x27;`) that
+/// `HTML_TAG_RE` has no logic to decode, and any tag that encodes a line or
+/// paragraph break (`<br>`, `</p>`, `</div>`, `<li>`, ...) that gets deleted
+/// without inserting the whitespace it represented, which can join separate
+/// lines/items into one run-on. Either produces a stripped value that looks
 /// well-formed but no longer matches the visible content it came from — if
 /// we declared that "faithful", the comparison against the incoming
 /// plain-text DESCRIPTION would permanently fail (a mismatch that can never
 /// resolve to equal) and keep resurrecting the per-open destructive rewrite.
 /// Treat both as unfaithful too.
+///
+/// roborev 298 #2: rather than denylist specific breaking tags (which misses
+/// any tag not yet enumerated — `<ul>`/`<li>`, `<table>`, etc.), every tag
+/// present in the trimmed original must be on the `INLINE_SAFE_TAGS`
+/// allowlist of genuinely non-breaking inline tags. One unenumerated tag is
+/// enough to call the whole value unfaithful — failing safe, since the cost
+/// of a false "unfaithful" is only skipping the description clause
+/// (`events_content_match` still compares every other tracked field), while
+/// a false "faithful" resurrects the destructive-rewrite loop.
 ///
 /// When this returns `false`, `events_content_match` skips the description
 /// clause entirely rather than let a lossy provider round-trip block a
@@ -317,8 +359,9 @@ fn description_channel_is_faithful(stored: &Option<String>) -> bool {
     if ENTITY_REF_RE.is_match(&stripped) {
         return false;
     }
-    let lower = trimmed.to_lowercase();
-    !lower.contains("<br") && !lower.contains("</p") && !lower.contains("</div")
+    TAG_NAME_RE
+        .captures_iter(trimmed)
+        .all(|cap| INLINE_SAFE_TAGS.contains(&cap[1].to_lowercase().as_str()))
 }
 
 /// Normalize an attendee list to a lowercased, sorted, deduplicated set of
@@ -2090,10 +2133,20 @@ END:VCALENDAR";
 
     #[test]
     fn description_channel_faithful_for_well_formed_html_wrapper_without_block_tags() {
-        // No entities, no line-break/block tags — nothing is lost by the
-        // crude strip, so this is a genuinely faithful rendering.
+        // No entities, and the only tag present (span) is on the
+        // INLINE_SAFE_TAGS allowlist — nothing is lost by the crude strip, so
+        // this is a genuinely faithful rendering.
         assert!(description_channel_is_faithful(&Some(
             "<span>Hi</span>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_faithful_for_multiple_allowlisted_inline_tags() {
+        // roborev 298 #2: several different allowlisted tags together should
+        // still be trusted, not just a single repeated one.
+        assert!(description_channel_is_faithful(&Some(
+            "<html><body><span>Hi <b>there</b>, <a href=\"x\">link</a></span></body></html>".into()
         )));
     }
 
@@ -2125,15 +2178,43 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn description_channel_unfaithful_when_hex_entity_reference_remains() {
+        // roborev 298 #1: `&#x27;`/`&#X2019;` are hex character references —
+        // the old ENTITY_REF_RE only matched the decimal form (`&#\d+;`), so
+        // these survived the strip undetected and the value was wrongly
+        // declared faithful even though it still decodes to different text
+        // than its source.
+        assert!(!description_channel_is_faithful(&Some(
+            "<span>It&#x27;s at 3</span>".into()
+        )));
+        assert!(!description_channel_is_faithful(&Some(
+            "<span>It&#X2019;s at 3</span>".into()
+        )));
+    }
+
+    #[test]
     fn description_channel_unfaithful_when_line_break_tag_present() {
         // roborev 297 #2: <br>, </p>, </div> are all silently deleted by the
         // crude strip without inserting the line/paragraph break they
-        // represented.
+        // represented — and none of them is on the INLINE_SAFE_TAGS
+        // allowlist (roborev 298 #2), so they're rejected on that basis too.
         assert!(!description_channel_is_faithful(&Some(
             "<p>Line one<br>Line two</p>".into()
         )));
         assert!(!description_channel_is_faithful(&Some(
             "<div>Room moved</div>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_for_unenumerated_list_tags() {
+        // roborev 298 #2: the old denylist only named <br>, </p>, </div> —
+        // anything else, like a list, was implicitly trusted. This strips
+        // clean to "onetwo" (no residual '<'/'>', no entities, no denylisted
+        // tag) but silently joins two list items into one run-on. The
+        // allowlist rejects it because <ul>/<li> aren't inline-safe tags.
+        assert!(!description_channel_is_faithful(&Some(
+            "<ul><li>one</li><li>two</li></ul>".into()
         )));
     }
 
