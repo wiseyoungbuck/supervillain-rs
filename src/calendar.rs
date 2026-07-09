@@ -78,10 +78,11 @@ const INLINE_SAFE_TAGS: &[&str] = &[
 /// letter immediately after its leading `<`, so it fails to parse as a tag
 /// name at all and is correctly rejected.
 ///
-/// roborev 300: no whitespace allowances — HTML permits none after `<` (a
-/// browser renders `< b` as literal text and treats `</ b>` as a bogus
-/// comment), so skipping spaces here would rescue a tag name out of a span
-/// whose deletion actually destroyed visible content.
+/// roborev 300: no whitespace allowances — HTML permits none after `<`, so
+/// skipping spaces here would either rescue a tag name from a span whose
+/// deletion destroyed visible text (`< b` renders as literal text) or trust
+/// a bogus-comment span we'd rather fail safe on (`</ b>` renders nothing,
+/// so rejecting it is a false "unfaithful" — the cheap direction).
 static TAG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^</?([a-zA-Z]+)").unwrap());
 
 // =============================================================================
@@ -2273,6 +2274,17 @@ END:VCALENDAR";
         // whitespace and rescue "b" from inside it.
         assert!(!description_channel_is_faithful(&Some(
             "<b>5 < b</b>".into()
+        )));
+    }
+
+    #[test]
+    fn description_channel_unfaithful_for_space_after_closing_slash() {
+        // roborev 301 companion: `</ b>` is a bogus comment (renders
+        // nothing), so rejecting it is a false "unfaithful" taken on
+        // purpose — pinned so whitespace tolerance after `</` can't be
+        // reintroduced without failing here.
+        assert!(!description_channel_is_faithful(&Some(
+            "<b>bold</ b>".into()
         )));
     }
 
