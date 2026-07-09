@@ -3075,6 +3075,14 @@ mod tests {
             block.contains("listItem.isUnread = false"),
             "loadEmailDetail's network path must flip isUnread on the matching list row"
         );
+        // roborev 304: the flip alone leaves the row's unread styling stale —
+        // returning to the list only toggles CSS classes — so the network
+        // path must also re-render the list (guarded on the email actually
+        // having been unread).
+        assert!(
+            block.contains("if (wasUnread) renderEmailList()"),
+            "loadEmailDetail's network path must re-render the list after the flip"
+        );
     }
 
     #[test]
@@ -4671,6 +4679,31 @@ white   = '#fdf6e3'
             between.contains("cancelAutosave()"),
             "mobile sendComposedEmail must cancel the autosave debounce AGAIN after \
              awaiting saveInFlight, before setComposeSending(true)"
+        );
+
+        // roborev 304: the identical re-arm window exists on desktop — the
+        // await on saveInFlight runs before `state.sending = true`, so a
+        // keystroke during it can arm a fresh debounce the sending-lock
+        // guard can't yet catch. Desktop sendEmail needs the same second
+        // cancelAutosave() between the await and the sending lock.
+        let start = APP_JS
+            .find("async function sendEmail(")
+            .expect("desktop sendEmail must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("sendEmail must close");
+        let block = &rest[..end];
+        let await_pos = block
+            .find("await saveInFlight.catch(() => {});")
+            .expect("desktop sendEmail must await the in-flight save before proceeding");
+        let after_await = &block[await_pos..];
+        let sending_true_pos = after_await
+            .find("state.sending = true")
+            .expect("desktop sendEmail must set the sending lock");
+        let between = &after_await[..sending_true_pos];
+        assert!(
+            between.contains("cancelAutosave()"),
+            "desktop sendEmail must cancel the autosave debounce AGAIN after \
+             awaiting saveInFlight, before state.sending = true"
         );
     }
 

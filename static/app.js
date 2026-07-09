@@ -1395,8 +1395,14 @@ async function loadEmailDetail(emailId) {
         // renderScreenDetail's network path), or a later cache-hit reopen
         // sees a stale isUnread=true and misfires the mark-read POST above
         // (roborev 303, fix 2).
+        const wasUnread = email.isUnread;
         email.isUnread = false;
         if (listItem) listItem.isUnread = false;
+        // The list row's unread styling only updates on a re-render —
+        // returning to the list just toggles CSS classes — so flip it now or
+        // the row stays bold until some unrelated action redraws it
+        // (roborev 304).
+        if (wasUnread) renderEmailList();
         // Only render if we're still looking at this email (user may have navigated away)
         if (state.currentEmail?.id === emailId) {
             state.currentEmail = email;
@@ -1534,6 +1540,13 @@ async function sendEmail() {
     // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
     // never rejects, but settle either way defensively.
     if (saveInFlight) await saveInFlight.catch(() => {});
+    // The in-flight save above can run >3s; a keystroke during that await
+    // fires the input handler's scheduleAutosave() and arms a fresh debounce,
+    // and state.sending isn't set yet, so runAutosave's own guard wouldn't
+    // catch it. Cancel again, synchronously ahead of the lock, so the
+    // re-armed timer never chains a save that would land after
+    // deleteTrackedDraft below (roborev 304 — same fix as mobile).
+    cancelAutosave();
 
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
