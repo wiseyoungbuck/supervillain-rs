@@ -3083,6 +3083,13 @@ mod tests {
             block.contains("if (wasUnread) renderEmailList()"),
             "loadEmailDetail's network path must re-render the list after the flip"
         );
+        // roborev 305: the guard must consider the ROW's pre-flip state too —
+        // a stale-unread row whose email was read elsewhere comes back with
+        // isUnread: false, and the row still needs its restyle.
+        assert!(
+            block.contains("email.isUnread || Boolean(listItem?.isUnread)"),
+            "the re-render guard must capture both the email's and the row's pre-flip state"
+        );
     }
 
     #[test]

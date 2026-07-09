@@ -1395,7 +1395,11 @@ async function loadEmailDetail(emailId) {
         // renderScreenDetail's network path), or a later cache-hit reopen
         // sees a stale isUnread=true and misfires the mark-read POST above
         // (roborev 303, fix 2).
-        const wasUnread = email.isUnread;
+        // Capture BOTH pre-flip flags: the row can be stale-unread while the
+        // server already considers the email read (read on another device
+        // after the list loaded) — the response then carries isUnread: false
+        // and the row still needs its re-render (roborev 305).
+        const wasUnread = email.isUnread || Boolean(listItem?.isUnread);
         email.isUnread = false;
         if (listItem) listItem.isUnread = false;
         // The list row's unread styling only updates on a re-render —
