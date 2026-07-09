@@ -3024,6 +3024,60 @@ mod tests {
     }
 
     #[test]
+    fn app_js_load_email_detail_never_adjusts_split_counts() {
+        // roborev 303, fix 1: split-tab counts are presence counts —
+        // compute_split_counts counts every matching email regardless of
+        // read state, so only archive/trash/removal (membership changes)
+        // should ever touch them. Marking an email read here, on either the
+        // cache-hit or network path, must not call adjustSplitCounts —
+        // mirroring toggleUnread, which never does either. The previous
+        // wave's cache-hit branch wrongly called adjustSplitCounts(-1) (and
+        // +1 on revert) with no mailbox/account guard, so a late revert
+        // could corrupt another mailbox's counts.
+        let start = APP_JS
+            .find("async function loadEmailDetail")
+            .expect("loadEmailDetail must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("loadEmailDetail must close");
+        let block = &rest[..end];
+        assert!(
+            !block.contains("adjustSplitCounts"),
+            "loadEmailDetail must never adjust split-tab counts on mark-read"
+        );
+    }
+
+    #[test]
+    fn app_js_network_open_marks_email_read_locally() {
+        // roborev 303, fix 2: get_email (src/routes.rs) fetches the email,
+        // then marks it read as a side effect — the JSON it returns still
+        // reflects the pre-mark isUnread state. Without a local flip,
+        // emailCache and the list row are left stale, so a later cache-hit
+        // reopen of loadEmailDetail sees isUnread=true and misfires the
+        // mark-read POST it issues from the cache-hit branch above. Mirrors
+        // mobile app.js's network path (renderScreenDetail).
+        let start = APP_JS
+            .find("async function loadEmailDetail")
+            .expect("loadEmailDetail must exist");
+        let rest = &APP_JS[start..];
+        let fetch_pos = rest
+            .find("const email = await api('GET', `/emails/${emailId}`);")
+            .expect("loadEmailDetail's network path must fetch the email");
+        let after_fetch = &rest[fetch_pos..];
+        let end = after_fetch
+            .find("} catch (err)")
+            .expect("loadEmailDetail's network path must have a catch block");
+        let block = &after_fetch[..end];
+        assert!(
+            block.contains("email.isUnread = false"),
+            "loadEmailDetail's network path must flip isUnread on the cached email object"
+        );
+        assert!(
+            block.contains("listItem.isUnread = false"),
+            "loadEmailDetail's network path must flip isUnread on the matching list row"
+        );
+    }
+
+    #[test]
     fn mobile_app_js_signature_prefilled_via_clear_compose_fields() {
         // Mirrors app_js_signature_prefilled_via_clear_compose: mobile's
         // startCompose/startReply/startForward all call clearComposeFields
@@ -4594,6 +4648,29 @@ white   = '#fdf6e3'
         assert!(
             block.contains("setComposeSending(false)"),
             "mobile sendComposedEmail must clear the sending lock when the send settles"
+        );
+
+        // roborev 303, fix 4: the FIRST cancelAutosave() (checked above) only
+        // closes the window before the await on saveInFlight starts. That
+        // await can itself run >3s (a save already in flight), and
+        // state.sending stays false until setComposeSending(true) — so a
+        // keystroke during the await can arm a fresh debounce that
+        // runAutosave's own `state.sending` guard wouldn't have caught. A
+        // SECOND cancelAutosave() must run after the await settles and
+        // before the sending lock is set, or that re-armed save can still
+        // land after deleteTrackedDraft.
+        let await_pos = block
+            .find("await saveInFlight.catch(() => {});")
+            .expect("mobile sendComposedEmail must await the in-flight save before proceeding");
+        let after_await = &block[await_pos..];
+        let sending_true_pos = after_await
+            .find("setComposeSending(true)")
+            .expect("mobile sendComposedEmail must set the sending lock");
+        let between = &after_await[..sending_true_pos];
+        assert!(
+            between.contains("cancelAutosave()"),
+            "mobile sendComposedEmail must cancel the autosave debounce AGAIN after \
+             awaiting saveInFlight, before setComposeSending(true)"
         );
     }
 

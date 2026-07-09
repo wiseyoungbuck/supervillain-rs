@@ -1351,20 +1351,21 @@ async function loadEmailDetail(emailId) {
         // now read; unlike the network-fetch path below (whose GET
         // auto-marks read server-side), we have to ask explicitly.
         // Optimistic, matching toggleUnread: flip the cached email and its
-        // list row immediately, and keep the split-tab counts in sync, all
-        // without blocking the render above; revert everything alongside
-        // showStatus on failure.
+        // list row immediately, without blocking the render above; revert
+        // everything alongside showStatus on failure. Split-tab counts are
+        // presence counts (compute_split_counts counts every matching email
+        // regardless of read state) — only archive/trash/removal changes
+        // membership, so mark-read must never adjust them here, same as
+        // toggleUnread never does (roborev 303, fix 1).
         const email = state.currentEmail;
         const listItem = state.emails.find(e => e.id === emailId);
         if (email.isUnread) {
             email.isUnread = false;
             if (listItem) listItem.isUnread = false;
-            adjustSplitCounts(-1);
             renderEmailList();
             api('POST', `/emails/${emailId}/mark-read`).catch(err => {
                 email.isUnread = true;
                 if (listItem) listItem.isUnread = true;
-                adjustSplitCounts(+1);
                 renderEmailList();
                 showStatus('Failed to mark read: ' + err.message, 'error');
             });
@@ -1386,6 +1387,16 @@ async function loadEmailDetail(emailId) {
     try {
         const email = await api('GET', `/emails/${emailId}`);
         emailCache[cacheKey(emailId)] = email;
+        // The GET above auto-marks the email read server-side, but the
+        // response body reflects the pre-mark state — the server fetches
+        // the email, then marks it read as a side effect, without mutating
+        // the object it already returned. Mirror the flip locally on both
+        // the cached object and the matching list row (mirrors mobile
+        // renderScreenDetail's network path), or a later cache-hit reopen
+        // sees a stale isUnread=true and misfires the mark-read POST above
+        // (roborev 303, fix 2).
+        email.isUnread = false;
+        if (listItem) listItem.isUnread = false;
         // Only render if we're still looking at this email (user may have navigated away)
         if (state.currentEmail?.id === emailId) {
             state.currentEmail = email;

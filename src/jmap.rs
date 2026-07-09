@@ -1405,11 +1405,25 @@ fn draft_verify_request(account_id: &str, draft_id: &str) -> Vec<serde_json::Val
 /// handling, which already treats "already gone" as idempotent success
 /// (e.g. discarding a draft the send flow already deleted). Pure so the
 /// decision logic is unit-testable without a network round-trip.
+///
+/// Fails closed on a malformed/error response (roborev 303, fix 3): a
+/// method-level JMAP error (`["error", {...}, "0"]` — session invalidated,
+/// rate limited, etc.) has no `list` at all, which used to fall through to
+/// the "already gone" branch above and return `Ok(())` — an unverified
+/// permanent destroy. Requiring the response to actually be an `Email/get`
+/// result first means a lookup failure is treated as "can't confirm this is
+/// a draft" rather than "must be already gone".
 fn verify_is_draft_response(
     resp: &serde_json::Value,
     draft_id: &str,
     drafts_mailbox_id: &str,
 ) -> Result<(), Error> {
+    if resp["methodResponses"][0][0].as_str() != Some("Email/get") {
+        return Err(Error::Internal(format!(
+            "draft verify lookup for {draft_id} failed: unexpected response {}",
+            resp["methodResponses"][0]
+        )));
+    }
     let found = resp["methodResponses"][0][1]["list"]
         .as_array()
         .and_then(|list| list.iter().find(|e| e["id"].as_str() == Some(draft_id)));
@@ -2611,6 +2625,25 @@ END:VCALENDAR";
         // idempotent notFound handling, not a mismatch.
         let resp = email_get_list_response(vec![]);
         assert!(verify_is_draft_response(&resp, "already-gone", "mb-drafts").is_ok());
+    }
+
+    #[test]
+    fn verify_is_draft_response_fails_closed_on_error_response() {
+        // roborev 303, fix 3: a method-level JMAP error (session invalidated,
+        // rate limited, etc.) leaves methodResponses[0] shaped as
+        // ["error", {...}, "0"] rather than ["Email/get", {"list": [...]}, "0"].
+        // Before the fix, `["list"]` on the error's argument object came back
+        // null, `.as_array()` was None, `found` was None, and the function
+        // returned Ok(()) via the "already gone" branch — an unverified
+        // permanent destroy. It must now refuse instead of guessing.
+        let resp = serde_json::json!({
+            "methodResponses": [["error", {"type": "serverFail"}, "0"]]
+        });
+        let err = verify_is_draft_response(&resp, "draft-xyz", "mb-drafts").unwrap_err();
+        assert!(
+            matches!(err, Error::Internal(ref m) if m.contains("draft-xyz")),
+            "a malformed/error lookup response must fail closed with an error, not Ok(())"
+        );
     }
 
     #[test]

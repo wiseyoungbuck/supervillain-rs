@@ -1965,6 +1965,14 @@ async function sendComposedEmail() {
     // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
     // never rejects, but settle either way defensively.
     if (saveInFlight) await saveInFlight.catch(() => {});
+    // The in-flight save above can run >3s; a keystroke during that await
+    // fires the input handler's scheduleAutosave() and arms a fresh
+    // debounce, and the sending lock set further below isn't held yet, so
+    // runAutosave's own guard wouldn't have caught it. Cancel again here,
+    // synchronously ahead of that lock, so the re-armed timer never fires
+    // and chains a save that would land after deleteTrackedDraft below
+    // (roborev 303, fix 4).
+    cancelAutosave();
 
     // Captured up front, before the await below: backing out of compose
     // mid-send and immediately starting a NEW draft also lands back on

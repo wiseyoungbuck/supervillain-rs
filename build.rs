@@ -51,10 +51,13 @@ fn main() {
     // logs/HEAD is the per-worktree reflog: git appends to it on every
     // commit, checkout, and ref update made in this specific worktree, so
     // watching it too means a fresh commit here always gets a fresh build
-    // id. Emitted unconditionally — a rerun-if-changed for a path that
-    // doesn't exist yet (e.g. a fresh repo with reflogs disabled via
-    // core.logAllRefUpdates=false) is harmless, cargo just starts watching
-    // it once it appears, so there's nothing to guard against crashing.
+    // id. Emitted unconditionally even when logs/HEAD doesn't exist yet
+    // (e.g. a fresh repo, or reflogs disabled via core.logAllRefUpdates=false)
+    // — that's not a harmless no-op: cargo treats a missing rerun-if-changed
+    // path as permanently dirty, so this build script re-runs on every build
+    // until the file appears. Accepted trade-off, not a bug — this build
+    // script and the env it emits are cheap/unchanged when nothing actually
+    // moved, so the extra reruns aren't worth guarding against.
     println!(
         "cargo:rerun-if-changed={}",
         git_dir.join("logs").join("HEAD").display()
