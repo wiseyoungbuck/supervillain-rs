@@ -111,10 +111,19 @@ pub async fn get_emails(
     }
 }
 
-/// Chunk size for [`get_emails_chunked`]. ~25 metadata fetches ≈ 2 s on a
-/// rate-limited Gmail account (5 concurrent × 80 ms spacing), which bounds
-/// how long any one read guard is held.
+/// Chunk size for [`get_emails_chunked`] on providers whose `get_emails`
+/// fans out one request per id (Gmail, Outlook). ~25 metadata fetches ≈ 2 s
+/// on a rate-limited Gmail account (5 concurrent × 80 ms spacing), which
+/// bounds how long any one read guard is held.
 pub const GET_EMAILS_CHUNK: usize = 25;
+
+/// Chunk size for JMAP (Fastmail), whose `get_emails` batches the whole id
+/// slice into ONE `Email/get` round trip. A per-id-tuned chunk of 25 would
+/// multiply its request count (6 calls for a 150-id list, 60 for a 1500-id
+/// split-count sample) for no guard-hold benefit — one JMAP call already
+/// holds the guard for just a single round trip (roborev 307 #2). 500
+/// matches the pre-chunking split-counts batch size.
+pub const JMAP_GET_EMAILS_CHUNK: usize = 500;
 
 /// Like [`get_emails`], but re-acquires the session read guard per chunk of
 /// ids instead of holding one guard across the whole fan-out.
@@ -133,8 +142,17 @@ pub async fn get_emails_chunked(
     properties_override: Option<&[&str]>,
     chunk_size: usize,
 ) -> Result<Vec<Email>, Error> {
+    // The caller's chunk_size is tuned for per-id fan-out providers; see
+    // JMAP_GET_EMAILS_CHUNK for why Fastmail overrides it.
+    let chunk_size = {
+        let session = session_lock.read().await;
+        match &*session {
+            ProviderSession::Fastmail(_) => JMAP_GET_EMAILS_CHUNK,
+            _ => chunk_size.max(1),
+        }
+    };
     let mut out = Vec::with_capacity(ids.len());
-    for chunk in ids.chunks(chunk_size.max(1)) {
+    for chunk in ids.chunks(chunk_size) {
         let session = session_lock.read().await;
         out.extend(get_emails(&session, chunk, fetch_body, properties_override).await?);
     }

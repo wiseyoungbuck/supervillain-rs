@@ -1059,11 +1059,16 @@ const STALE_REVALIDATE_MS = 5000;
 // poll is a sub-ms local cache read, so the bound is generous.
 const STALE_REVALIDATE_MAX = 96; // ≈8 minutes
 let staleRevalidateTimer = null;
-let staleRevalidateAttempts = 0;
+// Poll budget per list context (splitCacheKey()), cleared when that context
+// comes back fresh — a single global counter would let a few stale
+// mailboxes browsed after a restart drain the budget for the rest
+// (roborev 307 #4).
+const staleRevalidateAttempts = new Map();
 
 function scheduleStaleRevalidate(context) {
-    if (staleRevalidateAttempts >= STALE_REVALIDATE_MAX) return;
-    staleRevalidateAttempts++;
+    const used = staleRevalidateAttempts.get(context) || 0;
+    if (used >= STALE_REVALIDATE_MAX) return;
+    staleRevalidateAttempts.set(context, used + 1);
     clearTimeout(staleRevalidateTimer);
     staleRevalidateTimer = setTimeout(() => {
         // Only refetch if the user is still looking at the same list.
@@ -1095,10 +1100,17 @@ async function loadEmails() {
     // arrives. Only show the "Loading" placeholder on a true cold miss
     // (no cached entry and no in-memory emails).
     if (splitListCache[context]) {
-        state.emails = [...splitListCache[context]];
-        state.selectedIndex = 0;
-        rebuildThreadGroups();
-        renderEmailList();
+        // Skip the eager repaint when the cached payload is exactly what's
+        // already on screen. During stale-snapshot revalidation every poll
+        // tick re-enters loadEmails, and this branch used to re-render —
+        // resetting the selection to row 0 — before the fetch even started,
+        // defeating the unchanged-payload skip below (roborev 307 #1).
+        if (!emailListsEqual(state.emails, splitListCache[context])) {
+            state.emails = [...splitListCache[context]];
+            state.selectedIndex = 0;
+            rebuildThreadGroups();
+            renderEmailList();
+        }
     } else if (state.emails.length === 0) {
         els.emailList.innerHTML = '<div class="loading">Loading</div>';
     }
@@ -1129,7 +1141,7 @@ async function loadEmails() {
         if (headers.get('x-supervillain-stale') === '1') {
             scheduleStaleRevalidate(context);
         } else {
-            staleRevalidateAttempts = 0;
+            staleRevalidateAttempts.delete(context);
         }
     } catch (err) {
         if (err.name !== 'AbortError') {

@@ -678,17 +678,10 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
         elapsed_ms = started.elapsed().as_millis() as u64,
         "prefetch: account warmed"
     );
-
-    // Persist after every account pass (not just the full cycle) so a kill
-    // mid-cycle — the launcher stops the server with fuser -k — still keeps
-    // whatever was freshly warmed. See the "Disk persistence" section.
-    if let Err(e) = state
-        .prefetch
-        .save_to_disk(&state.prefetch_cache_path)
-        .await
-    {
-        tracing::warn!(account = %account_id, "prefetch: snapshot save failed: {e}");
-    }
+    // Snapshot persistence is scheduled by spawn_warmer (first + last
+    // account of each pass), not here — saving the full multi-account
+    // snapshot after every account rewrote tens of MB of mostly-unchanged
+    // JSON several times per cycle (roborev 307 #5).
 }
 
 /// Top-N latest bodies to prefetch per mailbox per warm cycle. Sized to match
@@ -1051,10 +1044,23 @@ pub fn spawn_warmer(
 ) -> tokio::task::JoinHandle<()> {
     let state_for_list = state.clone();
     let state_for_warm = state.clone();
+    // Pass-position bookkeeping for snapshot saves. The full multi-account
+    // snapshot is saved twice per pass: after the FIRST account (the
+    // default — its freshly-warmed inbox is what a mid-cycle kill must not
+    // lose; the launcher stops the server with a plain kill) and after the
+    // LAST (the complete pass). warm_loop drives accounts sequentially, so
+    // the counters never interleave.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pass_total = std::sync::Arc::new(AtomicUsize::new(0));
+    let pass_done = std::sync::Arc::new(AtomicUsize::new(0));
+    let total_for_list = pass_total.clone();
+    let done_for_list = pass_done.clone();
     tokio::spawn(async move {
         warm_loop(
             move || {
                 let s = state_for_list.clone();
+                let total = total_for_list.clone();
+                let done = done_for_list.clone();
                 async move {
                     let reg = s.accounts.read().await;
                     let default = reg.default_account.clone();
@@ -1065,14 +1071,27 @@ pub fn spawn_warmer(
                     // HashMap iteration order would otherwise randomize
                     // which account gets the first (and fastest) slot.
                     ids.sort_by_key(|id| *id != default);
+                    total.store(ids.len(), Ordering::SeqCst);
+                    done.store(0, Ordering::SeqCst);
                     ids
                 }
             },
             interval,
             move |account| {
                 let s = state_for_warm.clone();
+                let pass_total = pass_total.clone();
+                let pass_done = pass_done.clone();
                 async move {
-                    prefetch_account(s, &account).await;
+                    prefetch_account(s.clone(), &account).await;
+                    let done = pass_done.fetch_add(1, Ordering::SeqCst) + 1;
+                    if (done == 1 || done == pass_total.load(Ordering::SeqCst))
+                        && let Err(e) = s.prefetch.save_to_disk(&s.prefetch_cache_path).await
+                    {
+                        tracing::warn!(
+                            account = %account,
+                            "prefetch: snapshot save failed: {e}"
+                        );
+                    }
                 }
             },
         )

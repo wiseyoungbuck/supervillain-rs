@@ -4280,9 +4280,11 @@ mod tests {
         let end = rest.find("\n}").expect("loadEmails must close");
         let block = &rest[..end];
         assert!(
-            block.contains("emailListsEqual"),
-            "loadEmails must skip re-rendering an unchanged payload during the \
-             stale re-poll loop"
+            block.matches("emailListsEqual").count() >= 2,
+            "loadEmails must skip BOTH renders of an unchanged payload during \
+             the stale re-poll loop — the eager cache paint AND the post-fetch \
+             render; either alone resets the selection to row 0 every poll \
+             tick (roborev 307 #1)"
         );
     }
 
