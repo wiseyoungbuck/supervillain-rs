@@ -82,6 +82,12 @@ impl Spacer {
 /// interactive shapes we have (an email open is one `messages.get`, an RSVP
 /// or unsubscribe is one or two) while staying small enough that a bulk
 /// user action can't turn the lane into a second unbounded pool.
+///
+/// The lane is additive: peak in-flight requests can briefly reach
+/// `concurrency + PRIORITY_PERMITS` (Gmail 5 → 7). The shared spacer keeps
+/// the request *rate* unchanged; only providers that throttle on raw
+/// concurrent connections would notice, and both Gmail and Graph throttle
+/// on rate/quota.
 const PRIORITY_PERMITS: usize = 2;
 
 pub struct RateLimiter {
@@ -547,6 +553,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn priority_lane_bypasses_saturated_main_pool() {
+        // A 429-then-200 endpoint: the priority call must survive one
+        // retry without falling back to the main pool.
+        let hits = std::sync::Arc::new(AtomicU32::new(0));
+        let hits_for_handler = hits.clone();
+        let base = spawn_server(move || {
+            Router::new().route(
+                "/flaky",
+                get(move || {
+                    let hits = hits_for_handler.clone();
+                    async move {
+                        if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "0")],
+                                "slow down",
+                            )
+                                .into_response()
+                        } else {
+                            "ok".into_response()
+                        }
+                    }
+                }),
+            )
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let lim = RateLimiter::new("t", 3, Duration::from_millis(1), 3);
+
+        // Saturate the main pool the way a warm pass does: every permit
+        // held, so a normal `execute` queues indefinitely.
+        let _held = lim.sem.acquire_many(3).await.unwrap();
+
+        // Normal lane: must still be stuck behind the held permits.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            lim.execute("blocked", || async {
+                client.get(format!("{base}/flaky")).send().await
+            }),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a non-priority call must queue behind the saturated main pool"
+        );
+
+        // Priority lane: completes despite the saturated main pool, and
+        // its 429 retry re-acquires the priority semaphore (a fallback to
+        // the main pool would hang here and trip the timeout).
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            lim.execute_prioritized(true, "priority", || async {
+                client.get(format!("{base}/flaky")).send().await
+            }),
+        )
+        .await
+        .expect("priority call must not queue behind the main pool")
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "the 429 must have been retried on the priority lane"
+        );
     }
 
     #[tokio::test]

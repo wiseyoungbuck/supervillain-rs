@@ -750,8 +750,9 @@ async fn store_warmed_list(
 
 /// Warm the inbox-role list to completion first, then fan out the remaining
 /// mailboxes (and the inbox's split-counts) in parallel. The provider's
-/// `RateLimiter` already enforces concurrency caps (5 concurrent × 80 ms
-/// spacing on Gmail), so the fan-out doesn't need its own throttle — but
+/// `RateLimiter` already throttles the fan-out (main pool: 5 concurrent ×
+/// 80 ms spacing on Gmail; interactive requests ride a small reserved lane
+/// on top — see `RateLimiter`), so it doesn't need its own throttle — but
 /// the limiter drains FIFO, which is exactly why the inbox goes first: on a
 /// cold start the user is staring at the inbox's disk-restored (stale)
 /// snapshot, and its fresh list is the single most urgent write. Mixed into
@@ -782,9 +783,12 @@ async fn warm_all_mailboxes(
     // inbox mail is what the user opens first on a cold start, and the
     // body phase used to run dead last — after every label list and the
     // split-count sample — leaving exactly those bodies cold for minutes.
+    // Taking the Vec (instead of remembering an offset into it) keeps
+    // phase 2 structurally unable to double-warm these entries — it only
+    // ever sees what phase 1b appends (roborev 312 #5).
+    let inbox_warmed = std::mem::take(&mut warmed_ids);
     let mut total_bodies = 0usize;
-    let inbox_list_count = warmed_ids.len();
-    for (mailbox_id, ids) in &warmed_ids {
+    for (mailbox_id, ids) in &inbox_warmed {
         let prefix: Vec<String> = ids
             .iter()
             .take(BODY_PREFETCH_PER_MAILBOX)
@@ -868,9 +872,10 @@ async fn warm_all_mailboxes(
     }
 
     // ---- Phase 2: top-N body fan-out across the remaining mailboxes ----
-    // (the inbox's bodies were already warmed in phase 1a — skip them)
+    // (warmed_ids holds only phase 1b's entries — the inbox's bodies were
+    // taken and warmed in phase 1a)
     let mut body_set = tokio::task::JoinSet::new();
-    for (mailbox_id, ids) in warmed_ids.into_iter().skip(inbox_list_count) {
+    for (mailbox_id, ids) in warmed_ids {
         let prefix: Vec<String> = ids.into_iter().take(BODY_PREFETCH_PER_MAILBOX).collect();
         if prefix.is_empty() {
             continue;

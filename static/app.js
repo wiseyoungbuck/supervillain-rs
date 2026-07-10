@@ -84,6 +84,11 @@ const scrollPositions = {};
 
 // Rolling email cache
 const CACHE_LIMIT = 150;
+
+// One-shot guard consumed by the window focus listener: set when the
+// email-iframe focus-bounce returns focus to this window, so that synthetic
+// focus event doesn't re-fetch the theme on every click into an email body.
+let suppressFocusThemeRefresh = false;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
 
@@ -268,7 +273,14 @@ function init() {
     window.addEventListener('blur', () => {
         setTimeout(() => {
             const el = document.activeElement;
-            if (el?.classList?.contains('email-iframe')) el.blur();
+            if (el?.classList?.contains('email-iframe')) {
+                // Bouncing focus back fires a window focus event; flag it
+                // so the theme-refresh listener above ignores the synthetic
+                // wake (a real alt-tab-back still refreshes — the flag is
+                // consumed by the very next focus event).
+                suppressFocusThemeRefresh = true;
+                el.blur();
+            }
         }, 0);
     });
     els.commandInput.addEventListener('input', handleCommandInput);
@@ -446,8 +458,18 @@ function init() {
             }
         });
     });
-    // Reload theme on window focus (pick up theme changes after alt-tabbing back)
-    window.addEventListener('focus', loadTheme);
+    // Reload theme on window focus (pick up theme changes after alt-tabbing
+    // back). The iframe focus-bounce below hands focus back to this window,
+    // which fires a synthetic focus event — without the suppress flag every
+    // click into an email body would re-fetch and re-apply the theme
+    // (roborev 312 #2).
+    window.addEventListener('focus', () => {
+        if (suppressFocusThemeRefresh) {
+            suppressFocusThemeRefresh = false;
+            return;
+        }
+        loadTheme();
+    });
 
     // Timezone listeners
     els.tzAcceptSystem.addEventListener('click', acceptSystemTimezone);
@@ -3012,17 +3034,22 @@ function handleKeyDown(e) {
         return;
     }
 
-    // Compose normal-mode: 'a' opens file picker instead of reply-all
-    if (state.view === 'compose' && state.mode === 'normal' && e.key === 'a') {
+    // Compose normal-mode single-letter bindings. Bare keypresses only —
+    // Ctrl/Cmd/Alt chords (select-all, italics, devtools) must fall through
+    // to the browser, not be swallowed as vim commands (roborev 312 #3).
+    const bareKey = !e.ctrlKey && !e.metaKey && !e.altKey;
+
+    // 'a' opens the file picker instead of reply-all
+    if (state.view === 'compose' && state.mode === 'normal' && bareKey && e.key === 'a') {
         els.composeFileInput.click();
         e.preventDefault();
         return;
     }
 
-    // Compose normal-mode: 'i' re-enters insert in the message body — the
-    // vim counterpart to Escape. Focusing triggers the field's focus
-    // listener, which flips the mode (and the indicator) to insert.
-    if (state.view === 'compose' && state.mode === 'normal' && e.key === 'i') {
+    // 'i' re-enters insert in the message body — the vim counterpart to
+    // Escape. Focusing triggers the field's focus listener, which flips
+    // the mode (and the indicator) to insert.
+    if (state.view === 'compose' && state.mode === 'normal' && bareKey && e.key === 'i') {
         els.composeBody.focus();
         e.preventDefault();
         return;
