@@ -850,6 +850,7 @@ function selectAccount(account) {
     // (or fails), the previous account's emails must not stay on screen
     // looking like this account's inbox.
     els.emailList.innerHTML = '<div class="loading">Loading</div>';
+    lastRenderedContext = null;
     renderAccounts();
     loadMailboxes();
     loadIdentities();
@@ -1059,10 +1060,14 @@ const STALE_REVALIDATE_MS = 5000;
 // poll is a sub-ms local cache read, so the bound is generous.
 const STALE_REVALIDATE_MAX = 96; // ≈8 minutes
 let staleRevalidateTimer = null;
-// Poll budget per list context (splitCacheKey()), cleared when that context
-// comes back fresh — a single global counter would let a few stale
-// mailboxes browsed after a restart drain the budget for the rest
-// (roborev 307 #4).
+// Poll budget per list context (splitCacheKey()) — a single global counter
+// would let a few stale mailboxes browsed after a restart drain the budget
+// for the rest (roborev 307 #4). The whole map is cleared whenever ANY
+// context comes back fresh: a stale→fresh transition means the warmer is
+// making progress (or the server restarted and re-staled everything), so
+// exhausted contexts get re-armed instead of being locked out for the
+// page's lifetime — and the map can't accumulate an entry per search
+// string browsed (roborev 308 #2).
 const staleRevalidateAttempts = new Map();
 
 function scheduleStaleRevalidate(context) {
@@ -1084,6 +1089,14 @@ function emailListsEqual(a, b) {
     return a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
 }
 
+// Which context's list the pane currently shows (null while a Loading
+// placeholder is up). Both render-skips in loadEmails require this to match
+// in addition to payload equality — equality alone is a false proxy for
+// "already on screen": deep-equal payloads can belong to different contexts
+// (two empty mailboxes; a split holding every message vs. 'all'), and
+// skipping then would strand whatever the pane last showed (roborev 308 #1).
+let lastRenderedContext = null;
+
 async function loadEmails() {
     if (!state.currentMailbox) return;
 
@@ -1100,12 +1113,14 @@ async function loadEmails() {
     // arrives. Only show the "Loading" placeholder on a true cold miss
     // (no cached entry and no in-memory emails).
     if (splitListCache[context]) {
-        // Skip the eager repaint when the cached payload is exactly what's
-        // already on screen. During stale-snapshot revalidation every poll
-        // tick re-enters loadEmails, and this branch used to re-render —
-        // resetting the selection to row 0 — before the fetch even started,
-        // defeating the unchanged-payload skip below (roborev 307 #1).
-        if (!emailListsEqual(state.emails, splitListCache[context])) {
+        // Skip the eager repaint only when the pane already shows exactly
+        // this context's list with exactly this payload. During stale-
+        // snapshot revalidation every poll tick re-enters loadEmails, and
+        // an unconditional repaint here reset the selection to row 0 before
+        // the fetch even started (roborev 307 #1). See lastRenderedContext
+        // for why payload equality alone isn't sufficient.
+        if (lastRenderedContext !== context
+            || !emailListsEqual(state.emails, splitListCache[context])) {
             state.emails = [...splitListCache[context]];
             state.selectedIndex = 0;
             rebuildThreadGroups();
@@ -1113,6 +1128,7 @@ async function loadEmails() {
         }
     } else if (state.emails.length === 0) {
         els.emailList.innerHTML = '<div class="loading">Loading</div>';
+        lastRenderedContext = null;
     }
 
     try {
@@ -1123,14 +1139,12 @@ async function loadEmails() {
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
-        // The unchanged-payload skip below is only safe when the DOM
-        // already shows this context's list (the cache-paint branch above
-        // ran). On a cold miss the list area shows the Loading placeholder,
-        // which must always be replaced — even by an identical-looking
-        // (e.g. empty) list carried over in state.emails.
-        const paintedFromCache = !!splitListCache[context];
         splitListCache[context] = [...emails];
-        if (!paintedFromCache || !emailListsEqual(state.emails, emails)) {
+        // Render unless the pane already shows this context's list with an
+        // identical payload. lastRenderedContext is null while a Loading
+        // placeholder is up, so a cold miss always renders — even an
+        // identical-looking (e.g. empty) list carried over in state.emails.
+        if (lastRenderedContext !== context || !emailListsEqual(state.emails, emails)) {
             state.emails = emails;
             state.selectedIndex = 0;
             rebuildThreadGroups();
@@ -1141,7 +1155,7 @@ async function loadEmails() {
         if (headers.get('x-supervillain-stale') === '1') {
             scheduleStaleRevalidate(context);
         } else {
-            staleRevalidateAttempts.delete(context);
+            staleRevalidateAttempts.clear();
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -1958,6 +1972,9 @@ function toggleThreadExpand(threadId) {
 }
 
 function renderEmailList() {
+    // Every render draws the CURRENT context's state.emails, so the pane
+    // now shows that context — including the empty state below.
+    lastRenderedContext = splitCacheKey();
     const rows = visibleRows();
     if (!rows.length) {
         els.emailList.innerHTML = '<div class="empty-state">No emails</div>';

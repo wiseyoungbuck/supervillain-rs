@@ -4286,6 +4286,13 @@ mod tests {
              render; either alone resets the selection to row 0 every poll \
              tick (roborev 307 #1)"
         );
+        assert!(
+            block.matches("lastRenderedContext !== context").count() >= 2,
+            "both render-skips must also require the pane to actually show \
+             this context — payload equality alone strands a Loading \
+             placeholder when deep-equal payloads span contexts \
+             (roborev 308 #1)"
+        );
     }
 
     #[test]
