@@ -4293,6 +4293,22 @@ mod tests {
              placeholder when deep-equal payloads span contexts \
              (roborev 308 #1)"
         );
+        // The producer side of the same invariant (roborev 309): without
+        // the stamp both skips are permanently false and the row-0
+        // selection reset returns; without the placeholder nulls the
+        // stranded-placeholder bug returns. Both would leave the consumer
+        // assertions above passing.
+        assert!(
+            APP_JS.contains("lastRenderedContext = splitCacheKey()"),
+            "renderEmailList must stamp the context it draws"
+        );
+        assert!(
+            // 3 = the `let` declaration plus the two placeholder writers
+            // (selectAccount and the cold-miss branch).
+            APP_JS.matches("lastRenderedContext = null").count() >= 3,
+            "every Loading-placeholder write (selectAccount and the \
+             cold-miss branch) must null the rendered-context stamp"
+        );
     }
 
     #[test]
