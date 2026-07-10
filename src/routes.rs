@@ -4297,17 +4297,32 @@ mod tests {
         // the stamp both skips are permanently false and the row-0
         // selection reset returns; without the placeholder nulls the
         // stranded-placeholder bug returns. Both would leave the consumer
-        // assertions above passing.
+        // assertions above passing. Each assertion is scoped to the
+        // function that must contain it (roborev 310) — a stamp or null
+        // drifting elsewhere no longer means "the pane shows this context".
         assert!(
-            APP_JS.contains("lastRenderedContext = splitCacheKey()"),
+            block.contains("lastRenderedContext = null"),
+            "loadEmails' cold-miss Loading placeholder must null the \
+             rendered-context stamp"
+        );
+        let start = APP_JS
+            .find("function renderEmailList(")
+            .expect("renderEmailList must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("renderEmailList must close");
+        assert!(
+            rest[..end].contains("lastRenderedContext = splitCacheKey()"),
             "renderEmailList must stamp the context it draws"
         );
+        let start = APP_JS
+            .find("function selectAccount(")
+            .expect("selectAccount must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("selectAccount must close");
         assert!(
-            // 3 = the `let` declaration plus the two placeholder writers
-            // (selectAccount and the cold-miss branch).
-            APP_JS.matches("lastRenderedContext = null").count() >= 3,
-            "every Loading-placeholder write (selectAccount and the \
-             cold-miss branch) must null the rendered-context stamp"
+            rest[..end].contains("lastRenderedContext = null"),
+            "selectAccount's Loading placeholder must null the \
+             rendered-context stamp"
         );
     }
 
