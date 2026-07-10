@@ -4249,6 +4249,22 @@ mod tests {
     // Stale-snapshot revalidation + send feedback (cold-open / send-stall fix)
     // =========================================================================
 
+    /// Slice a JS function's body out of a bundle: from its declaration to
+    /// the first column-0 closing brace. A column-0 `}` inside a template
+    /// literal would silently shrink the slice — true of every copy of this
+    /// idiom in these tests; the helper centralizes that assumption so it
+    /// can rot in exactly one place (roborev 311).
+    fn js_fn_body<'a>(src: &'a str, decl: &str) -> &'a str {
+        let start = src
+            .find(decl)
+            .unwrap_or_else(|| panic!("{decl} must exist"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("{decl} must close"));
+        &rest[..end]
+    }
+
     #[test]
     fn load_emails_repolls_disk_stale_lists() {
         // Contract: list_emails tags a disk-restored (stale) cached list
@@ -4273,12 +4289,7 @@ mod tests {
         );
         // The poll must not fight the user: identical payloads (warmer not
         // done yet) skip the re-render that would reset the selection.
-        let start = APP_JS
-            .find("async function loadEmails(")
-            .expect("loadEmails must exist");
-        let rest = &APP_JS[start..];
-        let end = rest.find("\n}").expect("loadEmails must close");
-        let block = &rest[..end];
+        let block = js_fn_body(APP_JS, "async function loadEmails(");
         assert!(
             block.matches("emailListsEqual").count() >= 2,
             "loadEmails must skip BOTH renders of an unchanged payload during \
@@ -4305,22 +4316,13 @@ mod tests {
             "loadEmails' cold-miss Loading placeholder must null the \
              rendered-context stamp"
         );
-        let start = APP_JS
-            .find("function renderEmailList(")
-            .expect("renderEmailList must exist");
-        let rest = &APP_JS[start..];
-        let end = rest.find("\n}").expect("renderEmailList must close");
         assert!(
-            rest[..end].contains("lastRenderedContext = splitCacheKey()"),
+            js_fn_body(APP_JS, "function renderEmailList(")
+                .contains("lastRenderedContext = splitCacheKey()"),
             "renderEmailList must stamp the context it draws"
         );
-        let start = APP_JS
-            .find("function selectAccount(")
-            .expect("selectAccount must exist");
-        let rest = &APP_JS[start..];
-        let end = rest.find("\n}").expect("selectAccount must close");
         assert!(
-            rest[..end].contains("lastRenderedContext = null"),
+            js_fn_body(APP_JS, "function selectAccount(").contains("lastRenderedContext = null"),
             "selectAccount's Loading placeholder must null the \
              rendered-context stamp"
         );
