@@ -526,7 +526,7 @@ async fn list_emails(
         && let Some(config) = split_config.as_ref()
         && !config.splits.iter().any(|s| s.id == split_id)
     {
-        return Ok(Json(Vec::<serde_json::Value>::new()));
+        return Ok((HeaderMap::new(), Json(Vec::<serde_json::Value>::new())));
     }
 
     let fetch_limit = if params.split_id.is_some() {
@@ -539,7 +539,11 @@ async fn list_emails(
     // including why non-default sorts are excluded (roborev 291).
     let is_cacheable = list_is_cacheable(&params, offset, sort);
 
-    let mut emails = if is_cacheable {
+    // Both live paths below release the session read guard between the id
+    // query and each get_emails chunk (provider::get_emails_chunked) so a
+    // queued writer — most visibly a send — isn't stuck behind the whole
+    // fan-out.
+    let (mut emails, stale) = if is_cacheable {
         // `is_cacheable` guarantees `sort == EmailSort::default()` here, so
         // this key's `sort` is always `DateDesc` — the field still joins
         // the key (rather than being dropped) so the cache stays correct
@@ -554,32 +558,51 @@ async fn list_emails(
             .prefetch
             .inbox_list_or_fetch(&account_id, key, || async {
                 let session_lock = resolve_session(&state, Some(&account_id)).await?;
-                let session = session_lock.read().await;
-                let email_ids = provider::query_emails(
-                    &session,
-                    params.mailbox_id.as_deref(),
-                    fetch_limit,
-                    offset,
-                    query_ref,
-                    sort,
+                let email_ids = {
+                    let session = session_lock.read().await;
+                    provider::query_emails(
+                        &session,
+                        params.mailbox_id.as_deref(),
+                        fetch_limit,
+                        offset,
+                        query_ref,
+                        sort,
+                    )
+                    .await?
+                };
+                provider::get_emails_chunked(
+                    &session_lock,
+                    &email_ids,
+                    false,
+                    None,
+                    provider::GET_EMAILS_CHUNK,
                 )
-                .await?;
-                provider::get_emails(&session, &email_ids, false, None).await
+                .await
             })
             .await?
     } else {
         let session_lock = resolve_session(&state, Some(&account_id)).await?;
-        let session = session_lock.read().await;
-        let email_ids = provider::query_emails(
-            &session,
-            params.mailbox_id.as_deref(),
-            fetch_limit,
-            offset,
-            query_ref,
-            sort,
+        let email_ids = {
+            let session = session_lock.read().await;
+            provider::query_emails(
+                &session,
+                params.mailbox_id.as_deref(),
+                fetch_limit,
+                offset,
+                query_ref,
+                sort,
+            )
+            .await?
+        };
+        let live = provider::get_emails_chunked(
+            &session_lock,
+            &email_ids,
+            false,
+            None,
+            provider::GET_EMAILS_CHUNK,
         )
         .await?;
-        provider::get_emails(&session, &email_ids, false, None).await?
+        (live, false)
     };
 
     // Apply split filtering, scoped to this account's splits so "primary"
@@ -611,7 +634,18 @@ async fn list_emails(
         })
         .collect();
 
-    Ok(Json(response))
+    // A stale response is a disk-restored snapshot from the previous run,
+    // served for instant first paint. The header tells the frontend to keep
+    // re-polling (each poll is a cheap cache read) until the warmer has
+    // replaced the entry with live data — see loadEmails in app.js.
+    let mut headers = HeaderMap::new();
+    if stale {
+        headers.insert(
+            "x-supervillain-stale",
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    Ok((headers, Json(response)))
 }
 
 async fn get_email(
@@ -1414,27 +1448,36 @@ pub(crate) async fn compute_split_counts(
     query: Option<crate::types::ParsedQuery>,
 ) -> Result<HashMap<String, u32>, Error> {
     let session_lock = resolve_session(state, account).await?;
-    let session = session_lock.read().await;
 
     let fetch_limit = DEFAULT_INBOX_LIMIT * SPLIT_OVERFETCH_MULTIPLIER;
     // Split counts are order-independent (just counting matches), so the
     // default sort is fine here regardless of the user's list sort choice.
-    let email_ids = provider::query_emails(
-        &session,
-        Some(mailbox_id),
-        fetch_limit,
-        0,
-        query.as_ref(),
-        EmailSort::default(),
+    let email_ids = {
+        let session = session_lock.read().await;
+        provider::query_emails(
+            &session,
+            Some(mailbox_id),
+            fetch_limit,
+            0,
+            query.as_ref(),
+            EmailSort::default(),
+        )
+        .await?
+    };
+
+    // This is the single longest provider fan-out in the app (~1500 gets,
+    // minutes on a rate-limited Gmail account), so releasing the session
+    // guard between chunks matters most here: a send queued behind one
+    // monolithic guard used to stall until the whole sample finished.
+    let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
+    let all_emails = provider::get_emails_chunked(
+        &session_lock,
+        &email_ids,
+        false,
+        Some(minimal_props),
+        provider::GET_EMAILS_CHUNK,
     )
     .await?;
-
-    let minimal_props: &[&str] = &["id", "from", "to", "cc", "subject"];
-    let mut all_emails = Vec::new();
-    for batch in email_ids.chunks(500) {
-        let emails = provider::get_emails(&session, batch, false, Some(minimal_props)).await?;
-        all_emails.extend(emails);
-    }
 
     let mut counts = HashMap::new();
     for split in &config.splits {
@@ -2729,6 +2772,7 @@ mod tests {
             authorizing: accounts::AuthorizingSlot::default(),
             config_error_baseline: std::sync::RwLock::new(Vec::new()),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+            prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
         }
     }
 
@@ -4071,10 +4115,10 @@ mod tests {
         // email and must surface even after the user moved on (A6
         // re-review: failure-after-leave must surface).
         let start = MOBILE_APP_JS
-            .find("async function sendComposedEmail(")
-            .expect("sendComposedEmail must exist");
+            .find("async function doSendComposedEmail(")
+            .expect("doSendComposedEmail must exist");
         let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let end = rest.find("\n}").expect("doSendComposedEmail must close");
         let block = &rest[..end];
         assert!(
             block.contains("state.screen === Screen.COMPOSE"),
@@ -4172,10 +4216,10 @@ mod tests {
     #[test]
     fn mobile_app_js_blocks_send_during_upload() {
         let start = MOBILE_APP_JS
-            .find("async function sendComposedEmail(")
-            .expect("sendComposedEmail must exist");
+            .find("async function doSendComposedEmail(")
+            .expect("doSendComposedEmail must exist");
         let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let end = rest.find("\n}").expect("doSendComposedEmail must close");
         let block = &rest[..end];
         assert!(
             block.contains("status === 'uploading'"),
@@ -4186,10 +4230,10 @@ mod tests {
     #[test]
     fn mobile_app_js_send_includes_ready_attachments() {
         let start = MOBILE_APP_JS
-            .find("async function sendComposedEmail(")
-            .expect("sendComposedEmail must exist");
+            .find("async function doSendComposedEmail(")
+            .expect("doSendComposedEmail must exist");
         let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("sendComposedEmail must close");
+        let end = rest.find("\n}").expect("doSendComposedEmail must close");
         let block = &rest[..end];
         assert!(
             block.contains("blob_id") && block.contains("mime_type"),
@@ -4198,6 +4242,79 @@ mod tests {
         assert!(
             block.contains("undefined"),
             "attachments should be omitted (undefined) rather than sent as an empty array"
+        );
+    }
+
+    // =========================================================================
+    // Stale-snapshot revalidation + send feedback (cold-open / send-stall fix)
+    // =========================================================================
+
+    #[test]
+    fn load_emails_repolls_disk_stale_lists() {
+        // Contract: list_emails tags a disk-restored (stale) cached list
+        // with x-supervillain-stale: 1; loadEmails must read that header
+        // (via the withMeta api variant) and re-poll until the warmer has
+        // replaced the entry, instead of leaving yesterday's mail on screen.
+        assert!(
+            API_JS.contains("api.withMeta = request"),
+            "api.js must expose the withMeta variant that surfaces response headers"
+        );
+        assert!(
+            APP_JS.contains("x-supervillain-stale"),
+            "loadEmails must check the stale-snapshot response header"
+        );
+        assert!(
+            APP_JS.contains("function scheduleStaleRevalidate("),
+            "app.js must schedule bounded re-polls while the list is stale"
+        );
+        assert!(
+            APP_JS.contains("STALE_REVALIDATE_MAX"),
+            "the stale re-poll loop must be bounded"
+        );
+        // The poll must not fight the user: identical payloads (warmer not
+        // done yet) skip the re-render that would reset the selection.
+        let start = APP_JS
+            .find("async function loadEmails(")
+            .expect("loadEmails must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("loadEmails must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("emailListsEqual"),
+            "loadEmails must skip re-rendering an unchanged payload during the \
+             stale re-poll loop"
+        );
+    }
+
+    #[test]
+    fn send_gives_immediate_feedback_and_works_from_compose_normal_mode() {
+        // The user-visible half of the send-stall fix: feedback appears the
+        // moment Ctrl+Enter lands (before any await), and the chord works
+        // from compose normal mode too (Escape blurs the field; the send
+        // intent is unchanged).
+        let start = APP_JS
+            .find("async function sendEmail(")
+            .expect("sendEmail must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("sendEmail must close");
+        let wrapper = &rest[..end];
+        let status_pos = wrapper
+            .find("showStatus('Sending…')")
+            .expect("sendEmail must show Sending… feedback");
+        let await_pos = wrapper
+            .find("await doSendEmail()")
+            .expect("sendEmail must await the send body");
+        assert!(
+            status_pos < await_pos,
+            "the Sending… status must appear before the first await — a stalled \
+             send with no feedback reads as 'nothing happened'"
+        );
+        assert!(
+            APP_JS.contains(
+                "state.view === 'compose' && state.mode === 'normal' && \
+                 e.key === 'Enter' && (e.ctrlKey || e.metaKey)"
+            ),
+            "Ctrl+Enter must send from compose normal mode as well as insert mode"
         );
     }
 
@@ -4618,100 +4735,94 @@ white   = '#fdf6e3'
                 "{bundle} runAutosave must bail while a send is in flight"
             );
         }
-        // Desktop additionally must kill the pending debounce before its
-        // await and hold the sending lock across it (mobile already does via
-        // setComposeSending).
-        let start = APP_JS
-            .find("async function sendEmail(")
-            .expect("desktop sendEmail must exist");
-        let rest = &APP_JS[start..];
-        let end = rest.find("\n}").expect("sendEmail must close");
-        let block = &rest[..end];
-        assert!(
-            block.contains("cancelAutosave()"),
-            "desktop sendEmail must cancel the pending autosave debounce up front"
-        );
-        assert!(
-            block.contains("state.sending = true"),
-            "desktop sendEmail must set the sending lock runAutosave bails on"
-        );
-        assert!(
-            block.contains("state.sending = false"),
-            "desktop sendEmail must clear the sending lock when the send settles"
-        );
+        // Both bundles now split send into a wrapper (owns the sending lock)
+        // and a body (doSendEmail / doSendComposedEmail). The wrapper must
+        // take the lock BEFORE its first await: the old shape (lock set
+        // after the autosave settle) let two rapid Ctrl+Enters / taps both
+        // slip past a check-only guard during that settle and double-send.
+        for (js, bundle, wrapper_fn, body_await, lock_set, lock_clear) in [
+            (
+                APP_JS,
+                "desktop",
+                "async function sendEmail(",
+                "await doSendEmail()",
+                "state.sending = true",
+                "state.sending = false",
+            ),
+            (
+                MOBILE_APP_JS,
+                "mobile",
+                "async function sendComposedEmail(",
+                "await doSendComposedEmail()",
+                "setComposeSending(true)",
+                "setComposeSending(false)",
+            ),
+        ] {
+            let start = js
+                .find(wrapper_fn)
+                .unwrap_or_else(|| panic!("{bundle} send wrapper must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("send wrapper must close");
+            let wrapper = &rest[..end];
+            assert!(
+                wrapper.contains("if (state.sending) return"),
+                "{bundle} send wrapper must bail when a send is already in flight"
+            );
+            let lock_pos = wrapper
+                .find(lock_set)
+                .unwrap_or_else(|| panic!("{bundle} send wrapper must set the sending lock"));
+            let await_pos = wrapper
+                .find(body_await)
+                .unwrap_or_else(|| panic!("{bundle} send wrapper must await the send body"));
+            assert!(
+                lock_pos < await_pos,
+                "{bundle} send wrapper must take the sending lock BEFORE its first \
+                 await — after it, a second submit during the autosave settle \
+                 double-sends"
+            );
+            assert!(
+                wrapper.contains(lock_clear),
+                "{bundle} send wrapper must clear the sending lock when the send settles"
+            );
+        }
 
-        // Mobile additionally must kill the pending debounce before its await
-        // (roborev 302, fix 1) — a debounce firing mid-send while sendComposedEmail
-        // only awaits the previous saveInFlight would chain a fresh doAutosave that
-        // lands after deleteTrackedDraft, re-adopting a ghost draft of the sent
-        // mail. It already holds the sending lock across the send via
-        // setComposeSending.
-        let start = MOBILE_APP_JS
-            .find("async function sendComposedEmail(")
-            .expect("mobile sendComposedEmail must exist");
-        let rest = &MOBILE_APP_JS[start..];
-        let end = rest.find("\n}").expect("sendComposedEmail must close");
-        let block = &rest[..end];
-        assert!(
-            block.contains("cancelAutosave()"),
-            "mobile sendComposedEmail must cancel the pending autosave debounce up front"
-        );
-        assert!(
-            block.contains("setComposeSending(true)"),
-            "mobile sendComposedEmail must set the sending lock runAutosave bails on"
-        );
-        assert!(
-            block.contains("setComposeSending(false)"),
-            "mobile sendComposedEmail must clear the sending lock when the send settles"
-        );
-
-        // roborev 303, fix 4: the FIRST cancelAutosave() (checked above) only
-        // closes the window before the await on saveInFlight starts. That
-        // await can itself run >3s (a save already in flight), and
-        // state.sending stays false until setComposeSending(true) — so a
-        // keystroke during the await can arm a fresh debounce that
-        // runAutosave's own `state.sending` guard wouldn't have caught. A
-        // SECOND cancelAutosave() must run after the await settles and
-        // before the sending lock is set, or that re-armed save can still
-        // land after deleteTrackedDraft.
-        let await_pos = block
-            .find("await saveInFlight.catch(() => {});")
-            .expect("mobile sendComposedEmail must await the in-flight save before proceeding");
-        let after_await = &block[await_pos..];
-        let sending_true_pos = after_await
-            .find("setComposeSending(true)")
-            .expect("mobile sendComposedEmail must set the sending lock");
-        let between = &after_await[..sending_true_pos];
-        assert!(
-            between.contains("cancelAutosave()"),
-            "mobile sendComposedEmail must cancel the autosave debounce AGAIN after \
-             awaiting saveInFlight, before setComposeSending(true)"
-        );
-
-        // roborev 304: the identical re-arm window exists on desktop — the
-        // await on saveInFlight runs before `state.sending = true`, so a
-        // keystroke during it can arm a fresh debounce the sending-lock
-        // guard can't yet catch. Desktop sendEmail needs the same second
-        // cancelAutosave() between the await and the sending lock.
-        let start = APP_JS
-            .find("async function sendEmail(")
-            .expect("desktop sendEmail must exist");
-        let rest = &APP_JS[start..];
-        let end = rest.find("\n}").expect("sendEmail must close");
-        let block = &rest[..end];
-        let await_pos = block
-            .find("await saveInFlight.catch(() => {});")
-            .expect("desktop sendEmail must await the in-flight save before proceeding");
-        let after_await = &block[await_pos..];
-        let sending_true_pos = after_await
-            .find("state.sending = true")
-            .expect("desktop sendEmail must set the sending lock");
-        let between = &after_await[..sending_true_pos];
-        assert!(
-            between.contains("cancelAutosave()"),
-            "desktop sendEmail must cancel the autosave debounce AGAIN after \
-             awaiting saveInFlight, before state.sending = true"
-        );
+        // The bodies must kill the pending debounce up front (roborev 302,
+        // fix 1) — a debounce firing mid-send would chain a fresh doAutosave
+        // that lands after deleteTrackedDraft, re-adopting a ghost draft of
+        // the sent mail — and AGAIN after awaiting the in-flight save
+        // (roborev 303 fix 4 / 304): a keystroke during that await re-arms
+        // the debounce. The sending lock (now held from wrapper entry) makes
+        // runAutosave skip the re-armed save at fire time, but the second
+        // synchronous cancel stays as defense in depth.
+        for (js, bundle, body_fn) in [
+            (APP_JS, "desktop", "async function doSendEmail("),
+            (
+                MOBILE_APP_JS,
+                "mobile",
+                "async function doSendComposedEmail(",
+            ),
+        ] {
+            let start = js
+                .find(body_fn)
+                .unwrap_or_else(|| panic!("{bundle} send body must exist"));
+            let rest = &js[start..];
+            let end = rest.find("\n}").expect("send body must close");
+            let block = &rest[..end];
+            let await_pos = block
+                .find("await saveInFlight.catch(() => {});")
+                .unwrap_or_else(|| {
+                    panic!("{bundle} send body must await the in-flight save before proceeding")
+                });
+            assert!(
+                block[..await_pos].contains("cancelAutosave()"),
+                "{bundle} send body must cancel the pending autosave debounce up front"
+            );
+            assert!(
+                block[await_pos..].contains("cancelAutosave()"),
+                "{bundle} send body must cancel the autosave debounce AGAIN after \
+                 awaiting saveInFlight (re-arm window, roborev 303/304)"
+            );
+        }
     }
 
     // roborev 294 fix 4: two autosaves that would otherwise overlap must be
@@ -4758,8 +4869,12 @@ white   = '#fdf6e3'
     #[test]
     fn draft_send_awaits_in_flight_save_before_deleting_draft() {
         for (js, bundle, func) in [
-            (APP_JS, "desktop", "async function sendEmail("),
-            (MOBILE_APP_JS, "mobile", "async function sendComposedEmail("),
+            (APP_JS, "desktop", "async function doSendEmail("),
+            (
+                MOBILE_APP_JS,
+                "mobile",
+                "async function doSendComposedEmail(",
+            ),
         ] {
             let start = js
                 .find(func)

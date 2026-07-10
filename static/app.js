@@ -676,6 +676,12 @@ function api(method, path, body = null, signal = null) {
     return makeApi(state.currentAccount?.id)(method, path, body, signal);
 }
 
+// Like api(), but resolves to { data, headers } — for the one caller that
+// needs a response header (loadEmails' stale-snapshot detection).
+function apiWithMeta(method, path, body = null, signal = null) {
+    return makeApi(state.currentAccount?.id).withMeta(method, path, body, signal);
+}
+
 async function loadAccounts() {
     try {
         const data = await fetch('/api/accounts').then(r => r.json());
@@ -1039,6 +1045,40 @@ function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
     return url;
 }
 
+// Stale-snapshot revalidation. After a server restart the backend serves the
+// previous run's disk-restored list (instant paint) tagged with
+// x-supervillain-stale: 1, while its warmer fetches live data in the
+// background. Re-poll on a short timer — each poll is a cheap backend cache
+// read — until the tag clears. Bounded so a warmer stuck on provider rate
+// limits can't keep the poll alive forever.
+const STALE_REVALIDATE_MS = 5000;
+// The warmer replaces the DEFAULT account's inbox within ~20 s of boot
+// (inbox-first, default-account-first ordering), but a non-default
+// account's turn comes after every account before it finishes a full
+// pass — measured ~2.5 min with four accounts, worst case longer. Each
+// poll is a sub-ms local cache read, so the bound is generous.
+const STALE_REVALIDATE_MAX = 96; // ≈8 minutes
+let staleRevalidateTimer = null;
+let staleRevalidateAttempts = 0;
+
+function scheduleStaleRevalidate(context) {
+    if (staleRevalidateAttempts >= STALE_REVALIDATE_MAX) return;
+    staleRevalidateAttempts++;
+    clearTimeout(staleRevalidateTimer);
+    staleRevalidateTimer = setTimeout(() => {
+        // Only refetch if the user is still looking at the same list.
+        if (splitCacheKey() === context) loadEmails();
+    }, STALE_REVALIDATE_MS);
+}
+
+// Cheap deep-equality for the poll loop: identical payloads (warmer hasn't
+// replaced the entry yet) must not re-render — a re-render resets the
+// selection to the top row, which would visibly fight the user every poll.
+// Server JSON key order is stable, so stringify comparison is exact.
+function emailListsEqual(a, b) {
+    return a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
+}
+
 async function loadEmails() {
     if (!state.currentMailbox) return;
 
@@ -1065,17 +1105,32 @@ async function loadEmails() {
 
     try {
         const url = buildEmailListUrl(state.currentMailbox.id);
-        const emails = await api('GET', url, null, loadEmailsController.signal);
+        const { data: emails, headers } =
+            await apiWithMeta('GET', url, null, loadEmailsController.signal);
 
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
+        // The unchanged-payload skip below is only safe when the DOM
+        // already shows this context's list (the cache-paint branch above
+        // ran). On a cold miss the list area shows the Loading placeholder,
+        // which must always be replaced — even by an identical-looking
+        // (e.g. empty) list carried over in state.emails.
+        const paintedFromCache = !!splitListCache[context];
         splitListCache[context] = [...emails];
-        state.emails = emails;
-        state.selectedIndex = 0;
-        rebuildThreadGroups();
-        renderEmailList();
-        harvestContacts(emails, state.currentAccount?.id);
+        if (!paintedFromCache || !emailListsEqual(state.emails, emails)) {
+            state.emails = emails;
+            state.selectedIndex = 0;
+            rebuildThreadGroups();
+            renderEmailList();
+            harvestContacts(emails, state.currentAccount?.id);
+        }
+
+        if (headers.get('x-supervillain-stale') === '1') {
+            scheduleStaleRevalidate(context);
+        } else {
+            staleRevalidateAttempts = 0;
+        }
     } catch (err) {
         if (err.name !== 'AbortError') {
             showStatus('Failed to load emails: ' + err.message, 'error');
@@ -1533,10 +1588,29 @@ async function toggleFlag(emailId) {
 }
 
 async function sendEmail() {
+    // Re-entry guard: a second Ctrl+Enter while a send is settling its
+    // autosave (the awaits at the top of doSendEmail) or in flight must not
+    // fire a duplicate POST. state.sending is set here — before the first
+    // await — so both rapid presses can't slip past the check.
+    if (state.sending) return;
+    state.sending = true;
+    // Immediate feedback. Everything until the POST settles used to be
+    // silent, so a send stalled behind a busy backend read as "nothing
+    // happened" — and invited the duplicate Ctrl+Enter guarded above.
+    showStatus('Sending…');
+    try {
+        await doSendEmail();
+    } finally {
+        state.sending = false;
+    }
+}
+
+async function doSendEmail() {
     // A pending autosave firing mid-send would persist a fresh draft of the
     // very mail being sent — un-adopted (compose clears on success) and never
-    // deleted. Kill the debounce up front; state.sending (set around each
-    // await below) blocks any new one from running until the send settles.
+    // deleted. Kill the debounce up front; state.sending (set by sendEmail
+    // before any await) blocks any new one from running until the send
+    // settles.
     cancelAutosave();
     // cancelAutosave() only kills the pending TIMER — a save already in
     // flight keeps running. Without waiting for it, its created/updated id
@@ -1545,11 +1619,12 @@ async function sendEmail() {
     // never rejects, but settle either way defensively.
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
-    // fires the input handler's scheduleAutosave() and arms a fresh debounce,
-    // and state.sending isn't set yet, so runAutosave's own guard wouldn't
-    // catch it. Cancel again, synchronously ahead of the lock, so the
-    // re-armed timer never chains a save that would land after
-    // deleteTrackedDraft below (roborev 304 — same fix as mobile).
+    // fires the input handler's scheduleAutosave() and arms a fresh debounce.
+    // state.sending (set by the sendEmail wrapper) makes runAutosave's own
+    // guard skip it at fire time, but cancel again anyway, synchronously
+    // ahead of the lock, so the re-armed timer never chains a save that
+    // would land after deleteTrackedDraft below (roborev 304 — same fix as
+    // mobile).
     cancelAutosave();
 
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -1595,7 +1670,6 @@ async function sendEmail() {
         }
         const tz = (els.inviteTz.value.trim() || state.timezone?.primary || '').trim();
         const inviteAttendees = to.concat(cc).map(email => ({ email }));
-        state.sending = true;
         try {
             await api('POST', '/calendar/invite', {
                 to,
@@ -1620,13 +1694,10 @@ async function sendEmail() {
             showView('list');
         } catch (err) {
             showStatus('Invite send failed: ' + err.message, 'error');
-        } finally {
-            state.sending = false;
         }
         return;
     }
 
-    state.sending = true;
     try {
         await api('POST', '/emails/send', {
             to,
@@ -1644,8 +1715,6 @@ async function sendEmail() {
         showView('list');
     } catch (err) {
         showStatus('Send failed: ' + err.message, 'error');
-    } finally {
-        state.sending = false;
     }
 }
 
@@ -2878,6 +2947,16 @@ function handleKeyDown(e) {
             els.composeFileInput.click();
             e.preventDefault();
         }
+        return;
+    }
+
+    // Compose normal-mode: Ctrl+Enter still sends. Escape blurs the field
+    // (normal mode) but the mail on screen is unmistakably what the user
+    // means to send — without this branch the chord silently fell through
+    // to the global handler and did nothing, which read as "send is broken".
+    if (state.view === 'compose' && state.mode === 'normal' && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        sendEmail();
+        e.preventDefault();
         return;
     }
 

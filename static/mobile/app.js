@@ -1952,8 +1952,21 @@ function setComposeSending(sending) {
 // locks against double-send, reports failures via showError with the form
 // left intact for a retry.
 async function sendComposedEmail() {
+    // Re-entry lock, taken BEFORE the first await: a check-only guard here
+    // let two quick taps both slip past while the autosave settle below was
+    // still pending, firing a duplicate POST. The wrapper owns the lock;
+    // every early return in doSendComposedEmail releases it via finally
+    // (same shape as desktop sendEmail).
     if (state.sending) return;
+    setComposeSending(true);
+    try {
+        await doSendComposedEmail();
+    } finally {
+        setComposeSending(false);
+    }
+}
 
+async function doSendComposedEmail() {
     // A pending autosave firing mid-send would persist a fresh draft of the
     // very mail being sent — un-adopted (clearComposeFields doesn't bump
     // composeSession here) and never deleted. Kill the debounce up front,
@@ -1967,11 +1980,11 @@ async function sendComposedEmail() {
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
     // fires the input handler's scheduleAutosave() and arms a fresh
-    // debounce, and the sending lock set further below isn't held yet, so
-    // runAutosave's own guard wouldn't have caught it. Cancel again here,
-    // synchronously ahead of that lock, so the re-armed timer never fires
-    // and chains a save that would land after deleteTrackedDraft below
-    // (roborev 303, fix 4).
+    // debounce. The sending lock (held by the sendComposedEmail wrapper)
+    // makes runAutosave's own guard skip it at fire time, but cancel again
+    // anyway, synchronously, so the re-armed timer never fires and chains a
+    // save that would land after deleteTrackedDraft below (roborev 303,
+    // fix 4).
     cancelAutosave();
 
     // Captured up front, before the await below: backing out of compose
@@ -2017,7 +2030,6 @@ async function sendComposedEmail() {
         .filter(a => a.status === 'ready')
         .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
 
-    setComposeSending(true);
     try {
         await state.api('POST', '/emails/send', {
             to,
@@ -2060,8 +2072,6 @@ async function sendComposedEmail() {
         // gone and the new draft's fields belong to a send this one
         // didn't create, so there's nothing to keep "intact for a retry".
         showError('Send', err);
-    } finally {
-        setComposeSending(false);
     }
 }
 

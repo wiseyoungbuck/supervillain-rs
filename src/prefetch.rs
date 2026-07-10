@@ -9,6 +9,7 @@
 
 use crate::error::Error;
 use crate::types::{Email, EmailSort, Identity, Mailbox};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -35,11 +36,23 @@ use tokio::sync::{Mutex, RwLock};
 /// non-default sorts live is the simpler fix. This struct still carries
 /// `sort` so the cache remains correct by construction if that gate is
 /// ever loosened to warm additional sort orders.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InboxKey {
     pub mailbox_id: String,
     pub limit: usize,
     pub sort: EmailSort,
+}
+
+/// One cached mailbox list plus its freshness marker. `stale` is true only
+/// for entries restored from the on-disk snapshot at startup: they paint
+/// instantly but reflect the previous run's state. Every live write (warmer
+/// or route miss) stores `stale: false`. `list_emails` surfaces the flag via
+/// the `x-supervillain-stale` response header so the frontend can keep
+/// re-polling (cheap cache reads) until the warmer replaces the entry.
+#[derive(Clone)]
+struct InboxList {
+    emails: Vec<Email>,
+    stale: bool,
 }
 
 /// Per-account cache. `inbox_lists` is a map (one entry per (mailbox, limit))
@@ -52,7 +65,7 @@ pub struct InboxKey {
 struct AccountEntry {
     mailboxes: Option<Vec<Mailbox>>,
     identities: Option<Vec<Identity>>,
-    inbox_lists: HashMap<InboxKey, Vec<Email>>,
+    inbox_lists: HashMap<InboxKey, InboxList>,
     split_counts: Option<(String, HashMap<String, u32>)>,
     body_cache: HashMap<String, Email>,
     /// Monotonic version bumped on every `invalidate`. The warmer snapshots
@@ -109,12 +122,18 @@ impl PrefetchCache {
     pub async fn get_inbox_list(&self, account: &str, key: &InboxKey) -> Option<Vec<Email>> {
         let entry = self.entry(account).await;
         let guard = entry.lock().await;
-        guard.inbox_lists.get(key).cloned()
+        guard.inbox_lists.get(key).map(|l| l.emails.clone())
     }
 
     pub async fn set_inbox_list(&self, account: &str, key: InboxKey, emails: Vec<Email>) {
         let entry = self.entry(account).await;
-        entry.lock().await.inbox_lists.insert(key, emails);
+        entry.lock().await.inbox_lists.insert(
+            key,
+            InboxList {
+                emails,
+                stale: false,
+            },
+        );
     }
 
     pub async fn get_body(&self, account: &str, email_id: &str) -> Option<Email> {
@@ -268,7 +287,13 @@ impl PrefetchCache {
         if e.version != expected_version {
             return false;
         }
-        e.inbox_lists.insert(key, emails);
+        e.inbox_lists.insert(
+            key,
+            InboxList {
+                emails,
+                stale: false,
+            },
+        );
         true
     }
 
@@ -345,22 +370,30 @@ impl PrefetchCache {
         Ok(live)
     }
 
+    /// Returns `(emails, stale)`. A stale hit (disk-restored snapshot) is
+    /// still a hit — the caller gets the old list instantly instead of
+    /// waiting ~12 s on a live Gmail crawl — but the flag lets the route
+    /// tell the frontend to re-poll until the warmer lands fresh data.
     pub async fn inbox_list_or_fetch<F, Fut>(
         &self,
         account: &str,
         key: InboxKey,
         fetch: F,
-    ) -> Result<Vec<Email>, Error>
+    ) -> Result<(Vec<Email>, bool), Error>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<Email>, Error>>,
     {
-        if let Some(c) = self.get_inbox_list(account, &key).await {
-            return Ok(c);
+        {
+            let entry = self.entry(account).await;
+            let guard = entry.lock().await;
+            if let Some(l) = guard.inbox_lists.get(&key) {
+                return Ok((l.emails.clone(), l.stale));
+            }
         }
         let live = fetch().await?;
         self.set_inbox_list(account, key, live.clone()).await;
-        Ok(live)
+        Ok((live, false))
     }
 
     pub async fn body_or_fetch<F, Fut>(
@@ -406,6 +439,172 @@ impl Default for PrefetchCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// =============================================================================
+// Disk persistence
+// =============================================================================
+//
+// The cache is memory-only at runtime; these snapshots exist so a server
+// restart doesn't cold-start the UI. The launcher starts the binary on
+// demand, so "first open of the day" used to mean: empty cache, browser
+// racing the warmer, and a ~12 s live Gmail crawl before first paint.
+// Restoring the previous run's snapshot (with every inbox list marked
+// stale) makes first paint instant; the warmer then replaces the stale
+// entries within its first pass.
+
+/// Newest bodies kept per account in the snapshot, ranked by `received_at`.
+/// `body_cache` has no eviction in memory (bounded per warm cycle by
+/// `BODY_PREFETCH_PER_MAILBOX`), but persisting it verbatim would compound
+/// across restarts; the cap keeps the file to roughly what one warm cycle
+/// produces anyway.
+const SNAPSHOT_BODY_CAP: usize = 500;
+
+/// Serialized form of one account's cache entry. `inbox_lists` is a Vec of
+/// pairs (not a map) because `InboxKey` is a struct and JSON object keys
+/// must be strings. The `stale` flags are deliberately NOT persisted —
+/// everything in a snapshot is stale by definition when it's read back.
+#[derive(Serialize, Deserialize)]
+struct AccountSnapshot {
+    mailboxes: Option<Vec<Mailbox>>,
+    identities: Option<Vec<Identity>>,
+    inbox_lists: Vec<(InboxKey, Vec<Email>)>,
+    split_counts: Option<(String, HashMap<String, u32>)>,
+    body_cache: HashMap<String, Email>,
+}
+
+impl PrefetchCache {
+    /// Snapshot every account entry to `path` (JSON, 0600, tmp + rename so
+    /// a crash mid-write can't leave a torn file). Called by the warmer
+    /// after each account pass — mail bodies are user data, so the file
+    /// gets the same permissions treatment as the token store.
+    pub async fn save_to_disk(&self, path: &std::path::Path) -> Result<(), Error> {
+        let mut snapshot: HashMap<String, AccountSnapshot> = HashMap::new();
+        let entries: Vec<(String, Arc<Mutex<AccountEntry>>)> = {
+            let r = self.inner.read().await;
+            r.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        for (account, entry) in entries {
+            let e = entry.lock().await;
+            let mut bodies: Vec<(&String, &Email)> = e.body_cache.iter().collect();
+            bodies.sort_by(|a, b| b.1.received_at.cmp(&a.1.received_at));
+            snapshot.insert(
+                account,
+                AccountSnapshot {
+                    mailboxes: e.mailboxes.clone(),
+                    identities: e.identities.clone(),
+                    inbox_lists: e
+                        .inbox_lists
+                        .iter()
+                        .map(|(k, l)| (k.clone(), l.emails.clone()))
+                        .collect(),
+                    split_counts: e.split_counts.clone(),
+                    body_cache: bodies
+                        .into_iter()
+                        .take(SNAPSHOT_BODY_CAP)
+                        .map(|(id, email)| (id.clone(), email.clone()))
+                        .collect(),
+                },
+            );
+        }
+
+        let json = serde_json::to_vec(&snapshot)
+            .map_err(|e| Error::Internal(format!("Failed to serialize prefetch snapshot: {e}")))?;
+        let tmp = path.with_extension("tmp");
+        write_snapshot_file(&tmp, &json)?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::Internal(format!("Failed to move prefetch snapshot: {e}")))?;
+        Ok(())
+    }
+
+    /// Build a cache from the snapshot at `path`, marking every restored
+    /// inbox list stale. Restores only accounts in `allowed_accounts` so a
+    /// removed account's mail doesn't outlive its configuration. Any
+    /// read/parse failure just means starting cold — exactly the pre-
+    /// persistence behavior.
+    pub fn load_from_disk(path: &std::path::Path, allowed_accounts: &[String]) -> Self {
+        let cache = Self::new();
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return cache, // no snapshot yet — normal on first run
+        };
+        let snapshot: HashMap<String, AccountSnapshot> = match serde_json::from_slice(&raw) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "prefetch: ignoring unreadable snapshot {}: {e}",
+                    path.display()
+                );
+                return cache;
+            }
+        };
+        let mut restored = 0usize;
+        let mut inner = HashMap::new();
+        for (account, snap) in snapshot {
+            if !allowed_accounts.contains(&account) {
+                continue;
+            }
+            restored += 1;
+            inner.insert(
+                account,
+                Arc::new(Mutex::new(AccountEntry {
+                    mailboxes: snap.mailboxes,
+                    identities: snap.identities,
+                    inbox_lists: snap
+                        .inbox_lists
+                        .into_iter()
+                        .map(|(k, emails)| {
+                            (
+                                k,
+                                InboxList {
+                                    emails,
+                                    stale: true,
+                                },
+                            )
+                        })
+                        .collect(),
+                    split_counts: snap.split_counts,
+                    body_cache: snap.body_cache,
+                    version: 0,
+                })),
+            );
+        }
+        if restored > 0 {
+            tracing::info!(
+                accounts = restored,
+                "prefetch: restored snapshot from {}",
+                path.display()
+            );
+        }
+        Self {
+            inner: RwLock::new(inner),
+        }
+    }
+}
+
+/// Write with 0600 on Unix — snapshots contain mail bodies. Mirrors the
+/// token store's `write_token_file`.
+fn write_snapshot_file(path: &std::path::Path, contents: &[u8]) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| Error::Internal(format!("Failed to open prefetch snapshot: {e}")))?;
+        file.write_all(contents)
+            .map_err(|e| Error::Internal(format!("Failed to write prefetch snapshot: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+            .map_err(|e| Error::Internal(format!("Failed to write prefetch snapshot: {e}")))?;
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -471,7 +670,7 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
 
     // --- per-mailbox lists + bodies + split counts ---
     if let Some(mailboxes) = mailboxes {
-        warm_all_mailboxes(state, account_id, v, &mailboxes).await;
+        warm_all_mailboxes(state.clone(), account_id, v, &mailboxes).await;
     }
 
     tracing::info!(
@@ -479,6 +678,17 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
         elapsed_ms = started.elapsed().as_millis() as u64,
         "prefetch: account warmed"
     );
+
+    // Persist after every account pass (not just the full cycle) so a kill
+    // mid-cycle — the launcher stops the server with fuser -k — still keeps
+    // whatever was freshly warmed. See the "Disk persistence" section.
+    if let Err(e) = state
+        .prefetch
+        .save_to_disk(&state.prefetch_cache_path)
+        .await
+    {
+        tracing::warn!(account = %account_id, "prefetch: snapshot save failed: {e}");
+    }
 }
 
 /// Top-N latest bodies to prefetch per mailbox per warm cycle. Sized to match
@@ -489,12 +699,72 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
 /// 6-mailbox-per-account setup (see plan cost-analysis).
 pub(crate) const BODY_PREFETCH_PER_MAILBOX: usize = 25;
 
-/// Fan out list + body warming across every mailbox in parallel. The
-/// provider's `RateLimiter` already enforces concurrency caps (5 concurrent
-/// × 80 ms spacing on Gmail), so we don't need our own throttle — issuing
-/// every request at once just queues them at the limiter and they drain
-/// in-order. Sequential iteration here would multiply warm latency by the
-/// mailbox count without any quota benefit.
+/// Store one warmed mailbox list (or log its failure). Returns false when
+/// the account entry's version changed mid-fetch — a user mutation ran, so
+/// the caller should abort the rest of the pass (every later write would be
+/// rejected too).
+async fn store_warmed_list(
+    cache: &PrefetchCache,
+    account_id: &str,
+    v: u64,
+    mailbox_id: &str,
+    list_res: Result<Vec<Email>, Error>,
+    warmed_ids: &mut Vec<(String, Vec<String>)>,
+) -> bool {
+    match list_res {
+        Ok(emails) => {
+            let ids = emails.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+            if !cache
+                .try_set_inbox_list(
+                    account_id,
+                    v,
+                    InboxKey {
+                        mailbox_id: mailbox_id.to_string(),
+                        limit: crate::routes::DEFAULT_INBOX_LIMIT,
+                        // The warmer always warms the default (newest-first)
+                        // order — it has no notion of a per-session sort
+                        // toggle. Non-default-sort requests miss this entry
+                        // and fetch live; see the `InboxKey` doc comment.
+                        sort: EmailSort::DateDesc,
+                    },
+                    emails,
+                )
+                .await
+            {
+                tracing::debug!(
+                    account = %account_id,
+                    mailbox = %mailbox_id,
+                    "prefetch: inbox list discarded — version changed mid-fetch"
+                );
+                return false;
+            }
+            tracing::debug!(
+                account = %account_id,
+                mailbox = %mailbox_id,
+                list_n = ids.len(),
+                "warmed mailbox list"
+            );
+            warmed_ids.push((mailbox_id.to_string(), ids));
+        }
+        Err(e) => tracing::warn!(
+            account = %account_id,
+            mailbox = %mailbox_id,
+            "mailbox warm failed: {e}"
+        ),
+    }
+    true
+}
+
+/// Warm the inbox-role list to completion first, then fan out the remaining
+/// mailboxes (and the inbox's split-counts) in parallel. The provider's
+/// `RateLimiter` already enforces concurrency caps (5 concurrent × 80 ms
+/// spacing on Gmail), so the fan-out doesn't need its own throttle — but
+/// the limiter drains FIFO, which is exactly why the inbox goes first: on a
+/// cold start the user is staring at the inbox's disk-restored (stale)
+/// snapshot, and its fresh list is the single most urgent write. Mixed into
+/// the fan-out it would finish minutes later, interleaved behind every
+/// label; alone at the front it lands in seconds. Split-counts join the
+/// general fan-out — they feed the tab badges, not the list paint.
 async fn warm_all_mailboxes(
     state: Arc<crate::types::AppState>,
     account_id: &str,
@@ -502,28 +772,42 @@ async fn warm_all_mailboxes(
     mailboxes: &[Mailbox],
 ) {
     let cache = state.prefetch.clone();
+    let mut warmed_ids: Vec<(String, Vec<String>)> = Vec::new();
 
-    // ---- Phase 1: per-mailbox list + split-counts fan-out ----
+    // ---- Phase 1a: inbox-role list, alone, to completion ----
+    let (inbox_role, rest): (Vec<&Mailbox>, Vec<&Mailbox>) = mailboxes
+        .iter()
+        .partition(|m| m.role.as_deref() == Some("inbox"));
+    for mb in &inbox_role {
+        let list = fetch_inbox(&state, account_id, &mb.id).await;
+        if !store_warmed_list(&cache, account_id, v, &mb.id, list, &mut warmed_ids).await {
+            return;
+        }
+    }
+
+    // ---- Phase 1b: remaining mailbox lists + inbox split-counts fan-out ----
     let mut list_set = tokio::task::JoinSet::new();
-    for mb in mailboxes {
+    for mb in &rest {
         let state = state.clone();
         let account = account_id.to_string();
         let mailbox_id = mb.id.clone();
-        let mailbox_role = mb.role.clone();
         list_set.spawn(async move {
             let list = fetch_inbox(&state, &account, &mailbox_id).await;
-            // Only warm split-counts for the inbox role — that's the only
-            // mailbox where the sidebar split tabs render.
-            let counts = if mailbox_role.as_deref() == Some("inbox") {
-                Some(fetch_split_counts(&state, &account, &mailbox_id).await)
-            } else {
-                None
-            };
-            (mailbox_id, list, counts)
+            (mailbox_id, Some(list), None)
+        });
+    }
+    for mb in &inbox_role {
+        // Only warm split-counts for the inbox role — that's the only
+        // mailbox where the sidebar split tabs render.
+        let state = state.clone();
+        let account = account_id.to_string();
+        let mailbox_id = mb.id.clone();
+        list_set.spawn(async move {
+            let counts = fetch_split_counts(&state, &account, &mailbox_id).await;
+            (mailbox_id, None, Some(counts))
         });
     }
 
-    let mut warmed_ids: Vec<(String, Vec<String>)> = Vec::new();
     while let Some(joined) = list_set.join_next().await {
         let (mailbox_id, list_res, counts_res) = match joined {
             Ok(t) => t,
@@ -535,46 +819,18 @@ async fn warm_all_mailboxes(
                 continue;
             }
         };
-        match list_res {
-            Ok(emails) => {
-                let ids = emails.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
-                if !cache
-                    .try_set_inbox_list(
-                        account_id,
-                        v,
-                        InboxKey {
-                            mailbox_id: mailbox_id.clone(),
-                            limit: crate::routes::DEFAULT_INBOX_LIMIT,
-                            // The warmer always warms the default (newest-first)
-                            // order — it has no notion of a per-session sort
-                            // toggle. Non-default-sort requests miss this entry
-                            // and fetch live; see the `InboxKey` doc comment.
-                            sort: EmailSort::DateDesc,
-                        },
-                        emails,
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        account = %account_id,
-                        mailbox = %mailbox_id,
-                        "prefetch: inbox list discarded — version changed mid-fetch"
-                    );
-                    return;
-                }
-                tracing::debug!(
-                    account = %account_id,
-                    mailbox = %mailbox_id,
-                    list_n = ids.len(),
-                    "warmed mailbox list"
-                );
-                warmed_ids.push((mailbox_id.clone(), ids));
-            }
-            Err(e) => tracing::warn!(
-                account = %account_id,
-                mailbox = %mailbox_id,
-                "mailbox warm failed: {e}"
-            ),
+        if let Some(list_res) = list_res
+            && !store_warmed_list(
+                &cache,
+                account_id,
+                v,
+                &mailbox_id,
+                list_res,
+                &mut warmed_ids,
+            )
+            .await
+        {
+            return;
         }
         if let Some(counts_res) = counts_res {
             match counts_res {
@@ -665,8 +921,11 @@ async fn fetch_bodies(
     ids: &[String],
 ) -> Result<Vec<Email>, Error> {
     let session_lock = session_for(state, account_id).await?;
-    let session = session_lock.read().await;
-    crate::provider::get_emails(&session, ids, true, None).await
+    // Chunked so the read guard is released between batches — a send (which
+    // needs write()) queued mid-warm gets in within one chunk instead of
+    // waiting out the whole body fan-out. Bodies are the heaviest payload,
+    // hence the smaller chunk. See provider::get_emails_chunked.
+    crate::provider::get_emails_chunked(&session_lock, ids, true, None, 10).await
 }
 
 async fn fetch_mailboxes(
@@ -693,17 +952,28 @@ async fn fetch_inbox(
     mailbox_id: &str,
 ) -> Result<Vec<Email>, Error> {
     let session_lock = session_for(state, account_id).await?;
-    let session = session_lock.read().await;
-    let ids = crate::provider::query_emails(
-        &session,
-        Some(mailbox_id),
-        crate::routes::DEFAULT_INBOX_LIMIT,
-        0,
+    let ids = {
+        let session = session_lock.read().await;
+        crate::provider::query_emails(
+            &session,
+            Some(mailbox_id),
+            crate::routes::DEFAULT_INBOX_LIMIT,
+            0,
+            None,
+            EmailSort::DateDesc,
+        )
+        .await?
+    };
+    // Guard released between chunks so a queued writer (send) isn't stuck
+    // behind a whole 150-message fan-out. See provider::get_emails_chunked.
+    crate::provider::get_emails_chunked(
+        &session_lock,
+        &ids,
+        false,
         None,
-        EmailSort::DateDesc,
+        crate::provider::GET_EMAILS_CHUNK,
     )
-    .await?;
-    crate::provider::get_emails(&session, &ids, false, None).await
+    .await
 }
 
 async fn fetch_split_counts(
@@ -787,7 +1057,15 @@ pub fn spawn_warmer(
                 let s = state_for_list.clone();
                 async move {
                     let reg = s.accounts.read().await;
-                    reg.sessions.keys().cloned().collect::<Vec<_>>()
+                    let default = reg.default_account.clone();
+                    let mut ids = reg.sessions.keys().cloned().collect::<Vec<_>>();
+                    // Warm the default account first: it's the one the UI
+                    // shows on a cold open, so its stale disk snapshot is
+                    // the first thing the user is waiting to see replaced.
+                    // HashMap iteration order would otherwise randomize
+                    // which account gets the first (and fastest) slot.
+                    ids.sort_by_key(|id| *id != default);
+                    ids
                 }
             },
             interval,
@@ -1595,5 +1873,133 @@ mod tests {
             .await;
         let got = cache.get_split_counts("acc-1", "inbox").await.unwrap();
         assert_eq!(got.get("split-a"), Some(&7));
+    }
+
+    // ---- Disk persistence ----
+
+    fn snapshot_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sv-prefetch-test-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn snapshot_roundtrip_restores_data_and_marks_lists_stale() {
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateDesc,
+        };
+        cache.set_mailboxes("acc-1", vec![mb("inbox")]).await;
+        cache.set_identities("acc-1", vec![ident("me")]).await;
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
+            .await;
+        cache.set_body("acc-1", "e1".into(), email("e1")).await;
+        let mut counts = HashMap::new();
+        counts.insert("split-a".into(), 3);
+        cache
+            .set_split_counts("acc-1", "inbox".into(), counts)
+            .await;
+
+        let path = snapshot_path("roundtrip");
+        cache.save_to_disk(&path).await.unwrap();
+        let restored = PrefetchCache::load_from_disk(&path, &["acc-1".to_string()]);
+        std::fs::remove_file(&path).ok();
+
+        // Everything comes back...
+        assert_eq!(
+            restored.get_mailboxes("acc-1").await.unwrap()[0].id,
+            "inbox"
+        );
+        assert_eq!(restored.get_identities("acc-1").await.unwrap()[0].id, "me");
+        assert_eq!(restored.get_body("acc-1", "e1").await.unwrap().id, "e1");
+        assert_eq!(
+            restored
+                .get_split_counts("acc-1", "inbox")
+                .await
+                .unwrap()
+                .get("split-a"),
+            Some(&3)
+        );
+        // ...and the inbox list is served as a hit, but flagged stale so
+        // the route can tell the frontend to re-poll.
+        let (emails, stale) = restored
+            .inbox_list_or_fetch("acc-1", key.clone(), || async {
+                panic!("stale hit must not trigger a live fetch")
+            })
+            .await
+            .unwrap();
+        assert_eq!(emails[0].id, "e1");
+        assert!(stale, "disk-restored lists must be marked stale");
+
+        // A live write (what the warmer does) clears the flag.
+        let v = restored.version("acc-1").await;
+        assert!(
+            restored
+                .try_set_inbox_list("acc-1", v, key.clone(), vec![email("e2")])
+                .await
+        );
+        let (emails, stale) = restored
+            .inbox_list_or_fetch("acc-1", key, || async {
+                panic!("fresh hit must not trigger a live fetch")
+            })
+            .await
+            .unwrap();
+        assert_eq!(emails[0].id, "e2");
+        assert!(!stale, "a warmer write must clear the stale flag");
+    }
+
+    #[tokio::test]
+    async fn fresh_writes_are_not_stale() {
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateDesc,
+        };
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("e1")])
+            .await;
+        let (_, stale) = cache
+            .inbox_list_or_fetch("acc-1", key, || async { unreachable!() })
+            .await
+            .unwrap();
+        assert!(!stale, "a live set_inbox_list must never read back stale");
+    }
+
+    #[tokio::test]
+    async fn snapshot_load_skips_accounts_no_longer_configured() {
+        let cache = PrefetchCache::new();
+        cache.set_mailboxes("acc-keep", vec![mb("a")]).await;
+        cache.set_mailboxes("acc-removed", vec![mb("b")]).await;
+
+        let path = snapshot_path("skip-removed");
+        cache.save_to_disk(&path).await.unwrap();
+        let restored = PrefetchCache::load_from_disk(&path, &["acc-keep".to_string()]);
+        std::fs::remove_file(&path).ok();
+
+        assert!(restored.get_mailboxes("acc-keep").await.is_some());
+        assert!(
+            restored.get_mailboxes("acc-removed").await.is_none(),
+            "a removed account's mail must not outlive its configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_load_missing_or_garbage_file_starts_cold() {
+        let missing = PrefetchCache::load_from_disk(
+            std::path::Path::new("/nonexistent/prefetch.json"),
+            &["acc-1".to_string()],
+        );
+        assert!(missing.get_mailboxes("acc-1").await.is_none());
+
+        let path = snapshot_path("garbage");
+        std::fs::write(&path, b"not json{{{").unwrap();
+        let garbage = PrefetchCache::load_from_disk(&path, &["acc-1".to_string()]);
+        std::fs::remove_file(&path).ok();
+        assert!(garbage.get_mailboxes("acc-1").await.is_none());
     }
 }

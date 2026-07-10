@@ -111,6 +111,36 @@ pub async fn get_emails(
     }
 }
 
+/// Chunk size for [`get_emails_chunked`]. ~25 metadata fetches ≈ 2 s on a
+/// rate-limited Gmail account (5 concurrent × 80 ms spacing), which bounds
+/// how long any one read guard is held.
+pub const GET_EMAILS_CHUNK: usize = 25;
+
+/// Like [`get_emails`], but re-acquires the session read guard per chunk of
+/// ids instead of holding one guard across the whole fan-out.
+///
+/// Long fan-outs (a 150-message list refresh, a 1500-message split-count
+/// sample) used to pin a read guard for their full duration — minutes on a
+/// rate-limited Gmail account. tokio's `RwLock` queues fairly, so a writer
+/// (most visibly `send_email_handler`, which needs `write()`) queued behind
+/// such a guard stalled until the entire fan-out finished, and the UI showed
+/// nothing. Releasing between chunks lets a queued writer in within one
+/// chunk's latency instead.
+pub async fn get_emails_chunked(
+    session_lock: &crate::types::SessionLock,
+    ids: &[String],
+    fetch_body: bool,
+    properties_override: Option<&[&str]>,
+    chunk_size: usize,
+) -> Result<Vec<Email>, Error> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(chunk_size.max(1)) {
+        let session = session_lock.read().await;
+        out.extend(get_emails(&session, chunk, fetch_body, properties_override).await?);
+    }
+    Ok(out)
+}
+
 pub async fn mark_read(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::mark_read(s, email_id).await,

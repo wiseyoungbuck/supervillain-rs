@@ -326,7 +326,7 @@ impl ParsedQuery {
 /// hard error (axum's `Query` extractor turns it into a 400) rather than a
 /// silent fallback to the default — see `ListEmailsParams::sort` in
 /// `routes.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EmailSort {
     #[default]
@@ -468,6 +468,10 @@ pub struct AppState {
     /// every 5 min thereafter; consulted by the four hot routes (`list_*`,
     /// `split_counts`) before falling through to a live provider call.
     pub prefetch: std::sync::Arc<crate::prefetch::PrefetchCache>,
+    /// Where the prefetch cache snapshots itself (JSON next to the config).
+    /// Loaded at startup so a restart paints the last-known mailbox state
+    /// instantly instead of cold-starting; saved after each warm pass.
+    pub prefetch_cache_path: PathBuf,
 }
 
 impl AppState {

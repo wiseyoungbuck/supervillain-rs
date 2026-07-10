@@ -32,8 +32,11 @@ class ApiAuthError extends ApiError {
 // makeApi(accountId) → async api(method, path, body, signal) bound to one
 // account. Pass a falsy accountId for an unscoped instance (global routes,
 // or before accounts are loaded). Make a new instance on account switch.
+// The returned function also carries api.withMeta(...), which resolves to
+// { data, headers } for the callers that need a response header (currently
+// just loadEmails' stale-snapshot detection).
 function makeApi(accountId) {
-    return async function api(method, path, body = null, signal = null) {
+    async function request(method, path, body = null, signal = null) {
         const opts = {
             method,
             headers: { 'Content-Type': 'application/json' },
@@ -60,8 +63,14 @@ function makeApi(accountId) {
         if (!resp.ok) {
             throw new ApiError(await resp.text(), resp.status);
         }
-        if (resp.status === 204) return null;
+        if (resp.status === 204) return { data: null, headers: resp.headers };
         const text = await resp.text();
-        return text ? JSON.parse(text) : null;
-    };
+        return { data: text ? JSON.parse(text) : null, headers: resp.headers };
+    }
+
+    async function api(method, path, body = null, signal = null) {
+        return (await request(method, path, body, signal)).data;
+    }
+    api.withMeta = request;
+    return api;
 }

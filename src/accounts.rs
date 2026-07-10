@@ -2346,6 +2346,7 @@ api-token = tok
                 reason: "missing required field `provider`".into(),
             }]),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+            prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -2513,6 +2514,7 @@ api-token = tok
             authorizing: AuthorizingSlot::default(),
             config_error_baseline: std::sync::RwLock::new(Vec::new()),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+            prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
         });
 
         let incoming = AccountConfig::Fastmail {

@@ -18,6 +18,7 @@ async fn main() {
     let tokens_dir = config_dir.join("supervillain/tokens");
     let splits_config_path = config_dir.join("supervillain/splits.json");
     let timezone_config_path = config_dir.join("supervillain/timezone.json");
+    let prefetch_cache_path = config_dir.join("supervillain/prefetch-cache.json");
 
     platform::init_tracing();
 
@@ -107,7 +108,14 @@ async fn main() {
         token_store,
         authorizing: accounts::AuthorizingSlot::default(),
         config_error_baseline: std::sync::RwLock::new(parse_errors),
-        prefetch: std::sync::Arc::new(prefetch::PrefetchCache::new()),
+        // Restore the previous run's snapshot (inbox lists marked stale) so
+        // the first paint after a restart is instant; scoped to configured
+        // accounts so a removed account's mail doesn't outlive its config.
+        prefetch: std::sync::Arc::new(prefetch::PrefetchCache::load_from_disk(
+            &prefetch_cache_path,
+            &cfg.accounts.keys().cloned().collect::<Vec<_>>(),
+        )),
+        prefetch_cache_path,
     });
 
     // Kick off the background prefetch warmer. The first pass starts
