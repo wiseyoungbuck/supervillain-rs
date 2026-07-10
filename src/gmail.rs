@@ -985,6 +985,7 @@ pub async fn get_emails(
     session: &GmailSession,
     ids: &[String],
     fetch_body: bool,
+    priority: bool,
 ) -> Result<Vec<Email>, Error> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -1002,7 +1003,7 @@ pub async fn get_emails(
         join_set.spawn(async move {
             let url = format!("{GMAIL_BASE}/messages/{id}?format={format}");
             let resp = limiter
-                .execute("messages.get", || async {
+                .execute_prioritized(priority, "messages.get", || async {
                     client.get(&url).bearer_auth(&token).send().await
                 })
                 .await?;
@@ -1393,10 +1394,12 @@ async fn modify_labels(
     // Retry/backoff (including for the rapid archive + prefetch +
     // split-count fan-out bursts that used to need a bespoke 750ms
     // retry-once) is handled by the session limiter — see
-    // `build_gmail_limiter`.
+    // `build_gmail_limiter`. Every modify is user-initiated (mark-read on
+    // open, star, archive — the warmer never mutates), so it takes the
+    // priority lane rather than queuing behind a warm pass.
     let resp = session
         .limiter
-        .execute("messages.modify", || async {
+        .execute_prioritized(true, "messages.modify", || async {
             session
                 .client
                 .post(&url)

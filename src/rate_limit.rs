@@ -78,8 +78,21 @@ impl Spacer {
     }
 }
 
+/// Reserved permits for user-blocking requests. Two is enough for the
+/// interactive shapes we have (an email open is one `messages.get`, an RSVP
+/// or unsubscribe is one or two) while staying small enough that a bulk
+/// user action can't turn the lane into a second unbounded pool.
+const PRIORITY_PERMITS: usize = 2;
+
 pub struct RateLimiter {
     sem: Semaphore,
+    /// Separate small pool for interactive requests. `Semaphore` wakes
+    /// waiters FIFO, so during a warm pass the main pool's queue holds
+    /// hundreds of background fetches — a user opening an email used to
+    /// wait out that entire queue (measured: tens of seconds to minutes).
+    /// The shared `spacer` still paces every request start, so the total
+    /// request rate is unchanged; only queue position differs.
+    priority_sem: Semaphore,
     spacer: Spacer,
     max_attempts: u32,
     name: &'static str,
@@ -96,6 +109,7 @@ impl RateLimiter {
     ) -> Self {
         Self {
             sem: Semaphore::new(concurrency),
+            priority_sem: Semaphore::new(PRIORITY_PERMITS),
             spacer: Spacer::new(spacing),
             max_attempts,
             name,
@@ -121,8 +135,22 @@ impl RateLimiter {
     ///
     /// Non-rate-limit non-2xx responses are returned as `Ok(response)` —
     /// the caller's classify_* function reads the body and maps it.
-    pub async fn execute<F, Fut>(
+    pub async fn execute<F, Fut>(&self, op: &str, make_req: F) -> Result<reqwest::Response, Error>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+    {
+        self.execute_prioritized(false, op, make_req).await
+    }
+
+    /// Like [`execute`](Self::execute), but `priority: true` acquires from
+    /// the small reserved pool instead of queuing behind background work.
+    /// Reserve it for requests a user is actively waiting on (opening an
+    /// email, an RSVP) — bulk fan-outs must stay on the main pool or they
+    /// would starve the lane they're meant to be yielding to.
+    pub async fn execute_prioritized<F, Fut>(
         &self,
+        priority: bool,
         op: &str,
         mut make_req: F,
     ) -> Result<reqwest::Response, Error>
@@ -130,13 +158,18 @@ impl RateLimiter {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
     {
+        let sem = if priority {
+            &self.priority_sem
+        } else {
+            &self.sem
+        };
         let mut last_retry_after: Option<Duration> = None;
 
         for attempt in 0..self.max_attempts {
-            let permit =
-                self.sem.acquire().await.map_err(|e| {
-                    Error::Internal(format!("{} limiter sem closed: {e}", self.name))
-                })?;
+            let permit = sem
+                .acquire()
+                .await
+                .map_err(|e| Error::Internal(format!("{} limiter sem closed: {e}", self.name)))?;
             self.spacer.acquire().await;
 
             let resp = match make_req().await {

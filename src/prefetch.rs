@@ -778,6 +778,28 @@ async fn warm_all_mailboxes(
         }
     }
 
+    // The inbox's top bodies too, still ahead of the fan-out: the newest
+    // inbox mail is what the user opens first on a cold start, and the
+    // body phase used to run dead last — after every label list and the
+    // split-count sample — leaving exactly those bodies cold for minutes.
+    let mut total_bodies = 0usize;
+    let inbox_list_count = warmed_ids.len();
+    for (mailbox_id, ids) in &warmed_ids {
+        let prefix: Vec<String> = ids
+            .iter()
+            .take(BODY_PREFETCH_PER_MAILBOX)
+            .cloned()
+            .collect();
+        if prefix.is_empty() {
+            continue;
+        }
+        total_bodies += prefix.len();
+        let res = fetch_bodies(&state, account_id, &prefix).await;
+        if !store_warmed_bodies(&cache, account_id, v, mailbox_id, res).await {
+            return;
+        }
+    }
+
     // ---- Phase 1b: remaining mailbox lists + inbox split-counts fan-out ----
     let mut list_set = tokio::task::JoinSet::new();
     for mb in &rest {
@@ -845,10 +867,10 @@ async fn warm_all_mailboxes(
         }
     }
 
-    // ---- Phase 2: top-N body fan-out across all warmed mailboxes ----
+    // ---- Phase 2: top-N body fan-out across the remaining mailboxes ----
+    // (the inbox's bodies were already warmed in phase 1a — skip them)
     let mut body_set = tokio::task::JoinSet::new();
-    let mut total_bodies = 0usize;
-    for (mailbox_id, ids) in warmed_ids {
+    for (mailbox_id, ids) in warmed_ids.into_iter().skip(inbox_list_count) {
         let prefix: Vec<String> = ids.into_iter().take(BODY_PREFETCH_PER_MAILBOX).collect();
         if prefix.is_empty() {
             continue;
@@ -873,31 +895,8 @@ async fn warm_all_mailboxes(
                 continue;
             }
         };
-        match res {
-            Ok(emails) => {
-                let count = emails.len();
-                for email in emails {
-                    let id = email.id.clone();
-                    if !cache.try_set_body(account_id, v, id, email).await {
-                        tracing::debug!(
-                            account = %account_id,
-                            "prefetch: body discarded — version changed mid-fetch"
-                        );
-                        return;
-                    }
-                }
-                tracing::debug!(
-                    account = %account_id,
-                    mailbox = %mailbox_id,
-                    bodies_n = count,
-                    "warmed mailbox bodies"
-                );
-            }
-            Err(e) => tracing::warn!(
-                account = %account_id,
-                mailbox = %mailbox_id,
-                "body warm failed: {e}"
-            ),
+        if !store_warmed_bodies(&cache, account_id, v, &mailbox_id, res).await {
+            return;
         }
     }
 
@@ -906,6 +905,45 @@ async fn warm_all_mailboxes(
         bodies = total_bodies,
         "warmed account bodies across all mailboxes"
     );
+}
+
+/// Store one mailbox's warmed bodies (or log the failure). Returns false
+/// when the account entry's version changed mid-fetch — abort the pass,
+/// every later write would be rejected too.
+async fn store_warmed_bodies(
+    cache: &PrefetchCache,
+    account_id: &str,
+    v: u64,
+    mailbox_id: &str,
+    res: Result<Vec<Email>, Error>,
+) -> bool {
+    match res {
+        Ok(emails) => {
+            let count = emails.len();
+            for email in emails {
+                let id = email.id.clone();
+                if !cache.try_set_body(account_id, v, id, email).await {
+                    tracing::debug!(
+                        account = %account_id,
+                        "prefetch: body discarded — version changed mid-fetch"
+                    );
+                    return false;
+                }
+            }
+            tracing::debug!(
+                account = %account_id,
+                mailbox = %mailbox_id,
+                bodies_n = count,
+                "warmed mailbox bodies"
+            );
+        }
+        Err(e) => tracing::warn!(
+            account = %account_id,
+            mailbox = %mailbox_id,
+            "body warm failed: {e}"
+        ),
+    }
+    true
 }
 
 async fn fetch_bodies(

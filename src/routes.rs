@@ -663,8 +663,11 @@ async fn get_email(
     let email = state
         .prefetch
         .body_or_fetch(&account_key, &email_id, || async {
+            // priority: the user is staring at a spinner for exactly this
+            // response — it must not queue behind a warm pass's fan-out.
             let emails =
-                provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
+                provider::get_emails(&session, std::slice::from_ref(&email_id), true, None, true)
+                    .await?;
             emails
                 .into_iter()
                 .next()
@@ -1224,9 +1227,14 @@ async fn rsvp(
 
     // Determine attendee email (use account username as fallback)
     let attendee_email = {
-        let emails =
-            provider::get_emails(&session_guard, std::slice::from_ref(&email_id), false, None)
-                .await?;
+        let emails = provider::get_emails(
+            &session_guard,
+            std::slice::from_ref(&email_id),
+            false,
+            None,
+            true, // user-blocking: RSVP click
+        )
+        .await?;
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
@@ -1301,8 +1309,14 @@ async fn unsubscribe_and_archive(
     let session = session_lock.read().await;
 
     // Get the email to find the sender
-    let emails =
-        provider::get_emails(&session, std::slice::from_ref(&email_id), true, None).await?;
+    let emails = provider::get_emails(
+        &session,
+        std::slice::from_ref(&email_id),
+        true,
+        None,
+        true, // user-blocking: unsubscribe click
+    )
+    .await?;
     let email = emails
         .first()
         .ok_or_else(|| Error::NotFound("Email not found".into()))?;

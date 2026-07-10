@@ -87,26 +87,34 @@ pub async fn query_emails(
     }
 }
 
+/// `priority: true` puts the underlying requests on the limiter's reserved
+/// interactive lane (see `RateLimiter::execute_prioritized`). Use it only
+/// for fetches a user is actively waiting on — a single email open, an
+/// RSVP — never for bulk fan-outs, which would starve the lane.
 pub async fn get_emails(
     s: &ProviderSession,
     ids: &[String],
     fetch_body: bool,
     properties_override: Option<&[&str]>,
+    priority: bool,
 ) -> Result<Vec<Email>, Error> {
     match s {
         ProviderSession::Fastmail(s) => {
+            // JMAP batches the whole slice into one Email/get, so there is
+            // no per-id fan-out to jump ahead of — priority isn't plumbed.
+            let _ = priority;
             jmap::get_emails(s, ids, fetch_body, properties_override).await
         }
         ProviderSession::Outlook(s) => {
             // properties_override is JMAP-specific; Graph returns the full
             // message resource with $expand=attachments.
             let _ = properties_override;
-            outlook::get_emails(s, ids, fetch_body).await
+            outlook::get_emails(s, ids, fetch_body, priority).await
         }
         ProviderSession::Gmail(s) => {
             // properties_override is JMAP-specific; Gmail always returns the full payload.
             let _ = properties_override;
-            gmail::get_emails(s, ids, fetch_body).await
+            gmail::get_emails(s, ids, fetch_body, priority).await
         }
     }
 }
@@ -154,7 +162,10 @@ pub async fn get_emails_chunked(
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(chunk_size) {
         let session = session_lock.read().await;
-        out.extend(get_emails(&session, chunk, fetch_body, properties_override).await?);
+        // Chunked fetches are bulk by definition (lists, split counts,
+        // warm passes) — always the main limiter pool, never the
+        // interactive priority lane.
+        out.extend(get_emails(&session, chunk, fetch_body, properties_override, false).await?);
     }
     Ok(out)
 }

@@ -257,6 +257,20 @@ function init() {
         els.accountErrorBanner.classList.add('hidden');
     });
     document.addEventListener('keydown', handleKeyDown);
+    // The sandboxed email-body iframe (renderHtmlBodyIframe) swallows
+    // keyboard focus when clicked: it's cross-origin by design (no
+    // allow-same-origin), so once it holds focus every shortcut — Escape
+    // back to the list, j/k, all of it — silently dies, with no way back
+    // but the mouse. Focus moving into any iframe fires window blur;
+    // bounce it straight back. Mouse text-selection inside the email
+    // doesn't need keyboard focus, so reading and selecting still work
+    // (copying that selection needs the right-click menu).
+    window.addEventListener('blur', () => {
+        setTimeout(() => {
+            const el = document.activeElement;
+            if (el?.classList?.contains('email-iframe')) el.blur();
+        }, 0);
+    });
     els.commandInput.addEventListener('input', handleCommandInput);
     els.searchInput.addEventListener('keydown', handleSearchKeyDown);
     els.searchInput.addEventListener('input', handleSearchInputChange);
@@ -2137,9 +2151,18 @@ function selectMailbox(mailbox) {
 }
 
 function setMode(mode) {
+    const changed = state.mode !== mode;
     state.mode = mode;
     els.modeIndicator.textContent = mode === 'awaiting' ? '-- AWAITING AUTHORIZATION --' : mode.toUpperCase();
     els.modeIndicator.className = mode;
+    // Pulse on every real transition — the per-mode colors alone were easy
+    // to miss in peripheral vision. The className assignment above already
+    // dropped any previous mode-flash; the reflow read restarts the
+    // animation when transitions come back-to-back.
+    if (changed) {
+        void els.modeIndicator.offsetWidth;
+        els.modeIndicator.classList.add('mode-flash');
+    }
 }
 
 // ============================================================================
@@ -2992,6 +3015,15 @@ function handleKeyDown(e) {
     // Compose normal-mode: 'a' opens file picker instead of reply-all
     if (state.view === 'compose' && state.mode === 'normal' && e.key === 'a') {
         els.composeFileInput.click();
+        e.preventDefault();
+        return;
+    }
+
+    // Compose normal-mode: 'i' re-enters insert in the message body — the
+    // vim counterpart to Escape. Focusing triggers the field's focus
+    // listener, which flips the mode (and the indicator) to insert.
+    if (state.view === 'compose' && state.mode === 'normal' && e.key === 'i') {
+        els.composeBody.focus();
         e.preventDefault();
         return;
     }

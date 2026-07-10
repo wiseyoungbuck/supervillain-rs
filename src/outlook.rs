@@ -1403,6 +1403,7 @@ pub async fn get_emails(
     session: &OutlookSession,
     ids: &[String],
     fetch_body: bool,
+    priority: bool,
 ) -> Result<Vec<crate::types::Email>, Error> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -1418,7 +1419,7 @@ pub async fn get_emails(
             let encoded = crate::provider_utils::encode_path_segment(&id);
             let url = format!("{GRAPH_BASE}/me/messages/{encoded}?$expand=attachments");
             let resp = limiter
-                .execute("messages.get", || async {
+                .execute_prioritized(priority, "messages.get", || async {
                     client.get(&url).bearer_auth(&token).send().await
                 })
                 .await?;
@@ -1708,9 +1709,11 @@ pub async fn archive_batch(session: &OutlookSession, msg_ids: &[String]) -> Resu
     let mut succeeded = 0usize;
     for chunk in chunks {
         let body = build_batch_archive_body(&chunk);
+        // Archives are user-initiated (the warmer never mutates) — take the
+        // priority lane rather than queuing behind a warm pass.
         let resp = session
             .limiter
-            .execute("$batch.archive", || async {
+            .execute_prioritized(true, "$batch.archive", || async {
                 session
                     .client
                     .post(format!("{GRAPH_BASE}/$batch"))
