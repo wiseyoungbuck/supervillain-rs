@@ -85,10 +85,13 @@ const scrollPositions = {};
 // Rolling email cache
 const CACHE_LIMIT = 150;
 
-// One-shot guard consumed by the window focus listener: set when the
+// Deadline guard consumed by the window focus listener: set when the
 // email-iframe focus-bounce returns focus to this window, so that synthetic
 // focus event doesn't re-fetch the theme on every click into an email body.
-let suppressFocusThemeRefresh = false;
+// Time-bounded rather than one-shot: if the OS window loses focus before
+// the bounce fires, no synthetic focus ever arrives, and a stale boolean
+// would swallow the next REAL alt-tab-back refresh (roborev 313).
+let suppressFocusThemeRefreshUntil = 0;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
 
@@ -274,11 +277,11 @@ function init() {
         setTimeout(() => {
             const el = document.activeElement;
             if (el?.classList?.contains('email-iframe')) {
-                // Bouncing focus back fires a window focus event; flag it
-                // so the theme-refresh listener above ignores the synthetic
-                // wake (a real alt-tab-back still refreshes — the flag is
-                // consumed by the very next focus event).
-                suppressFocusThemeRefresh = true;
+                // Bouncing focus back fires a window focus event; suppress
+                // the theme refresh for the synthetic wake only. The short
+                // deadline (not a one-shot flag) means a real alt-tab-back
+                // is never swallowed if the synthetic event doesn't arrive.
+                suppressFocusThemeRefreshUntil = Date.now() + 50;
                 el.blur();
             }
         }, 0);
@@ -464,8 +467,8 @@ function init() {
     // click into an email body would re-fetch and re-apply the theme
     // (roborev 312 #2).
     window.addEventListener('focus', () => {
-        if (suppressFocusThemeRefresh) {
-            suppressFocusThemeRefresh = false;
+        if (Date.now() < suppressFocusThemeRefreshUntil) {
+            suppressFocusThemeRefreshUntil = 0;
             return;
         }
         loadTheme();
