@@ -4318,19 +4318,36 @@ mod tests {
         // the only copy. The success path must skip the delete when a newer
         // session has recaptured that very id; a live-but-already-sent
         // draft is strictly safer than deleting content under an editor.
-        for (bundle, src, decl) in [
-            ("app.js", APP_JS, "async function doSendEmail("),
+        //
+        // The guard must read the module-level trackedDraftId/
+        // trackedDraftSession pair — which clearCompose/clearComposeFields
+        // deliberately never touch — NOT the point-in-time state.draftId: a
+        // snapshot guard misses reopen → edit → leave-again before the
+        // stale send resolves (state.draftId is nulled by then) and would
+        // delete the draft carrying the post-reopen edits (roborev 317).
+        // Desktop has TWO delete sites (invite and regular send); each
+        // needs its own guard.
+        for (bundle, src, decl, sites) in [
+            ("app.js", APP_JS, "async function doSendEmail(", 2usize),
             (
                 "mobile/app.js",
                 MOBILE_APP_JS,
                 "async function doSendComposedEmail(",
+                1,
             ),
         ] {
             let block = js_fn_body(src, decl);
+            let guard = "trackedDraftSession !== session && trackedDraftId === draftId";
             assert!(
-                block.contains("state.composeSession !== session && state.draftId === draftId"),
-                "{bundle}: the success path must detect its captured id being \
-                 recaptured by a newer compose session and skip the delete"
+                block.matches(guard).count() >= sites,
+                "{bundle}: all {sites} delete site(s) must skip when a newer \
+                 compose session has recaptured the captured id, via the \
+                 leave-surviving tracked pair"
+            );
+            assert!(
+                !block.contains("state.draftId === draftId"),
+                "{bundle}: the recapture guard must not read the \
+                 point-in-time state.draftId — it is nulled by leave-compose"
             );
         }
     }

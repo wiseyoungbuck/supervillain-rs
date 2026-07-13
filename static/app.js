@@ -1777,8 +1777,14 @@ async function doSendEmail() {
             // would yank the draft from under the active editor and leave
             // trackedDraftId dead (autosaves 404 with only a console.warn;
             // the next leave-compose wipes the only copy). A live-but-
-            // already-sent draft is the safer residue (roborev 316).
-            const reopened = state.composeSession !== session && state.draftId === draftId;
+            // already-sent draft is the safer residue (roborev 316). The
+            // check reads the tracked pair — which leave-compose never
+            // clears — not state.draftId: a snapshot of the live id misses
+            // reopen → edit → leave-again before this completion (the live
+            // id is nulled by then) and would delete the post-reopen edits
+            // (roborev 317). In the normal still-in-compose case
+            // trackedDraftSession === session, so the delete fires.
+            const reopened = trackedDraftSession !== session && trackedDraftId === draftId;
             if (!reopened) deleteDraftById(draftId);
             if (state.composeSession === session) {
                 clearCompose();
@@ -1807,7 +1813,7 @@ async function doSendEmail() {
         // Same shape as the invite path above: captured-id delete unless a
         // newer session recaptured the id (see the comment there),
         // clear/navigate only while this send still owns the compose.
-        const reopened = state.composeSession !== session && state.draftId === draftId;
+        const reopened = trackedDraftSession !== session && trackedDraftId === draftId;
         if (!reopened) deleteDraftById(draftId);
         if (state.composeSession === session) {
             clearCompose();
