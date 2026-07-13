@@ -4534,8 +4534,18 @@ mod tests {
         ] {
             let block = js_fn_body(src, "async function runAutosave(");
             assert!(
-                block.contains("state.sending && state.composeSession === sendingSession"),
-                "{bundle}: runAutosave must skip only the sending session's saves"
+                block.contains("composeSendLocked()"),
+                "{bundle}: runAutosave must skip only the sending session's \
+                 saves, via the shared composeSendLocked predicate"
+            );
+            // The canonical predicate lives in exactly one place per bundle
+            // (roborev 324): the helper every consumer — autosave gate,
+            // attachment guards — routes through.
+            assert!(
+                js_fn_body(src, "function composeSendLocked(")
+                    .contains("state.sending && state.composeSession === sendingSession"),
+                "{bundle}: composeSendLocked must hold the session-scoped \
+                 sending predicate"
             );
             assert!(
                 src.contains("sendingSession = state.composeSession"),
@@ -5242,8 +5252,10 @@ white   = '#fdf6e3'
             let end = rest.find("\n}").expect("runAutosave must close");
             let block = &rest[..end];
             assert!(
-                block.contains("state.sending"),
-                "{bundle} runAutosave must bail while a send is in flight"
+                block.contains("composeSendLocked()"),
+                "{bundle} runAutosave must bail while the active compose's \
+                 send is in flight (the session-scoped composeSendLocked \
+                 predicate, roborev 318/324)"
             );
         }
         // Both bundles now split send into a wrapper (owns the sending lock)

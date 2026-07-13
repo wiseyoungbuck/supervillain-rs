@@ -2313,8 +2313,7 @@ async function runAutosave() {
     // Drafts. Scoped to the sending session (roborev 318): a different
     // compose (reopened or new mid-send) must keep saving normally, or its
     // edits are silently lost at leave time.
-    if (!draftsEnabled() || !composeDirty()
-        || (state.sending && state.composeSession === sendingSession)) return;
+    if (!draftsEnabled() || !composeDirty() || composeSendLocked()) return;
     // Capture synchronously — a flush-on-leave clears the compose right after.
     const session = state.composeSession;
     const payload = {
