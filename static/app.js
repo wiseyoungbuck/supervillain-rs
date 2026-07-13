@@ -1679,9 +1679,9 @@ async function doSendEmail() {
     cancelAutosave();
     // cancelAutosave() only kills the pending TIMER — a save already in
     // flight keeps running. Without waiting for it, its created/updated id
-    // would land after the tracked draft is already deleted below and never
-    // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
-    // never rejects, but settle either way defensively.
+    // would land after the send-owned draft is already deleted below and
+    // never get adopted or removed: a ghost draft (roborev 294, fix 3).
+    // doAutosave never rejects, but settle either way defensively.
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
     // fires the input handler's scheduleAutosave() and arms a fresh debounce.
@@ -1770,9 +1770,16 @@ async function doSendEmail() {
             });
             showStatus('Invite sent!', 'success');
             // Delete the autosaved draft of the mail that just went out — by
-            // the captured id, unconditionally: even a stale completion owns
-            // that draft (a newer compose's autosave POSTs a fresh id).
-            deleteDraftById(draftId);
+            // the captured id, even from a stale completion — UNLESS a newer
+            // session has recaptured that very id: openDraftInCompose adopts
+            // the EXISTING id rather than POSTing a fresh one, so after
+            // leave-mid-send + reopen-from-Drafts an unconditional delete
+            // would yank the draft from under the active editor and leave
+            // trackedDraftId dead (autosaves 404 with only a console.warn;
+            // the next leave-compose wipes the only copy). A live-but-
+            // already-sent draft is the safer residue (roborev 316).
+            const reopened = state.composeSession !== session && state.draftId === draftId;
+            if (!reopened) deleteDraftById(draftId);
             if (state.composeSession === session) {
                 clearCompose();
                 showView('list');
@@ -1797,9 +1804,11 @@ async function doSendEmail() {
             attachments: readyAttachments.length ? readyAttachments : undefined,
         });
         showStatus('Sent!', 'success');
-        // Same shape as the invite path above: captured-id delete always,
+        // Same shape as the invite path above: captured-id delete unless a
+        // newer session recaptured the id (see the comment there),
         // clear/navigate only while this send still owns the compose.
-        deleteDraftById(draftId);
+        const reopened = state.composeSession !== session && state.draftId === draftId;
+        if (!reopened) deleteDraftById(draftId);
         if (state.composeSession === session) {
             clearCompose();
             showView('list');

@@ -1974,17 +1974,17 @@ async function doSendComposedEmail() {
     cancelAutosave();
     // cancelAutosave() only kills the pending TIMER — a save already in
     // flight keeps running. Without waiting for it, its created/updated id
-    // would land after the tracked draft is already deleted below and never
-    // get adopted or removed: a ghost draft (roborev 294, fix 3). doAutosave
-    // never rejects, but settle either way defensively.
+    // would land after the send-owned draft is already deleted below and
+    // never get adopted or removed: a ghost draft (roborev 294, fix 3).
+    // doAutosave never rejects, but settle either way defensively.
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
     // fires the input handler's scheduleAutosave() and arms a fresh
     // debounce. The sending lock (held by the sendComposedEmail wrapper)
     // makes runAutosave's own guard skip it at fire time, but cancel again
     // anyway, synchronously, so the re-armed timer never fires and chains a
-    // save that would land after deleteTrackedDraft below (roborev 303,
-    // fix 4).
+    // save that would land after the captured-id draft delete below
+    // (roborev 303, fix 4).
     cancelAutosave();
 
     // Captured up front, before the await below: backing out of compose
@@ -2061,11 +2061,18 @@ async function doSendComposedEmail() {
         // and never touch a draft this send didn't create.
         //
         // Send succeeded → delete the persisted draft (kata wm57) by the
-        // captured id, unconditionally: even a stale completion owns that
-        // draft (a newer compose's autosave POSTs a fresh id), and after a
-        // back-out the session gate below would pass while live draftId is
-        // already null (roborev 315).
-        deleteDraftById(draftId);
+        // captured id, even from a stale completion (after a back-out the
+        // session gate below passes while live draftId is already null, so
+        // a live read would no-op and ghost the draft — roborev 315) —
+        // UNLESS a newer session has recaptured that very id:
+        // startDraftCompose adopts the EXISTING id rather than POSTing a
+        // fresh one, so after back-out + reopen-from-Drafts an
+        // unconditional delete would yank the draft from under the active
+        // editor and leave trackedDraftId dead (autosaves 404 with only a
+        // console.warn; the next leave wipes the only copy). A live-but-
+        // already-sent draft is the safer residue (roborev 316).
+        const reopened = state.composeSession !== session && state.draftId === draftId;
+        if (!reopened) deleteDraftById(draftId);
         if (state.composeSession === session) {
             if (state.screen === Screen.COMPOSE) {
                 showToast('Sent', 3000);

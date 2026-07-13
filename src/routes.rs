@@ -4306,6 +4306,36 @@ mod tests {
     }
 
     #[test]
+    fn send_skips_delete_when_its_draft_was_reopened() {
+        // Counterpart edge to the captured-id delete above (roborev 316):
+        // the restore paths (openDraftInCompose / startDraftCompose) adopt
+        // the EXISTING draft id rather than POSTing a fresh one. So: send
+        // draft X, leave mid-send, reopen X from the Drafts mailbox, send
+        // resolves — an unconditional delete of the captured id would yank
+        // the draft out from under the active editor AND leave
+        // trackedDraftId pointing at a dead id, so every later autosave
+        // PUTs a 404 (console.warn only) and the next leave-compose wipes
+        // the only copy. The success path must skip the delete when a newer
+        // session has recaptured that very id; a live-but-already-sent
+        // draft is strictly safer than deleting content under an editor.
+        for (bundle, src, decl) in [
+            ("app.js", APP_JS, "async function doSendEmail("),
+            (
+                "mobile/app.js",
+                MOBILE_APP_JS,
+                "async function doSendComposedEmail(",
+            ),
+        ] {
+            let block = js_fn_body(src, decl);
+            assert!(
+                block.contains("state.composeSession !== session && state.draftId === draftId"),
+                "{bundle}: the success path must detect its captured id being \
+                 recaptured by a newer compose session and skip the delete"
+            );
+        }
+    }
+
+    #[test]
     fn mobile_html_has_compose_reply_actions() {
         // Reply / reply-all / forward entry points on the detail action bar.
         for id in [
@@ -4683,6 +4713,17 @@ mod tests {
         assert!(
             handler_src.contains("font/woff2"),
             "font responses must carry the woff2 content type"
+        );
+        // OFL §2: redistribution of the font files must be accompanied by
+        // the copyright notice and license text (roborev 316).
+        let ofl = include_str!("../static/fonts/OFL.txt");
+        assert!(
+            ofl.contains("SIL OPEN FONT LICENSE"),
+            "static/fonts must ship the OFL license text alongside the woff2s"
+        );
+        assert!(
+            ofl.contains("JetBrains Mono"),
+            "the OFL copy must carry the JetBrains Mono copyright line"
         );
     }
 
