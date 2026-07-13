@@ -1946,6 +1946,13 @@ function setComposeSending(sending) {
     btn.textContent = sending ? 'Sending…' : 'Send';
 }
 
+// The compose session a send is currently in flight for, null outside a
+// send — see desktop app.js sendingSession for the full rationale
+// (roborev 318): runAutosave's mid-send skip is scoped to exactly this
+// session so a compose the user reopens or starts fresh during a slow send
+// keeps persisting its edits.
+let sendingSession = null;
+
 // Send. Payload mirrors desktop sendEmail exactly: plain body carries the
 // '> '-quoted original, html_body (only when quoting HTML) wraps the user's
 // text in a <div> above a <blockquote> of the original. Validates ≥1 To,
@@ -1959,10 +1966,15 @@ async function sendComposedEmail() {
     // (same shape as desktop sendEmail).
     if (state.sending) return;
     setComposeSending(true);
+    // Scope the mid-send autosave skip to THIS compose (roborev 318, same
+    // as desktop sendEmail): a compose the user reopens or starts fresh
+    // while this send is in flight must keep persisting its edits.
+    sendingSession = state.composeSession;
     try {
         await doSendComposedEmail();
     } finally {
         setComposeSending(false);
+        sendingSession = null;
     }
 }
 
@@ -2072,11 +2084,15 @@ async function doSendComposedEmail() {
         // console.warn; the next leave wipes the only copy). A live-but-
         // already-sent draft is the safer residue (roborev 316). The check
         // reads the tracked pair — which leave-compose never clears — not
-        // state.draftId: a snapshot of the live id misses reopen → edit →
+        // state.draftId: a snapshot of the live id misses reopen →
         // leave-again before this completion (the live id is nulled by
-        // then) and would delete the post-reopen edits (roborev 317). In
-        // the normal still-in-compose case trackedDraftSession === session,
-        // so the delete fires.
+        // then) and would delete the reopened draft out from under its
+        // still-live tracking (roborev 317). Persisting the post-reopen
+        // edits themselves is the session-scoped sending gate's job (see
+        // sendingSession, roborev 318); this guard then covers the window
+        // where such a mid-send save is still in flight and the tracked id
+        // hasn't rotated yet. In the normal still-in-compose case
+        // trackedDraftSession === session, so the delete fires.
         const reopened = trackedDraftSession !== session && trackedDraftId === draftId;
         if (!reopened) deleteDraftById(draftId);
         if (state.composeSession === session) {
@@ -2233,7 +2249,13 @@ function flushAutosave() {
 
 async function runAutosave() {
     autosaveTimer = null;
-    if (!draftsEnabled() || !composeDirty() || state.sending) return;
+    // Never save the compose that is mid-send — the mail is about to stop
+    // being a draft, and a save landing now would leave a ghost copy in
+    // Drafts. Scoped to the sending session (roborev 318): a different
+    // compose (reopened or new mid-send) must keep saving normally, or its
+    // edits are silently lost at leave time.
+    if (!draftsEnabled() || !composeDirty()
+        || (state.sending && state.composeSession === sendingSession)) return;
     // Capture synchronously — a flush-on-leave clears the compose right after.
     const session = state.composeSession;
     const payload = {

@@ -4322,11 +4322,14 @@ mod tests {
         // The guard must read the module-level trackedDraftId/
         // trackedDraftSession pair — which clearCompose/clearComposeFields
         // deliberately never touch — NOT the point-in-time state.draftId: a
-        // snapshot guard misses reopen → edit → leave-again before the
-        // stale send resolves (state.draftId is nulled by then) and would
-        // delete the draft carrying the post-reopen edits (roborev 317).
-        // Desktop has TWO delete sites (invite and regular send); each
-        // needs its own guard.
+        // snapshot guard misses reopen → leave-again before the stale send
+        // resolves (state.draftId is nulled by then) and would delete the
+        // reopened draft out from under its still-live tracking
+        // (roborev 317). Persisting the post-reopen edits themselves is the
+        // session-scoped sending gate's job (roborev 318, see
+        // autosave_gate_is_scoped_to_the_sending_session below). Desktop
+        // has TWO delete sites (invite and regular send); each needs its
+        // own guard.
         for (bundle, src, decl, sites) in [
             ("app.js", APP_JS, "async function doSendEmail(", 2usize),
             (
@@ -4348,6 +4351,36 @@ mod tests {
                 !block.contains("state.draftId === draftId"),
                 "{bundle}: the recapture guard must not read the \
                  point-in-time state.draftId — it is nulled by leave-compose"
+            );
+        }
+    }
+
+    #[test]
+    fn autosave_gate_is_scoped_to_the_sending_session() {
+        // roborev 318: state.sending gates runAutosave so the compose being
+        // sent is never re-saved mid-send (it's about to stop being a draft;
+        // a late save would ghost a copy in Drafts). But the gate was
+        // GLOBAL: a compose the user reopened or started fresh while an
+        // unrelated slow send was in flight couldn't persist anything —
+        // its debounced saves were skipped and the leave-flush no-op'd on
+        // the same gate right before clearCompose wiped the editor: silent
+        // data loss. Both bundles must scope the skip to the session that
+        // initiated the send; the tracked-pair recapture guard above then
+        // keeps the send's completion from deleting whatever id those
+        // mid-send saves are tracking.
+        for (bundle, src) in [("app.js", APP_JS), ("mobile/app.js", MOBILE_APP_JS)] {
+            let block = js_fn_body(src, "async function runAutosave(");
+            assert!(
+                block.contains("state.sending && state.composeSession === sendingSession"),
+                "{bundle}: runAutosave must skip only the sending session's saves"
+            );
+            assert!(
+                src.contains("sendingSession = state.composeSession"),
+                "{bundle}: the send wrapper must record which session it is sending"
+            );
+            assert!(
+                src.contains("sendingSession = null"),
+                "{bundle}: the send wrapper must clear the sending session when done"
             );
         }
     }
