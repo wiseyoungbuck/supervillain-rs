@@ -1995,6 +1995,14 @@ async function doSendComposedEmail() {
     // match gates both the success-path clear/back and the failure-path
     // handling below against touching a draft this send didn't create.
     const session = state.composeSession;
+    // The draft this send owns — captured only now, after the settle above
+    // adopted any in-flight save's final id. The completion below must
+    // delete THIS id, never live state.draftId: backing out of compose
+    // mid-send runs clearComposeFields, which nulls draftId WITHOUT bumping
+    // composeSession, so the session gate alone still passes while a live
+    // read no-ops — orphaning the just-sent mail's autosaved draft as a
+    // ghost copy in Drafts (roborev 315).
+    const draftId = state.draftId;
 
     const to = composeEl('compose-to').value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = composeEl('compose-cc').value.split(',').map(s => s.trim()).filter(Boolean);
@@ -2051,10 +2059,14 @@ async function doSendComposedEmail() {
         // actually tells this stale completion apart from the new draft.
         // The send itself succeeded; only make sure no draft state lingers,
         // and never touch a draft this send didn't create.
+        //
+        // Send succeeded → delete the persisted draft (kata wm57) by the
+        // captured id, unconditionally: even a stale completion owns that
+        // draft (a newer compose's autosave POSTs a fresh id), and after a
+        // back-out the session gate below would pass while live draftId is
+        // already null (roborev 315).
+        deleteDraftById(draftId);
         if (state.composeSession === session) {
-            // Send succeeded → delete the persisted draft (kata wm57), before
-            // clearComposeFields nulls the id it reads.
-            deleteTrackedDraft();
             if (state.screen === Screen.COMPOSE) {
                 showToast('Sent', 3000);
                 clearComposeFields();
@@ -2303,12 +2315,20 @@ function adoptDraftId(newId) {
     state.draftId = newId;
 }
 
-// Fire-and-forget delete of the tracked draft (on send / explicit discard).
-// Nulls draftId up front so a racing autosave completion can't resurrect it.
+// Fire-and-forget delete of the tracked draft (explicit discard only — the
+// send path captures its own id instead, see doSendComposedEmail). Nulls
+// draftId up front so a racing autosave completion can't resurrect it.
 function deleteTrackedDraft() {
     const id = state.draftId;
     state.draftId = null;
     cancelAutosave();
+    deleteDraftById(id);
+}
+
+// Fire-and-forget delete of a draft by an id the caller owns. Deliberately
+// doesn't touch state.draftId or the autosave timer — a send's stale
+// completion must not disturb whatever compose is now active (roborev 315).
+function deleteDraftById(id) {
     if (!id || !draftsEnabled()) return;
     state.api('DELETE', '/drafts/' + encodeURIComponent(id))
         .catch(err => console.warn('Draft delete failed:', err));

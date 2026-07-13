@@ -1,3 +1,33 @@
+/* Self-hosted JetBrains Mono (roborev 315). The old Google Fonts stylesheet
+   import was CSP-blocked and never loaded (dropped in cf614e5), so the face
+   silently depended on a local install. Serving the woff2 from this server makes
+   rendering deterministic on every machine and keeps the tailnet/offline
+   goal — CSP already allows font-src 'self'. Weights match actual usage
+   (400 body, 600, bold=700); the single italic use synthesizes. */
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('/fonts/JetBrainsMono-SemiBold.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/fonts/JetBrainsMono-Bold.woff2') format('woff2');
+}
+
 :root {
     --bg: #000000;
     --bg-secondary: #0a0a0a;

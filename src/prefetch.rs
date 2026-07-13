@@ -487,7 +487,7 @@ impl PrefetchCache {
         for (account, entry) in entries {
             let e = entry.lock().await;
             let mut bodies: Vec<(&String, &Email)> = e.body_cache.iter().collect();
-            bodies.sort_by(|a, b| b.1.received_at.cmp(&a.1.received_at));
+            bodies.sort_by_key(|b| std::cmp::Reverse(b.1.received_at));
             snapshot.insert(
                 account,
                 AccountSnapshot {

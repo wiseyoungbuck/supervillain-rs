@@ -39,6 +39,9 @@ const ICON_180: &[u8] = include_bytes!("../static/icon-180.png");
 const ICON_192: &[u8] = include_bytes!("../static/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../static/icon-512.png");
 const SUPERVILLAIN_JPG: &[u8] = include_bytes!("../static/supervillain.jpg");
+const FONT_JBM_REGULAR: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Regular.woff2");
+const FONT_JBM_SEMIBOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-SemiBold.woff2");
+const FONT_JBM_BOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Bold.woff2");
 
 // =============================================================================
 // Router
@@ -99,6 +102,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/app.js", get(app_js))
         .route("/api.js", get(api_js))
         .route("/style.css", get(style_css))
+        .route("/fonts/JetBrainsMono-Regular.woff2", get(font_jbm_regular))
+        .route(
+            "/fonts/JetBrainsMono-SemiBold.woff2",
+            get(font_jbm_semibold),
+        )
+        .route("/fonts/JetBrainsMono-Bold.woff2", get(font_jbm_bold))
         .route("/favicon-32.png", get(favicon_32))
         .route("/icon-180.png", get(icon_180))
         .route("/icon-192.png", get(icon_192))
@@ -212,6 +221,18 @@ async fn mobile_sw() -> impl IntoResponse {
         ],
         body,
     )
+}
+
+async fn font_jbm_regular() -> impl IntoResponse {
+    ([("content-type", "font/woff2")], FONT_JBM_REGULAR)
+}
+
+async fn font_jbm_semibold() -> impl IntoResponse {
+    ([("content-type", "font/woff2")], FONT_JBM_SEMIBOLD)
+}
+
+async fn font_jbm_bold() -> impl IntoResponse {
+    ([("content-type", "font/woff2")], FONT_JBM_BOLD)
 }
 
 async fn favicon_32() -> impl IntoResponse {
@@ -660,14 +681,25 @@ async fn get_email(
     let session_lock = resolve_session(&state, Some(&account_key)).await?;
     let session = session_lock.read().await;
 
+    // The reserved interactive lane is only for fetches the user is actively
+    // waiting on (see provider::get_emails). mark_read=false is the prefetch
+    // signature — both bundles' adjacent-email warmers set it — and those
+    // fire-and-forget warm-ups must not queue full bodies ahead of a
+    // genuinely user-blocking open (roborev 315).
+    let priority = params.mark_read.unwrap_or(true);
     let email = state
         .prefetch
         .body_or_fetch(&account_key, &email_id, || async {
-            // priority: the user is staring at a spinner for exactly this
-            // response — it must not queue behind a warm pass's fan-out.
-            let emails =
-                provider::get_emails(&session, std::slice::from_ref(&email_id), true, None, true)
-                    .await?;
+            // priority: when set, the user is staring at a spinner for exactly
+            // this response — it must not queue behind a warm pass's fan-out.
+            let emails = provider::get_emails(
+                &session,
+                std::slice::from_ref(&email_id),
+                true,
+                None,
+                priority,
+            )
+            .await?;
             emails
                 .into_iter()
                 .next()
@@ -2890,6 +2922,32 @@ mod tests {
         assert_eq!(params.account.as_deref(), Some("work"));
     }
 
+    #[test]
+    fn get_email_keeps_prefetch_off_the_interactive_lane() {
+        // provider::get_emails' reserved lane is "only for fetches a user is
+        // actively waiting on … never for bulk fan-outs" — but both bundles'
+        // prefetchAdjacentEmails hit this same route fire-and-forget (three
+        // full-body fetches per email open). mark_read=false is the prefetch
+        // signature, so the handler must derive the lane from it instead of
+        // hardcoding priority for every caller (roborev 315).
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        let start = handler_src
+            .find("async fn get_email(")
+            .expect("get_email must exist");
+        let rest = &handler_src[start..];
+        let end = rest.find("\n}").expect("get_email must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("let priority = params.mark_read.unwrap_or(true)"),
+            "get_email must derive the interactive-lane flag from mark_read"
+        );
+        assert!(
+            !block.contains("None, true)"),
+            "the fetch closure must pass the derived flag, not hardcode priority"
+        );
+    }
+
     // =========================================================================
     // ListEmailsParams sort deserialization (kata 09ef) — accept both known
     // values and absence, hard-reject anything else so a typo'd sort=
@@ -4164,6 +4222,90 @@ mod tests {
     }
 
     #[test]
+    fn app_js_send_guards_stale_completion() {
+        // Desktop mirror of the mobile contract above (roborev 315): a send
+        // resolving after the user Escaped out of compose must not clear or
+        // navigate a compose it no longer owns. Escape's leave path runs
+        // `flushAutosave(); clearCompose(); showView('list')` with no
+        // state.sending gate, so a slow send can still be in flight when the
+        // user moves on — clearCompose bumps composeSession, and the
+        // completion must check the token it captured before the await.
+        let block = js_fn_body(APP_JS, "async function doSendEmail(");
+        assert!(
+            block.contains("const session = state.composeSession"),
+            "doSendEmail must capture state.composeSession before the send's await"
+        );
+        assert!(
+            block.matches("state.composeSession === session").count() >= 2,
+            "both success paths (invite and regular send) must gate their \
+             clear/navigate on composeSession still matching"
+        );
+        // The failure paths are the one thing deliberately NOT session-gated
+        // (same contract as mobile): a failed send is a lost email and must
+        // surface even after the user moved on.
+        assert_eq!(
+            block.matches("} catch (err)").count(),
+            2,
+            "doSendEmail should have exactly its invite and send catches"
+        );
+        for (i, _) in block.match_indices("} catch (err)") {
+            // 300 chars spans the catch's comment + its showStatus line but
+            // stays well short of the next success path's session gate.
+            let body = &block[i..(i + 300).min(block.len())];
+            assert!(
+                body.contains("showStatus("),
+                "each send catch must surface the failure"
+            );
+            assert!(
+                !body.contains("composeSession"),
+                "failure toasts must be unconditional, never session-gated"
+            );
+        }
+    }
+
+    #[test]
+    fn send_deletes_the_draft_it_captured_not_live_state() {
+        // Both bundles (roborev 315): at completion time state.draftId may
+        // belong to someone else entirely — the user can leave compose
+        // mid-send (nulling it, so the just-sent mail's autosaved draft
+        // ghosts in Drafts forever) or open a DIFFERENT draft from the
+        // Drafts mailbox (a live read would DELETE that draft — real data
+        // loss; it passes the server's is-a-draft check). The send must
+        // capture the id it owns once — after the in-flight autosave settle
+        // adopts the final id — and delete exactly that id on success.
+        for (bundle, src, decl) in [
+            ("app.js", APP_JS, "async function doSendEmail("),
+            (
+                "mobile/app.js",
+                MOBILE_APP_JS,
+                "async function doSendComposedEmail(",
+            ),
+        ] {
+            let block = js_fn_body(src, decl);
+            let settle = block
+                .find("await saveInFlight")
+                .unwrap_or_else(|| panic!("{bundle}: send must settle saveInFlight first"));
+            let capture = block
+                .find("const draftId = state.draftId")
+                .unwrap_or_else(|| panic!("{bundle}: send must capture the draft id it owns"));
+            assert!(
+                capture > settle,
+                "{bundle}: the capture must come after the saveInFlight settle, \
+                 when the adopted id is final"
+            );
+            assert!(
+                block.contains("deleteDraftById(draftId)"),
+                "{bundle}: send success must delete the CAPTURED id"
+            );
+            assert!(
+                !block.contains("deleteTrackedDraft()"),
+                "{bundle}: the send path must not read live draft state at \
+                 completion time"
+            );
+        }
+    }
+
+    #[test]
     fn mobile_html_has_compose_reply_actions() {
         // Reply / reply-all / forward entry points on the detail action bar.
         for id in [
@@ -4501,6 +4643,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jetbrains_mono_is_self_hosted() {
+        // cf614e5 dropped the Google Fonts @import (CSP-blocked; it never
+        // loaded) but left 'JetBrains Mono' leading --font-mono, so the
+        // typeface silently depended on a local install. Self-host the woff2
+        // from this server instead (CSP already allows font-src 'self'):
+        // deterministic rendering, no cross-origin fetch, works on the
+        // tailnet and offline (roborev 315).
+        assert!(
+            !STYLE_CSS.contains("@import"),
+            "style.css must not depend on cross-origin fetches"
+        );
+        assert!(
+            STYLE_CSS.contains("--font-mono: 'JetBrains Mono'"),
+            "the mono stack should still lead with JetBrains Mono"
+        );
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        // Weights matching actual CSS usage: 400 (body), 600, and bold=700.
+        // The single italic use synthesizes. include_bytes! makes the files'
+        // existence a compile-time guarantee.
+        for face in ["Regular", "SemiBold", "Bold"] {
+            let url = format!("url('/fonts/JetBrainsMono-{face}.woff2')");
+            assert!(
+                STYLE_CSS.contains(&url),
+                "style.css must declare a self-hosted @font-face src {url}"
+            );
+            let route = format!("\"/fonts/JetBrainsMono-{face}.woff2\"");
+            assert!(
+                handler_src.contains(&route),
+                "routes must serve {route} from 'self'"
+            );
+        }
+        assert!(
+            STYLE_CSS.matches("@font-face").count() >= 3,
+            "each shipped weight needs its own @font-face block"
+        );
+        assert!(
+            handler_src.contains("font/woff2"),
+            "font responses must carry the woff2 content type"
+        );
+    }
+
     #[tokio::test]
     async fn theme_endpoint_returns_css_content_type() {
         let resp = get_theme().await.into_response();
@@ -4706,15 +4891,17 @@ white   = '#fdf6e3'
     }
 
     // Both clients must wire the same draft contract: a debounced autosave that
-    // POSTs then PUTs, a tracked draftId deleted on send, and the
-    // drafts-mailbox-opens-compose restore — all gated on the fastmail provider.
+    // POSTs then PUTs, the send-owned draft id (captured at send time, see
+    // send_deletes_the_draft_it_captured_not_live_state) deleted on send, and
+    // the drafts-mailbox-opens-compose restore — all gated on the fastmail
+    // provider.
     fn assert_bundle_has_draft_autosave(js: &str, bundle: &str) {
         for needle in [
             "AUTOSAVE_DEBOUNCE_MS",
             "function scheduleAutosave",
             "function runAutosave",
             "function flushAutosave",
-            "function deleteTrackedDraft",
+            "function deleteDraftById",
             "state.draftId",
             "'/drafts'",
             "/drafts/",
@@ -4941,12 +5128,12 @@ white   = '#fdf6e3'
             let await_pos = block
                 .find("await saveInFlight")
                 .unwrap_or_else(|| panic!("{bundle} send must await the in-flight autosave"));
-            let delete_pos = block.find("deleteTrackedDraft()").unwrap_or_else(|| {
-                panic!("{bundle} send must delete the tracked draft on success")
+            let delete_pos = block.find("deleteDraftById(draftId)").unwrap_or_else(|| {
+                panic!("{bundle} send must delete the send-owned draft on success")
             });
             assert!(
                 await_pos < delete_pos,
-                "{bundle} send must await saveInFlight BEFORE deleteTrackedDraft(), \
+                "{bundle} send must await saveInFlight BEFORE deleting the draft, \
                  so a late-adopted id is the one that gets deleted"
             );
         }

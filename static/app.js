@@ -1688,9 +1688,24 @@ async function doSendEmail() {
     // state.sending (set by the sendEmail wrapper) makes runAutosave's own
     // guard skip it at fire time, but cancel again anyway, synchronously
     // ahead of the lock, so the re-armed timer never chains a save that
-    // would land after deleteTrackedDraft below (roborev 304 — same fix as
+    // would land after the draft delete below (roborev 304 — same fix as
     // mobile).
     cancelAutosave();
+
+    // Both captured before the send's await, used at completion (roborev
+    // 315, mirroring mobile's doSendComposedEmail).
+    // session: Escape's leave path (flushAutosave/clearCompose/showView) has
+    // no sending gate, so a slow send can resolve after the user left — or
+    // after they opened a DIFFERENT draft (openDraftInCompose bumps
+    // composeSession too). A stale completion must not clear or navigate a
+    // compose it doesn't own.
+    // draftId: the draft this send owns, final now that the settle above
+    // adopted any in-flight save's id (state.sending blocks new autosaves).
+    // Deleting the LIVE state.draftId at completion instead would ghost the
+    // sent mail's draft after a leave (clearCompose nulls it) or destroy an
+    // unrelated draft the user opened mid-send.
+    const session = state.composeSession;
+    const draftId = state.draftId;
 
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -1754,10 +1769,17 @@ async function doSendEmail() {
                 attachments: readyAttachments.length ? readyAttachments : undefined,
             });
             showStatus('Invite sent!', 'success');
-            deleteTrackedDraft();
-            clearCompose();
-            showView('list');
+            // Delete the autosaved draft of the mail that just went out — by
+            // the captured id, unconditionally: even a stale completion owns
+            // that draft (a newer compose's autosave POSTs a fresh id).
+            deleteDraftById(draftId);
+            if (state.composeSession === session) {
+                clearCompose();
+                showView('list');
+            }
         } catch (err) {
+            // Unconditional (never session-gated): a failed send is a lost
+            // email and must surface even after the user moved on.
             showStatus('Invite send failed: ' + err.message, 'error');
         }
         return;
@@ -1775,10 +1797,16 @@ async function doSendEmail() {
             attachments: readyAttachments.length ? readyAttachments : undefined,
         });
         showStatus('Sent!', 'success');
-        deleteTrackedDraft();
-        clearCompose();
-        showView('list');
+        // Same shape as the invite path above: captured-id delete always,
+        // clear/navigate only while this send still owns the compose.
+        deleteDraftById(draftId);
+        if (state.composeSession === session) {
+            clearCompose();
+            showView('list');
+        }
     } catch (err) {
+        // Unconditional (never session-gated): a failed send is a lost
+        // email and must surface even after the user moved on.
         showStatus('Send failed: ' + err.message, 'error');
     }
 }
@@ -3918,12 +3946,14 @@ function adoptDraftId(newId) {
     state.draftId = newId;
 }
 
-// Fire-and-forget delete of the tracked draft (on send / explicit discard).
-// Nulls draftId up front so a racing autosave completion can't resurrect it.
-function deleteTrackedDraft() {
-    const id = state.draftId;
-    state.draftId = null;
-    cancelAutosave();
+// Fire-and-forget delete of a draft by an id the caller owns (doSendEmail
+// captures it before its await). Never reads live state.draftId: at
+// completion time that may already belong to a different compose, and
+// deleting it would destroy user content (roborev 315). Deliberately
+// doesn't touch state.draftId or the autosave timer either — a stale
+// completion must not disturb whatever compose is now active; the owning
+// path (clearCompose) does that cleanup itself.
+function deleteDraftById(id) {
     if (!id || !draftsEnabled()) return;
     api('DELETE', `/drafts/${encodeURIComponent(id)}`)
         .catch(err => console.warn('Draft delete failed:', err));
