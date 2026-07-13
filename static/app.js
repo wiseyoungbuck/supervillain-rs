@@ -1685,6 +1685,17 @@ function setComposeLocked(locked) {
     }
 }
 
+// True while the ACTIVE compose is the one a send is in flight for — the
+// window where the payload is already snapshotted and any change would be
+// silently discarded (or, for attachment removal, silently NOT applied to
+// the mail). The DOM lock above can't constrain the non-form entry points —
+// dropping a file on the compose view, pasting an image (paste events still
+// fire on a readOnly textarea), clicking an attachment's remove button — so
+// those handlers check this themselves (roborev 322).
+function composeSendLocked() {
+    return state.sending && state.composeSession === sendingSession;
+}
+
 async function sendEmail() {
     // Re-entry guard: a second Ctrl+Enter while a send is settling its
     // autosave (the awaits at the top of doSendEmail) or in flight must not
@@ -4194,6 +4205,12 @@ function renderComposeAttachments() {
 function handleAttachmentListClick(e) {
     const removeBtn = e.target.closest('.attachment-remove');
     if (!removeBtn) return;
+    // Mid-send removal is the inverse illusion of a mid-send add: the
+    // snapshotted send still carries the attachment (roborev 322).
+    if (composeSendLocked()) {
+        showStatus('Sending — attachments can no longer be changed', 'error');
+        return;
+    }
     const id = parseInt(removeBtn.dataset.id);
     const idx = state.pendingAttachments.findIndex(a => a._id === id);
     if (idx === -1) return;
@@ -4243,6 +4260,15 @@ function handleComposePaste(e) {
 }
 
 function addFiles(files) {
+    // Single choke point for every attachment add path (file input, drop,
+    // paste). A file added mid-send would upload and render, then be
+    // aborted by the success path's clearCompose under the "Sent!" toast —
+    // the POST carries the pre-settle snapshot (roborev 322). Refuse
+    // loudly; a silent no-op would just be the same discard, earlier.
+    if (composeSendLocked()) {
+        showStatus('Sending — attachments can no longer be changed', 'error');
+        return;
+    }
     for (const file of files) {
         if (file.size > 25 * 1024 * 1024) {
             showStatus(`${file.name} is too large (max 25 MB)`, 'error');

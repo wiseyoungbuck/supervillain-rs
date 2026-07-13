@@ -4456,10 +4456,33 @@ mod tests {
             wrapper.contains("setComposeLocked(true)"),
             "desktop's send wrapper must lock the compose at send start"
         );
+        // Positional (roborev 322): the unlock must live in the FINALLY —
+        // moved to the success path only, a failed send would stay locked
+        // forever with no retry possible.
+        let finally_pos = wrapper
+            .find("finally {")
+            .expect("sendEmail must have a finally");
+        let unlock_pos = wrapper
+            .find("setComposeLocked(false)")
+            .expect("desktop's send wrapper must unlock when the send settles");
         assert!(
-            wrapper.contains("setComposeLocked(false)"),
-            "desktop's send wrapper must unlock when the send settles"
+            unlock_pos > finally_pos,
+            "the wrapper's unlock must be inside finally, not the success path"
         );
+        // The DOM lock can't constrain the non-form attachment routes
+        // (roborev 322): dropping a file on the compose view and pasting an
+        // image both still fire mid-send (paste events fire on a readOnly
+        // textarea), funneling into addFiles — the attachment would upload,
+        // render, then be aborted by clearCompose under the "Sent!" toast,
+        // the exact silent-discard class the lock exists to close. The
+        // remove buttons are the inverse illusion: "removing" an attachment
+        // the snapshotted send still carries. Both must check the lock.
+        for entry in ["function addFiles(", "function handleAttachmentListClick("] {
+            assert!(
+                js_fn_body(APP_JS, entry).contains("composeSendLocked()"),
+                "{entry} must refuse while the active compose's send is in flight"
+            );
+        }
         assert!(
             js_fn_body(APP_JS, "function clearCompose(").contains("setComposeLocked(false)"),
             "clearCompose must unlock — a new compose during a slow send \
