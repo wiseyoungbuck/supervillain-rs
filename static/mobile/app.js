@@ -1746,6 +1746,12 @@ function renderComposeAttachments() {
 function handleComposeAttachmentListClick(e) {
     const removeBtn = e.target.closest('.att-chip-remove');
     if (!removeBtn) return;
+    // Mid-send removal is an illusion: the snapshotted send still carries
+    // the attachment (roborev 323, mirroring desktop).
+    if (composeSendLocked()) {
+        showToast('Sending — attachments can no longer be changed', 3000);
+        return;
+    }
     const id = Number(removeBtn.dataset.id);
     const idx = state.pendingAttachments.findIndex(a => a._id === id);
     if (idx === -1) return;
@@ -1967,6 +1973,16 @@ function setComposeLocked(locked) {
         const el = composeEl(id);
         if (el) el.disabled = locked;
     }
+}
+
+// True while the ACTIVE compose is the one a send is in flight for — the
+// window where the payload is already snapshotted, so any change would be
+// silently ignored by the mail actually going out. The DOM lock above
+// covers every add path on mobile, but the attachment chips' remove
+// buttons aren't form fields — their handler checks this itself
+// (roborev 323, mirroring desktop composeSendLocked).
+function composeSendLocked() {
+    return state.sending && state.composeSession === sendingSession;
 }
 
 // The compose session a send is currently in flight for, null outside a

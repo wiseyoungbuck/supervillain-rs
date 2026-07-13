@@ -4483,6 +4483,16 @@ mod tests {
                 "{entry} must refuse while the active compose's send is in flight"
             );
         }
+        // Mobile's add paths are fully covered by its DOM lock (button +
+        // file input disabled; no drop/paste routes), but the attachment
+        // chips' ✕ buttons stay tappable mid-send — the same
+        // inverse-illusion as desktop's remove buttons (roborev 323).
+        assert!(
+            js_fn_body(MOBILE_APP_JS, "function handleComposeAttachmentListClick(")
+                .contains("composeSendLocked()"),
+            "mobile's chip-remove handler must refuse while the active \
+             compose's send is in flight"
+        );
         assert!(
             js_fn_body(APP_JS, "function clearCompose(").contains("setComposeLocked(false)"),
             "clearCompose must unlock — a new compose during a slow send \
