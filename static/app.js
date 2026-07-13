@@ -1662,6 +1662,29 @@ async function toggleFlag(emailId) {
 // editor: silent data loss.
 let sendingSession = null;
 
+// Lock the compose surface while ITS send is in flight (roborev 321): the
+// payload is snapshotted at send initiation (see doSendEmail), so anything
+// typed after Ctrl+Enter would be silently discarded — the session-scoped
+// gate skips this session's autosaves, the scoped cancel kills its re-armed
+// timer, and success clears the editor under a "Sent!" toast. Make mid-send
+// edits impossible instead of invisible. Unlocked by the wrapper's finally
+// (a failed send must stay editable for retry) and by clearCompose (a new
+// or restored compose can start while an old slow send is still in flight
+// and must never inherit the lock). readOnly for text fields; disabled for
+// controls readOnly doesn't constrain (select/checkbox/datetime/file — a
+// disabled file input also ignores the attach handlers' .click()).
+function setComposeLocked(locked) {
+    for (const el of [els.composeTo, els.composeCc, els.composeSubject,
+                      els.composeBody, els.inviteSummary, els.inviteLocation,
+                      els.inviteTz]) {
+        if (el) el.readOnly = locked;
+    }
+    for (const el of [els.composeFrom, els.composeInviteEnabled,
+                      els.inviteStart, els.inviteEnd, els.composeFileInput]) {
+        if (el) el.disabled = locked;
+    }
+}
+
 async function sendEmail() {
     // Re-entry guard: a second Ctrl+Enter while a send is settling its
     // autosave (the awaits at the top of doSendEmail) or in flight must not
@@ -1670,6 +1693,7 @@ async function sendEmail() {
     if (state.sending) return;
     state.sending = true;
     sendingSession = state.composeSession;
+    setComposeLocked(true);
     // Immediate feedback. Everything until the POST settles used to be
     // silent, so a send stalled behind a busy backend read as "nothing
     // happened" — and invited the duplicate Ctrl+Enter guarded above.
@@ -1679,6 +1703,7 @@ async function sendEmail() {
     } finally {
         state.sending = false;
         sendingSession = null;
+        setComposeLocked(false);
     }
 }
 
@@ -3773,6 +3798,9 @@ function clearCompose() {
     // the first autosave POSTs.
     state.composeSession++;
     cancelAutosave();
+    // A fresh compose must never inherit a still-in-flight send's lock
+    // (roborev 321) — that send's finally will unlock again harmlessly.
+    setComposeLocked(false);
     state.draftId = null;
     els.composeTo.value = '';
     els.composeCc.value = '';

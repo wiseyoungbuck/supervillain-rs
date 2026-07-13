@@ -1786,6 +1786,9 @@ function clearComposeFields() {
     // (startDraftCompose) sets draftId again after calling this; a plain new
     // compose leaves it null until the first autosave POSTs.
     cancelAutosave();
+    // A fresh compose must never inherit a still-in-flight send's lock
+    // (roborev 321) — that send's finally will unlock again harmlessly.
+    setComposeLocked(false);
     state.draftId = null;
     composeEl('compose-to').value = '';
     composeEl('compose-cc').value = '';
@@ -1940,10 +1943,30 @@ function autosizeComposeBody() {
 // state.sending; the button's disabled state mirrors it for the user.
 function setComposeSending(sending) {
     state.sending = sending;
+    setComposeLocked(sending);
     const btn = composeEl('compose-send-btn');
     if (!btn) return;
     btn.disabled = sending;
     btn.textContent = sending ? 'Sending…' : 'Send';
+}
+
+// Lock the compose surface while ITS send is in flight (roborev 321, same
+// as desktop setComposeLocked): the payload is snapshotted at send
+// initiation, so anything typed after tapping Send would be silently
+// discarded. Unlocked via setComposeSending(false) in the wrapper's finally
+// (a failed send must stay editable for retry) and by clearComposeFields (a
+// new or restored compose can start while an old slow send is still in
+// flight and must never inherit the lock). readOnly for text fields;
+// disabled for the From select, the file input, and the attach button.
+function setComposeLocked(locked) {
+    for (const id of ['compose-to', 'compose-cc', 'compose-subject', 'compose-body']) {
+        const el = composeEl(id);
+        if (el) el.readOnly = locked;
+    }
+    for (const id of ['compose-from', 'compose-file-input', 'compose-attach-btn']) {
+        const el = composeEl(id);
+        if (el) el.disabled = locked;
+    }
 }
 
 // The compose session a send is currently in flight for, null outside a

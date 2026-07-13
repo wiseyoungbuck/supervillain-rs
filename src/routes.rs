@@ -4371,29 +4371,49 @@ mod tests {
         // adopted id). Reading live state afterward sent the NEW compose's
         // fields, passed the completion gates as their owner, and deleted
         // the reopened draft.
-        for (bundle, src, decl, field_read) in [
+        for (bundle, src, decl, pre_reads, forbidden) in [
             (
                 "app.js",
                 APP_JS,
                 "async function doSendEmail(",
-                "els.compose",
+                // els.invite covers the invite snapshot too (roborev 321):
+                // those fields don't match the els.compose prefix, so
+                // without it a live els.invite*.value read drifting back
+                // below the settle would pass this test.
+                &[
+                    "const session = sendingSession",
+                    "els.compose",
+                    "els.invite",
+                    "state.replyContext",
+                ][..],
+                &[
+                    "els.compose",
+                    "els.invite",
+                    "state.replyContext",
+                    "state.pendingAttachments",
+                ][..],
             ),
             (
                 "mobile/app.js",
                 MOBILE_APP_JS,
                 "async function doSendComposedEmail(",
-                "composeEl(",
+                &[
+                    "const session = sendingSession",
+                    "composeEl(",
+                    "state.replyContext",
+                ][..],
+                &[
+                    "composeEl(",
+                    "state.replyContext",
+                    "state.pendingAttachments",
+                ][..],
             ),
         ] {
             let block = js_fn_body(src, decl);
             let settle = block
                 .find("await saveInFlight")
                 .unwrap_or_else(|| panic!("{bundle}: send must settle saveInFlight"));
-            for needle in [
-                "const session = sendingSession",
-                field_read,
-                "state.replyContext",
-            ] {
+            for needle in pre_reads {
                 let pos = block
                     .find(needle)
                     .unwrap_or_else(|| panic!("{bundle}: send must read {needle}"));
@@ -4403,7 +4423,7 @@ mod tests {
                 );
             }
             let after = &block[settle..];
-            for live_read in [field_read, "state.replyContext", "state.pendingAttachments"] {
+            for live_read in forbidden {
                 assert!(
                     !after.contains(live_read),
                     "{bundle}: no live {live_read} read may follow the settle \
@@ -4411,6 +4431,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compose_locks_while_its_send_is_in_flight() {
+        // roborev 321: the payload is snapshotted at send initiation (see
+        // send_snapshots_payload_before_the_settle_await), so anything typed
+        // into the SENDING compose afterward would be silently discarded —
+        // the session-scoped gate skips its autosaves, the scoped cancel
+        // kills its re-armed timer, and success clears the editor under a
+        // "Sent!" toast. Lock the compose surface for the duration so
+        // mid-send edits are impossible rather than invisible. Unlock on
+        // the failure path (a failed send must stay editable for retry) and
+        // on every new/restored compose — one can start while an old slow
+        // send is still in flight and must never inherit the lock.
+        for (bundle, src) in [("app.js", APP_JS), ("mobile/app.js", MOBILE_APP_JS)] {
+            assert!(
+                src.contains("function setComposeLocked("),
+                "{bundle} must implement the compose send-lock"
+            );
+        }
+        let wrapper = js_fn_body(APP_JS, "async function sendEmail(");
+        assert!(
+            wrapper.contains("setComposeLocked(true)"),
+            "desktop's send wrapper must lock the compose at send start"
+        );
+        assert!(
+            wrapper.contains("setComposeLocked(false)"),
+            "desktop's send wrapper must unlock when the send settles"
+        );
+        assert!(
+            js_fn_body(APP_JS, "function clearCompose(").contains("setComposeLocked(false)"),
+            "clearCompose must unlock — a new compose during a slow send \
+             must not inherit the lock"
+        );
+        assert!(
+            js_fn_body(MOBILE_APP_JS, "function setComposeSending(")
+                .contains("setComposeLocked(sending)"),
+            "mobile's sending hook must drive the lock"
+        );
+        assert!(
+            js_fn_body(MOBILE_APP_JS, "function clearComposeFields(")
+                .contains("setComposeLocked(false)"),
+            "clearComposeFields must unlock — a new compose during a slow \
+             send must not inherit the lock"
+        );
     }
 
     #[test]
