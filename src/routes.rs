@@ -4198,9 +4198,11 @@ mod tests {
              screen is still active before touching history"
         );
         assert!(
-            block.contains("const session = state.composeSession"),
-            "sendComposedEmail must capture state.composeSession before the \
-             send's await"
+            block.contains("const session = sendingSession"),
+            "sendComposedEmail must take its session token from the \
+             wrapper-set sendingSession (synchronous with send initiation), \
+             not a state.composeSession re-read that can drift across the \
+             settle await (roborev 320)"
         );
         assert!(
             block.contains("state.composeSession === session"),
@@ -4232,8 +4234,11 @@ mod tests {
         // completion must check the token it captured before the await.
         let block = js_fn_body(APP_JS, "async function doSendEmail(");
         assert!(
-            block.contains("const session = state.composeSession"),
-            "doSendEmail must capture state.composeSession before the send's await"
+            block.contains("const session = sendingSession"),
+            "doSendEmail must take its session token from the wrapper-set \
+             sendingSession (synchronous with send initiation), not a \
+             state.composeSession re-read that can drift across the settle \
+             await (roborev 320)"
         );
         assert!(
             block.matches("state.composeSession === session").count() >= 2,
@@ -4352,6 +4357,59 @@ mod tests {
                 "{bundle}: the recapture guard must not read the \
                  point-in-time state.draftId — it is nulled by leave-compose"
             );
+        }
+    }
+
+    #[test]
+    fn send_snapshots_payload_before_the_settle_await() {
+        // roborev 320: the settle await can block >3s and the leave paths
+        // have no sending gate, so the user can Escape (or browser-back) and
+        // reopen another draft before the send body resumes. Everything the
+        // send POSTs — and the session token its completion gates compare
+        // against — must be snapshotted synchronously before that await;
+        // only draftId waits for the settle (it needs the in-flight save's
+        // adopted id). Reading live state afterward sent the NEW compose's
+        // fields, passed the completion gates as their owner, and deleted
+        // the reopened draft.
+        for (bundle, src, decl, field_read) in [
+            (
+                "app.js",
+                APP_JS,
+                "async function doSendEmail(",
+                "els.compose",
+            ),
+            (
+                "mobile/app.js",
+                MOBILE_APP_JS,
+                "async function doSendComposedEmail(",
+                "composeEl(",
+            ),
+        ] {
+            let block = js_fn_body(src, decl);
+            let settle = block
+                .find("await saveInFlight")
+                .unwrap_or_else(|| panic!("{bundle}: send must settle saveInFlight"));
+            for needle in [
+                "const session = sendingSession",
+                field_read,
+                "state.replyContext",
+            ] {
+                let pos = block
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{bundle}: send must read {needle}"));
+                assert!(
+                    pos < settle,
+                    "{bundle}: {needle} must be snapshotted before the settle await"
+                );
+            }
+            let after = &block[settle..];
+            for live_read in [field_read, "state.replyContext", "state.pendingAttachments"] {
+                assert!(
+                    !after.contains(live_read),
+                    "{bundle}: no live {live_read} read may follow the settle \
+                     await — the compose may belong to someone else by then"
+                );
+            }
         }
     }
 

@@ -1689,41 +1689,20 @@ async function doSendEmail() {
     // (see sendingSession) blocks this compose's new saves from running
     // until the send settles.
     cancelAutosave();
-    // cancelAutosave() only kills the pending TIMER — a save already in
-    // flight keeps running. Without waiting for it, its created/updated id
-    // would land after the send-owned draft is already deleted below and
-    // never get adopted or removed: a ghost draft (roborev 294, fix 3).
-    // doAutosave never rejects, but settle either way defensively.
-    if (saveInFlight) await saveInFlight.catch(() => {});
-    // The in-flight save above can run >3s; a keystroke during that await
-    // fires the input handler's scheduleAutosave() and arms a fresh debounce.
-    // But a timer alive NOW may equally belong to a compose the user
-    // reopened or started fresh during that await (every leave-compose path
-    // flushes the old session's timer first, so a surviving timer is the
-    // CURRENT session's) — and since the sending gate is session-scoped
-    // (roborev 318), that other compose's save must fire, not die here.
-    // Cancel only while this compose is still the one being sent: its
-    // re-armed timer would otherwise chain a save landing after the draft
-    // delete below (roborev 304; scoped in roborev 319). The sending
-    // session's own mid-send saves are skipped at fire time by runAutosave's
-    // gate either way.
-    if (state.composeSession === sendingSession) cancelAutosave();
-
-    // Both captured before the send's await, used at completion (roborev
-    // 315, mirroring mobile's doSendComposedEmail).
-    // session: Escape's leave path (flushAutosave/clearCompose/showView) has
-    // no sending gate, so a slow send can resolve after the user left — or
-    // after they opened a DIFFERENT draft (openDraftInCompose bumps
-    // composeSession too). A stale completion must not clear or navigate a
-    // compose it doesn't own.
-    // draftId: the draft this send owns, final now that the settle above
-    // adopted any in-flight save's id (the session-scoped sending gate
-    // blocks this compose's new autosaves).
-    // Deleting the LIVE state.draftId at completion instead would ghost the
-    // sent mail's draft after a leave (clearCompose nulls it) or destroy an
-    // unrelated draft the user opened mid-send.
-    const session = state.composeSession;
-    const draftId = state.draftId;
+    // Snapshot EVERYTHING the send posts — and the session token its
+    // completion gates compare against — synchronously, before the settle
+    // await below can yield (roborev 320). That await can block >3s, and the
+    // leave paths have no sending gate, so the user can Escape and reopen a
+    // different draft before this function resumes; reading the live form or
+    // state.composeSession afterward would send the NEW compose's fields,
+    // pass the completion gates as their owner, and delete the reopened
+    // draft. The token comes from sendingSession (set by the wrapper in this
+    // same tick), so it names the compose the user actually hit send on: a
+    // stale completion must not clear or navigate a compose it doesn't own —
+    // Escape's leave path (flushAutosave/clearCompose/showView) runs freely
+    // mid-send, and openDraftInCompose bumps composeSession too (roborev
+    // 315).
+    const session = sendingSession;
 
     const to = els.composeTo.value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = els.composeCc.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -1743,6 +1722,7 @@ async function doSendEmail() {
 
     const quotedText = state.replyContext?.quotedText;
     const quotedHtml = state.replyContext?.quotedHtml;
+    const inReplyTo = state.replyContext?.inReplyTo || null;
 
     const fullTextBody = quotedText
         ? userText + '\n\n' + quotedText.split('\n').map(l => '> ' + l).join('\n')
@@ -1757,7 +1737,10 @@ async function doSendEmail() {
         .filter(a => a.status === 'ready')
         .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
 
+    // The invite fields join the same pre-settle snapshot; only the POST
+    // itself runs after the settle.
     const includeInvite = els.composeInviteEnabled && els.composeInviteEnabled.checked;
+    let invite = null;
     if (includeInvite) {
         const summary = els.inviteSummary.value.trim();
         const start = els.inviteStart.value;
@@ -1767,20 +1750,62 @@ async function doSendEmail() {
             return;
         }
         const tz = (els.inviteTz.value.trim() || state.timezone?.primary || '').trim();
-        const inviteAttendees = to.concat(cc).map(email => ({ email }));
+        invite = {
+            summary,
+            location: els.inviteLocation.value.trim() || null,
+            start,
+            end,
+            tz: tz || null,
+            attendees: to.concat(cc).map(email => ({ email })),
+        };
+    }
+
+    // cancelAutosave() at the top only kills the pending TIMER — a save
+    // already in flight keeps running. Without waiting for it, its
+    // created/updated id would land after the send-owned draft is already
+    // deleted below and never get adopted or removed: a ghost draft
+    // (roborev 294, fix 3). doAutosave never rejects, but settle either way
+    // defensively.
+    if (saveInFlight) await saveInFlight.catch(() => {});
+    // The in-flight save above can run >3s; a keystroke during that await
+    // fires the input handler's scheduleAutosave() and arms a fresh debounce.
+    // But a timer alive NOW may equally belong to a compose the user
+    // reopened or started fresh during that await (every leave-compose path
+    // flushes the old session's timer first, so a surviving timer is the
+    // CURRENT session's) — and since the sending gate is session-scoped
+    // (roborev 318), that other compose's save must fire, not die here.
+    // Cancel only while this compose is still the one being sent: its
+    // re-armed timer would otherwise chain a save landing after the draft
+    // delete below (roborev 304; scoped in roborev 319). The sending
+    // session's own mid-send saves are skipped at fire time by runAutosave's
+    // gate either way. This line is pinned verbatim by the
+    // autosave_gate_is_scoped_to_the_sending_session contract test — keep
+    // the unbraced single-line form.
+    if (state.composeSession === sendingSession) cancelAutosave();
+    // The draft this send owns: the ONE capture that must wait for the
+    // settle, which adopts an in-flight save's final id (the session-scoped
+    // sending gate blocks this compose's new autosaves, so the id can't
+    // move again). Deleting the LIVE id at completion instead would ghost
+    // the sent mail's draft after a leave (clearCompose nulls it) or
+    // destroy an unrelated draft the user opened mid-send (roborev 315).
+    // If the user left-and-reopened during the settle this reads the
+    // reopened draft's id — the recapture guard below skips that delete.
+    const draftId = state.draftId;
+
+    if (invite) {
         try {
             await api('POST', '/calendar/invite', {
                 to,
                 cc,
                 subject,
                 body: fullTextBody,
-                summary,
-                location: els.inviteLocation.value.trim() || null,
+                summary: invite.summary,
+                location: invite.location,
                 description: null,
-                start,
-                end,
-                tz: tz || null,
-                attendees: inviteAttendees,
+                start: invite.start,
+                end: invite.end,
+                tz: invite.tz,
+                attendees: invite.attendees,
                 from_address: fromAddress,
                 // Roborev 186 #6: pass through attachments so the invite+files
                 // combo doesn't silently drop the user's uploads.
@@ -1828,7 +1853,7 @@ async function doSendEmail() {
             subject,
             body: fullTextBody,
             html_body: fullHtmlBody || undefined,
-            in_reply_to: state.replyContext?.inReplyTo || null,
+            in_reply_to: inReplyTo,
             from_address: fromAddress,
             attachments: readyAttachments.length ? readyAttachments : undefined,
         });

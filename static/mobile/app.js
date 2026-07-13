@@ -1984,42 +1984,23 @@ async function doSendComposedEmail() {
     // composeSession here) and never deleted. Kill the debounce up front,
     // mirroring desktop sendEmail (roborev 302, fix 1).
     cancelAutosave();
-    // cancelAutosave() only kills the pending TIMER — a save already in
-    // flight keeps running. Without waiting for it, its created/updated id
-    // would land after the send-owned draft is already deleted below and
-    // never get adopted or removed: a ghost draft (roborev 294, fix 3).
-    // doAutosave never rejects, but settle either way defensively.
-    if (saveInFlight) await saveInFlight.catch(() => {});
-    // The in-flight save above can run >3s; a keystroke during that await
-    // fires the input handler's scheduleAutosave() and arms a fresh
-    // debounce. But a timer alive NOW may equally belong to a compose the
-    // user reopened or started fresh during that await (every leave-compose
-    // path flushes the old session's timer first, so a surviving timer is
-    // the CURRENT session's) — and since the sending gate is session-scoped
-    // (roborev 318), that other compose's save must fire, not die here.
-    // Cancel only while this compose is still the one being sent: its
-    // re-armed timer would otherwise chain a save landing after the
-    // captured-id draft delete below (roborev 303, fix 4; scoped in
-    // roborev 319). The sending session's own mid-send saves are skipped at
-    // fire time by runAutosave's gate either way.
-    if (state.composeSession === sendingSession) cancelAutosave();
-
-    // Captured up front, before the await below: backing out of compose
-    // mid-send and immediately starting a NEW draft also lands back on
-    // Screen.COMPOSE, so the screen check alone can't distinguish this
-    // send's stale completion from the new draft. composeSession is bumped
-    // by every startCompose/startReply/startForward — requiring it to still
-    // match gates both the success-path clear/back and the failure-path
-    // handling below against touching a draft this send didn't create.
-    const session = state.composeSession;
-    // The draft this send owns — captured only now, after the settle above
-    // adopted any in-flight save's final id. The completion below must
-    // delete THIS id, never live state.draftId: backing out of compose
-    // mid-send runs clearComposeFields, which nulls draftId WITHOUT bumping
-    // composeSession, so the session gate alone still passes while a live
-    // read no-ops — orphaning the just-sent mail's autosaved draft as a
-    // ghost copy in Drafts (roborev 315).
-    const draftId = state.draftId;
+    // Snapshot EVERYTHING the send posts — and the session token its
+    // completion gates compare against — synchronously, before the settle
+    // await below can yield (roborev 320). That await can block >3s, and
+    // browser-back has no sending gate, so the user can back out and reopen
+    // a different draft before this function resumes; reading the live form
+    // or state.composeSession afterward would send the NEW compose's
+    // fields, pass the completion gates as their owner, and delete the
+    // reopened draft. The token comes from sendingSession (set by the
+    // wrapper in this same tick), so it names the compose the user actually
+    // hit send on. Backing out and immediately starting a NEW draft also
+    // lands back on Screen.COMPOSE, so the screen check alone can't
+    // distinguish this send's stale completion from the new draft —
+    // composeSession is bumped by every startCompose/startReply/
+    // startForward, and requiring it to still match gates the success-path
+    // clear/back against touching a draft this send didn't create (roborev
+    // 315).
+    const session = sendingSession;
 
     const to = composeEl('compose-to').value.split(',').map(s => s.trim()).filter(Boolean);
     const cc = composeEl('compose-cc').value.split(',').map(s => s.trim()).filter(Boolean);
@@ -2041,6 +2022,7 @@ async function doSendComposedEmail() {
 
     const quotedText = state.replyContext?.quotedText;
     const quotedHtml = state.replyContext?.quotedHtml;
+    const inReplyTo = state.replyContext?.inReplyTo || null;
 
     const fullTextBody = quotedText
         ? userText + '\n\n' + quotedText.split('\n').map(l => '> ' + l).join('\n')
@@ -2055,6 +2037,39 @@ async function doSendComposedEmail() {
         .filter(a => a.status === 'ready')
         .map(a => ({ blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size }));
 
+    // cancelAutosave() at the top only kills the pending TIMER — a save
+    // already in flight keeps running. Without waiting for it, its
+    // created/updated id would land after the send-owned draft is already
+    // deleted below and never get adopted or removed: a ghost draft
+    // (roborev 294, fix 3). doAutosave never rejects, but settle either way
+    // defensively.
+    if (saveInFlight) await saveInFlight.catch(() => {});
+    // The in-flight save above can run >3s; a keystroke during that await
+    // fires the input handler's scheduleAutosave() and arms a fresh
+    // debounce. But a timer alive NOW may equally belong to a compose the
+    // user reopened or started fresh during that await (every leave-compose
+    // path flushes the old session's timer first, so a surviving timer is
+    // the CURRENT session's) — and since the sending gate is session-scoped
+    // (roborev 318), that other compose's save must fire, not die here.
+    // Cancel only while this compose is still the one being sent: its
+    // re-armed timer would otherwise chain a save landing after the
+    // captured-id draft delete below (roborev 303, fix 4; scoped in
+    // roborev 319). The sending session's own mid-send saves are skipped at
+    // fire time by runAutosave's gate either way. This line is pinned
+    // verbatim by the autosave_gate_is_scoped_to_the_sending_session
+    // contract test — keep the unbraced single-line form.
+    if (state.composeSession === sendingSession) cancelAutosave();
+    // The draft this send owns: the ONE capture that must wait for the
+    // settle, which adopts an in-flight save's final id. The completion
+    // below must delete THIS id, never the live one: backing out of compose
+    // mid-send runs clearComposeFields, which nulls the live id WITHOUT
+    // bumping composeSession, so the session gate alone still passes while
+    // a live read no-ops — orphaning the just-sent mail's autosaved draft
+    // as a ghost copy in Drafts (roborev 315). If the user backed out and
+    // reopened a draft during the settle this reads the reopened draft's id
+    // — the recapture guard below skips that delete.
+    const draftId = state.draftId;
+
     try {
         await state.api('POST', '/emails/send', {
             to,
@@ -2062,7 +2077,7 @@ async function doSendComposedEmail() {
             subject,
             body: fullTextBody,
             html_body: fullHtmlBody || undefined,
-            in_reply_to: state.replyContext?.inReplyTo || null,
+            in_reply_to: inReplyTo,
             from_address: fromAddress,
             attachments: readyAttachments.length ? readyAttachments : undefined,
         });
