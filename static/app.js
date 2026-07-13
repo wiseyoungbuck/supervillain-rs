@@ -1685,9 +1685,9 @@ async function sendEmail() {
 async function doSendEmail() {
     // A pending autosave firing mid-send would persist a fresh draft of the
     // very mail being sent — un-adopted (compose clears on success) and never
-    // deleted. Kill the debounce up front; state.sending (set by sendEmail
-    // before any await) blocks any new one from running until the send
-    // settles.
+    // deleted. Kill the debounce up front; the session-scoped sending gate
+    // (see sendingSession) blocks this compose's new saves from running
+    // until the send settles.
     cancelAutosave();
     // cancelAutosave() only kills the pending TIMER — a save already in
     // flight keeps running. Without waiting for it, its created/updated id
@@ -1697,12 +1697,17 @@ async function doSendEmail() {
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
     // fires the input handler's scheduleAutosave() and arms a fresh debounce.
-    // state.sending (set by the sendEmail wrapper) makes runAutosave's own
-    // guard skip it at fire time, but cancel again anyway, synchronously
-    // ahead of the lock, so the re-armed timer never chains a save that
-    // would land after the draft delete below (roborev 304 — same fix as
-    // mobile).
-    cancelAutosave();
+    // But a timer alive NOW may equally belong to a compose the user
+    // reopened or started fresh during that await (every leave-compose path
+    // flushes the old session's timer first, so a surviving timer is the
+    // CURRENT session's) — and since the sending gate is session-scoped
+    // (roborev 318), that other compose's save must fire, not die here.
+    // Cancel only while this compose is still the one being sent: its
+    // re-armed timer would otherwise chain a save landing after the draft
+    // delete below (roborev 304; scoped in roborev 319). The sending
+    // session's own mid-send saves are skipped at fire time by runAutosave's
+    // gate either way.
+    if (state.composeSession === sendingSession) cancelAutosave();
 
     // Both captured before the send's await, used at completion (roborev
     // 315, mirroring mobile's doSendComposedEmail).
@@ -1712,7 +1717,8 @@ async function doSendEmail() {
     // composeSession too). A stale completion must not clear or navigate a
     // compose it doesn't own.
     // draftId: the draft this send owns, final now that the settle above
-    // adopted any in-flight save's id (state.sending blocks new autosaves).
+    // adopted any in-flight save's id (the session-scoped sending gate
+    // blocks this compose's new autosaves).
     // Deleting the LIVE state.draftId at completion instead would ghost the
     // sent mail's draft after a leave (clearCompose nulls it) or destroy an
     // unrelated draft the user opened mid-send.

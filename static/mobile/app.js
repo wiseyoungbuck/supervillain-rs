@@ -1992,12 +1992,17 @@ async function doSendComposedEmail() {
     if (saveInFlight) await saveInFlight.catch(() => {});
     // The in-flight save above can run >3s; a keystroke during that await
     // fires the input handler's scheduleAutosave() and arms a fresh
-    // debounce. The sending lock (held by the sendComposedEmail wrapper)
-    // makes runAutosave's own guard skip it at fire time, but cancel again
-    // anyway, synchronously, so the re-armed timer never fires and chains a
-    // save that would land after the captured-id draft delete below
-    // (roborev 303, fix 4).
-    cancelAutosave();
+    // debounce. But a timer alive NOW may equally belong to a compose the
+    // user reopened or started fresh during that await (every leave-compose
+    // path flushes the old session's timer first, so a surviving timer is
+    // the CURRENT session's) — and since the sending gate is session-scoped
+    // (roborev 318), that other compose's save must fire, not die here.
+    // Cancel only while this compose is still the one being sent: its
+    // re-armed timer would otherwise chain a save landing after the
+    // captured-id draft delete below (roborev 303, fix 4; scoped in
+    // roborev 319). The sending session's own mid-send saves are skipped at
+    // fire time by runAutosave's gate either way.
+    if (state.composeSession === sendingSession) cancelAutosave();
 
     // Captured up front, before the await below: backing out of compose
     // mid-send and immediately starting a NEW draft also lands back on

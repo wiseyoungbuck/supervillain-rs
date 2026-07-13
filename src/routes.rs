@@ -4368,7 +4368,14 @@ mod tests {
         // initiated the send; the tracked-pair recapture guard above then
         // keeps the send's completion from deleting whatever id those
         // mid-send saves are tracking.
-        for (bundle, src) in [("app.js", APP_JS), ("mobile/app.js", MOBILE_APP_JS)] {
+        for (bundle, src, send_decl) in [
+            ("app.js", APP_JS, "async function doSendEmail("),
+            (
+                "mobile/app.js",
+                MOBILE_APP_JS,
+                "async function doSendComposedEmail(",
+            ),
+        ] {
             let block = js_fn_body(src, "async function runAutosave(");
             assert!(
                 block.contains("state.sending && state.composeSession === sendingSession"),
@@ -4381,6 +4388,20 @@ mod tests {
             assert!(
                 src.contains("sendingSession = null"),
                 "{bundle}: the send wrapper must clear the sending session when done"
+            );
+            // The send path's post-settle cancelAutosave must be scoped the
+            // same way (roborev 319): a timer alive after the settle await
+            // can belong to a compose the user reopened or started fresh
+            // DURING that await (leave-compose flushes the old session's
+            // timer first, so a surviving timer is the current session's),
+            // and killing it silently drops that compose's last edits at
+            // the next leave — through the timer instead of the gate.
+            let send_block = js_fn_body(src, send_decl);
+            assert!(
+                send_block
+                    .contains("if (state.composeSession === sendingSession) cancelAutosave()"),
+                "{bundle}: the post-settle cancel must only kill the sending \
+                 session's timer"
             );
         }
     }
