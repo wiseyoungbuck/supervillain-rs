@@ -1157,7 +1157,7 @@ fn parse_address_list(s: &str) -> Vec<EmailAddress> {
                 && close > open
             {
                 let email = part[open + 1..close].trim().to_string();
-                let name_part = part[..open].trim().trim_matches('"').trim().to_string();
+                let name_part = unquote_display_name(part[..open].trim());
                 let name = if name_part.is_empty() {
                     None
                 } else {
@@ -1173,14 +1173,17 @@ fn parse_address_list(s: &str) -> Vec<EmailAddress> {
         .collect()
 }
 
-/// Split an address list on commas that sit outside double-quoted strings
-/// and outside `<...>` angle brackets (an addr-spec can't legally contain a
-/// top-level comma, but the guard is free insurance).
+/// Split an address list on commas that sit outside double-quoted strings,
+/// outside `(...)` comments (which nest and may contain commas), and outside
+/// `<...>` angle brackets (an addr-spec can't legally contain a top-level
+/// comma, but the guard is free insurance). Comment text is not stripped
+/// from the parts — it just doesn't split them.
 fn split_top_level_commas(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
     let mut in_angle = false;
+    let mut comment_depth = 0u32;
     let mut escaped = false;
     for (i, c) in s.char_indices() {
         if escaped {
@@ -1188,11 +1191,13 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
             continue;
         }
         match c {
-            '\\' if in_quotes => escaped = true,
-            '"' => in_quotes = !in_quotes,
-            '<' if !in_quotes => in_angle = true,
-            '>' if !in_quotes => in_angle = false,
-            ',' if !in_quotes && !in_angle => {
+            '\\' if in_quotes || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => in_quotes = !in_quotes,
+            '(' if !in_quotes => comment_depth += 1,
+            ')' if !in_quotes && comment_depth > 0 => comment_depth -= 1,
+            '<' if !in_quotes && comment_depth == 0 => in_angle = true,
+            '>' if !in_quotes && comment_depth == 0 => in_angle = false,
+            ',' if !in_quotes && !in_angle && comment_depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + 1;
             }
@@ -1201,6 +1206,26 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     }
     parts.push(&s[start..]);
     parts
+}
+
+/// Strip one outer `"..."` pair from a display name and unescape RFC 5322
+/// quoted-pairs (`\"` → `"`, `\\` → `\`). Unquoted names pass through as-is.
+fn unquote_display_name(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2946,11 +2971,23 @@ mod tests {
     #[test]
     fn parse_address_escaped_quote_inside_quoted_name() {
         // A \" inside a quoted-string must not close the quote and expose
-        // the comma to the splitter.
+        // the comma to the splitter, and the quoted-pairs must be unescaped
+        // in the display name (roborev 329).
         let addrs = parse_address_list(r#""Acme \"West, Inc.\"" <sales@acme.com>, bob@y.com"#);
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].email, "sales@acme.com");
+        assert_eq!(addrs[0].name.as_deref(), Some(r#"Acme "West, Inc.""#));
         assert_eq!(addrs[1].email, "bob@y.com");
+    }
+
+    #[test]
+    fn parse_address_comment_with_comma_does_not_split() {
+        // RFC 5322 comments may contain commas: the comment must not split
+        // the list (roborev 329). The comment text staying glued to the
+        // email is a documented limitation; the count is what matters.
+        let addrs = parse_address_list("bob@y.com (Acme, Inc.), carol@z.com");
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[1].email, "carol@z.com");
     }
 
     // ---- mime_path ----
