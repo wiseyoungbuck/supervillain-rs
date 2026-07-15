@@ -2987,6 +2987,10 @@ mod tests {
         // email is a documented limitation; the count is what matters.
         let addrs = parse_address_list("bob@y.com (Acme, Inc.), carol@z.com");
         assert_eq!(addrs.len(), 2);
+        // Pin the documented limitation (roborev 330): the comment stays
+        // glued to the email field. If this changes, revisit the doc
+        // comments on split_top_level_commas / parse_address_list.
+        assert_eq!(addrs[0].email, "bob@y.com (Acme, Inc.)");
         assert_eq!(addrs[1].email, "carol@z.com");
     }
 
