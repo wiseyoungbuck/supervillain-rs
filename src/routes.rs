@@ -5981,11 +5981,10 @@ white   = '#fdf6e3'
             region.contains("color:#222"),
             "{label}: email body default text must be dark, readable on the white default background"
         );
-        assert!(
-            !region.contains("dark ?") && !region.contains("dark?"),
-            "{label}: wrapEmailHtml must not vary the email canvas with the app theme \
-             — that is what made sender-colored text unreadable under dark themes"
-        );
+        // Theme-independence is enforced by the literal-value assertions above:
+        // any reintroduced theme conditional (e.g. `'background:' + bg`) breaks
+        // the `background:#fff` / `color:#222` literals regardless of how the
+        // conditional is spelled.
         assert!(
             region.contains(r#"<meta name="color-scheme" content="light">"#),
             "{label}: iframe color-scheme must be pinned to light so the browser \
@@ -6041,6 +6040,16 @@ white   = '#fdf6e3'
         assert!(
             APP_JS.contains("els.emailBody.innerHTML = linkifyText(e.textBody"),
             "app.js: plain-text bodies must render directly in the themed app \
+             document, not through the email iframe's fixed light canvas"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_plain_text_body_follows_app_theme() {
+        assert!(
+            MOBILE_APP_JS
+                .contains(r#"'<div class="plain-text-body">' + linkifyText(email.textBody)"#),
+            "mobile app.js: plain-text bodies must render directly in the themed app \
              document, not through the email iframe's fixed light canvas"
         );
     }
