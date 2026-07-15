@@ -203,10 +203,16 @@ t_short_sha_width_is_pinned() {
     # the SAME commit -> spurious rebuild on every launch until reinstall.
     # The contract spans three files that must agree; any one drifting is
     # a failure.
+    # Match the invocation forms, not the adjacent comments — a stale
+    # comment surviving a code drift is exactly the failure mode here.
+    grep -q -- '"--short=12"' "$REPO/build.rs" || {
+        echo "  FAIL: build.rs does not pin --short=12"
+        return 1
+    }
     local f
-    for f in build.rs scripts/check-and-update.sh scripts/supervillain-launcher.sh; do
-        grep -q -- '--short=12' "$REPO/$f" || {
-            echo "  FAIL: $f does not pin --short=12"
+    for f in scripts/check-and-update.sh scripts/supervillain-launcher.sh; do
+        grep -q -- 'rev-parse --short=12 HEAD' "$REPO/$f" || {
+            echo "  FAIL: $f does not pin rev-parse --short=12 HEAD"
             return 1
         }
     done
