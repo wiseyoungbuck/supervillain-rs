@@ -4769,7 +4769,10 @@ mod tests {
         );
         // ...and for e.account to be real data rather than a dead parameter,
         // the server must serialize it on both email shapes (roborev 336 #1).
+        // Strip the tests module so these can't self-match their own string
+        // literals if a handler is renamed (roborev 337).
         let src = include_str!("routes.rs");
+        let src = src.split("mod tests").next().unwrap_or(src);
         assert!(
             js_fn_body(src, "async fn get_email(").contains(r#""account": account_key"#),
             "get_email must serialize the resolved account onto the email"
