@@ -5965,6 +5965,86 @@ white   = '#fdf6e3'
         assert_wrap_email_html_neutralizes_vertical_writing_mode(MOBILE_APP_JS, "mobile app.js");
     }
 
+    // HTML emails assume a white canvas: they routinely set explicit dark text
+    // colors and no background. Rendering them on the app theme's dark surface
+    // produces dark-gray-on-dark text (kata tgax). The iframe stylesheet must
+    // therefore give the message body an explicit light default background and
+    // dark default text, unconditionally — never the theme's dark palette.
+    fn assert_wrap_email_html_uses_theme_independent_light_defaults(source: &str, label: &str) {
+        let region = wrap_email_html_region(source, label);
+        assert!(
+            region.contains("background:#fff"),
+            "{label}: email body must default to an explicit white background \
+             so sender text colors that assume a white canvas stay readable"
+        );
+        assert!(
+            region.contains("color:#222"),
+            "{label}: email body default text must be dark, readable on the white default background"
+        );
+        assert!(
+            !region.contains("dark ?") && !region.contains("dark?"),
+            "{label}: wrapEmailHtml must not vary the email canvas with the app theme \
+             — that is what made sender-colored text unreadable under dark themes"
+        );
+        assert!(
+            region.contains(r#"<meta name="color-scheme" content="light">"#),
+            "{label}: iframe color-scheme must be pinned to light so the browser \
+             cannot impose a dark canvas under a dark OS/app theme"
+        );
+    }
+
+    #[test]
+    fn app_js_wrap_email_html_uses_theme_independent_light_defaults() {
+        assert_wrap_email_html_uses_theme_independent_light_defaults(APP_JS, "app.js");
+    }
+
+    #[test]
+    fn mobile_app_js_wrap_email_html_uses_theme_independent_light_defaults() {
+        assert_wrap_email_html_uses_theme_independent_light_defaults(
+            MOBILE_APP_JS,
+            "mobile app.js",
+        );
+    }
+
+    // The email's own colors must win over the injected defaults: the
+    // stylesheet may only set color/background at the html,body level, never
+    // with !important, so sender CSS (inline or <style>) overrides it.
+    fn assert_wrap_email_html_defaults_are_overridable(source: &str, label: &str) {
+        let region = wrap_email_html_region(source, label);
+        for decl in ["background:", "color:"] {
+            for (pos, _) in region.match_indices(decl) {
+                let rest = &region[pos..];
+                let value_end = rest.find([';', '}']).unwrap_or(rest.len());
+                assert!(
+                    !rest[..value_end].contains("!important"),
+                    "{label}: injected {decl} defaults must not use !important \
+                     — sender-specified colors must be honored"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn app_js_wrap_email_html_defaults_are_overridable() {
+        assert_wrap_email_html_defaults_are_overridable(APP_JS, "app.js");
+    }
+
+    #[test]
+    fn mobile_app_js_wrap_email_html_defaults_are_overridable() {
+        assert_wrap_email_html_defaults_are_overridable(MOBILE_APP_JS, "mobile app.js");
+    }
+
+    // Plain-text bodies are NOT iframed: they render in the app document and
+    // must keep following the app theme (light or dark) as before.
+    #[test]
+    fn app_js_plain_text_body_follows_app_theme() {
+        assert!(
+            APP_JS.contains("els.emailBody.innerHTML = linkifyText(e.textBody"),
+            "app.js: plain-text bodies must render directly in the themed app \
+             document, not through the email iframe's fixed light canvas"
+        );
+    }
+
     #[tokio::test]
     async fn index_html_sets_restrictive_csp() {
         let resp = index_html().await.into_response();

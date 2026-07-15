@@ -4827,7 +4827,7 @@ function renderHtmlBodyIframe(container, html, opts) {
         autosize ? 'allow-same-origin' : 'allow-popups allow-popups-to-escape-sandbox'
     );
     iframe.className = 'email-iframe';
-    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html), isDarkTheme()));
+    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
     if (autosize) {
         iframe.addEventListener('load', () => {
             try {
@@ -4837,10 +4837,6 @@ function renderHtmlBodyIframe(container, html, opts) {
         });
     }
     container.appendChild(iframe);
-}
-
-function isDarkTheme() {
-    return !document.body.classList.contains('light-theme');
 }
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
@@ -4872,27 +4868,28 @@ function linkifyHtml(html) {
     return doc.body.innerHTML;
 }
 
-function wrapEmailHtml(html, dark) {
-    const bg = dark ? '#1e1e1e' : '#fff';
-    const fg = dark ? '#ddd' : '#222';
-    const linkColor = dark ? '#58a6ff' : '#0366d6';
-    const quoteBorder = dark ? '#555' : '#ccc';
-    const quoteFg = dark ? '#aaa' : '#555';
-    const codeBg = dark ? '#2a2a2a' : '#f4f4f4';
+// HTML emails are authored against a white canvas: senders routinely set
+// explicit dark text colors and no background. The iframe therefore always
+// gets a light canvas, independent of the app theme — a dark surface under
+// sender-colored text is what made messages unreadable (kata tgax). Emails
+// that set their own background override these html,body defaults (nothing
+// here uses !important on colors). Plain-text bodies never come through
+// here and keep following the app theme.
+function wrapEmailHtml(html) {
     return '<!doctype html><html><head>'
         + '<meta charset="utf-8">'
         + '<base target="_blank">'
-        + '<meta name="color-scheme" content="' + (dark ? 'dark' : 'light') + '">'
+        + '<meta name="color-scheme" content="light">'
         + '<style>'
-        + 'html,body{margin:0;padding:12px;background:' + bg + ';color:' + fg + ';'
+        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
         + 'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
         + 'font-size:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
         + 'img{max-width:100%;height:auto;}'
-        + 'a{color:' + linkColor + ';}'
-        + 'blockquote,.gmail_quote{border-left:2px solid ' + quoteBorder + ';padding-left:12px;margin-left:0;color:' + quoteFg + ';}'
+        + 'a{color:#0366d6;}'
+        + 'blockquote,.gmail_quote{border-left:2px solid #ccc;padding-left:12px;margin-left:0;color:#555;}'
         + 'table{border-collapse:collapse;}'
         + 'td,th{padding:4px 8px;}'
-        + 'pre,code{background:' + codeBg + ';padding:2px 4px;border-radius:3px;}'
+        + 'pre,code{background:#f4f4f4;padding:2px 4px;border-radius:3px;}'
         + '*{writing-mode: horizontal-tb !important;text-orientation: mixed !important;}'
         + '</style>'
         + '</head><body>'

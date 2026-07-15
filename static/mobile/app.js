@@ -158,15 +158,8 @@ function renderHtmlBodyIframe(container, html) {
     const iframe = document.createElement('iframe');
     iframe.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
     iframe.className = 'email-iframe';
-    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html), isDarkTheme()));
+    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
     container.appendChild(iframe);
-}
-
-// Mobile follows the OS color scheme (prefers-color-scheme media query in
-// the page <style>). matchMedia gives us the same signal to mirror inside
-// the iframe so the email doesn't render bright in a dark UI.
-function isDarkTheme() {
-    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
@@ -198,26 +191,27 @@ function linkifyHtml(html) {
     return doc.body.innerHTML;
 }
 
-function wrapEmailHtml(html, dark) {
-    const bg = dark ? '#1a1a2e' : '#fff';
-    const fg = dark ? '#e0e0e0' : '#222';
-    const linkColor = dark ? '#e94560' : '#e94560';
-    const quoteBorder = dark ? '#444' : '#ddd';
-    const quoteFg = dark ? '#999' : '#666';
+// HTML emails are authored against a white canvas: senders routinely set
+// explicit dark text colors and no background. The iframe therefore always
+// gets a light canvas, independent of the OS color scheme — a dark surface
+// under sender-colored text is what made messages unreadable (kata tgax).
+// Emails that set their own background override these html,body defaults
+// (nothing here uses !important on colors).
+function wrapEmailHtml(html) {
     return '<!doctype html><html><head>'
         + '<meta charset="utf-8">'
         + '<meta name="viewport" content="width=device-width, initial-scale=1">'
         + '<base target="_blank">'
-        + '<meta name="color-scheme" content="' + (dark ? 'dark' : 'light') + '">'
+        + '<meta name="color-scheme" content="light">'
         + '<style>'
-        + 'html,body{margin:0;padding:12px;background:' + bg + ';color:' + fg + ';'
+        + 'html,body{margin:0;padding:12px;background:#fff;color:#222;'
         + 'font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;'
         + 'font-size:15px;line-height:1.5;word-wrap:break-word;overflow-wrap:break-word;}'
         + 'img{max-width:100%;height:auto;}'
         + 'table{max-width:100%;overflow-x:auto;display:block;}'
         + 'pre{white-space:pre-wrap;overflow-x:auto;}'
-        + 'a{color:' + linkColor + ';}'
-        + 'blockquote{border-left:3px solid ' + quoteBorder + ';margin:8px 0;padding:4px 12px;color:' + quoteFg + ';}'
+        + 'a{color:#e94560;}'
+        + 'blockquote{border-left:3px solid #ddd;margin:8px 0;padding:4px 12px;color:#666;}'
         + '*{writing-mode: horizontal-tb !important;text-orientation: mixed !important;}'
         + '</style>'
         + '</head><body>'
