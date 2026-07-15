@@ -2224,7 +2224,7 @@ function renderEmailDetail() {
 
     // Render attachments if present
     if (e.attachments?.length) {
-        renderAttachments(e.attachments, e.id);
+        renderAttachments(e.attachments, e.id, e.account);
     } else {
         els.attachments.classList.add('hidden');
     }
@@ -4929,16 +4929,21 @@ function linkifyText(text) {
 
 // Attachment functions
 
-function renderAttachments(attachments, emailId) {
+function renderAttachments(attachments, emailId, account) {
     els.attachments.classList.remove('hidden');
     const downloadAllBtn = attachments.length > 1
         ? `<a class="attachments-download-all" onclick="downloadAllAttachments(event)">Download All</a>`
         : '';
     const header = `<div class="attachments-header"><span>📎 Attachments (${attachments.length})</span>${downloadAllBtn}</div>`;
+    // Plain hrefs can't go through api()'s auto ?account= appending, so pin
+    // the account here — the email's own, not the globally current one:
+    // without it the server resolves blob ids against the default account.
+    const acct = account || state.currentAccount?.id;
+    const acctQuery = acct ? `?account=${encodeURIComponent(acct)}` : '';
     const items = attachments.map(att => {
         const icon = getFileIcon(att.mime_type, att.name);
         const size = formatFileSize(att.size);
-        const url = `/api/emails/${emailId}/attachments/${encodeURIComponent(att.blob_id)}/${encodeURIComponent(att.name)}`;
+        const url = `/api/emails/${emailId}/attachments/${encodeURIComponent(att.blob_id)}/${encodeURIComponent(att.name)}${acctQuery}`;
         return `
             <a class="attachment-item" href="${url}" download="${escapeHtml(att.name)}">
                 <span class="attachment-icon">${icon}</span>

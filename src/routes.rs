@@ -664,6 +664,10 @@ async fn list_emails(
                 "isFlagged": e.is_flagged(),
                 "hasAttachment": e.has_attachment,
                 "hasCalendar": e.has_calendar,
+                // Which account this row belongs to — rows must stay
+                // self-describing so per-email URLs (attachment hrefs)
+                // can't resolve against the wrong provider (kata kph2).
+                "account": account_id,
             })
         })
         .collect();
@@ -925,6 +929,9 @@ async fn get_email(
         "isFlagged": email.is_flagged(),
         "hasAttachment": email.has_attachment,
         "hasCalendar": email.has_calendar,
+        // See list_emails: emails stay self-describing about their account
+        // so per-email URLs resolve against the right provider (kata kph2).
+        "account": account_key,
         "textBody": email.text_body,
         "htmlBody": email.html_body,
         // Threading parent — lets a restored draft rehydrate its reply
@@ -4730,6 +4737,50 @@ mod tests {
             .find("\n}")
             .unwrap_or_else(|| panic!("{decl} must close"));
         &rest[..end]
+    }
+
+    #[test]
+    fn desktop_attachment_hrefs_carry_account_param() {
+        // Contract (kata kph2): download_attachment resolves the session
+        // from the ?account= query param and silently falls back to the
+        // default account without it — so desktop's hand-built attachment
+        // hrefs must pin the account, like mobile's attachmentUrl does.
+        // Match code forms, not prose — an explanatory comment inside the
+        // same slice must not be able to satisfy these (roborev 336 #2).
+        let block = js_fn_body(APP_JS, "function renderAttachments(");
+        assert!(
+            block.contains("?account=${encodeURIComponent(acct)}"),
+            "renderAttachments must build an account query string — without \
+             it blob ids resolve against the default account on \
+             multi-account setups"
+        );
+        assert!(
+            block.contains("${acctQuery}"),
+            "the attachment href template must actually interpolate the \
+             account query string"
+        );
+        // The account must be the rendered email's own, not the globally
+        // current one: search/list rows can belong to another account.
+        assert!(
+            js_fn_body(APP_JS, "function renderEmailDetail(")
+                .contains("renderAttachments(e.attachments, e.id, e.account"),
+            "renderEmailDetail must pass the email's own account to \
+             renderAttachments"
+        );
+        // ...and for e.account to be real data rather than a dead parameter,
+        // the server must serialize it on both email shapes (roborev 336 #1).
+        // Strip the tests module so these can't self-match their own string
+        // literals if a handler is renamed (roborev 337).
+        let src = include_str!("routes.rs");
+        let src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            js_fn_body(src, "async fn get_email(").contains(r#""account": account_key"#),
+            "get_email must serialize the resolved account onto the email"
+        );
+        assert!(
+            js_fn_body(src, "async fn list_emails(").contains(r#""account": account_id"#),
+            "list_emails must serialize the resolved account onto each row"
+        );
     }
 
     #[test]
