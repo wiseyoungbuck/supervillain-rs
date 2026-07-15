@@ -4733,6 +4733,29 @@ mod tests {
     }
 
     #[test]
+    fn desktop_attachment_hrefs_carry_account_param() {
+        // Contract (kata kph2): download_attachment resolves the session
+        // from the ?account= query param and silently falls back to the
+        // default account without it — so desktop's hand-built attachment
+        // hrefs must pin the account, like mobile's attachmentUrl does.
+        let block = js_fn_body(APP_JS, "function renderAttachments(");
+        assert!(
+            block.contains("?account="),
+            "renderAttachments must append ?account= to attachment hrefs — \
+             without it blob ids resolve against the default account on \
+             multi-account setups"
+        );
+        // The account must be the rendered email's own, not the globally
+        // current one: search/list rows can belong to another account.
+        assert!(
+            js_fn_body(APP_JS, "function renderEmailDetail(")
+                .contains("renderAttachments(e.attachments, e.id, e.account"),
+            "renderEmailDetail must pass the email's own account to \
+             renderAttachments"
+        );
+    }
+
+    #[test]
     fn load_emails_repolls_disk_stale_lists() {
         // Contract: list_emails tags a disk-restored (stale) cached list
         // with x-supervillain-stale: 1; loadEmails must read that header
