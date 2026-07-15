@@ -67,6 +67,23 @@ notify_error() {
     echo "Supervillain: $msg" >&2
 }
 
+# A running server keeps serving the code compiled into its binary, so a
+# merged fix stays invisible until restart (kata tgax). Stale = the running
+# server's /api/build-id differs from the repo HEAD. Conservative on
+# unknowns: can't read the repo → not stale (never restart on bad
+# information); can't read the endpoint → stale (only pre-endpoint binaries
+# lack it, and those are by definition old).
+server_is_stale() {
+    local repo="$1"
+    [[ -n "$repo" && -e "$repo/.git" ]] || return 1
+    command -v curl &>/dev/null || return 1
+    local repo_head running_id
+    repo_head="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)" || return 1
+    [[ -n "$repo_head" ]] || return 1
+    running_id="$(curl -fsS --max-time 2 "$URL/api/build-id" 2>/dev/null)" || running_id=""
+    [[ "$running_id" != "$repo_head" ]]
+}
+
 # Tests source this file to exercise functions in isolation; either flag
 # short-circuits before the main flow. Both names are kept for symmetry
 # with the historical macOS / Linux launcher pair.
@@ -92,9 +109,25 @@ if ! BIN="$(command -v supervillain 2>/dev/null)"; then
     exit 1
 fi
 
+# An already-running server is only reused if it's running the code the
+# repo is at; otherwise stop it and fall through to start the freshly
+# installed binary (check_and_update above already rebuilt it).
 if port_listening; then
-    open_webapp
-    exit 0
+    if server_is_stale "${REPO_DIR_FROM_STAMP:-}"; then
+        echo "Supervillain: running server is stale — restarting..."
+        pkill -x supervillain 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            port_listening || break
+            sleep 0.25
+        done
+        if port_listening; then
+            notify_error "couldn't stop the stale supervillain server on port $PORT — restart it manually"
+            exit 1
+        fi
+    else
+        open_webapp
+        exit 0
+    fi
 fi
 
 nohup "$BIN" --no-browser > "$LOG_FILE" 2>&1 &

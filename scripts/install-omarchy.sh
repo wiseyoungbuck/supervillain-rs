@@ -9,8 +9,15 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cargo install --path "$REPO_DIR"
 
 mkdir -p "$HOME/.local/bin"
-cp "$REPO_DIR/scripts/supervillain-launcher.sh" "$HOME/.local/bin/supervillain-launcher"
-chmod +x "$HOME/.local/bin/supervillain-launcher"
+# Symlink, don't copy: a copied launcher goes stale the moment the repo
+# script changes (kata tgax — a Jul 7 copy kept launching without any
+# freshness checks). The repo path is already a hard dependency via the
+# stamp file below, so the symlink adds no new coupling.
+ln -sf "$REPO_DIR/scripts/supervillain-launcher.sh" "$HOME/.local/bin/supervillain-launcher"
+# Older installs (and existing Hyprland bindings) used the name
+# supervillain-launch; claim it too so no stale copy lingers on PATH.
+ln -sf "$REPO_DIR/scripts/supervillain-launcher.sh" "$HOME/.local/bin/supervillain-launch"
+chmod +x "$REPO_DIR/scripts/supervillain-launcher.sh"
 
 ICONS_DIR="$HOME/.local/share/applications/icons"
 mkdir -p "$ICONS_DIR"
