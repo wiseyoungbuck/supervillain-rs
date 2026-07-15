@@ -201,7 +201,15 @@ t_short_sha_width_is_pinned() {
     # git's default --short width grows with the object count, so an
     # unpinned width can disagree with the id embedded at build time for
     # the SAME commit -> spurious rebuild on every launch until reinstall.
-    grep -q -- '--short=12' "$REPO/scripts/check-and-update.sh"
+    # The contract spans three files that must agree; any one drifting is
+    # a failure.
+    local f
+    for f in build.rs scripts/check-and-update.sh scripts/supervillain-launcher.sh; do
+        grep -q -- '--short=12' "$REPO/$f" || {
+            echo "  FAIL: $f does not pin --short=12"
+            return 1
+        }
+    done
 }
 
 t_sourced_under_errexit_does_not_abort() {

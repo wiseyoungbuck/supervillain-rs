@@ -95,8 +95,10 @@ t_empty_repo_arg_is_not_stale() {
 
 t_stop_stale_server_kills_by_port() {
     KILL_CALLS="$TMP/kill_calls"; : > "$KILL_CALLS"; export KILL_CALLS
+    LSOF_CALLS="$TMP/lsof_calls"; : > "$LSOF_CALLS"; export LSOF_CALLS
     cat > "$BIN/lsof" <<'STUB'
 #!/usr/bin/env bash
+printf '%s\n' "$@" >> "$LSOF_CALLS"
 echo 12345
 STUB
     chmod +x "$BIN/lsof"
@@ -107,7 +109,11 @@ STUB
     chmod +x "$BIN/kill"
     port_listening() { return 1; }  # port released immediately after kill
     stop_stale_server || return 1
-    grep -qx '12345' "$KILL_CALLS"
+    # The port-scoping lives in the lsof arguments — assert them, or a
+    # regression to a name-scoped or unfiltered pid dump passes unnoticed.
+    grep -qx ":$PORT" "$LSOF_CALLS" &&
+        grep -qx -- '-sTCP:LISTEN' "$LSOF_CALLS" &&
+        grep -qx '12345' "$KILL_CALLS"
 }
 
 t_stop_stale_server_fails_when_port_stays_held() {

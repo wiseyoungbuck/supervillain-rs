@@ -94,7 +94,9 @@ stop_stale_server() {
     if command -v lsof &>/dev/null; then
         lsof -ti ":$PORT" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null || true
     elif command -v fuser &>/dev/null; then
-        fuser -k "${PORT}/tcp" 2>/dev/null || true
+        # -TERM: match the lsof path's graceful SIGTERM (fuser -k defaults
+        # to SIGKILL); the drain loop below tolerates a slow exit.
+        fuser -k -TERM "${PORT}/tcp" 2>/dev/null || true
     else
         pkill -x supervillain 2>/dev/null || true
     fi
