@@ -57,10 +57,16 @@ check_and_update() {
     # at compile time, so a binary older than HEAD keeps serving old code
     # until reinstalled (kata tgax). An empty id (binary missing, or too old
     # to know --build-id) also counts as stale.
+    # --short=12 pinned to match build.rs: git's default abbreviation width
+    # grows with the repo's object count, so an unpinned width can disagree
+    # with the embedded id for the SAME commit and force spurious rebuilds.
+    # --no-browser matters on the probe: pre---build-id binaries ignore the
+    # flag and run full startup, and without it they'd pop the user's
+    # browser before the timeout cap kills them.
     local repo_head installed_id
-    repo_head="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)" || return 0
+    repo_head="$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null)" || return 0
     [[ -n "$repo_head" ]] || return 0
-    installed_id="$(_supervillain_with_timeout supervillain --build-id 2>/dev/null)" || installed_id=""
+    installed_id="$(_supervillain_with_timeout supervillain --build-id --no-browser 2>/dev/null)" || installed_id=""
     if [[ "$installed_id" != "$repo_head" ]]; then
         echo "Supervillain: installed binary (${installed_id:-unknown}) != repo HEAD ($repo_head) — rebuilding from $repo..."
         cargo install --path "$repo"

@@ -89,12 +89,55 @@ t_empty_repo_arg_is_not_stale() {
     server_is_stale "" && return 1 || return 0
 }
 
+# ---- stop_stale_server (roborev 332) ----
+# The staleness check is port-scoped, so the kill must be too: killing by
+# process name would take down a healthy second instance on another port.
+
+t_stop_stale_server_kills_by_port() {
+    KILL_CALLS="$TMP/kill_calls"; : > "$KILL_CALLS"; export KILL_CALLS
+    cat > "$BIN/lsof" <<'STUB'
+#!/usr/bin/env bash
+echo 12345
+STUB
+    chmod +x "$BIN/lsof"
+    cat > "$BIN/kill" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >> "$KILL_CALLS"
+STUB
+    chmod +x "$BIN/kill"
+    port_listening() { return 1; }  # port released immediately after kill
+    stop_stale_server || return 1
+    grep -qx '12345' "$KILL_CALLS"
+}
+
+t_stop_stale_server_fails_when_port_stays_held() {
+    cat > "$BIN/lsof" <<'STUB'
+#!/usr/bin/env bash
+echo 12345
+STUB
+    chmod +x "$BIN/lsof"
+    cat > "$BIN/kill" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$BIN/kill"
+    cat > "$BIN/sleep" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+    chmod +x "$BIN/sleep"
+    port_listening() { return 0; }  # something keeps holding the port
+    stop_stale_server && return 1 || return 0
+}
+
 run_test "fresh server: not stale"                 t_fresh_server_is_not_stale
 run_test "mismatched build id: stale"              t_mismatched_build_id_is_stale
 run_test "no /api/build-id endpoint: stale"        t_missing_endpoint_is_stale
 run_test "git failure: not stale (can't tell)"     t_git_failure_is_not_stale
 run_test "missing repo dir: not stale"             t_missing_repo_is_not_stale
 run_test "empty repo arg: not stale"               t_empty_repo_arg_is_not_stale
+run_test "stop_stale_server: kills the port owner" t_stop_stale_server_kills_by_port
+run_test "stop_stale_server: fails if port stays held" t_stop_stale_server_fails_when_port_stays_held
 
 echo
 echo "All server_is_stale tests passed."

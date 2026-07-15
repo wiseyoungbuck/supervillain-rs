@@ -30,7 +30,7 @@ for ((i=1; i<=$#; i++)); do
             case "${!next}" in
                 HEAD) echo "${GIT_HEAD:-aaa}"; exit 0 ;;
                 '@{u}') echo "${GIT_UPSTREAM:-aaa}"; exit 0 ;;
-                --short)
+                --short | --short=*)
                     if [[ "${GIT_SHORT_EXIT:-0}" != 0 ]]; then exit "${GIT_SHORT_EXIT}"; fi
                     echo "${GIT_SHORT_HEAD:-abc}"; exit 0 ;;
             esac
@@ -51,10 +51,13 @@ STUB
     # supervillain stub: reports the "installed" binary's build id.
     cat > "$BIN/supervillain" <<'STUB'
 #!/usr/bin/env bash
+printf '%s\n' "$@" >> "${SUPERVILLAIN_STUB_CALLS:-/dev/null}"
 if [[ "${SUPERVILLAIN_STUB_EXIT:-0}" != 0 ]]; then exit "${SUPERVILLAIN_STUB_EXIT}"; fi
 echo "${SUPERVILLAIN_STUB_BUILD_ID:-abc}"
 STUB
     chmod +x "$BIN/supervillain"
+    export SUPERVILLAIN_STUB_CALLS="$TMP/supervillain_calls"
+    : > "$SUPERVILLAIN_STUB_CALLS"
 
     export PATH="$BIN:$PATH"
     export CARGO_CALLS_FILE="$TMP/cargo_calls"
@@ -184,6 +187,23 @@ t_short_head_failure_is_nonfatal() {
     assert_no_cargo_install "short-head-failure"
 }
 
+t_probe_passes_no_browser() {
+    # Pre---build-id binaries ignore the flag and run full startup; without
+    # --no-browser that startup pops the user's browser before the timeout
+    # cap kills it (roborev 332). Old binaries DO honor --no-browser.
+    GIT_HEAD=abc123 GIT_UPSTREAM=abc123 GIT_SHORT_HEAD=abc123 \
+        SUPERVILLAIN_STUB_BUILD_ID=abc123 check_and_update
+    grep -qx -- '--build-id' "$SUPERVILLAIN_STUB_CALLS" &&
+        grep -qx -- '--no-browser' "$SUPERVILLAIN_STUB_CALLS"
+}
+
+t_short_sha_width_is_pinned() {
+    # git's default --short width grows with the object count, so an
+    # unpinned width can disagree with the id embedded at build time for
+    # the SAME commit -> spurious rebuild on every launch until reinstall.
+    grep -q -- '--short=12' "$REPO/scripts/check-and-update.sh"
+}
+
 t_sourced_under_errexit_does_not_abort() {
     # check-and-update.sh's last statement must leave $? == 0, otherwise
     # callers running `set -e` will abort when they `source` it.
@@ -202,6 +222,8 @@ run_test "fresh binary: skips reinstall"                t_fresh_binary_no_instal
 run_test "missing binary: triggers cargo install"       t_missing_binary_triggers_install
 run_test "offline + stale binary: still rebuilds"       t_offline_stale_binary_still_rebuilds
 run_test "short-HEAD failure: no install, no crash"     t_short_head_failure_is_nonfatal
+run_test "probe passes --no-browser alongside --build-id" t_probe_passes_no_browser
+run_test "short-sha width is pinned"                    t_short_sha_width_is_pinned
 run_test "source under set -e: does not abort caller"  t_sourced_under_errexit_does_not_abort
 
 echo
