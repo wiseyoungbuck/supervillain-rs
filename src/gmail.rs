@@ -1139,11 +1139,14 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
     }
 }
 
-/// Naive RFC 5322 address-list parser: splits on `,` and pulls `Name <email>`
-/// or bare email. Gmail returns clean values for the common cases; corner
-/// cases (quoted commas in display names) will be revisited if they bite.
+/// RFC 5322 address-list parser: splits on top-level `,` and pulls
+/// `Name <email>` or bare email. Commas inside double-quoted display names
+/// (honoring `\"` escapes) and inside `<...>` don't split. Known limitation:
+/// an *unquoted* `Last, First <a@b>` still splits — RFC 5322 forbids commas
+/// in unquoted display names, and Gmail quotes such names on the wire.
 fn parse_address_list(s: &str) -> Vec<EmailAddress> {
-    s.split(',')
+    split_top_level_commas(s)
+        .into_iter()
         .filter_map(|part| {
             let part = part.trim();
             if part.is_empty() {
@@ -1168,6 +1171,36 @@ fn parse_address_list(s: &str) -> Vec<EmailAddress> {
             })
         })
         .collect()
+}
+
+/// Split an address list on commas that sit outside double-quoted strings
+/// and outside `<...>` angle brackets (an addr-spec can't legally contain a
+/// top-level comma, but the guard is free insurance).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '<' if !in_quotes => in_angle = true,
+            '>' if !in_quotes => in_angle = false,
+            ',' if !in_quotes && !in_angle => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2890,6 +2923,36 @@ mod tests {
         assert_eq!(addrs[1].name.as_deref(), Some("Bob"));
     }
 
+    #[test]
+    fn parse_address_quoted_name_with_comma_stays_one_entry() {
+        // Repro from kata fcge: Gmail From header on an Anthropic receipt was
+        // split into two garbage entries at the comma inside the quoted name.
+        let addrs =
+            parse_address_list(r#""Anthropic, PBC" <invoice+statements@mail.anthropic.com>"#);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email, "invoice+statements@mail.anthropic.com");
+        assert_eq!(addrs[0].name.as_deref(), Some("Anthropic, PBC"));
+    }
+
+    #[test]
+    fn parse_address_quoted_comma_name_followed_by_more_addresses() {
+        let addrs = parse_address_list(r#""Doe, Jane" <jane@x.com>, bob@y.com"#);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0].name.as_deref(), Some("Doe, Jane"));
+        assert_eq!(addrs[0].email, "jane@x.com");
+        assert_eq!(addrs[1].email, "bob@y.com");
+    }
+
+    #[test]
+    fn parse_address_escaped_quote_inside_quoted_name() {
+        // A \" inside a quoted-string must not close the quote and expose
+        // the comma to the splitter.
+        let addrs = parse_address_list(r#""Acme \"West, Inc.\"" <sales@acme.com>, bob@y.com"#);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0].email, "sales@acme.com");
+        assert_eq!(addrs[1].email, "bob@y.com");
+    }
+
     // ---- mime_path ----
 
     #[test]
@@ -3563,16 +3626,11 @@ mod tests {
     /// 5322 parser would handle this. Test pins the current behavior so a
     /// future fix has something to flip.
     #[test]
-    fn parse_address_quoted_comma_is_currently_mis_parsed() {
+    fn parse_address_quoted_comma_parses_as_one_entry() {
         let addrs = parse_address_list(r#""Smith, John" <jsmith@example.com>"#);
-        // Current behavior: splits on the comma, producing two malformed
-        // entries. When this test starts failing, the parser was fixed —
-        // update the assertion.
-        assert_eq!(
-            addrs.len(),
-            2,
-            "if this now returns 1, the parser was fixed — update the test"
-        );
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email, "jsmith@example.com");
+        assert_eq!(addrs[0].name.as_deref(), Some("Smith, John"));
     }
 
     // ---- Milestone B: mutation body builders ----
