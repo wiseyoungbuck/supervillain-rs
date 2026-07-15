@@ -96,6 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/timezone/zones", get(list_timezones))
         .route("/api/calendar/invite", post(send_invite_handler))
+        .route("/api/build-id", get(build_id))
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))
@@ -162,6 +163,18 @@ async fn app_js() -> impl IntoResponse {
     (
         [("content-type", "application/javascript; charset=utf-8")],
         APP_JS,
+    )
+}
+
+// Bare embedded build id (git short sha from build.rs) as plain text, so the
+// launcher can tell whether the RUNNING server matches the repo HEAD without
+// JSON parsing. Static assets are compiled into the binary — a merged fix is
+// not live until rebuild+restart, and this is how launch detects that (kata
+// tgax).
+async fn build_id() -> impl IntoResponse {
+    (
+        [("content-type", "text/plain; charset=utf-8")],
+        env!("SUPERVILLAIN_BUILD_ID"),
     )
 }
 
@@ -3639,6 +3652,37 @@ mod tests {
         assert!(
             !text.contains("__SUPERVILLAIN_VERSION__"),
             "served sw.js must not leak the unreplaced version placeholder"
+        );
+    }
+
+    // Launch-time freshness (kata tgax): static assets are compiled into the
+    // binary, so a merged fix isn't live until the server is rebuilt and
+    // restarted. The launcher decides whether the RUNNING server is stale by
+    // comparing this endpoint against the repo HEAD — it must return the bare
+    // embedded build id as plain text (script-friendly, no JSON parsing).
+    #[tokio::test]
+    async fn api_build_id_returns_bare_embedded_build_id() {
+        let resp = build_id().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .expect("build-id must set content-type")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ct.starts_with("text/plain"),
+            "build-id must be plain text for shell consumers, got {ct}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            text,
+            env!("SUPERVILLAIN_BUILD_ID"),
+            "build-id body must be exactly the embedded id, no wrapping"
         );
     }
 

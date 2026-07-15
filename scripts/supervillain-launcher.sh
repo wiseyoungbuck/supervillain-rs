@@ -67,6 +67,46 @@ notify_error() {
     echo "Supervillain: $msg" >&2
 }
 
+# A running server keeps serving the code compiled into its binary, so a
+# merged fix stays invisible until restart (kata tgax). Stale = the running
+# server's /api/build-id differs from the repo HEAD. Conservative on
+# unknowns: can't read the repo → not stale (never restart on bad
+# information); can't read the endpoint → stale (only pre-endpoint binaries
+# lack it, and those are by definition old).
+server_is_stale() {
+    local repo="$1"
+    [[ -n "$repo" && -e "$repo/.git" ]] || return 1
+    command -v curl &>/dev/null || return 1
+    # --short=12 pinned to match build.rs — see check-and-update.sh.
+    local repo_head running_id
+    repo_head="$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null)" || return 1
+    [[ -n "$repo_head" ]] || return 1
+    running_id="$(curl -fsS --max-time 2 "$URL/api/build-id" 2>/dev/null)" || running_id=""
+    [[ "$running_id" != "$repo_head" ]]
+}
+
+# Stop whatever holds $PORT and wait for the port to be released; fails if
+# it's still held after ~5s. Port-scoped, not name-scoped: the staleness
+# check talked to $URL, so kill exactly that listener — a healthy second
+# instance on another port must survive, and a non-supervillain process
+# squatting the port still gets stopped instead of pkill silently missing.
+stop_stale_server() {
+    if command -v lsof &>/dev/null; then
+        lsof -ti ":$PORT" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null || true
+    elif command -v fuser &>/dev/null; then
+        # -TERM: match the lsof path's graceful SIGTERM (fuser -k defaults
+        # to SIGKILL); the drain loop below tolerates a slow exit.
+        fuser -k -TERM "${PORT}/tcp" 2>/dev/null || true
+    else
+        pkill -x supervillain 2>/dev/null || true
+    fi
+    for _ in $(seq 1 20); do
+        port_listening || return 0
+        sleep 0.25
+    done
+    ! port_listening
+}
+
 # Tests source this file to exercise functions in isolation; either flag
 # short-circuits before the main flow. Both names are kept for symmetry
 # with the historical macOS / Linux launcher pair.
@@ -92,9 +132,23 @@ if ! BIN="$(command -v supervillain 2>/dev/null)"; then
     exit 1
 fi
 
+# An already-running server is only reused if it's running the code the
+# repo is at; otherwise stop it and fall through to start the freshly
+# installed binary (check_and_update above already rebuilt it). This main
+# flow is below the source-only short-circuit and intentionally untested;
+# the decisions it composes (server_is_stale, stop_stale_server) are
+# behavior-tested in scripts/tests/test_launcher_stale.sh.
 if port_listening; then
-    open_webapp
-    exit 0
+    if server_is_stale "${REPO_DIR_FROM_STAMP:-}"; then
+        echo "Supervillain: running server is stale — restarting..."
+        if ! stop_stale_server; then
+            notify_error "couldn't stop the stale server on port $PORT — restart it manually"
+            exit 1
+        fi
+    else
+        open_webapp
+        exit 0
+    fi
 fi
 
 nohup "$BIN" --no-browser > "$LOG_FILE" 2>&1 &

@@ -13,6 +13,14 @@ use supervillain::{
 
 #[tokio::main]
 async fn main() {
+    // Bare build id for scripts (launcher freshness check, kata tgax):
+    // print and exit before any startup work so `supervillain --build-id`
+    // never binds the port or touches config.
+    if std::env::args().any(|a| a == "--build-id") {
+        println!("{}", env!("SUPERVILLAIN_BUILD_ID"));
+        return;
+    }
+
     let config_dir = platform::config_dir();
     let config_path = config_dir.join("supervillain/config");
     let tokens_dir = config_dir.join("supervillain/tokens");

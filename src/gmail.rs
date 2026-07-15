@@ -1139,11 +1139,14 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
     }
 }
 
-/// Naive RFC 5322 address-list parser: splits on `,` and pulls `Name <email>`
-/// or bare email. Gmail returns clean values for the common cases; corner
-/// cases (quoted commas in display names) will be revisited if they bite.
+/// RFC 5322 address-list parser: splits on top-level `,` and pulls
+/// `Name <email>` or bare email. Commas inside double-quoted display names
+/// (honoring `\"` escapes) and inside `<...>` don't split. Known limitation:
+/// an *unquoted* `Last, First <a@b>` still splits — RFC 5322 forbids commas
+/// in unquoted display names, and Gmail quotes such names on the wire.
 fn parse_address_list(s: &str) -> Vec<EmailAddress> {
-    s.split(',')
+    split_top_level_commas(s)
+        .into_iter()
         .filter_map(|part| {
             let part = part.trim();
             if part.is_empty() {
@@ -1154,7 +1157,7 @@ fn parse_address_list(s: &str) -> Vec<EmailAddress> {
                 && close > open
             {
                 let email = part[open + 1..close].trim().to_string();
-                let name_part = part[..open].trim().trim_matches('"').trim().to_string();
+                let name_part = unquote_display_name(part[..open].trim());
                 let name = if name_part.is_empty() {
                     None
                 } else {
@@ -1168,6 +1171,61 @@ fn parse_address_list(s: &str) -> Vec<EmailAddress> {
             })
         })
         .collect()
+}
+
+/// Split an address list on commas that sit outside double-quoted strings,
+/// outside `(...)` comments (which nest and may contain commas), and outside
+/// `<...>` angle brackets (an addr-spec can't legally contain a top-level
+/// comma, but the guard is free insurance). Comment text is not stripped
+/// from the parts — it just doesn't split them.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    let mut comment_depth = 0u32;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 => in_quotes = !in_quotes,
+            '(' if !in_quotes => comment_depth += 1,
+            ')' if !in_quotes && comment_depth > 0 => comment_depth -= 1,
+            '<' if !in_quotes && comment_depth == 0 => in_angle = true,
+            '>' if !in_quotes && comment_depth == 0 => in_angle = false,
+            ',' if !in_quotes && !in_angle && comment_depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Strip one outer `"..."` pair from a display name and unescape RFC 5322
+/// quoted-pairs (`\"` → `"`, `\\` → `\`). Unquoted names pass through as-is.
+fn unquote_display_name(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2890,6 +2948,52 @@ mod tests {
         assert_eq!(addrs[1].name.as_deref(), Some("Bob"));
     }
 
+    #[test]
+    fn parse_address_quoted_name_with_comma_stays_one_entry() {
+        // Repro from kata fcge: Gmail From header on an Anthropic receipt was
+        // split into two garbage entries at the comma inside the quoted name.
+        let addrs =
+            parse_address_list(r#""Anthropic, PBC" <invoice+statements@mail.anthropic.com>"#);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email, "invoice+statements@mail.anthropic.com");
+        assert_eq!(addrs[0].name.as_deref(), Some("Anthropic, PBC"));
+    }
+
+    #[test]
+    fn parse_address_quoted_comma_name_followed_by_more_addresses() {
+        let addrs = parse_address_list(r#""Doe, Jane" <jane@x.com>, bob@y.com"#);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0].name.as_deref(), Some("Doe, Jane"));
+        assert_eq!(addrs[0].email, "jane@x.com");
+        assert_eq!(addrs[1].email, "bob@y.com");
+    }
+
+    #[test]
+    fn parse_address_escaped_quote_inside_quoted_name() {
+        // A \" inside a quoted-string must not close the quote and expose
+        // the comma to the splitter, and the quoted-pairs must be unescaped
+        // in the display name (roborev 329).
+        let addrs = parse_address_list(r#""Acme \"West, Inc.\"" <sales@acme.com>, bob@y.com"#);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0].email, "sales@acme.com");
+        assert_eq!(addrs[0].name.as_deref(), Some(r#"Acme "West, Inc.""#));
+        assert_eq!(addrs[1].email, "bob@y.com");
+    }
+
+    #[test]
+    fn parse_address_comment_with_comma_does_not_split() {
+        // RFC 5322 comments may contain commas: the comment must not split
+        // the list (roborev 329). The comment text staying glued to the
+        // email is a documented limitation; the count is what matters.
+        let addrs = parse_address_list("bob@y.com (Acme, Inc.), carol@z.com");
+        assert_eq!(addrs.len(), 2);
+        // Pin the documented limitation (roborev 330): the comment stays
+        // glued to the email field. If this changes, revisit the doc
+        // comments on split_top_level_commas / parse_address_list.
+        assert_eq!(addrs[0].email, "bob@y.com (Acme, Inc.)");
+        assert_eq!(addrs[1].email, "carol@z.com");
+    }
+
     // ---- mime_path ----
 
     #[test]
@@ -3563,16 +3667,11 @@ mod tests {
     /// 5322 parser would handle this. Test pins the current behavior so a
     /// future fix has something to flip.
     #[test]
-    fn parse_address_quoted_comma_is_currently_mis_parsed() {
+    fn parse_address_quoted_comma_parses_as_one_entry() {
         let addrs = parse_address_list(r#""Smith, John" <jsmith@example.com>"#);
-        // Current behavior: splits on the comma, producing two malformed
-        // entries. When this test starts failing, the parser was fixed —
-        // update the assertion.
-        assert_eq!(
-            addrs.len(),
-            2,
-            "if this now returns 1, the parser was fixed — update the test"
-        );
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].email, "jsmith@example.com");
+        assert_eq!(addrs[0].name.as_deref(), Some("Smith, John"));
     }
 
     // ---- Milestone B: mutation body builders ----

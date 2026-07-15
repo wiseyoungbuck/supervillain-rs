@@ -18,7 +18,11 @@ fn git_stdout(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let build_id = git_stdout(&["rev-parse", "--short", "HEAD"]);
+    // Width pinned to 12: git's default abbreviation grows with the object
+    // count, so an unpinned --short could disagree with the launch scripts'
+    // `rev-parse --short=12 HEAD` for the same commit, forcing a spurious
+    // rebuild+restart on every launch until reinstalled.
+    let build_id = git_stdout(&["rev-parse", "--short=12", "HEAD"]);
     let build_id_unavailable = build_id.is_none();
     let build_id = build_id.unwrap_or_else(|| "unknown".to_string());
 
