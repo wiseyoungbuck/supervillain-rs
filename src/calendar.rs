@@ -99,9 +99,13 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
     // so that standalone .ics exports don't trigger auto-add to calendar.
     let method = extract_property(data, "METHOD").unwrap_or_else(|| "PUBLISH".into());
 
-    // Find VEVENT block
+    // Find VEVENT block. The END search is scoped to *after* vevent_start —
+    // an unanchored search over the whole data would match literal
+    // "END:VEVENT" text sitting in an earlier property value (e.g. a
+    // DESCRIPTION that mentions it) and produce an end index before the
+    // start index, which panics the slice below (kata 4ycd).
     let vevent_start = data.find("BEGIN:VEVENT")?;
-    let vevent_end = data.find("END:VEVENT")?;
+    let vevent_end = vevent_start + data[vevent_start..].find("END:VEVENT")?;
     let vevent = &data[vevent_start..vevent_end + "END:VEVENT".len()];
 
     // Unfold lines (RFC 5545: continuation lines start with space or tab)
@@ -598,10 +602,7 @@ fn parse_ics_datetime_property(
         // Time" labels).
         if let Some(tzid) = extract_param_from_str(params, "TZID") {
             if let Ok(tz) = Tz::from_str(&tzid) {
-                let resolved = tz
-                    .from_local_datetime(&dt)
-                    .earliest()
-                    .or_else(|| tz.from_local_datetime(&dt).latest())?;
+                let resolved = resolve_local_datetime_lenient(&tz, dt)?;
                 return Some(resolved.with_timezone(&Utc));
             }
             if let Some(offset) = tz_offsets.get(&tzid) {
@@ -612,10 +613,49 @@ fn parse_ics_datetime_property(
 
         // Case 3: Floating time (no Z, no TZID) — interpret as system local tz.
         // Use from_local_datetime on the event's date to get the correct DST offset.
-        let local = Local.from_local_datetime(&dt).earliest()?;
+        //
+        // NOTE (kata 6t75): per RFC 5545 this should really be the app's
+        // configured *primary* timezone (see timezone::resolve/primary_tz),
+        // not the process's system tz — chrono::Local can silently disagree
+        // with what the user picked in settings. Deliberately not changed
+        // here: that config lives behind `AppState.timezone_config_path` and
+        // is only reachable from routes.rs, while every caller of
+        // `parse_ics`/`parse_ics_datetime_property` (provider.rs, jmap.rs,
+        // routes.rs) is out of scope for this fix — threading it through
+        // would require a signature change that forces edits in those other
+        // files. See the report for what a follow-up would need to do.
+        let local = resolve_local_datetime_lenient(&Local, dt)?;
         return Some(local.with_timezone(&Utc));
     }
     None
+}
+
+/// Resolve a naive local datetime against `tz`, preferring the earlier
+/// instant when the wall-clock time is ambiguous (DST "fall back") — the
+/// same preference the old `.earliest().or_else(latest())` expressed for
+/// that case.
+///
+/// Unlike that expression, this also handles the "spring forward" gap:
+/// when the wall-clock time never occurred at all (e.g. 2:30 AM on a day
+/// clocks jump straight from 2:00 to 3:00), `from_local_datetime` reports no
+/// mapping and both `.earliest()` and `.latest()` are `None` — so the old
+/// `?`-chained code silently returned `None` from
+/// `parse_ics_datetime_property`, which made `parse_ics` drop the entire
+/// event (kata 6t75). Instead, shift the naive time forward in half-hour
+/// steps until it lands on a real instant — reporting the event a little
+/// later beats losing it outright. Capped at 4 hours, comfortably above any
+/// real-world DST jump (nearly all are exactly one hour).
+fn resolve_local_datetime_lenient<TZ: TimeZone>(
+    tz: &TZ,
+    dt: NaiveDateTime,
+) -> Option<DateTime<TZ>> {
+    if let Some(resolved) = tz.from_local_datetime(&dt).earliest() {
+        return Some(resolved);
+    }
+    (1..=8).find_map(|steps| {
+        let shifted = dt + chrono::Duration::minutes(30 * steps);
+        tz.from_local_datetime(&shifted).earliest()
+    })
 }
 
 /// Extract a parameter value from the params portion of an ICS property line.
@@ -669,14 +709,47 @@ fn parse_attendees(text: &str) -> Vec<Attendee> {
 }
 
 fn extract_mailto(line: &str) -> String {
-    // Look for mailto: (case-insensitive)
-    let lower = line.to_lowercase();
-    if let Some(pos) = lower.find("mailto:") {
-        let start = pos + "mailto:".len();
-        let rest = &line[start..];
-        // Email ends at next non-email char
-        let end = rest.find([';', ',', '\r', '\n', ' ']).unwrap_or(rest.len());
-        return rest[..end].to_string();
+    // Search for "mailto:" case-insensitively directly on `line`, never on a
+    // lowercased copy: `to_lowercase()` isn't byte-length-preserving for all
+    // Unicode input (e.g. U+0130 'İ' lowercases to 2 chars), so an offset
+    // computed against the lowered copy and then applied to `line` can land
+    // mid-character (panicking on a non-char-boundary slice) or select the
+    // wrong bytes entirely (kata s2s8).
+    //
+    // Also skip any "mailto:" found inside a quoted parameter value (e.g.
+    // CN="...") — an unanchored first-match search would let a crafted CN
+    // like `CN="mailto:victim@evil.com"` hijack the extracted address ahead
+    // of the real one after the property's value colon, which feeds the
+    // anti-spoof checks in invite_update_decision/cancel_decision.
+    const MARKER: &[u8] = b"mailto:";
+    let bytes = line.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            in_quotes = !in_quotes;
+            i += 1;
+            continue;
+        }
+        // Compare raw bytes (not `str` slices) so this never needs a
+        // char-boundary check on either end: MARKER is pure ASCII, and a
+        // byte-for-byte, case-insensitive match against it can only succeed
+        // when every one of those bytes is itself a single-byte ASCII code
+        // point — which makes both `i` and `i + MARKER.len()` valid char
+        // boundaries automatically once a match is found.
+        if !in_quotes
+            && bytes.len() - i >= MARKER.len()
+            && bytes[i..i + MARKER.len()]
+                .iter()
+                .zip(MARKER)
+                .all(|(b, m)| b.eq_ignore_ascii_case(m))
+        {
+            let rest = &line[i + MARKER.len()..];
+            // Email ends at next non-email char
+            let end = rest.find([';', ',', '\r', '\n', ' ']).unwrap_or(rest.len());
+            return rest[..end].to_string();
+        }
+        i += 1;
     }
     String::new()
 }
@@ -1245,6 +1318,33 @@ END:VCALENDAR";
         assert!(parse_ics(data).is_none());
     }
 
+    /// kata 4ycd: a decoy "END:VEVENT" appearing in a property value BEFORE
+    /// the real BEGIN:VEVENT block used to make the unanchored `data.find`
+    /// searches return an end index earlier than the start index, panicking
+    /// the `data[vevent_start..vevent_end + ...]` slice. The END search must
+    /// be scoped to after the real BEGIN:VEVENT so the actual event still
+    /// parses instead of crashing the request that opens this email.
+    #[test]
+    fn parse_ics_end_vevent_text_before_begin_does_not_panic() {
+        let data = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+X-WR-CALDESC:Reminder: this note mentions END:VEVENT before the real event\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:end-before-begin@example.com\r\n\
+DTSTART:20260215T100000Z\r\n\
+SUMMARY:Real event\r\n\
+ORGANIZER:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let event =
+            parse_ics(data).expect("should parse the real VEVENT despite decoy text earlier");
+        assert_eq!(event.uid, "end-before-begin@example.com");
+        assert_eq!(event.summary, "Real event");
+    }
+
     #[test]
     fn parse_attendee_without_cn() {
         let event = parse_ics(SAMPLE_ICS_ATTENDEE_NO_CN).unwrap();
@@ -1252,6 +1352,44 @@ END:VCALENDAR";
         assert!(event.attendees[0].name.is_none());
         assert_eq!(event.attendees[0].email, "dave@example.com");
         assert_eq!(event.attendees[0].status, "ACCEPTED");
+    }
+
+    // --- extract_mailto tests (kata s2s8) ---
+
+    /// U+0130 'İ' lowercases to a 2-char sequence, so `to_lowercase()`
+    /// produces a string with a different byte length than the original.
+    /// The old implementation computed the "mailto:" offset against that
+    /// lowered copy and then sliced the ORIGINAL line at that byte offset —
+    /// desynced offsets either panicked on a non-char-boundary slice or
+    /// silently returned the wrong bytes. Searching and slicing the same
+    /// string must produce the correct address without panicking.
+    #[test]
+    fn extract_mailto_handles_unicode_before_marker_without_panic() {
+        let line = "ATTENDEE;CN=İ:mailto:é@x.com";
+        assert_eq!(extract_mailto(line), "é@x.com");
+    }
+
+    /// A crafted CN containing the literal text "mailto:" must not be
+    /// picked up ahead of the real address after the property's value
+    /// colon — that would let a spoofed CN hijack `organizer_email`, which
+    /// feeds the anti-spoof checks in `invite_update_decision`/
+    /// `cancel_decision`.
+    #[test]
+    fn extract_mailto_ignores_mailto_inside_quoted_cn() {
+        let line = "ATTENDEE;CN=\"Trusted mailto:spoofed@evil.com\":mailto:real@company.com";
+        assert_eq!(extract_mailto(line), "real@company.com");
+    }
+
+    #[test]
+    fn extract_mailto_still_works_on_plain_ascii_line() {
+        let line = "ORGANIZER;CN=Alice:mailto:alice@example.com";
+        assert_eq!(extract_mailto(line), "alice@example.com");
+    }
+
+    #[test]
+    fn extract_mailto_is_case_insensitive() {
+        let line = "ORGANIZER;CN=Alice:MAILTO:alice@example.com";
+        assert_eq!(extract_mailto(line), "alice@example.com");
     }
 
     #[test]
@@ -1322,6 +1460,35 @@ END:VEVENT\r\n\
 END:VCALENDAR\r\n";
         let event = parse_ics(ics).unwrap();
         assert_eq!(event.dtstart.hour(), 18);
+    }
+
+    /// kata 6t75: DST spring-forward gap. Clocks in America/New_York jump
+    /// from 02:00 to 03:00 on 2026-03-08, so 02:30 local never occurs.
+    /// `from_local_datetime` reports no mapping at all for that wall-clock
+    /// time (`.earliest()` and `.latest()` both `None`), which used to make
+    /// `parse_ics_datetime_property` return `None` and `parse_ics` drop the
+    /// whole event. It must instead resolve to a valid instant (shifted
+    /// forward past the gap) rather than silently discarding the invite.
+    #[test]
+    fn parse_ics_dst_gap_dtstart_does_not_drop_event() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:dst-gap@example.com\r\n\
+SUMMARY:Spring forward\r\n\
+DTSTART;TZID=America/New_York:20260308T023000\r\n\
+ORGANIZER:mailto:alice@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let event = parse_ics(ics)
+            .expect("a DTSTART landing in a DST spring-forward gap must not drop the event");
+        // The gap runs [02:00, 03:00) EST/EDT; the first valid instant at or
+        // after the requested 02:30 is 03:00 EDT (UTC-4) = 07:00 UTC.
+        assert_eq!(event.dtstart.hour(), 7);
+        assert_eq!(event.dtstart.minute(), 0);
     }
 
     // --- generate_rsvp tests ---
