@@ -110,14 +110,17 @@ fn parse_date_offset(s: &str) -> Option<NaiveDate> {
     }
 
     // Try relative format first: Nd, Nw, Nm
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    // Split on the last *character*, not the last byte, so a multi-byte
+    // trailing char (e.g. "3é") doesn't land inside a char boundary.
+    let (last_idx, last_char) = s.char_indices().next_back().unwrap();
+    let num_str = &s[..last_idx];
     if let Ok(num) = num_str.parse::<i64>()
         && num > 0
     {
-        let days = match unit {
-            "d" => Some(num),
-            "w" => Some(num * 7),
-            "m" => Some(num * 30),
+        let days = match last_char {
+            'd' => Some(num),
+            'w' => Some(num * 7),
+            'm' => Some(num * 30),
             _ => None,
         };
         if let Some(days) = days {
@@ -327,6 +330,14 @@ mod tests {
     #[test]
     fn parse_newer_than_invalid_unit() {
         let q = parse_query("newer_than:1x");
+        assert!(q.after.is_none());
+    }
+
+    #[test]
+    fn parse_newer_than_multibyte_char_does_not_panic() {
+        // "é" is a multi-byte UTF-8 character; splitting on byte length
+        // instead of char boundary previously panicked here.
+        let q = parse_query("newer_than:3é");
         assert!(q.after.is_none());
     }
 }
