@@ -10,9 +10,23 @@
 use crate::error::Error;
 use crate::types::{Email, EmailSort, Identity, Mailbox};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+/// Hard cap on how many bodies `AccountEntry::body_cache` holds in memory,
+/// per account. Without this, kata a5r8: the cache is only ever inserted
+/// into (warmer + `get_email` hits) and is cleared only by
+/// `invalidate_full` (account removal) — the per-mutation `invalidate`
+/// deliberately leaves it alone (see its doc comment), and the warmer never
+/// trims it either. Over a long-running daemon it grows monotonically with
+/// total mail volume; `SNAPSHOT_BODY_CAP` (below) only bounds what gets
+/// *persisted* to disk, not what's held in memory. 2000 is well above one
+/// warm cycle's insert volume (`BODY_PREFETCH_PER_MAILBOX` × mailbox count,
+/// typically ~150) so normal warming never evicts anything useful, while
+/// still bounding worst-case resident memory for an account with heavy
+/// `get_email` traffic across many distinct messages.
+const BODY_CACHE_MAX: usize = 2000;
 
 /// Lookup key for the cached inbox email list. Two cache hits must share
 /// the same mailbox, limit, and sort order; otherwise the cached payload
@@ -68,11 +82,49 @@ struct AccountEntry {
     inbox_lists: HashMap<InboxKey, InboxList>,
     split_counts: Option<(String, HashMap<String, u32>)>,
     body_cache: HashMap<String, Email>,
+    /// Recency order for `body_cache`, oldest-first, used to LRU-evict once
+    /// `body_cache` exceeds `BODY_CACHE_MAX`. Updated on every read *and*
+    /// write of `body_cache` (see `touch_body`) so an entry a user keeps
+    /// reopening isn't evicted just because it was inserted early.
+    body_order: VecDeque<String>,
     /// Monotonic version bumped on every `invalidate`. The warmer snapshots
     /// this before each provider call and discards its result if the version
     /// changed mid-flight — otherwise a slow in-flight refresh could
     /// overwrite a freshly invalidated entry with stale data.
     version: u64,
+}
+
+impl AccountEntry {
+    /// Mark `id` as the most-recently-used body_cache entry. Called on every
+    /// body_cache read (hit) and write so LRU eviction reflects actual usage,
+    /// not just insertion order.
+    fn touch_body(&mut self, id: &str) {
+        if let Some(pos) = self.body_order.iter().position(|k| k == id) {
+            self.body_order.remove(pos);
+        }
+        self.body_order.push_back(id.to_string());
+    }
+
+    /// Insert (or overwrite) a body_cache entry, mark it most-recently-used,
+    /// then evict least-recently-used entries until back under
+    /// `BODY_CACHE_MAX`. The single insertion path shared by `set_body` and
+    /// `try_set_body` so the cap can't be bypassed by either caller.
+    fn insert_body(&mut self, id: String, email: Email) {
+        self.body_cache.insert(id.clone(), email);
+        self.touch_body(&id);
+        self.evict_body_overflow();
+    }
+
+    fn evict_body_overflow(&mut self) {
+        while self.body_cache.len() > BODY_CACHE_MAX {
+            match self.body_order.pop_front() {
+                Some(oldest) => {
+                    self.body_cache.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 pub struct PrefetchCache {
@@ -138,12 +190,17 @@ impl PrefetchCache {
 
     pub async fn get_body(&self, account: &str, email_id: &str) -> Option<Email> {
         let entry = self.entry(account).await;
-        entry.lock().await.body_cache.get(email_id).cloned()
+        let mut e = entry.lock().await;
+        let found = e.body_cache.get(email_id).cloned();
+        if found.is_some() {
+            e.touch_body(email_id);
+        }
+        found
     }
 
     pub async fn set_body(&self, account: &str, email_id: String, email: Email) {
         let entry = self.entry(account).await;
-        entry.lock().await.body_cache.insert(email_id, email);
+        entry.lock().await.insert_body(email_id, email);
     }
 
     pub async fn get_split_counts(
@@ -210,6 +267,7 @@ impl PrefetchCache {
         e.inbox_lists.clear();
         e.split_counts = None;
         e.body_cache.clear();
+        e.body_order.clear();
         e.version = e.version.wrapping_add(1);
     }
 
@@ -309,7 +367,7 @@ impl PrefetchCache {
         if e.version != expected_version {
             return false;
         }
-        e.body_cache.insert(email_id, email);
+        e.insert_body(email_id, email);
         true
     }
 
@@ -454,10 +512,10 @@ impl Default for PrefetchCache {
 // entries within its first pass.
 
 /// Newest bodies kept per account in the snapshot, ranked by `received_at`.
-/// `body_cache` has no eviction in memory (bounded per warm cycle by
-/// `BODY_PREFETCH_PER_MAILBOX`), but persisting it verbatim would compound
-/// across restarts; the cap keeps the file to roughly what one warm cycle
-/// produces anyway.
+/// This is independent of (and smaller than) `BODY_CACHE_MAX`, the
+/// in-memory LRU cap: persisting the full in-memory cache verbatim would
+/// compound across restarts, so this cap keeps the file to roughly what one
+/// warm cycle produces instead of `BODY_CACHE_MAX`'s worst case.
 const SNAPSHOT_BODY_CAP: usize = 500;
 
 /// Serialized form of one account's cache entry. `inbox_lists` is a Vec of
@@ -545,29 +603,34 @@ impl PrefetchCache {
                 continue;
             }
             restored += 1;
-            inner.insert(
-                account,
-                Arc::new(Mutex::new(AccountEntry {
-                    mailboxes: snap.mailboxes,
-                    identities: snap.identities,
-                    inbox_lists: snap
-                        .inbox_lists
-                        .into_iter()
-                        .map(|(k, emails)| {
-                            (
-                                k,
-                                InboxList {
-                                    emails,
-                                    stale: true,
-                                },
-                            )
-                        })
-                        .collect(),
-                    split_counts: snap.split_counts,
-                    body_cache: snap.body_cache,
-                    version: 0,
-                })),
-            );
+            // Snapshot doesn't record recency, only `received_at` order (see
+            // `save_to_disk`); seed body_order from the restored keys as a
+            // reasonable proxy and let evict_body_overflow enforce the cap
+            // in case SNAPSHOT_BODY_CAP ever exceeds BODY_CACHE_MAX.
+            let body_order: VecDeque<String> = snap.body_cache.keys().cloned().collect();
+            let mut restored_entry = AccountEntry {
+                mailboxes: snap.mailboxes,
+                identities: snap.identities,
+                inbox_lists: snap
+                    .inbox_lists
+                    .into_iter()
+                    .map(|(k, emails)| {
+                        (
+                            k,
+                            InboxList {
+                                emails,
+                                stale: true,
+                            },
+                        )
+                    })
+                    .collect(),
+                split_counts: snap.split_counts,
+                body_cache: snap.body_cache,
+                body_order,
+                version: 0,
+            };
+            restored_entry.evict_body_overflow();
+            inner.insert(account, Arc::new(Mutex::new(restored_entry)));
         }
         if restored > 0 {
             tracing::info!(
@@ -1754,6 +1817,80 @@ mod tests {
             .await;
         let got = cache.get_body("acc-1", "msg-1").await.unwrap();
         assert_eq!(got.id, "msg-1");
+    }
+
+    #[tokio::test]
+    async fn body_cache_is_bounded_and_evicts_oldest() {
+        // kata a5r8: body_cache was only ever inserted into (set_body /
+        // try_set_body / the warmer) and cleared only by invalidate_full
+        // (account removal). Neither the per-mutation invalidate nor the
+        // warmer ever trimmed it, so a long-running daemon's in-memory
+        // body cache grew monotonically with total mail volume — the
+        // 500-entry SNAPSHOT_BODY_CAP only bounds what gets persisted to
+        // disk, not what's held in memory. Inserting more than the cap
+        // must evict something, keeping the cache size bounded.
+        let cache = PrefetchCache::new();
+        let n = BODY_CACHE_MAX + 50;
+        for i in 0..n {
+            cache
+                .set_body("acc-1", format!("msg-{i}"), email(&format!("msg-{i}")))
+                .await;
+        }
+
+        let size = {
+            let entry = cache.entry("acc-1").await;
+            entry.lock().await.body_cache.len()
+        };
+        assert!(
+            size <= BODY_CACHE_MAX,
+            "body_cache must never exceed BODY_CACHE_MAX, got {size}"
+        );
+
+        // The oldest entries (inserted first) must have been evicted.
+        assert!(
+            cache.get_body("acc-1", "msg-0").await.is_none(),
+            "oldest entry must be evicted once the cache exceeds its cap"
+        );
+        // The most recently inserted entry must still be present.
+        assert!(
+            cache
+                .get_body("acc-1", &format!("msg-{}", n - 1))
+                .await
+                .is_some(),
+            "most recently inserted entry must survive eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_cache_recently_used_entries_survive_eviction() {
+        // LRU semantics, not pure insertion-order FIFO: touching an old
+        // entry (a cache hit) must count as "recently used" and protect
+        // it from the next round of evictions, otherwise a warm/idle
+        // entry a user keeps reopening gets thrown away just because it
+        // was inserted early.
+        let cache = PrefetchCache::new();
+        cache
+            .set_body("acc-1", "keep-me".into(), email("keep-me"))
+            .await;
+        for i in 0..BODY_CACHE_MAX {
+            // Touch "keep-me" partway through so it's marked recently used
+            // relative to the entries inserted after it.
+            if i == BODY_CACHE_MAX / 2 {
+                assert!(cache.get_body("acc-1", "keep-me").await.is_some());
+            }
+            cache
+                .set_body(
+                    "acc-1",
+                    format!("filler-{i}"),
+                    email(&format!("filler-{i}")),
+                )
+                .await;
+        }
+
+        assert!(
+            cache.get_body("acc-1", "keep-me").await.is_some(),
+            "a recently-touched entry must survive eviction even though it was inserted first"
+        );
     }
 
     #[tokio::test]
