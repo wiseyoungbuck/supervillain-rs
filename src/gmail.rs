@@ -625,10 +625,15 @@ struct SendAsEntry {
 pub async fn get_identities(session: &GmailSession) -> Result<Vec<Identity>, Error> {
     let token = access_token(session).await?;
     let resp = session
-        .client
-        .get(format!("{GMAIL_BASE}/settings/sendAs"))
-        .bearer_auth(&token)
-        .send()
+        .limiter
+        .execute("sendAs.list", || async {
+            session
+                .client
+                .get(format!("{GMAIL_BASE}/settings/sendAs"))
+                .bearer_auth(&token)
+                .send()
+                .await
+        })
         .await?;
     let status = resp.status();
     if !status.is_success() {
@@ -750,7 +755,17 @@ async fn fetch_messages_page(
             qp.append_pair("pageToken", t);
         }
     }
-    let resp = session.client.get(url).bearer_auth(token).send().await?;
+    let resp = session
+        .limiter
+        .execute("messages.list", || async {
+            session
+                .client
+                .get(url.clone())
+                .bearer_auth(token)
+                .send()
+                .await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -1097,6 +1112,7 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
         &mut attachments,
         &mut has_calendar,
         false,
+        0,
     );
 
     let has_attachment = !attachments.is_empty();
@@ -1228,6 +1244,14 @@ fn unquote_display_name(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Recursion bound for `walk_payload` and `mime_path`. Untrusted MIME
+/// structure (a malicious or corrupted Gmail response) could otherwise nest
+/// multipart parts arbitrarily deep and overflow the stack, one frame per
+/// level. Real-world messages never nest more than a handful of levels, so
+/// this is generous headroom rather than a real limit — `find_calendar_ics`
+/// sidesteps the whole class of bug by being iterative instead.
+const MAX_MIME_DEPTH: usize = 64;
+
 #[allow(clippy::too_many_arguments)]
 fn walk_payload(
     part: &GmailPayload,
@@ -1238,11 +1262,27 @@ fn walk_payload(
     attachments: &mut Vec<crate::types::Attachment>,
     has_calendar: &mut bool,
     in_related: bool,
+    depth: usize,
 ) {
+    if depth > MAX_MIME_DEPTH {
+        tracing::warn!(
+            msg_id = %msg_id,
+            depth,
+            "Gmail payload nesting exceeded MAX_MIME_DEPTH — stopping walk early"
+        );
+        return;
+    }
+
     let mime_type = part.mime_type.to_ascii_lowercase();
 
     if mime_type.starts_with("multipart/") {
-        let new_in_related = in_related || mime_type == "multipart/related";
+        // Only direct children of multipart/related get the in_related flag —
+        // a nested multipart/mixed subtree resets it, matching jmap.rs's
+        // collect_attachments (see that function's comment). Without the
+        // reset, a real attachment nested multipart/related > multipart/mixed
+        // would inherit in_related=true from the outer related part and get
+        // silently dropped as if it were an HTML-embedded inline image.
+        let new_in_related = mime_type == "multipart/related";
         if let Some(parts) = &part.parts {
             for child in parts {
                 walk_payload(
@@ -1254,6 +1294,7 @@ fn walk_payload(
                     attachments,
                     has_calendar,
                     new_in_related,
+                    depth + 1,
                 );
             }
         }
@@ -1341,6 +1382,18 @@ fn walk_payload(
 /// can't tell "text/plain was hiding inside multipart/related" from "text/plain
 /// was a top-level sibling."
 fn mime_path(part: &GmailPayload) -> String {
+    mime_path_depth(part, 0)
+}
+
+/// Depth-bounded worker for `mime_path` — see `MAX_MIME_DEPTH`. Past the
+/// bound, nested structure is elided with `...` instead of recursing
+/// further; this is a diagnostic string, not the source of truth, so a
+/// truncated rendering is an acceptable trade for not overflowing the stack
+/// on a pathological payload.
+fn mime_path_depth(part: &GmailPayload, depth: usize) -> String {
+    if depth > MAX_MIME_DEPTH {
+        return "...".to_string();
+    }
     let mut buf = part.mime_type.clone();
     if let Some(parts) = &part.parts
         && !parts.is_empty()
@@ -1350,7 +1403,7 @@ fn mime_path(part: &GmailPayload) -> String {
             if i > 0 {
                 buf.push_str(", ");
             }
-            buf.push_str(&mime_path(child));
+            buf.push_str(&mime_path_depth(child, depth + 1));
         }
         buf.push(']');
     }
@@ -1601,7 +1654,12 @@ async fn message_has_label(
     let token = access_token(session).await?;
     // format=metadata returns labelIds without the payload bytes (cheaper).
     let url = format!("{GMAIL_BASE}/messages/{msg_id}?format=metadata");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("messages.get(metadata)", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -1618,7 +1676,14 @@ async fn message_has_label(
 pub async fn trash(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/{msg_id}/trash");
-    let resp = session.client.post(&url).bearer_auth(&token).send().await?;
+    // Priority lane: trashing is a direct user action, same as
+    // `modify_labels` (mark-read/star/archive) — see that fn's comment.
+    let resp = session
+        .limiter
+        .execute_prioritized(true, "messages.trash", || async {
+            session.client.post(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -1644,12 +1709,21 @@ pub async fn archive_batch(session: &GmailSession, msg_ids: &[String]) -> Result
     }
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/batchModify");
+    let body = batch_modify_body(msg_ids, &[], &["INBOX"]);
+    // Non-priority lane: this is a bulk fan-out, not a single interactive
+    // action — see `get_mailboxes`'s labels.get comment on keeping bulk
+    // work off the priority pool so it doesn't starve interactive requests.
     let resp = session
-        .client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&batch_modify_body(msg_ids, &[], &["INBOX"]))
-        .send()
+        .limiter
+        .execute("messages.batchModify", || async {
+            session
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
         .await?;
     let status = resp.status();
     if !status.is_success() {
@@ -1696,7 +1770,12 @@ pub async fn download_blob(
 
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/{msg_id}/attachments/{att_id}");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("messages.attachments.get", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -1845,7 +1924,12 @@ async fn lookup_parent_message_id(
     let encoded_id = encode_path_segment(gmail_msg_id);
     let url =
         format!("{GMAIL_BASE}/messages/{encoded_id}?format=metadata&metadataHeaders=Message-ID");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("messages.get(metadata,Message-ID)", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -2103,12 +2187,20 @@ pub async fn send_email(
 
     let token = access_token(session).await?;
     let url = format!("{GMAIL_BASE}/messages/send");
+    let body = serde_json::json!({ "raw": raw });
+    // Priority lane: the user is actively waiting on this send to complete —
+    // same reasoning as `modify_labels`.
     let resp = session
-        .client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&serde_json::json!({ "raw": raw }))
-        .send()
+        .limiter
+        .execute_prioritized(true, "messages.send", || async {
+            session
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
         .await?;
     let status = resp.status();
     if !status.is_success() {
@@ -2157,7 +2249,12 @@ async fn find_event_id_by_ical_uid(
     // narrowed, audit these query-string callers.
     let encoded = encode_path_segment(uid);
     let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("calendar.events.list?iCalUID", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -2394,7 +2491,12 @@ pub async fn get_calendar_event(
     // superset of query-component requirements, so reusing it here is safe.
     let encoded = encode_path_segment(uid);
     let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("calendar.events.list?iCalUID", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -2428,11 +2530,16 @@ pub async fn add_to_calendar(
     let body = calendar_event_to_google_json(event);
     let url = format!("{CALENDAR_BASE}/events/import");
     let resp = session
-        .client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
+        .limiter
+        .execute("calendar.events.import", || async {
+            session
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
         .await?;
     let status = resp.status();
     if status.is_success() {
@@ -2463,10 +2570,10 @@ pub async fn remove_from_calendar(session: &GmailSession, uid: &str) -> Result<b
     let encoded_id = encode_path_segment(&event_id);
     let url = format!("{CALENDAR_BASE}/events/{encoded_id}");
     let resp = session
-        .client
-        .delete(&url)
-        .bearer_auth(&token)
-        .send()
+        .limiter
+        .execute("calendar.events.delete", || async {
+            session.client.delete(&url).bearer_auth(&token).send().await
+        })
         .await?;
     let status = resp.status();
     if status.is_success() || status.as_u16() == 404 {
@@ -2509,10 +2616,15 @@ pub async fn respond_to_event(
     // GET the current event so we have the full attendees array (Google's
     // PATCH semantics require the full array; partial PATCH silently wipes).
     let get_resp = session
-        .client
-        .get(&event_url)
-        .bearer_auth(&token)
-        .send()
+        .limiter
+        .execute("calendar.events.get", || async {
+            session
+                .client
+                .get(&event_url)
+                .bearer_auth(&token)
+                .send()
+                .await
+        })
         .await?;
     let get_status = get_resp.status();
     if !get_status.is_success() {
@@ -2573,12 +2685,19 @@ pub async fn respond_to_event(
 
     let patch_body = serde_json::json!({ "attendees": attendees });
     let patch_url = format!("{event_url}?sendUpdates=all");
+    // Priority lane: the user is actively waiting on this RSVP click — same
+    // reasoning as `modify_labels`/`trash`/`send_email`.
     let patch_resp = session
-        .client
-        .patch(&patch_url)
-        .bearer_auth(&token)
-        .json(&patch_body)
-        .send()
+        .limiter
+        .execute_prioritized(true, "calendar.events.patch", || async {
+            session
+                .client
+                .patch(&patch_url)
+                .bearer_auth(&token)
+                .json(&patch_body)
+                .send()
+                .await
+        })
         .await?;
     let patch_status = patch_resp.status();
     if patch_status.is_success() {
@@ -2611,7 +2730,12 @@ pub async fn get_calendar_data(
     let token = access_token(session).await?;
     let encoded_id = encode_path_segment(email_id);
     let url = format!("{GMAIL_BASE}/messages/{encoded_id}?format=full");
-    let resp = session.client.get(&url).bearer_auth(&token).send().await?;
+    let resp = session
+        .limiter
+        .execute("messages.get(full)", || async {
+            session.client.get(&url).bearer_auth(&token).send().await
+        })
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -3362,6 +3486,138 @@ mod tests {
         assert!(email.has_attachment);
         assert_eq!(email.attachments.len(), 1);
         assert_eq!(email.attachments[0].name, "photo.jpg");
+    }
+
+    #[test]
+    fn parse_message_inline_attachment_nested_in_mixed_under_related_not_skipped() {
+        // multipart/related > multipart/mixed > inline-disposition attachment.
+        // in_related must reset at the multipart/mixed boundary (like jmap.rs's
+        // collect_attachments does), not stay "sticky" from the outer
+        // multipart/related — otherwise a real user attachment nested this way
+        // is silently dropped.
+        let msg = GmailMessage {
+            id: "msg-nested".into(),
+            thread_id: "t-nested".into(),
+            label_ids: vec!["INBOX".into()],
+            snippet: "".into(),
+            internal_date: "1700000000000".into(),
+            size_estimate: 0,
+            payload: GmailPayload {
+                mime_type: "multipart/related".into(),
+                filename: String::new(),
+                headers: vec![header("Subject", "Nested inline attachment")],
+                body: None,
+                parts: Some(vec![
+                    GmailPayload {
+                        mime_type: "text/html".into(),
+                        filename: String::new(),
+                        headers: vec![],
+                        body: Some(GmailBody {
+                            size: 1,
+                            data: Some(base64url_encode("<p>x</p>")),
+                            attachment_id: None,
+                        }),
+                        parts: None,
+                    },
+                    GmailPayload {
+                        mime_type: "multipart/mixed".into(),
+                        filename: String::new(),
+                        headers: vec![],
+                        body: None,
+                        parts: Some(vec![GmailPayload {
+                            mime_type: "image/png".into(),
+                            filename: "real-attachment.png".into(),
+                            headers: vec![header(
+                                "Content-Disposition",
+                                "inline; filename=real-attachment.png",
+                            )],
+                            body: Some(GmailBody {
+                                size: 100,
+                                data: None,
+                                attachment_id: Some("att_real".into()),
+                            }),
+                            parts: None,
+                        }]),
+                    },
+                ]),
+            },
+        };
+        let email = parse_message_to_email(msg, true);
+        assert!(email.has_attachment);
+        assert_eq!(email.attachments.len(), 1);
+        assert_eq!(email.attachments[0].name, "real-attachment.png");
+    }
+
+    #[test]
+    fn walk_payload_depth_guard_stops_descending_past_limit() {
+        // A pathological (or malicious) payload could nest multipart/mixed
+        // arbitrarily deep. walk_payload recurses one stack frame per level
+        // with no bound, so a deep-enough tree can overflow the stack.
+        // Build a tree well past any sane MIME nesting depth with a real
+        // attachment buried at the bottom, and assert the guard stops the
+        // walk before reaching it — proving descent is bounded rather than
+        // relying on the leaf simply never being reached in practice.
+        let mut current = GmailPayload {
+            mime_type: "application/octet-stream".into(),
+            filename: "deep.bin".into(),
+            headers: vec![],
+            body: Some(GmailBody {
+                size: 10,
+                data: None,
+                attachment_id: Some("att_deep".into()),
+            }),
+            parts: None,
+        };
+        for _ in 0..150 {
+            current = GmailPayload {
+                mime_type: "multipart/mixed".into(),
+                filename: String::new(),
+                headers: vec![],
+                body: None,
+                parts: Some(vec![current]),
+            };
+        }
+        let msg = GmailMessage {
+            id: "msg-deep".into(),
+            thread_id: "t-deep".into(),
+            label_ids: vec!["INBOX".into()],
+            snippet: "".into(),
+            internal_date: "1700000000000".into(),
+            size_estimate: 0,
+            payload: current,
+        };
+        // Must not panic/overflow, and the buried attachment past the depth
+        // guard must not be collected.
+        let email = parse_message_to_email(msg, true);
+        assert!(email.attachments.is_empty());
+        assert!(!email.has_attachment);
+    }
+
+    #[test]
+    fn mime_path_depth_guard_truncates_past_limit() {
+        // Same untrusted-depth concern as walk_payload: mime_path recurses
+        // once per nesting level with no bound. Build a tree deep enough
+        // that unbounded recursion would be unsafe, and assert the render
+        // terminates with a truncation marker instead of recursing forever.
+        let mut current = GmailPayload {
+            mime_type: "text/plain".into(),
+            filename: String::new(),
+            headers: vec![],
+            body: None,
+            parts: None,
+        };
+        for _ in 0..150 {
+            current = GmailPayload {
+                mime_type: "multipart/mixed".into(),
+                filename: String::new(),
+                headers: vec![],
+                body: None,
+                parts: Some(vec![current]),
+            };
+        }
+        let rendered = mime_path(&current);
+        assert!(rendered.contains("..."));
+        assert!(!rendered.contains("text/plain"));
     }
 
     #[test]
