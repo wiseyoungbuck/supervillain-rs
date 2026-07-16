@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::provider_utils::{MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP};
+use crate::provider_utils::{
+    MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES, UPLOAD_CACHE_CAP,
+    should_clear_tokens_on_refresh_failure,
+};
 use crate::rate_limit::RateLimiter;
 use crate::types::{CalendarEvent, EmailSort, Mailbox};
 
@@ -189,11 +192,19 @@ async fn exchange_code(
 
 /// Refresh if token expires within 60 seconds. Uses interior mutability via Mutex.
 async fn ensure_token(session: &OutlookSession) -> Result<(), Error> {
+    ensure_token_at(session, TOKEN_URL).await
+}
+
+/// Core of `ensure_token`, parameterized on the token endpoint so tests can
+/// point it at a local mock server instead of Microsoft's real OAuth
+/// endpoint (which `TOKEN_URL` is hardcoded to). `ensure_token` is the thin
+/// production wrapper that always passes `TOKEN_URL`.
+async fn ensure_token_at(session: &OutlookSession, token_url: &str) -> Result<(), Error> {
     let mut token = session.token.lock().await;
     if Utc::now() + chrono::Duration::seconds(60) >= token.token_expiry {
         let resp = session
             .client
-            .post(TOKEN_URL)
+            .post(token_url)
             .form(&[
                 ("client_id", session.client_id.as_str()),
                 ("grant_type", "refresh_token"),
@@ -204,7 +215,24 @@ async fn ensure_token(session: &OutlookSession) -> Result<(), Error> {
             .await?;
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            // Mirrors Gmail's `should_clear_tokens_on_refresh_failure` handling:
+            // an `invalid_grant`/revocation failure is irrecoverable — the
+            // stored refresh token will never succeed again — so without
+            // clearing it here, `ensure_token` re-attempts (and re-fails)
+            // this same refresh on every call forever, with authStatus
+            // staying "ok" and no in-app path back to a fresh OAuth flow.
+            // `clear_stored_tokens` was previously documented as reachable
+            // from here but only exercised from tests.
+            if should_clear_tokens_on_refresh_failure(status, &text) {
+                drop(token);
+                clear_stored_tokens(session).await;
+                return Err(Error::Auth(format!(
+                    "Outlook refresh token expired or revoked. Stored tokens cleared; \
+                     restart supervillain to re-authenticate. ({status}): {text}"
+                )));
+            }
             return Err(Error::Auth(format!("Token refresh failed: {text}")));
         }
 
@@ -227,7 +255,12 @@ async fn access_token(session: &OutlookSession) -> Result<String, Error> {
     Ok(session.token.lock().await.access_token.clone())
 }
 
-/// Persist tokens to disk
+/// Persist tokens to disk. Writes are atomic (tmp file + rename) and the
+/// token file is created 0600 — via `accounts::atomic_write_bytes`'s
+/// `secret` mode, the same helper Gmail's token path and account config
+/// storage use — so a crash mid-write can't leave a truncated token file
+/// and a permissive umask can't leave tokens group/world-readable. The
+/// parent directory is additionally locked to 0700 for the same reason.
 fn save_tokens_inner(
     token_path: &std::path::Path,
     token: &OutlookToken,
@@ -236,6 +269,13 @@ fn save_tokens_inner(
     if let Some(parent) = token_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Internal(format!("Failed to create token dir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| Error::Internal(format!("Failed to set token dir permissions: {e}")),
+            )?;
+        }
     }
     let stored = StoredTokens {
         access_token: token.access_token.clone(),
@@ -245,7 +285,7 @@ fn save_tokens_inner(
     };
     let json = serde_json::to_string_pretty(&stored)
         .map_err(|e| Error::Internal(format!("Failed to serialize tokens: {e}")))?;
-    std::fs::write(token_path, json)
+    crate::accounts::atomic_write_bytes(token_path, json.as_bytes(), /* secret */ true)
         .map_err(|e| Error::Internal(format!("Failed to write tokens: {e}")))?;
     Ok(())
 }
@@ -341,6 +381,14 @@ struct MeResponse {
     user_principal_name: Option<String>,
     #[serde(default)]
     other_mails: Vec<String>,
+    // Not requested by `fetch_user_email`'s `$select` (defaults to None
+    // there), but `get_identities`'s `$select` does include them — shared
+    // here so `get_identities` can reuse `primary_address`'s empty-string
+    // filtering instead of reimplementing (and re-breaking) it.
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 impl MeResponse {
@@ -348,13 +396,13 @@ impl MeResponse {
     /// Empty-string filtering matters because Graph sometimes returns `"mail": ""` on
     /// MSA edge cases — `Option::or` would short-circuit on `Some("")` and we'd persist
     /// an empty account label (which becomes the token-file stem).
-    fn primary_address(self) -> Option<String> {
-        fn nonempty(s: Option<String>) -> Option<String> {
-            s.filter(|v| !v.is_empty())
+    fn primary_address(&self) -> Option<String> {
+        fn nonempty(s: Option<&String>) -> Option<String> {
+            s.filter(|v| !v.is_empty()).cloned()
         }
-        nonempty(self.mail)
-            .or_else(|| nonempty(self.user_principal_name))
-            .or_else(|| self.other_mails.into_iter().find(|s| !s.is_empty()))
+        nonempty(self.mail.as_ref())
+            .or_else(|| nonempty(self.user_principal_name.as_ref()))
+            .or_else(|| self.other_mails.iter().find(|s| !s.is_empty()).cloned())
     }
 }
 
@@ -593,7 +641,8 @@ pub(crate) fn parse_graph_message(
         .iter()
         .any(|a| a.mime_type.eq_ignore_ascii_case("text/calendar"));
 
-    let size = json["sizeEstimate"].as_i64().unwrap_or(0);
+    // Graph's message size field is "size" — not Gmail's "sizeEstimate".
+    let size = json["size"].as_i64().unwrap_or(0);
 
     crate::types::Email {
         id: id.clone(),
@@ -1218,25 +1267,35 @@ pub async fn get_identities(
         let text = resp.text().await.unwrap_or_default();
         return Err(classify_outlook_error("me.get", status, &text));
     }
-    let parsed: serde_json::Value = resp.json().await?;
-    let email = parsed["mail"]
-        .as_str()
-        .or_else(|| parsed["userPrincipalName"].as_str())
-        .unwrap_or(&session.email)
-        .to_string();
-    let display_name = parsed["displayName"].as_str().unwrap_or("").to_string();
-    let id = parsed["id"].as_str().unwrap_or(&email).to_string();
-
-    let identities = vec![crate::types::Identity {
-        id,
-        email,
-        name: display_name,
-    }];
+    let parsed: MeResponse = resp.json().await?;
+    let identities = vec![identity_from_me_response(&parsed, &session.email)];
     *session.identity_cache.lock().await = Some(IdentityCacheEntry {
         fetched_at: Instant::now(),
         identities: identities.clone(),
     });
     Ok(identities)
+}
+
+/// Build the single Outlook `Identity` from a parsed `/me` response. Pure —
+/// split out of `get_identities` for testability (no HTTP).
+///
+/// Reuses `MeResponse::primary_address` rather than reimplementing the
+/// mail → userPrincipalName fallback: a bespoke `Option::or` chain here
+/// previously reintroduced the empty-`"mail"` bug that helper guards
+/// against (Graph returns `"mail": ""` on some MSA accounts), which would
+/// have short-circuited on `Some("")` and produced an empty-string
+/// identity email instead of falling back to userPrincipalName.
+fn identity_from_me_response(parsed: &MeResponse, fallback_email: &str) -> crate::types::Identity {
+    let email = parsed
+        .primary_address()
+        .unwrap_or_else(|| fallback_email.to_string());
+    let display_name = parsed.display_name.clone().unwrap_or_default();
+    let id = parsed.id.clone().unwrap_or_else(|| email.clone());
+    crate::types::Identity {
+        id,
+        email,
+        name: display_name,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1267,6 +1326,30 @@ fn sort_cache_tag(sort: EmailSort) -> &'static str {
     }
 }
 
+/// Build the `page_cache` key for a query. Pure — split out of
+/// `query_emails` for testability. Combines folder + serialized query +
+/// sort order + effective page size (`$top`) for cursor reuse. See
+/// `sort_cache_tag` for why the order must be part of the key. `limit`
+/// must be part of it too: the `@odata.nextLink` Graph hands back bakes in
+/// the `$top` of the request that produced it, so reusing a cursor cached
+/// under one page size for a request asking for a different page size
+/// would silently follow a cursor built for the wrong page size.
+fn page_cache_key(
+    folder_id: Option<&str>,
+    odata: &OdataQuery,
+    sort: EmailSort,
+    limit: usize,
+) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        folder_id.unwrap_or(""),
+        odata.filter.as_deref().unwrap_or(""),
+        odata.search.as_deref().unwrap_or(""),
+        sort_cache_tag(sort),
+        limit
+    )
+}
+
 /// Query messages with pagination. Graph paginates via opaque
 /// `@odata.nextLink` URLs; we cache the link verbatim for forward iteration
 /// and re-use `$skip` for jump-back. Bounded by `MAX_REWALK_PAGES` to keep
@@ -1281,16 +1364,7 @@ pub async fn query_emails(
 ) -> Result<Vec<String>, Error> {
     let token = access_token(session).await?;
     let odata = query.map(translate_query_to_odata).unwrap_or_default();
-
-    // Cache key combines folder + serialized query + sort order for cursor
-    // reuse. See `sort_cache_tag` for why the order must be part of the key.
-    let cache_key = format!(
-        "{}|{}|{}|{}",
-        folder_id.unwrap_or(""),
-        odata.filter.as_deref().unwrap_or(""),
-        odata.search.as_deref().unwrap_or(""),
-        sort_cache_tag(sort)
-    );
+    let cache_key = page_cache_key(folder_id, &odata, sort, limit);
 
     // Forward iteration: if cache has a next_link for at_position == position,
     // follow it. Otherwise, build a fresh URL with $skip.
@@ -2590,20 +2664,68 @@ async fn delete_draft(session: &OutlookSession, token: &str, draft_id: &str) -> 
 // Microsoft Graph Calendar Operations
 // =============================================================================
 
+/// Send a Graph GET/POST/etc. request and parse the body as JSON — but only
+/// after checking the HTTP status. A Graph error body (e.g. a 429/5xx) is
+/// still valid JSON (`{"error": {...}}`), just without a top-level "value"
+/// key, so blindly parsing it and indexing into "value" silently reads as
+/// "empty result" rather than surfacing the failure. That mis-read is what
+/// let a transient error while looking up a calendar event masquerade as
+/// "event not found" — causing `add_to_calendar` to POST a duplicate event
+/// and `remove_from_calendar` to report success without a real lookup.
+/// Mirrors the status check done at the other 20+ Graph call sites in this
+/// file, factored out here so `find_event_by_uid` and `get_calendar_event`
+/// share it.
+async fn send_graph_json(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+) -> Result<serde_json::Value, Error> {
+    let resp = request.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(classify_outlook_error(operation, status, &text));
+    }
+    serde_json::from_str(&text).map_err(|e| {
+        Error::Internal(format!(
+            "Graph {operation} returned non-JSON: {e}: {}",
+            truncate_error_body(&text)
+        ))
+    })
+}
+
+/// Build the `POST /me/events/{id}/{action}` RSVP URL. Pure — no HTTP.
+/// `event_id` is Graph's opaque event ID (base64-ish, but not guaranteed to
+/// avoid `/`), so it's percent-encoded via `encode_path_segment` like every
+/// other ID-in-path interpolation in this file; an unencoded `/` inside the
+/// ID would otherwise split the path and hit the wrong (or a nonexistent)
+/// Graph route.
+fn build_event_action_url(event_id: &str, action: &str) -> String {
+    format!(
+        "{GRAPH_BASE}/me/events/{}/{action}",
+        crate::provider_utils::encode_path_segment(event_id)
+    )
+}
+
+/// Build the `DELETE /me/events/{id}` URL. Pure — no HTTP. See
+/// `build_event_action_url` for why `event_id` must be encoded.
+fn build_event_delete_url(event_id: &str) -> String {
+    format!(
+        "{GRAPH_BASE}/me/events/{}",
+        crate::provider_utils::encode_path_segment(event_id)
+    )
+}
+
 /// Find a Graph event ID by iCalUId
 async fn find_event_by_uid(session: &OutlookSession, uid: &str) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     // Escape single quotes in UID to prevent OData filter injection
     let safe_uid = uid.replace('\'', "''");
     let url = format!("{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id",);
-    let resp: serde_json::Value = session
-        .client
-        .get(&url)
-        .bearer_auth(&token)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let resp = send_graph_json(
+        session.client.get(&url).bearer_auth(&token),
+        "events.filter",
+    )
+    .await?;
 
     Ok(resp["value"]
         .as_array()
@@ -2673,7 +2795,7 @@ pub async fn respond_to_event(
 
     let resp = session
         .client
-        .post(format!("{GRAPH_BASE}/me/events/{event_id}/{action}"))
+        .post(build_event_action_url(&event_id, action))
         .bearer_auth(&token)
         .json(&serde_json::json!({"sendResponse": true}))
         .send()
@@ -2702,21 +2824,21 @@ pub async fn get_calendar_event(
         "{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id,subject,start,end,location,body,organizer,attendees,iCalUId"
     );
 
-    let resp: serde_json::Value = session
-        .client
-        .get(&url)
-        .bearer_auth(&token)
-        // roborev 296 #1: without this, Graph returns the event body
-        // HTML-wrapped by default. That HTML skeleton never equals the
-        // plain-text DESCRIPTION parsed from the incoming ICS, so the
-        // content-idempotence guard in events_content_match never sees a
-        // match and the destructive remove+re-add fires on every re-open of
-        // a SEQUENCE>=1 invite (with or without a real description change).
-        .header("Prefer", r#"outlook.body-content-type="text""#)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let resp = send_graph_json(
+        session
+            .client
+            .get(&url)
+            .bearer_auth(&token)
+            // roborev 296 #1: without this, Graph returns the event body
+            // HTML-wrapped by default. That HTML skeleton never equals the
+            // plain-text DESCRIPTION parsed from the incoming ICS, so the
+            // content-idempotence guard in events_content_match never sees a
+            // match and the destructive remove+re-add fires on every re-open of
+            // a SEQUENCE>=1 invite (with or without a real description change).
+            .header("Prefer", r#"outlook.body-content-type="text""#),
+        "events.get",
+    )
+    .await?;
 
     let event_json = match resp["value"].as_array().and_then(|arr| arr.first()) {
         Some(ev) => ev,
@@ -2825,7 +2947,7 @@ pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result
 
     let resp = session
         .client
-        .delete(format!("{GRAPH_BASE}/me/events/{event_id}"))
+        .delete(build_event_delete_url(&event_id))
         .bearer_auth(&token)
         .send()
         .await?;
@@ -2961,6 +3083,42 @@ mod tests {
             r#"{"mail":null,"userPrincipalName":null,"otherMails":["","real@example.com"]}"#,
         );
         assert_eq!(me.primary_address(), Some("real@example.com".into()));
+    }
+
+    // ---- identity_from_me_response (kata 8qdw #2) ----
+    //
+    // get_identities used to reimplement the mail-or-userPrincipalName
+    // fallback with a bespoke `Option::or` chain instead of reusing
+    // `MeResponse::primary_address`, reintroducing the empty-`"mail"` bug
+    // that helper exists to guard against.
+
+    #[test]
+    fn identity_from_me_response_falls_back_to_upn_on_empty_mail() {
+        let me = parse_me(
+            r#"{"mail":"","userPrincipalName":"upn@example.com","otherMails":[],"displayName":"User","id":"abc123"}"#,
+        );
+        let identity = identity_from_me_response(&me, "fallback@example.com");
+        assert_eq!(identity.email, "upn@example.com");
+        assert_eq!(identity.id, "abc123");
+        assert_eq!(identity.name, "User");
+    }
+
+    #[test]
+    fn identity_from_me_response_uses_session_email_when_all_fields_empty() {
+        let me = parse_me(r#"{"mail":"","userPrincipalName":null,"otherMails":[]}"#);
+        let identity = identity_from_me_response(&me, "session@example.com");
+        assert_eq!(identity.email, "session@example.com");
+        // id falls back to the resolved email when Graph doesn't return one.
+        assert_eq!(identity.id, "session@example.com");
+    }
+
+    #[test]
+    fn identity_from_me_response_prefers_populated_mail() {
+        let me = parse_me(
+            r#"{"mail":"user@example.com","userPrincipalName":"upn@example.com","otherMails":[]}"#,
+        );
+        let identity = identity_from_me_response(&me, "fallback@example.com");
+        assert_eq!(identity.email, "user@example.com");
     }
 
     // ---- truncate_error_body (roborev 200 #3) ----
@@ -3361,6 +3519,40 @@ mod tests {
         assert_eq!(event.dtstart.format("%H:%M").to_string(), "14:30");
     }
 
+    // ---- build_event_action_url / build_event_delete_url (kata 8qdw #4) ----
+    //
+    // respond_to_event and remove_from_calendar used to interpolate the
+    // Graph event ID into the URL path without encode_path_segment, unlike
+    // every other ID-in-path interpolation in this file.
+
+    #[test]
+    fn build_event_action_url_encodes_slash_in_event_id() {
+        let url = build_event_action_url("AAMkAG/weird+id", "accept");
+        assert!(
+            !url.contains("AAMkAG/weird"),
+            "unencoded slash must not survive into the path: {url}"
+        );
+        assert!(url.contains("AAMkAG%2Fweird"));
+        // Encoded ID sits between /events/ and /accept — a raw slash would
+        // otherwise split the path and hit a different (or nonexistent)
+        // Graph route.
+        assert!(url.ends_with("/accept"));
+    }
+
+    #[test]
+    fn build_event_delete_url_encodes_slash_in_event_id() {
+        let url = build_event_delete_url("some/nested/id");
+        assert!(!url.contains("some/nested/id"));
+        assert!(url.contains("some%2Fnested%2Fid"));
+        assert!(url.starts_with(&format!("{GRAPH_BASE}/me/events/")));
+    }
+
+    #[test]
+    fn build_event_action_url_passthrough_for_normal_id() {
+        let url = build_event_action_url("AAMkAGI1AAA", "decline");
+        assert_eq!(url, format!("{GRAPH_BASE}/me/events/AAMkAGI1AAA/decline"));
+    }
+
     // =========================================================================
     // Phase 4 Milestone A — Outlook email
     //
@@ -3649,6 +3841,207 @@ mod tests {
 
         clear_stored_tokens(&session).await;
         clear_stored_tokens(&session).await; // second call must not panic
+    }
+
+    // ---- save_tokens_inner (kata q4fx) ----
+    //
+    // Tokens were written via a plain std::fs::write with no explicit
+    // mode (subject to umask) and non-atomically. Fixed to go through
+    // accounts::atomic_write_bytes(secret=true) (0600, tmp+rename) with
+    // the parent dir locked to 0700, matching Gmail's write_token_file /
+    // accounts.rs' atomic_write_bytes.
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tokens_inner_writes_file_with_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Force a permissive umask-equivalent starting point by pre-creating
+        // the dir wide open; save_tokens_inner must still lock it down.
+        let token_path = dir.path().join("nested").join("outlook-tokens.json");
+        let token = OutlookToken {
+            access_token: "access-abc".into(),
+            refresh_token: "refresh-xyz".into(),
+            token_expiry: Utc::now(),
+        };
+
+        save_tokens_inner(&token_path, &token, "u@example.com").unwrap();
+
+        let file_mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "token file must be 0600, got {file_mode:o}"
+        );
+
+        let dir_mode = std::fs::metadata(token_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "token dir must be 0700, got {dir_mode:o}");
+    }
+
+    #[tokio::test]
+    async fn save_tokens_inner_round_trips_via_load_tokens() {
+        // Sanity check that the switch to atomic_write_bytes didn't change
+        // the on-disk format load_tokens expects.
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("outlook-tokens.json");
+        let token = OutlookToken {
+            access_token: "access-abc".into(),
+            refresh_token: "refresh-xyz".into(),
+            token_expiry: Utc::now(),
+        };
+        save_tokens_inner(&token_path, &token, "u@example.com").unwrap();
+
+        let loaded = load_tokens(&token_path, "client-id").expect("tokens should load back");
+        assert_eq!(loaded.email, "u@example.com");
+        assert_eq!(loaded.token.lock().await.access_token, "access-abc");
+    }
+
+    // ---- Local HTTP test server shared by send_graph_json / ensure_token_at
+    // tests below. Mirrors rate_limit.rs's spawn_server helper — a real
+    // local axum server rather than a mocking framework (none is a
+    // dependency here).
+
+    async fn spawn_test_server<F>(make_app: F) -> String
+    where
+        F: FnOnce() -> axum::Router,
+    {
+        let app = make_app();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    // ---- send_graph_json (kata 8qdw #1) ----
+    //
+    // find_event_by_uid / get_calendar_event used to parse the response
+    // body as JSON with no status check. A Graph error body is still
+    // valid JSON but has no "value" key, so it silently read as "no
+    // events found" instead of surfacing the failure — causing
+    // add_to_calendar to POST a duplicate event on a transient 429/5xx,
+    // and remove_from_calendar to report success without a real lookup.
+
+    #[tokio::test]
+    async fn send_graph_json_errors_on_non_success_status() {
+        let base = spawn_test_server(|| {
+            axum::Router::new().route(
+                "/events",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "error": { "code": "InternalServerError", "message": "boom" }
+                        })),
+                    )
+                }),
+            )
+        })
+        .await;
+        let client = reqwest::Client::new();
+
+        let result = send_graph_json(client.get(format!("{base}/events")), "events.filter").await;
+
+        assert!(
+            result.is_err(),
+            "a non-2xx response must yield Err, not a silently-empty Ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_graph_json_parses_body_on_success() {
+        let base = spawn_test_server(|| {
+            axum::Router::new().route(
+                "/events",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"value": [{"id": "evt-1"}]}))
+                }),
+            )
+        })
+        .await;
+        let client = reqwest::Client::new();
+
+        let result = send_graph_json(client.get(format!("{base}/events")), "events.filter")
+            .await
+            .unwrap();
+
+        assert_eq!(result["value"][0]["id"].as_str(), Some("evt-1"));
+    }
+
+    // ---- ensure_token_at (kata 0ch3) ----
+    //
+    // ensure_token previously never called clear_stored_tokens on an
+    // irrecoverable refresh failure (invalid_grant / revoked refresh
+    // token), so a revoked token looped forever with no in-app recovery.
+
+    #[tokio::test]
+    async fn ensure_token_at_clears_tokens_on_invalid_grant() {
+        let base = spawn_test_server(|| {
+            axum::Router::new().route(
+                "/token",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({
+                            "error": "invalid_grant",
+                            "error_description": "AADSTS70000: refresh token has expired or is revoked"
+                        })),
+                    )
+                }),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("outlook-tokens.json");
+        let mut session = make_outlook_session_with_token_file(token_path.clone());
+        // Force the refresh branch.
+        session.token.get_mut().token_expiry = Utc::now() - chrono::Duration::seconds(10);
+        assert!(token_path.exists(), "precondition: token file was seeded");
+
+        let token_url = format!("{base}/token");
+        let result = ensure_token_at(&session, &token_url).await;
+
+        assert!(result.is_err(), "invalid_grant refresh must return Err");
+        assert!(
+            !token_path.exists(),
+            "invalid_grant refresh must clear the stored token file"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_token_at_keeps_tokens_on_other_refresh_error() {
+        // A non-invalid_grant failure (e.g. transient 500) must NOT clear
+        // stored tokens — only the irrecoverable class should evict.
+        let base = spawn_test_server(|| {
+            axum::Router::new().route(
+                "/token",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({"error": "server_error"})),
+                    )
+                }),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("outlook-tokens.json");
+        let mut session = make_outlook_session_with_token_file(token_path.clone());
+        session.token.get_mut().token_expiry = Utc::now() - chrono::Duration::seconds(10);
+
+        let token_url = format!("{base}/token");
+        let result = ensure_token_at(&session, &token_url).await;
+
+        assert!(result.is_err());
+        assert!(
+            token_path.exists(),
+            "a transient (non-invalid_grant) refresh failure must not clear stored tokens"
+        );
     }
 
     // ---- translate_query_to_odata ----
@@ -3962,6 +4355,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_graph_message_reads_size_field() {
+        // Graph's message size field is "size" — not Gmail's
+        // "sizeEstimate". Reading the wrong key silently reports 0 for
+        // every Outlook message.
+        let mut j = graph_message_minimal();
+        j["size"] = serde_json::json!(54321);
+        let m = parse_graph_message(&j, true);
+        assert_eq!(m.size, 54321);
+    }
+
+    #[test]
+    fn parse_graph_message_size_ignores_gmail_size_estimate_field() {
+        // A stray "sizeEstimate" (Gmail's field name) must not leak into
+        // Outlook's parsed size — confirms we're keyed on "size", not a
+        // field shared across providers.
+        let mut j = graph_message_minimal();
+        j["sizeEstimate"] = serde_json::json!(99999);
+        let m = parse_graph_message(&j, true);
+        assert_eq!(m.size, 0);
+    }
+
+    #[test]
     fn parse_graph_message_read_state_via_isread() {
         // isRead: true → $seen keyword (matches Email::is_unread() semantics)
         let m = parse_graph_message(&graph_message_minimal(), true);
@@ -4263,6 +4678,29 @@ mod tests {
             sort_cache_tag(EmailSort::DateDesc),
             sort_cache_tag(EmailSort::DateAsc)
         );
+    }
+
+    // ---- page_cache_key (kata 8qdw #5) ----
+    //
+    // The cache key previously omitted the effective page size ($top), so
+    // a next_link cursor built for one page size could be reused for a
+    // request asking for a different page size, silently returning the
+    // wrong-sized page.
+
+    #[test]
+    fn page_cache_key_differs_by_page_size() {
+        let odata = OdataQuery::default();
+        let key_25 = page_cache_key(Some("inbox"), &odata, EmailSort::DateDesc, 25);
+        let key_50 = page_cache_key(Some("inbox"), &odata, EmailSort::DateDesc, 50);
+        assert_ne!(key_25, key_50);
+    }
+
+    #[test]
+    fn page_cache_key_same_for_identical_inputs() {
+        let odata = OdataQuery::default();
+        let a = page_cache_key(Some("inbox"), &odata, EmailSort::DateDesc, 25);
+        let b = page_cache_key(Some("inbox"), &odata, EmailSort::DateDesc, 25);
+        assert_eq!(a, b);
     }
 
     // ---- Roborev 179 #11: classify_outlook_error tests ----
