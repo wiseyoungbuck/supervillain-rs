@@ -1130,6 +1130,27 @@ fn promote_default_if_empty(reg: &mut AccountRegistry, id: &str) {
     }
 }
 
+// Test-only synchronization point (kata s1pw #2 regression coverage): lets
+// a test pause one specific `upsert_account` call between its advisory read
+// and the write-lock merge, to deterministically prove the merge is
+// computed against fresh state rather than a snapshot taken before another
+// concurrent update landed. Scoped per-task via `tokio::task_local!`, so
+// it's a silent no-op for every task that doesn't explicitly opt in via
+// `UPSERT_RACE_PAUSE.scope(..)` — safe to leave present unconditionally
+// under `cfg(test)` without risk of hanging unrelated tests that share the
+// same test binary.
+#[cfg(test)]
+tokio::task_local! {
+    static UPSERT_RACE_PAUSE: std::sync::Arc<tokio::sync::Notify>;
+}
+
+#[cfg(test)]
+async fn upsert_race_pause_point() {
+    if let Ok(notify) = UPSERT_RACE_PAUSE.try_with(std::sync::Arc::clone) {
+        notify.notified().await;
+    }
+}
+
 /// `POST /api/accounts/{id}` — upsert.
 ///
 /// Body is an `AccountConfig` payload (serde discriminates on `provider`).
@@ -1140,21 +1161,23 @@ async fn upsert_account(
     AxumPath(id): AxumPath<String>,
     Json(incoming): Json<AccountConfig>,
 ) -> Result<impl IntoResponse, Error> {
-    // Look up the existing account (if any) in the in-memory registry — no
-    // disk read needed; the registry is the canonical post-startup mirror.
-    let (is_new, cfg) = {
+    // Advisory-only lookup: decides whether to take the create path (network
+    // connect / OAuth-needed flag) below. This is NOT the state the final
+    // merge is computed against — see the write-lock re-read further down
+    // (kata s1pw #2). Between this read lock releasing and the write lock
+    // being acquired, another upsert of the same id can complete; merging
+    // against this stale snapshot would silently lose that update's secret
+    // (an empty incoming field reads as "keep existing", and "existing"
+    // here would be the old, pre-update value).
+    let is_new = {
         let reg = state.accounts.read().await;
-        match reg.account_configs.get(&id) {
-            Some(existing) => {
-                check_provider_change(existing, &incoming)
-                    .map_err(|e| Error::BadRequest(e.into()))?;
-                (false, merge_secrets(existing, incoming))
-            }
-            None => (true, incoming),
-        }
+        !reg.account_configs.contains_key(&id)
     };
 
-    if let Err(errs) = validate_account(&cfg, &id) {
+    #[cfg(test)]
+    upsert_race_pause_point().await;
+
+    if is_new && let Err(errs) = validate_account(&incoming, &id) {
         return Err(Error::BadRequest(
             serde_json::to_string(&errs).unwrap_or_else(|_| "validation failed".into()),
         ));
@@ -1165,7 +1188,7 @@ async fn upsert_account(
     let mut new_session: Option<ProviderSession> = None;
     let mut needs_auth = false;
     if is_new {
-        match &cfg {
+        match &incoming {
             AccountConfig::Fastmail {
                 username,
                 api_token,
@@ -1191,14 +1214,35 @@ async fn upsert_account(
         }
     }
 
-    // Take the lock, mutate, write config — all held under the write lock
-    // (Carmack et al.: a millisecond of held-lock during disk write beats
-    // the lost-update race where T2's snapshot overwrites T1's commit).
-    {
+    // Take the lock, re-read the CURRENT state, compute the merge against
+    // that (not the advisory read above), validate, then mutate and write —
+    // all held under one write lock (Carmack et al.: a millisecond of
+    // held-lock during disk write beats the lost-update race where T2's
+    // stale-snapshot merge overwrites T1's commit).
+    let (cfg, was_new) = {
         let mut reg = state.accounts.write().await;
-        if is_new && reg.account_configs.contains_key(&id) {
-            return Err(Error::Conflict(format!("account '{id}' already exists")));
+        let fresh_existing = reg.account_configs.get(&id).cloned();
+        let (was_new, cfg) = match fresh_existing {
+            Some(existing) => {
+                if is_new {
+                    // Someone else created this id while we were building a
+                    // session for a create — refuse rather than silently
+                    // switching to an update and merging over their config.
+                    return Err(Error::Conflict(format!("account '{id}' already exists")));
+                }
+                check_provider_change(&existing, &incoming)
+                    .map_err(|e| Error::BadRequest(e.into()))?;
+                (false, merge_secrets(&existing, incoming))
+            }
+            None => (true, incoming),
+        };
+
+        if let Err(errs) = validate_account(&cfg, &id) {
+            return Err(Error::BadRequest(
+                serde_json::to_string(&errs).unwrap_or_else(|_| "validation failed".into()),
+            ));
         }
+
         if let Some(session) = new_session {
             reg.sessions.insert(
                 id.clone(),
@@ -1212,7 +1256,8 @@ async fn upsert_account(
         // Inside the write lock so no GET can observe the clean file against
         // the stale baseline (sync lock, held for a clear() — never awaits).
         state.reset_config_error_baseline();
-    }
+        (cfg, was_new)
+    };
 
     clear_setup_sentinel(&state).await;
     if needs_auth {
@@ -1238,7 +1283,7 @@ async fn upsert_account(
         None => None,
     };
     let resp = account_response(&id, &cfg, session_ref, is_default);
-    let status = if is_new {
+    let status = if was_new {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -1359,16 +1404,50 @@ async fn run_and_install_authorize(
     state: &AppState,
 ) -> Result<(AccountConfig, bool), String> {
     let session = run_authorize(id, account, state).await?;
+    install_authorized_session(id, account, session, state).await
+}
 
+/// Install a freshly-obtained OAuth session into the registry.
+///
+/// `authorize_account` snapshots the account config, then this runs an OAuth
+/// flow that can take up to five minutes. `AuthorizingGuard` only single-
+/// flights a *second* `/authorize` on the same id — it does not block a
+/// concurrent delete or settings edit, so `snapshot` may be stale by the time
+/// we get here. Re-check under the write lock before installing: an
+/// unconditional insert would resurrect a deleted account (and could
+/// re-promote it to default) or silently revert a concurrent edit back to
+/// this stale pre-flow snapshot (kata s1pw #1). If the id is gone or its
+/// config no longer matches `snapshot`, abort the install cleanly rather
+/// than writing anything.
+async fn install_authorized_session(
+    id: &str,
+    snapshot: &AccountConfig,
+    session: ProviderSession,
+    state: &AppState,
+) -> Result<(AccountConfig, bool), String> {
     let email_from_session = match &session {
         ProviderSession::Fastmail(s) => Some(s.username.clone()),
         ProviderSession::Outlook(s) => Some(s.email.clone()),
         ProviderSession::Gmail(s) => Some(s.email.clone()),
     };
-    let updated_account = update_email_from_session(account.clone(), email_from_session);
+    let updated_account = update_email_from_session(snapshot.clone(), email_from_session);
 
     let is_default = {
         let mut reg = state.accounts.write().await;
+        match reg.account_configs.get(id) {
+            Some(current) if current == snapshot => {}
+            Some(_) => {
+                return Err(format!(
+                    "account '{id}' was edited during authorization; discarding this \
+                     session so the newer settings aren't reverted"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "account '{id}' was deleted during authorization; discarding this session"
+                ));
+            }
+        }
         reg.sessions.insert(
             id.to_string(),
             SessionLock::new(tokio::sync::RwLock::new(session)),
@@ -2629,6 +2708,32 @@ api-token = tok
         }
     }
 
+    /// Shared `AppState` builder for handler-level tests, backed by a
+    /// tempdir so `atomic_write_config` has somewhere real to write.
+    fn test_app_state(
+        reg: AccountRegistry,
+        config_path: PathBuf,
+        tokens_dir: PathBuf,
+    ) -> Arc<AppState> {
+        Arc::new(crate::types::AppState {
+            accounts: tokio::sync::RwLock::new(reg),
+            account_errors: tokio::sync::RwLock::new(Vec::new()),
+            splits_config_path: PathBuf::from("/tmp/nonexistent-splits.json"),
+            timezone_config_path: PathBuf::from("/tmp/nonexistent-timezone.json"),
+            timezone_write_lock: tokio::sync::Mutex::new(()),
+            config_path,
+            tokens_dir: tokens_dir.clone(),
+            token_store: std::sync::Arc::new(crate::platform::FsTokenStore::new(tokens_dir)),
+            authorizing: AuthorizingSlot::default(),
+            config_error_baseline: std::sync::RwLock::new(Vec::new()),
+            prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
+            prefetch_cache_path: std::env::temp_dir().join(format!(
+                "supervillain-test-prefetch-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        })
+    }
+
     // ---- startup_config_errors (the seam main.rs uses) ----
 
     #[test]
@@ -2820,5 +2925,233 @@ api-token = tok
         assert!(run(&slot).is_err());
         // After the simulated error, the slot must be free for retry.
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    // ---- kata s1pw #1: authorize must not resurrect a deleted / edited account ----
+
+    fn dummy_session(username: &str) -> ProviderSession {
+        // A cheap, network-free stand-in for "whatever session the OAuth
+        // flow returned" — `install_authorized_session`'s re-check logic
+        // doesn't care which provider the session belongs to, only whether
+        // the account id is still present and unchanged.
+        ProviderSession::Fastmail(Box::new(crate::jmap::JmapSession::new(
+            username,
+            "Bearer test-token",
+        )))
+    }
+
+    #[tokio::test]
+    async fn authorize_install_does_not_resurrect_deleted_account() {
+        // Reproduces kata s1pw #1: `authorize_account` snapshots the config,
+        // runs an OAuth flow that can take minutes, then used to install the
+        // resulting session unconditionally. If the account was deleted
+        // during that window, the unconditional insert would resurrect it
+        // (and could re-promote it to default).
+        let snapshot = outlook("client-id", None);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        // Registry reflects the *post-delete* world: "acct" is gone, as if
+        // `DELETE /api/accounts/acct` ran while the browser-consent window
+        // was open.
+        let reg = empty_registry();
+        let state = test_app_state(reg, config_path.clone(), tokens_dir);
+
+        let result =
+            install_authorized_session("acct", &snapshot, dummy_session("u@out.com"), &state).await;
+
+        assert!(
+            result.is_err(),
+            "install must refuse to resurrect a deleted account"
+        );
+        let reg = state.accounts.read().await;
+        assert!(
+            !reg.account_configs.contains_key("acct"),
+            "deleted account must stay deleted"
+        );
+        assert!(
+            !reg.sessions.contains_key("acct"),
+            "no session should be installed for a deleted account"
+        );
+        // Nothing should have been written to disk either.
+        assert!(
+            !config_path.exists(),
+            "install must not touch disk on abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_install_does_not_resurrect_and_repromote_default() {
+        // Sharper variant: deleting the only other account leaves the
+        // registry's default empty. An unconditional install would both
+        // resurrect the deleted account AND re-promote it to default via
+        // `promote_default_if_empty`. The re-check must short-circuit
+        // before either happens.
+        let snapshot = outlook("client-id", None);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let reg = empty_registry(); // "acct" deleted, default now empty
+        let state = test_app_state(reg, config_path, tokens_dir);
+
+        let _ =
+            install_authorized_session("acct", &snapshot, dummy_session("u@out.com"), &state).await;
+
+        let reg = state.accounts.read().await;
+        assert!(
+            reg.default_account.is_empty(),
+            "must not re-promote a deleted account to default"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_install_does_not_revert_concurrent_edit() {
+        // The other half of kata s1pw #1: a concurrent settings edit that
+        // completes while OAuth is in flight must not be reverted back to
+        // the stale pre-flow snapshot.
+        let original = outlook("client-id", None);
+        let edited = outlook("client-id", Some("edited@out.com"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs.insert("acct".into(), edited.clone());
+        reg.default_account = "acct".into();
+        let state = test_app_state(reg, config_path, tokens_dir);
+
+        let result =
+            install_authorized_session("acct", &original, dummy_session("u@out.com"), &state).await;
+
+        assert!(
+            result.is_err(),
+            "install must refuse to overwrite a config that changed during authorization"
+        );
+        let reg = state.accounts.read().await;
+        assert_eq!(
+            reg.account_configs.get("acct"),
+            Some(&edited),
+            "the concurrent edit must survive, not be reverted by the stale OAuth snapshot"
+        );
+        assert!(
+            !reg.sessions.contains_key("acct"),
+            "the stale session must not be installed over the edited account"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_install_succeeds_when_account_unchanged() {
+        // Sanity/regression check: the happy path (nothing changed during
+        // the OAuth flow) must still work after the re-check was added.
+        let account = outlook("client-id", None);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs.insert("acct".into(), account.clone());
+        let state = test_app_state(reg, config_path.clone(), tokens_dir);
+
+        let (updated, _is_default) =
+            install_authorized_session("acct", &account, dummy_session("u@out.com"), &state)
+                .await
+                .expect("install must succeed when nothing raced it");
+
+        match updated {
+            AccountConfig::Outlook { email, .. } => {
+                assert_eq!(email.as_deref(), Some("u@out.com"));
+            }
+            other => panic!("expected outlook, got {other:?}"),
+        }
+        let reg = state.accounts.read().await;
+        assert!(reg.sessions.contains_key("acct"));
+        assert!(config_path.exists(), "happy path must persist to disk");
+    }
+
+    // ---- kata s1pw #2: upsert must merge against current state, not a stale read ----
+
+    #[tokio::test]
+    async fn upsert_concurrent_update_merges_against_current_state_not_stale_snapshot() {
+        // Reproduces kata s1pw #2: `upsert_account`'s update path used to
+        // read the existing config under a read lock released before
+        // merge_secrets/validate ran. A second concurrent update landing in
+        // that gap would be silently reverted by the first update's merge,
+        // which was computed against data that was already stale by the
+        // time it actually wrote.
+        //
+        // Task A sends an empty api-token ("keep whatever is current") plus
+        // a new signature, and is paused (via the test-only race hook)
+        // right after its advisory read — the exact point where the old
+        // code had already captured its (soon-to-be-stale) merge snapshot.
+        // Task B fully commits a brand-new secret while A is parked. A is
+        // then released. If A's merge is computed against its pre-pause
+        // snapshot (the bug), B's secret is lost; if it's computed against
+        // current state (the fix), B's secret survives.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "orig-secret"));
+        reg.default_account = "fm".into();
+        let state = test_app_state(reg, config_path, tokens_dir);
+
+        let pause = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state_a = state.clone();
+        let pause_a = pause.clone();
+        let task_a = tokio::spawn(UPSERT_RACE_PAUSE.scope(pause_a, async move {
+            let incoming = AccountConfig::Fastmail {
+                username: "u@fm.com".into(),
+                api_token: String::new(), // empty => "keep whatever is current"
+                signature: Some("from-A".into()),
+            };
+            upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
+        }));
+
+        // Let task A run up to (and block on) its pause point before we
+        // drive task B to completion on this task.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let incoming_b = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: "secret-from-B".into(),
+            signature: None,
+        };
+        upsert_account(
+            State(state.clone()),
+            AxumPath("fm".into()),
+            Json(incoming_b),
+        )
+        .await
+        .expect("task B update succeeds");
+
+        // Release A now that B has committed.
+        pause.notify_one();
+        task_a
+            .await
+            .expect("task A join")
+            .expect("task A update succeeds");
+
+        let reg = state.accounts.read().await;
+        match reg.account_configs.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                api_token,
+                signature,
+                ..
+            } => {
+                assert_eq!(
+                    api_token, "secret-from-B",
+                    "A's merge must read B's already-committed secret, not A's pre-pause snapshot"
+                );
+                assert_eq!(signature.as_deref(), Some("from-A"));
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
     }
 }
