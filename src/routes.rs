@@ -25,6 +25,58 @@ pub(crate) const SPLIT_OVERFETCH_MULTIPLIER: usize = 10;
 /// silently bypasses the cache.
 pub(crate) const DEFAULT_INBOX_LIMIT: usize = 150;
 
+/// Sane upper bounds for client-supplied list pagination (kata f7mm #2).
+/// `limit` feeds `fetch_limit = limit * SPLIT_OVERFETCH_MULTIPLIER` in the
+/// split branch of `list_emails` — an unbounded, huge `limit` (a buggy
+/// client, or `usize::MAX`) could overflow that multiplication. Clamping
+/// both `limit` and `offset` up front keeps the arithmetic safe and rejects
+/// nonsensical pagination requests before they ever reach the provider.
+pub(crate) const MAX_LIST_LIMIT: usize = 1000;
+pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
+
+/// Clamp a client-supplied list `limit` to `MAX_LIST_LIMIT`. Pulled out as a
+/// pure function so the clamp is unit-testable without spinning up a full
+/// handler (kata f7mm #2).
+fn clamp_list_limit(limit: usize) -> usize {
+    limit.min(MAX_LIST_LIMIT)
+}
+
+/// Clamp a client-supplied list `offset` to `MAX_LIST_OFFSET` (kata f7mm #2).
+fn clamp_list_offset(offset: usize) -> usize {
+    offset.min(MAX_LIST_OFFSET)
+}
+
+/// Per-uid async locks serializing the calendar-invite-update overwrite
+/// (`get_email`'s background `InviteAction::Update` spawn, which calls
+/// `provider::add_to_calendar(only_if_new = false)` — a remove+re-add of the
+/// CalDAV object) against the `rsvp` handler's own remove+re-add for the
+/// same uid (kata f7mm #1).
+///
+/// Without this, a user who accepts a just-rescheduled invite can race the
+/// background overwrite: if the overwrite's remove+re-add interleaves with
+/// (or lands after) the RSVP's own remove+re-add, the accept is silently
+/// reverted to NEEDS-ACTION. Both call sites acquire the same per-uid lock
+/// around their CalDAV write so the two operations can never interleave —
+/// whichever started first runs to completion before the other begins.
+///
+/// The outer `std::sync::Mutex` only guards the `HashMap` lookup/insert
+/// (never held across an `.await`); the returned `tokio::sync::Mutex` is
+/// what actually serializes the calendar write and is safe to hold across
+/// `.await` points.
+static CALENDAR_UID_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+/// Returns the per-uid mutex for `uid`, creating it on first use.
+fn calendar_uid_lock(uid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let map = CALENDAR_UID_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("calendar uid lock map poisoned");
+    guard
+        .entry(uid.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const API_JS: &str = include_str!("../static/api.js");
@@ -524,8 +576,8 @@ async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
 ) -> Result<impl IntoResponse, Error> {
-    let limit = params.limit.unwrap_or(DEFAULT_INBOX_LIMIT);
-    let offset = params.offset.unwrap_or(0);
+    let limit = clamp_list_limit(params.limit.unwrap_or(DEFAULT_INBOX_LIMIT));
+    let offset = clamp_list_offset(params.offset.unwrap_or(0));
     let sort = params.sort.unwrap_or_default();
 
     let mut query = params.search.as_deref().map(search::parse_query);
@@ -564,7 +616,10 @@ async fn list_emails(
     }
 
     let fetch_limit = if params.split_id.is_some() {
-        limit * SPLIT_OVERFETCH_MULTIPLIER
+        // `limit` is already clamped to MAX_LIST_LIMIT above; `saturating_mul`
+        // is defense-in-depth so this can never overflow even if that clamp
+        // is ever loosened or bypassed (kata f7mm #2).
+        limit.saturating_mul(SPLIT_OVERFETCH_MULTIPLIER)
     } else {
         limit
     };
@@ -817,6 +872,15 @@ async fn get_email(
                     let uid = event.uid.clone();
                     let acct = account_key.clone();
                     tokio::spawn(async move {
+                        // Hold the per-uid lock across the whole overwrite so
+                        // it can't interleave with a concurrent `rsvp` write
+                        // for the same uid (kata f7mm #1) — whichever of the
+                        // two acquires the lock first runs to completion
+                        // before the other's remove+re-add can start, so a
+                        // subsequent RSVP is never clobbered by this stale
+                        // background overwrite.
+                        let uid_lock = calendar_uid_lock(&uid);
+                        let _uid_guard = uid_lock.lock().await;
                         if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                             let s = s_lock.read().await;
                             if let Err(e) =
@@ -1290,6 +1354,13 @@ async fn rsvp(
         &state.timezone_config_path,
         timezone_env_override().as_deref(),
     ));
+
+    // Serialize against `get_email`'s background invite-update overwrite for
+    // the same uid (kata f7mm #1) — see `calendar_uid_lock`'s doc comment.
+    // Held across the provider call so the RSVP's own remove+re-add can't
+    // interleave with that overwrite's remove+re-add.
+    let uid_lock = calendar_uid_lock(&event.uid);
+    let _uid_guard = uid_lock.lock().await;
 
     // Dispatch full RSVP flow to provider (Fastmail: iTIP email + CalDAV, Outlook: Graph API)
     provider::rsvp(
@@ -3007,6 +3078,75 @@ mod tests {
         assert!(
             result.is_err(),
             "an unrecognized sort value must be a 400, not a silent default"
+        );
+    }
+
+    // =========================================================================
+    // limit/offset clamping (kata f7mm #2) — an unbounded client-supplied
+    // `limit` feeds `fetch_limit = limit * SPLIT_OVERFETCH_MULTIPLIER` in the
+    // split branch of `list_emails`, which can overflow for a huge limit.
+    // =========================================================================
+
+    #[test]
+    fn huge_limit_is_clamped_to_max() {
+        assert_eq!(clamp_list_limit(usize::MAX), MAX_LIST_LIMIT);
+        assert_eq!(clamp_list_limit(MAX_LIST_LIMIT + 1), MAX_LIST_LIMIT);
+    }
+
+    #[test]
+    fn ordinary_limit_passes_through_clamp_unchanged() {
+        assert_eq!(clamp_list_limit(50), 50);
+        assert_eq!(clamp_list_limit(DEFAULT_INBOX_LIMIT), DEFAULT_INBOX_LIMIT);
+        assert_eq!(clamp_list_limit(MAX_LIST_LIMIT), MAX_LIST_LIMIT);
+    }
+
+    #[test]
+    fn huge_offset_is_clamped_to_max() {
+        assert_eq!(clamp_list_offset(usize::MAX), MAX_LIST_OFFSET);
+        assert_eq!(clamp_list_offset(MAX_LIST_OFFSET + 1), MAX_LIST_OFFSET);
+    }
+
+    #[test]
+    fn ordinary_offset_passes_through_clamp_unchanged() {
+        assert_eq!(clamp_list_offset(0), 0);
+        assert_eq!(clamp_list_offset(500), 500);
+    }
+
+    #[test]
+    fn clamped_limit_split_fetch_multiply_does_not_overflow() {
+        // Mirrors list_emails's split-branch fetch_limit computation: clamp
+        // first, then saturating_mul (defense-in-depth even if a future edit
+        // loosens or skips the clamp). A raw `usize::MAX * 10` would panic
+        // (debug) or silently wrap (release) — neither is acceptable.
+        let clamped = clamp_list_limit(usize::MAX);
+        let fetch_limit = clamped.saturating_mul(SPLIT_OVERFETCH_MULTIPLIER);
+        assert_eq!(clamped, MAX_LIST_LIMIT);
+        assert_eq!(fetch_limit, MAX_LIST_LIMIT * SPLIT_OVERFETCH_MULTIPLIER);
+
+        // Even without the clamp, saturating_mul on the raw huge value must
+        // not panic and must saturate rather than wrap.
+        let unclamped_fetch_limit = usize::MAX.saturating_mul(SPLIT_OVERFETCH_MULTIPLIER);
+        assert_eq!(unclamped_fetch_limit, usize::MAX);
+    }
+
+    #[test]
+    fn list_emails_uses_clamp_helpers_and_saturating_mul() {
+        // Source-shape guard: list_emails must route limit/offset through
+        // the clamp helpers (not use params.limit/offset raw), and the
+        // split-branch multiply must use saturating_mul, not `*`.
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            handler_src.contains("clamp_list_limit(params.limit.unwrap_or(DEFAULT_INBOX_LIMIT))"),
+            "list_emails must clamp the incoming limit"
+        );
+        assert!(
+            handler_src.contains("clamp_list_offset(params.offset.unwrap_or(0))"),
+            "list_emails must clamp the incoming offset"
+        );
+        assert!(
+            handler_src.contains("limit.saturating_mul(SPLIT_OVERFETCH_MULTIPLIER)"),
+            "the split-branch fetch_limit multiply must use saturating_mul"
         );
     }
 
@@ -6500,6 +6640,116 @@ white   = '#fdf6e3'
         assert!(
             handler_src.contains("calendar_event = Some(event);"),
             "the parsed CANCEL event must still be returned for the banner"
+        );
+    }
+
+    // =========================================================================
+    // Per-uid calendar lock (kata f7mm #1) — get_email's background
+    // InviteAction::Update overwrite (remove+re-add) must not race the rsvp
+    // handler's own remove+re-add for the same uid, or a just-accepted RSVP
+    // can be silently reverted to NEEDS-ACTION.
+    // =========================================================================
+
+    #[test]
+    fn get_email_and_rsvp_both_acquire_calendar_uid_lock() {
+        // Source-shape guard: both call sites must acquire the shared
+        // per-uid lock around their CalDAV write. Without this, nothing
+        // prevents the background overwrite from interleaving with a
+        // concurrent RSVP for the same uid.
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            handler_src.contains("static CALENDAR_UID_LOCKS:"),
+            "a shared per-uid lock map must exist"
+        );
+        // The Update arm: lock acquired before add_to_calendar(only_if_new=false).
+        let update_arm = handler_src
+            .split("calendar::InviteAction::Update => {")
+            .nth(1)
+            .expect("Update arm must exist");
+        let update_arm_before_add = update_arm
+            .split("provider::add_to_calendar(&s, &ics_clone, &uid, false)")
+            .next()
+            .expect("add_to_calendar call must exist in the Update arm");
+        assert!(
+            update_arm_before_add.contains("calendar_uid_lock(&uid)")
+                && update_arm_before_add.contains("uid_lock.lock().await"),
+            "the Update arm must acquire the per-uid lock before its \
+             add_to_calendar overwrite"
+        );
+        // The rsvp handler: lock acquired before provider::rsvp.
+        let rsvp_fn = handler_src
+            .split("async fn rsvp(")
+            .nth(1)
+            .expect("rsvp handler must exist");
+        let rsvp_before_call = rsvp_fn
+            .split("provider::rsvp(")
+            .next()
+            .expect("provider::rsvp call must exist in rsvp handler");
+        assert!(
+            rsvp_before_call.contains("calendar_uid_lock(&event.uid)")
+                && rsvp_before_call.contains("uid_lock.lock().await"),
+            "the rsvp handler must acquire the per-uid lock before \
+             dispatching provider::rsvp"
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_uid_lock_serializes_update_overwrite_against_rsvp() {
+        // Behavioral regression test for kata f7mm #1. Simulates both call
+        // sites' CalDAV writes (each a remove-then-add pair) against a
+        // shared log, contending for the same uid via the real
+        // `calendar_uid_lock` helper. If the two writes are allowed to
+        // interleave — e.g. the update's "remove" landing between the
+        // rsvp's "remove" and "add" — the rsvp's accept can be clobbered by
+        // (or itself clobber, out of order) the stale background overwrite.
+        // The lock must force one write to fully complete before the other
+        // begins.
+        let uid = "uid-f7mm-race";
+        let log: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        async fn simulate_write(
+            uid: &str,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+            remove_tag: &'static str,
+            add_tag: &'static str,
+        ) {
+            let uid_lock = calendar_uid_lock(uid);
+            let _guard = uid_lock.lock().await;
+            log.lock().unwrap().push(remove_tag);
+            // Yield repeatedly to give the runtime every opportunity to
+            // interleave the other task here — this is exactly the race
+            // window that used to exist with no lock held.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
+            log.lock().unwrap().push(add_tag);
+        }
+
+        // Mirrors get_email spawning the background overwrite first (it
+        // fires while the user is still looking at the opened email), well
+        // before the user's RSVP click reaches the server.
+        let update_task = tokio::spawn(simulate_write(
+            uid,
+            log.clone(),
+            "update:remove",
+            "update:add",
+        ));
+        tokio::task::yield_now().await;
+        let rsvp_task = tokio::spawn(simulate_write(uid, log.clone(), "rsvp:remove", "rsvp:add"));
+
+        update_task.await.unwrap();
+        rsvp_task.await.unwrap();
+
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["update:remove", "update:add", "rsvp:remove", "rsvp:add"],
+            "the update overwrite and the rsvp write must not interleave — \
+             the lock must serialize them in start order so a subsequent \
+             RSVP is never clobbered by the earlier-started background \
+             overwrite: got {recorded:?}"
         );
     }
 
