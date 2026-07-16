@@ -545,20 +545,7 @@ fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
         {
             let mut cids = Vec::new();
             collect_inline_cids(body_structure, &mut cids);
-            for (cid, blob_id, name) in &cids {
-                let encoded_name = percent_encode_path(name);
-                let download_url = format!(
-                    "/api/emails/{}/attachments/{}/{}",
-                    raw.id, blob_id, encoded_name
-                );
-                // HTML-escape the URL for safe injection into src="..." attributes
-                let safe_url = download_url
-                    .replace('&', "&amp;")
-                    .replace('"', "&quot;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;");
-                *html = replace_case_insensitive(html, &format!("cid:{cid}"), &safe_url);
-            }
+            *html = resolve_inline_cids(html, &raw.id, &cids);
         }
 
         // Check for calendar in body structure
@@ -715,6 +702,35 @@ fn collect_inline_cids(part: &BodyStructurePart, out: &mut Vec<(String, String, 
         let name = part.name.as_deref().unwrap_or("inline");
         out.push((cid.to_string(), blob_id.to_string(), name.to_string()));
     }
+}
+
+/// Rewrite `cid:` references in `html` to attachment download URLs.
+///
+/// Replaces longest cid first. `replace_case_insensitive` is a plain
+/// substring match, so if a shorter cid (e.g. "1") were replaced before a
+/// longer cid that has it as a prefix (e.g. "12"), the short replacement
+/// would corrupt the middle of the "cid:12" occurrence — turning
+/// `cid:12` into `<url-for-1>2`. Processing longest-first guarantees a
+/// longer cid's occurrences are already rewritten (and thus no longer
+/// contain the literal text "cid:<shorter-cid>") by the time the shorter
+/// cid's replacement runs.
+fn resolve_inline_cids(html: &str, email_id: &str, cids: &[(String, String, String)]) -> String {
+    let mut ordered: Vec<&(String, String, String)> = cids.iter().collect();
+    ordered.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let mut result = html.to_string();
+    for (cid, blob_id, name) in ordered {
+        let encoded_name = percent_encode_path(name);
+        let download_url = format!("/api/emails/{email_id}/attachments/{blob_id}/{encoded_name}");
+        // HTML-escape the URL for safe injection into src="..." attributes
+        let safe_url = download_url
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        result = replace_case_insensitive(&result, &format!("cid:{cid}"), &safe_url);
+    }
+    result
 }
 
 // =============================================================================
@@ -893,6 +909,43 @@ pub async fn trash(s: &JmapSession, email_id: &str) -> Result<bool, Error> {
     move_to_role(s, email_id, "trash").await
 }
 
+/// Build a JMAP `Email/set` patch that adds `target_id` to `mailboxIds` and,
+/// if `source_id` is given and differs from `target_id`, removes it —
+/// using slash-path patches (`"mailboxIds/{id}": true|null`) rather than a
+/// bare `{"mailboxIds": {...}}` update. RFC 8621 treats the latter as a full
+/// replacement of the `mailboxIds` property, which wipes out membership in
+/// any other mailbox the message happens to be in (e.g. a user-created
+/// folder alongside the Inbox). The slash-path form only touches the two
+/// keys named here, leaving unrelated memberships untouched. Mirrors the
+/// pattern already used by `send_email`'s Drafts → Sent transition.
+///
+/// `source_id` is a best-effort "where this message is probably filed" hint
+/// (typically the Inbox) — removing it approximates the intuitive "moved
+/// out of X into Y" semantics without requiring a fetch of the message's
+/// actual current `mailboxIds`.
+fn build_mailbox_move_patch(
+    target_id: &str,
+    source_id: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut patch = serde_json::Map::new();
+    patch.insert(format!("mailboxIds/{target_id}"), serde_json::json!(true));
+    if let Some(source_id) = source_id
+        && source_id != target_id
+    {
+        patch.insert(format!("mailboxIds/{source_id}"), serde_json::Value::Null);
+    }
+    patch
+}
+
+/// The Inbox mailbox id, if this account has one — used as the "source" to
+/// remove when filing a message elsewhere (archive/trash/move).
+fn inbox_mailbox_id(s: &JmapSession) -> Option<String> {
+    s.mailbox_cache
+        .values()
+        .find(|mb| mb.role.as_deref() == Some("inbox"))
+        .map(|mb| mb.id.clone())
+}
+
 async fn move_to_role(s: &JmapSession, email_id: &str, role: &str) -> Result<bool, Error> {
     debug_assert!(!email_id.is_empty(), "email_id must not be empty");
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
@@ -904,6 +957,7 @@ async fn move_to_role(s: &JmapSession, email_id: &str, role: &str) -> Result<boo
         .ok_or_else(|| Error::Internal(format!("No mailbox with role '{role}'")))?;
 
     let target_id = target_mb.id.clone();
+    let patch = build_mailbox_move_patch(&target_id, inbox_mailbox_id(s).as_deref());
 
     let resp = jmap_call(
         s,
@@ -912,9 +966,7 @@ async fn move_to_role(s: &JmapSession, email_id: &str, role: &str) -> Result<boo
             {
                 "accountId": account_id,
                 "update": {
-                    email_id: {
-                        "mailboxIds": { target_id: true }
-                    }
+                    email_id: patch
                 }
             },
             "0"
@@ -938,6 +990,8 @@ pub async fn move_to_mailbox(
     debug_assert!(!mailbox_id.is_empty(), "mailbox_id must not be empty");
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
+    let patch = build_mailbox_move_patch(mailbox_id, inbox_mailbox_id(s).as_deref());
+
     let resp = jmap_call(
         s,
         vec![serde_json::json!([
@@ -945,9 +999,7 @@ pub async fn move_to_mailbox(
             {
                 "accountId": account_id,
                 "update": {
-                    email_id: {
-                        "mailboxIds": { mailbox_id: true }
-                    }
+                    email_id: patch
                 }
             },
             "0"
@@ -974,14 +1026,13 @@ pub async fn archive_batch(s: &JmapSession, email_ids: &[String]) -> Result<usiz
         .find(|mb| mb.role.as_deref() == Some("archive"))
         .ok_or_else(|| Error::Internal("No archive mailbox".into()))?;
     let archive_id = archive_mb.id.clone();
+    let inbox_id = inbox_mailbox_id(s);
 
     let mut updates = serde_json::Map::new();
     for id in email_ids {
         updates.insert(
             id.clone(),
-            serde_json::json!({
-                "mailboxIds": { &archive_id: true }
-            }),
+            serde_json::Value::Object(build_mailbox_move_patch(&archive_id, inbox_id.as_deref())),
         );
     }
 
@@ -1625,10 +1676,14 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
         .replace("{type}", "text/calendar");
 
     let resp = s
-        .client
-        .get(&url)
-        .header("Authorization", &s.auth_header)
-        .send()
+        .limiter
+        .execute("blob.download", || async {
+            s.client
+                .get(&url)
+                .header("Authorization", &s.auth_header)
+                .send()
+                .await
+        })
         .await?;
 
     if !resp.status().is_success() {
@@ -2286,6 +2341,121 @@ END:VCALENDAR";
         collect_inline_cids(&body, &mut cids);
         assert_eq!(cids.len(), 1);
         assert_eq!(cids[0].2, "inline");
+    }
+
+    // --- resolve_inline_cids tests ---
+
+    #[test]
+    fn resolve_inline_cids_prefix_cid_does_not_corrupt_longer_cid() {
+        // Reproduces the bug: naive substring replacement of "cid:1" would
+        // match inside "cid:12", turning it into "<url-for-1>2" instead of
+        // leaving the "cid:12" reference to be replaced by its own URL.
+        let html = r#"<img src="cid:12"><img src="cid:1">"#;
+        let cids = vec![
+            ("1".to_string(), "blob-1".to_string(), "one.png".to_string()),
+            (
+                "12".to_string(),
+                "blob-12".to_string(),
+                "twelve.png".to_string(),
+            ),
+        ];
+        let result = resolve_inline_cids(html, "email-1", &cids);
+        assert_eq!(
+            result,
+            r#"<img src="/api/emails/email-1/attachments/blob-12/twelve.png"><img src="/api/emails/email-1/attachments/blob-1/one.png">"#
+        );
+    }
+
+    #[test]
+    fn resolve_inline_cids_prefix_cid_regardless_of_input_order() {
+        // Same as above but with cids supplied in the opposite order, to
+        // confirm the fix sorts by length rather than relying on the
+        // caller's (document) order.
+        let html = r#"<img src="cid:1"><img src="cid:12">"#;
+        let cids = vec![
+            (
+                "12".to_string(),
+                "blob-12".to_string(),
+                "twelve.png".to_string(),
+            ),
+            ("1".to_string(), "blob-1".to_string(), "one.png".to_string()),
+        ];
+        let result = resolve_inline_cids(html, "email-1", &cids);
+        assert_eq!(
+            result,
+            r#"<img src="/api/emails/email-1/attachments/blob-1/one.png"><img src="/api/emails/email-1/attachments/blob-12/twelve.png">"#
+        );
+    }
+
+    #[test]
+    fn resolve_inline_cids_single_cid() {
+        let html = r#"<img src="cid:abc">"#;
+        let cids = vec![(
+            "abc".to_string(),
+            "blob-abc".to_string(),
+            "a.png".to_string(),
+        )];
+        let result = resolve_inline_cids(html, "email-2", &cids);
+        assert_eq!(
+            result,
+            r#"<img src="/api/emails/email-2/attachments/blob-abc/a.png">"#
+        );
+    }
+
+    #[test]
+    fn resolve_inline_cids_no_cids_is_noop() {
+        let html = "<p>no images here</p>";
+        let result = resolve_inline_cids(html, "email-3", &[]);
+        assert_eq!(result, html);
+    }
+
+    // --- build_mailbox_move_patch tests (ticket ec9f) ---
+
+    #[test]
+    fn move_patch_adds_target_only_when_no_source() {
+        let patch = build_mailbox_move_patch("mb-archive", None);
+        assert_eq!(patch.len(), 1);
+        assert_eq!(
+            patch.get("mailboxIds/mb-archive"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn move_patch_adds_target_and_removes_source() {
+        let patch = build_mailbox_move_patch("mb-archive", Some("mb-inbox"));
+        assert_eq!(patch.len(), 2);
+        assert_eq!(
+            patch.get("mailboxIds/mb-archive"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            patch.get("mailboxIds/mb-inbox"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn move_patch_does_not_remove_source_equal_to_target() {
+        // Moving "to" the mailbox it's already the source of (e.g. restoring
+        // to Inbox when Inbox is both target and would-be source) must not
+        // add-then-immediately-null the same path.
+        let patch = build_mailbox_move_patch("mb-inbox", Some("mb-inbox"));
+        assert_eq!(patch.len(), 1);
+        assert_eq!(
+            patch.get("mailboxIds/mb-inbox"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn move_patch_is_a_patch_not_a_replace() {
+        // The core regression this ticket fixes: the patch must never
+        // contain a bare "mailboxIds" key (which JMAP treats as a full
+        // property replacement, wiping unrelated mailbox memberships).
+        let patch = build_mailbox_move_patch("mb-archive", Some("mb-inbox"));
+        assert!(patch.get("mailboxIds").is_none());
+        assert!(patch.keys().all(|k| k.starts_with("mailboxIds/")));
     }
 
     // --- build_draft_email tests ---
