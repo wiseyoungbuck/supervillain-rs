@@ -6276,6 +6276,143 @@ white   = '#fdf6e3'
         );
     }
 
+    // ceph: the read-side email iframe is content-sized so the parent pane can
+    // scroll (Space/Shift-Space). The sizing must not strand the iframe at a
+    // partial height when the iframe `load` event fires before layout is
+    // complete (images with no explicit dimensions, web fonts, large tables).
+    // The symptom: the email renders only the top ~10%, then fills in — or
+    // stays stuck partial. The helper measures on several cues and splits
+    // them into a GROW-only load burst (a stale small read must never clip an
+    // already-larger iframe) and SETTLED cues (fonts.ready, ResizeObserver)
+    // that may also shrink (a shorter web-font swap or an image error must
+    // reclaim trailing blank space, else Space pages past the end). String-
+    // invariant test per repo convention (no JS harness): pins the shape of
+    // static/app.js so a future edit can't silently drop the robustness. The
+    // real proof is manual repro (a layout race can't be asserted from a
+    // string), which is the honest division.
+    #[test]
+    fn app_js_size_iframe_measures_on_multiple_cues_and_grow_burst_vs_settled_shrink() {
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        // The true full content height, robust to body-margin / sender-CSS
+        // edge cases where body.scrollHeight under-reports documentElement.
+        // Code-shaped form (doc.documentElement.scrollHeight) so an in-body
+        // comment mentioning the property can't satisfy this (roborev 336 #2).
+        assert!(
+            block.contains("doc.documentElement.scrollHeight"),
+            "sizeIframeToContent must read doc.documentElement.scrollHeight for the grow measure — body.scrollHeight alone can under-report and clip the email (ceph)"
+        );
+        // Re-measure on the next layout tick so a partial load-time scrollHeight
+        // (DOM parsed but layout incomplete) is corrected. Code-shaped form
+        // (the parenthesized call), not the bare word — an explanatory comment
+        // must not satisfy this (roborev 336 #2).
+        assert!(
+            block.contains("requestAnimationFrame("),
+            "sizeIframeToContent must re-measure via requestAnimationFrame(...) — the load event fires before layout is complete (ceph)"
+        );
+        // Web fonts reflow text after load; fonts.ready is the reliable cue
+        // for that specific late-layout trigger. Code-shaped form.
+        assert!(
+            block.contains(".ready.then("),
+            "sizeIframeToContent must re-measure on fonts.ready.then(...) — web-font reflow after load is a common partial-then-full trigger (ceph)"
+        );
+        // The only-grow guard for the load burst: a stale smaller read must
+        // never overwrite a larger height already set, or a transient partial
+        // measurement strands the email clipped. Pin the ACTUAL guard token,
+        // not the measurement Math.max — deleting the guard must fail this
+        // test (roborev on ceph).
+        assert!(
+            block.contains("h > cur"),
+            "sizeIframeToContent must guard burst growth with `h > cur` (only-grow on the load burst) — a stale small read must not clip an already-larger iframe (ceph)"
+        );
+        // The settled (shrink-capable) path must measure CONTENT height
+        // independent of the iframe's viewport: documentElement.scrollHeight is
+        // floored at the viewport (= current style.height) in standards mode, so
+        // it can never reflect a shrink. getBoundingClientRect().height on the
+        // root (height:auto) tracks content, not the viewport. Pin the
+        // code-shaped call form, not the bare word — the function body mentions
+        // getBoundingClientRect in a comment, so a bare-word assert would pass
+        // even if the call were deleted (roborev 336 #2, ceph).
+        assert!(
+            block.contains(".getBoundingClientRect()"),
+            "sizeIframeToContent's settled path must call .getBoundingClientRect() — documentElement.scrollHeight is viewport-floored and shrink can never fire (ceph)"
+        );
+        // The ratchet no-progress guard must live on the RECURRING settled
+        // path (ResizeObserver), NOT the finite load burst — a guard on the
+        // burst would discard a genuine small correction (< epsilon, one to
+        // three lines) from rAF/timeout and re-clip the email by up to ~63px,
+        // a small version of the bug the multi-cue re-measure fixes. Pin the
+        // epsilon constant is referenced in the settled branch's grow guard
+        // (roborev on ceph).
+        assert!(
+            block.contains("EMAIL_IFRAME_RATCHET_EPSILON"),
+            "sizeIframeToContent must reference EMAIL_IFRAME_RATCHET_EPSILON on the settled/recurring path so viewport-relative CSS can't ratchet to the cap (ceph)"
+        );
+        // fonts.ready is a ONE-SHOT cue and must NOT route through the
+        // epsilon-guarded observer path — a small font-swap grow (< 64px) on
+        // the observer path would be dropped and the email stays permanently
+        // clipped by up to ~63px. Pin it routes through a distinct one-shot
+        // variant (roborev on ceph).
+        assert!(
+            block.contains("fonts.ready.then(oneshot)") && block.contains("measure('oneshot')"),
+            "sizeIframeToContent must route fonts.ready through a one-shot measure variant (no epsilon on grows) — a one-shot cue can't ratchet, so a small font-swap grow must apply (ceph)"
+        );
+        // The ResizeObserver stays for ongoing changes (images loading after
+        // open). Code-shaped form (the constructor call) so a comment can't
+        // satisfy it.
+        assert!(
+            block.contains("new ResizeObserver("),
+            "sizeIframeToContent must keep new ResizeObserver(...) for images loading after open (ceph)"
+        );
+        // Shrink is the RISKY direction: a self-sustaining DOWNWARD ratchet is
+        // possible on viewport-proportional sender CSS (a 90vh hero shrinks
+        // the iframe → viewport → vh-sized body → shrink again, collapsing to
+        // ~10px). The in-flow floor is built into the measurement (h = max of
+        // rect.height and body.scrollHeight), so a shrink can never clip
+        // in-flow content. The remaining risk is acting on a TRANSIENT dip or a
+        // ratchet loop's non-stable reads. Defense: don't shrink on the first
+        // smaller read — record it (_pendingShrink) and schedule a delayed
+        // self-confirmation; a real content shrink is stable and confirms, a
+        // feedback loop's reads keep changing and never confirm. Pin both the
+        // pending-state field and the delayed confirm (roborev on ceph).
+        assert!(
+            block.contains("_pendingShrink"),
+            "sizeIframeToContent must gate shrinks on a delayed self-confirmation (_pendingShrink) — a one-off dip or ratchet loop must not clip (ceph)"
+        );
+        // The delayed confirm must re-measure via the observer path. Pin the
+        // UNIQUE call site (observerFn(); inside the setTimeout body) — the
+        // bare `setTimeout(`/`observerFn)` substrings each match unrelated
+        // tokens (the burst setTimeout(grow,0) and new ResizeObserver(observerFn)),
+        // so deleting the confirm would still pass a loose check (roborev 336 #2).
+        assert!(
+            block.contains("observerFn();") && block.contains("}, 200)"),
+            "sizeIframeToContent must schedule a delayed re-measure (setTimeout with observerFn() and a 200ms delay) to confirm a shrink — a single-cue shrink (image error) must still reclaim blank space (ceph)"
+        );
+        // The ACTUAL ratchet breaker: the delayed confirm alone can't stop the
+        // downward vh-ratchet (each step is stable until the shrink write), so
+        // a consecutive-shrink streak counter must stop collapsing after N
+        // confirmed shrinks with no intervening grow. Pin it so a future edit
+        // can't drop the defense that actually holds (roborev on ceph).
+        assert!(
+            block.contains("_shrinkStreak"),
+            "sizeIframeToContent must suppress consecutive confirmed shrinks (_shrinkStreak) — the delayed confirm alone can't break the viewport-proportional downward ratchet (ceph)"
+        );
+        // Suppressed small grows must still EVENTUALLY apply or the email stays
+        // clipped by up to ~63px (a small version of the ceph bug). The
+        // delayed confirm must (a) wait LONGER than the quiet-gap threshold so
+        // a self-scheduled confirm resets the streak and applies instead of
+        // re-suppressing forever, and (b) be guarded by a single-pending flag
+        // so overlapping ratchet ticks don't stack a perpetual timer loop.
+        // Pin both (roborev on ceph).
+        assert!(
+            block.contains("_pendingGrowConfirm"),
+            "sizeIframeToContent must guard the suppressed-grow confirm with a single-pending flag (_pendingGrowConfirm) — overlapping ratchet ticks must not stack a perpetual timer loop (ceph)"
+        );
+        assert!(
+            block.contains("}, 600)"),
+            "sizeIframeToContent's suppressed-grow confirm must wait >500ms (600ms) so it clears the quiet-gap reset and applies a real grow instead of re-suppressing forever (ceph)"
+        );
+    }
+
     #[test]
     fn mobile_app_js_renders_email_body_in_sandboxed_iframe() {
         assert!(
