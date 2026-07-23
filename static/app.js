@@ -4976,24 +4976,263 @@ function renderHtmlBodyIframe(container, html, opts) {
 // Size a sandboxed (allow-same-origin, no-scripts) iframe to its content's
 // full height so it never scrolls internally — the parent pane scrolls
 // instead, which is what keeps the document-level keyboard shortcuts working.
-// A ResizeObserver re-measures on content-size changes (late-loading images,
-// lazy media) so the parent's scroll height tracks the real email height
-// without jumping the user's scroll position.
+//
+// The iframe `load` event fires when the DOM is PARSED, not when LAYOUT is
+// complete: images without explicit dimensions contribute height 0 until
+// they load, web fonts reflow text after load, large tables lay out late.
+// A single load-time `body.scrollHeight` therefore returns a PARTIAL height,
+// and setting the iframe to that clips the email below it — the "only the top
+// 10%" bug (ceph). Measure on several cues:
+//
+//   - load + rAF + a short timeout: catch post-parse layout on the next
+//     frame and a tick later (covers layout that rAF misses). Only-GROW on
+//     these burst cues — a stale smaller read here must not clip an already-
+//     larger iframe (the original bug). Settled cues (below) may shrink.
+//   - document.fonts.ready + ResizeObserver: "settled" cues that fire AFTER
+//     the burst. These may also SHRINK the iframe, because content can
+//     legitimately get smaller after settling — a web font swapping in
+//     SHORTER than the fallback, or an image erroring out after reserving
+//     height. Without shrink here, Space pages past the end of the email
+//     through trailing blank space.
+//
+// Math.max(body.scrollHeight, documentElement.scrollHeight) is the true full
+// content height for the GROW path — body.scrollHeight alone can under-report
+// under collapsed-margins / sender-authored inline body styles. For the
+// SETTLED path (which may shrink) documentElement.scrollHeight is the WRONG
+// measure: in standards mode (the srcdoc has <!doctype html>) it's floored at
+// the viewport height, and the iframe's viewport IS its current style.height,
+// so h >= cur always and shrink never fires. Use
+// documentElement.getBoundingClientRect().height there instead — the root
+// element's height is `auto`, so its border box tracks CONTENT, not the
+// viewport, and a real content shrink (shorter web font, image error) is
+// reflected (roborev on ceph).
+//
+// Ratchet guard: viewport-relative sender CSS (min-height:100vh, common in
+// marketing emails) makes documentElement.scrollHeight = viewport + wrapper
+// padding, so every grow triggers another grow of ~+padding — ~4k relayouts
+// to hit the cap. An absolute ceiling bounds the worst case, and a
+// no-progress guard stops the ratchet early: once a grow's delta falls below
+// a small epsilon (just the wrapper padding, not real content) we stop
+// growing from observer-driven cues (roborev on ceph).
+const EMAIL_IFRAME_MAX_HEIGHT = 200_000;
+const EMAIL_IFRAME_RATCHET_EPSILON = 64; // ~wrapper padding; smaller grows are noise
+
 function sizeIframeToContent(iframe) {
+    // `canShrink` distinguishes the load burst (only-grow — a stale small read
+    // must not clip) from settled cues (fonts.ready, ResizeObserver) that fire
+    // AFTER layout settles and may legitimately shrink (web font shorter than
+    // fallback, image error after reserving height — otherwise Space pages
+    // past the end through trailing blank space).
+    // Three modes share one measure:
+    //   'burst'    — load/rAF/timeout. Grow-only, NO epsilon guard: a genuine
+    //     small correction (< 64px, a line or three the first measure missed)
+    //     must apply or the email stays permanently clipped (the ceph bug).
+    //   'oneshot'  — fonts.ready. Shrink-capable, grow without epsilon: a
+    //     one-shot cue cannot ratchet, so a small font-swap grow must apply.
+    //   'observer' — ResizeObserver. Shrink-capable, grow with a CONSECUTIVE-
+    //     small-grow suppression: the viewport-relative ratchet (min-height:
+    //     100vh sender CSS) self-sustains ONLY on this recurring path, growing
+    //     ~48px per tick to the cap. Suppress after N consecutive sub-epsilon
+    //     grows; any real grow (>= epsilon) or any shrink resets the count.
+    const measure = (mode) => () => {
+        try {
+            const doc = iframe.contentDocument;
+            if (!doc) return;
+            const body = doc.body;
+            if (!body) return;
+            // Measure the true content height. The grow path uses scrollHeight
+            // (the established full-height measure). The shrink-capable paths
+            // use getBoundingClientRect().height on the root AND body.
+            // scrollHeight — but NOT documentElement.scrollHeight: in standards
+            // mode the root's scrollHeight is floored at the viewport (=
+            // current style.height), so including it makes h >= cur always and
+            // shrink can never fire. The rect (root height:auto) tracks
+            // content, not the viewport; body.scrollHeight tracks content too
+            // and covers a pinned root (sender CSS html{height:100%}, common in
+            // email templates) where the rect is clamped to the viewport but
+            // body still grows when a late image loads. Their max is the true
+            // content height for the settled paths (roborev ceph).
+            const canShrink = mode !== 'burst';
+            let h;
+            if (canShrink) {
+                const rect = doc.documentElement.getBoundingClientRect();
+                h = Math.max(rect.height, body.scrollHeight);
+            } else {
+                // Grow path uses scrollHeight (the established full-height
+                // measure). Computed here, not above, so the settled (recurring
+                // observer) path doesn't pay for a forced documentElement
+                // reflow on every tick (roborev on ceph).
+                const rootScrollH = doc.documentElement.scrollHeight;
+                h = Math.max(body.scrollHeight, rootScrollH);
+            }
+            // Ratchet guard: cap at an absolute ceiling so viewport-relative
+            // sender CSS (min-height:100vh) can't grow the iframe unboundedly.
+            h = Math.min(h, EMAIL_IFRAME_MAX_HEIGHT);
+            if (h <= 0) return;
+            const cur = parseFloat(iframe.style.height) || 0;
+            if (canShrink) {
+                // Epsilon equality so sub-pixel fractional rect heights
+                // don't thrash the style on every observer tick. A near-equal
+                // read also clears any pending shrink: content recovered to
+                // ~cur before the confirm fired, so the pending smaller value
+                // was transient and must not be re-armed by a later dip
+                // (roborev on ceph).
+                if (Math.abs(h - cur) < 1) {
+                    iframe._pendingShrink = undefined;
+                    return;
+                }
+                if (h < cur) {
+                    // Shrink is the RISKY direction: a self-sustaining
+                    // DOWNWARD ratchet is possible on viewport-proportional
+                    // sender CSS (a 90vh hero: shrink the iframe → shrink the
+                    // viewport → shrink the vh-sized body → shrink again,
+                    // collapsing toward the in-flow floor). The in-flow floor
+                    // is built into the measurement (h = max of rect.height and
+                    // body.scrollHeight), so a shrink can't clip in-flow
+                    // content — but vh-dominant email CAN collapse to near-zero
+                    // in-flow content. TWO defenses:
+                    //   - Delayed self-confirmation: don't shrink on the first
+                    //     smaller read; record it and re-measure after 200ms. A
+                    //     real content shrink (shorter web font, image error) is
+                    //     stable and confirms; a one-off transient dip recovers
+                    //     and clears the pending value.
+                    //   - Consecutive-shrink suppression (mirrors
+                    //     _smallGrowStreak): each ratchet STEP is stable until
+                    //     the shrink write, so the confirm alone can't stop the
+                    //     loop — the iframe still collapses geometrically in
+                    //     200ms steps. After N confirmed shrinks with no
+                    //     intervening >=epsilon grow, stop shrinking from the
+                    //     observer path; a real grow resets the streak. This is
+                    //     what actually breaks the ratchet (roborev ceph).
+                    const prev = iframe._pendingShrink;
+                    if (prev === undefined || Math.abs(prev - h) >= 1) {
+                        // First smaller read, or a different value than the
+                        // pending one — record and schedule a confirmation.
+                        iframe._pendingShrink = h;
+                        setTimeout(() => {
+                            // Re-measure via the observer path; if the value is
+                            // still ~h, it's stable and the shrink applies. If
+                            // layout changed again, _pendingShrink was updated
+                            // by that read and this confirm is a no-op.
+                            observerFn();
+                        }, 200);
+                        return;
+                    }
+                    // Stable confirmed shrink (this read ~= the pending one).
+                    // Consecutive-shrink suppression: stop after a short streak
+                    // of confirmed shrinks with no intervening grow — the
+                    // viewport-proportional ratchet, not a real content shrink.
+                    // Quiet-gap reset (mirrors the grow side): the ratchet runs
+                    // at a tight ~200ms cadence, so well-separated legit
+                    // shrinks (blocked images releasing height minutes apart)
+                    // reset the streak and still reclaim blank space (roborev ceph).
+                    const nowS = Date.now();
+                    const lastShrink = iframe._lastShrinkAt || 0;
+                    if (nowS - lastShrink > 1000) iframe._shrinkStreak = 0;
+                    iframe._lastShrinkAt = nowS;
+                    iframe._shrinkStreak = (iframe._shrinkStreak || 0) + 1;
+                    if (iframe._shrinkStreak > 2) {
+                        iframe._pendingShrink = undefined;
+                        return; // ratchet — stop collapsing
+                    }
+                    iframe._pendingShrink = undefined;
+                    iframe._smallGrowStreak = 0;
+                    iframe.style.height = h + 'px';
+                } else {
+                    // Grow on a settled path — clears any pending shrink (the
+                    // content grew, the earlier smaller read was transient) and
+                    // resets the shrink streak (a real grow breaks the ratchet).
+                    iframe._pendingShrink = undefined;
+                    iframe._shrinkStreak = 0;
+                    if (mode === 'observer'
+                        && h - cur < EMAIL_IFRAME_RATCHET_EPSILON) {
+                        // Sub-epsilon grow on the RECURRING path: could be the
+                        // viewport-relative ratchet OR several real small
+                        // images loading sequentially on a slow connection
+                        // (icons/badges < 64px each). Suppressing the 3rd+
+                        // would clip the tail of the image sequence — WORSE
+                        // than the ratchet, which is already hard-bounded by
+                        // EMAIL_IFRAME_MAX_HEIGHT. So: only count it toward the
+                        // streak if the ticks are RAPID (the ratchet self-
+                        // sustains at ~one observer callback per layout, back-
+                        // to-back); a quiet gap (>500ms with no observer tick)
+                        // means a new image loaded, not a ratchet — reset the
+                        // streak and let the grow apply (roborev on ceph).
+                        const now = Date.now();
+                        const lastTick = iframe._observerLastTick || 0;
+                        iframe._observerLastTick = now;
+                        if (now - lastTick > 500) {
+                            iframe._smallGrowStreak = 0; // quiet gap — new image, not ratchet
+                        }
+                        iframe._smallGrowStreak = (iframe._smallGrowStreak || 0) + 1;
+                        if (iframe._smallGrowStreak > 2) {
+                            // Suppressed — but a real small grow (several small
+                            // images on a FAST connection, <500ms apart) must
+                            // still eventually apply or the email stays clipped
+                            // by up to ~63px (a small version of the ceph bug).
+                            // Schedule a one-shot delayed re-measure AFTER the
+                            // quiet-gap threshold: the self-scheduled confirm
+                            // re-enters this branch, and with now-lastTick > 500
+                            // it RESETS the streak and applies the grow. The
+                            // ratchet self-sustains at one tick per layout, so
+                            // it fires again before the 600ms confirm and re-
+                            // suppresses — bounded to ~epsilon per 600ms period
+                            // (no perpetual loop: a single pending confirm per
+                            // iframe, cleared if a real observer tick supersedes
+                            // it). A real grow with no further ratchet ticks
+                            // confirms and applies (roborev on ceph).
+                            if (!iframe._pendingGrowConfirm) {
+                                iframe._pendingGrowConfirm = true;
+                                setTimeout(() => {
+                                    iframe._pendingGrowConfirm = false;
+                                    observerFn();
+                                }, 600);
+                            }
+                            return;
+                        }
+                    } else {
+                        iframe._smallGrowStreak = 0;
+                    }
+                    iframe.style.height = h + 'px';
+                }
+            } else if (h > cur) {
+                // Burst: only-grow, no epsilon guard (a genuine small
+                // correction must apply — see mode doc above).
+                iframe.style.height = h + 'px';
+            }
+        } catch (_) { /* allow-same-origin should always succeed */ }
+    };
+    const grow = measure('burst');
+    const oneshot = measure('oneshot');
+    const observerFn = measure('observer');
+    // Immediate + next layout tick + a short delay for post-load layout rAF
+    // misses. Burst cues: only-grow, no epsilon guard.
+    grow();
+    requestAnimationFrame(grow);
+    setTimeout(grow, 0);
+    // Settled one-shot cue: web fonts reflow text after load. Shrink-capable
+    // (font shorter than fallback), grow without epsilon (one-shot, can't
+    // ratchet) so a small font-swap grow applies.
     try {
-        const body = iframe.contentDocument && iframe.contentDocument.body;
-        if (!body) return;
-        const measure = () => {
-            const h = body.scrollHeight;
-            if (h) iframe.style.height = h + 'px';
-        };
-        measure();
-        if (!iframe._sized) {
-            iframe._sized = true;
-            iframe._ro = new ResizeObserver(measure);
-            iframe._ro.observe(body);
-        }
+        const fonts = iframe.contentDocument?.fonts;
+        if (fonts?.ready) fonts.ready.then(oneshot);
     } catch (_) { /* allow-same-origin should always succeed */ }
+    // Ongoing re-measure for images loading after open. Recurring settled cue:
+    // shrink-capable, grow with consecutive-small suppression (the ratchet
+    // defense). Assign _ro BEFORE observe() so a thrown observer is still
+    // disconnectable; attach is effectively one-shot from the load handler, so
+    // if body is null here ongoing tracking is lost for this open (rare — body
+    // exists at load in practice) (roborev on ceph).
+    if (!iframe._sized) {
+        try {
+            const body = iframe.contentDocument && iframe.contentDocument.body;
+            if (!body) return;
+            const ro = new ResizeObserver(observerFn);
+            iframe._ro = ro;
+            ro.observe(body);
+            iframe._sized = true;
+        } catch (_) { /* allow-same-origin should always succeed */ }
+    }
 }
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
