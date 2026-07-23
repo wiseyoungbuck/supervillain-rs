@@ -2230,7 +2230,11 @@ function renderEmailDetail() {
     }
 
     if (e.htmlBody) {
-        renderHtmlBodyIframe(els.emailBody, e.htmlBody);
+        // Pass the saved scroll position so the iframe's load handler can
+        // restore it once the iframe is sized and the parent pane is
+        // scrollable (the parent can't scroll until the iframe has height).
+        const key = cacheKey(e.id);
+        renderHtmlBodyIframe(els.emailBody, e.htmlBody, { scrollTop: scrollPositions[key] || 0 });
         els.emailBody.classList.add('html-content');
     } else {
         els.emailBody.innerHTML = linkifyText(e.textBody || '(no content)');
@@ -4783,12 +4787,16 @@ function escapeAttr(text) {
 }
 
 // Render attacker-controlled email HTML in a sandboxed iframe. The sandbox
-// token list deliberately omits allow-scripts and allow-same-origin, so
-// scripts inside the iframe do not run at all — closing the entire class of
-// HTML-sanitizer bypasses (mXSS, scheme tricks, namespace confusion, future
-// parser quirks). allow-popups + allow-popups-to-escape-sandbox lets links
-// click through to new tabs as a normal browsing context. <base target=_blank>
-// in the srcdoc makes all links default to opening externally.
+// token list deliberately omits allow-scripts, so scripts inside the iframe
+// do not run at all — closing the entire class of HTML-sanitizer bypasses
+// (mXSS, scheme tricks, namespace confusion, future parser quirks).
+// allow-same-origin is granted (still safe with allow-scripts absent: no JS
+// runs in the iframe, so the token only lets the parent measure/scroll passive
+// DOM) so the parent can size the iframe to its content and drive it with the
+// same keyboard shortcuts as plain-text email. allow-popups +
+// allow-popups-to-escape-sandbox lets links click through to new tabs as a
+// normal browsing context; <base target=_blank> in the srcdoc makes all links
+// default to opening externally.
 // Header is trusted HTML (caller composed it from escapeHtml output); body is
 // attacker-controlled and goes into an iframe via renderHtmlBodyIframe.
 function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
@@ -4808,35 +4816,68 @@ function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
     els.composeQuote.classList.remove('hidden');
 }
 
-// Read-side (default): sandbox omits allow-scripts AND allow-same-origin —
-// scripts in the iframe never run, closing the whole class of HTML-sanitizer
-// bypasses. allow-popups + allow-popups-to-escape-sandbox lets recipient
-// links click through to new tabs; <base target=_blank> makes that default.
+// Both sides use sandbox="allow-same-origin" with NO allow-scripts: scripts in
+// the iframe never run, closing the whole class of HTML-sanitizer bypasses.
+// Same-origin is safe *precisely because* allow-scripts is absent — no JS runs
+// in the iframe, so the token only lets the parent measure/scroll passive DOM.
 //
-// Compose-quote side (opts.autosize=true): swaps to sandbox="allow-same-origin"
-// (still no scripts/forms/popups) so the parent can read
-// contentDocument.body.scrollHeight and resize the iframe to fit. Same-origin
-// is safe *precisely because* allow-scripts is absent: no JS runs in the
-// iframe, so granting same-origin just lets the parent measure passive DOM.
+// Read-side (default): additionally keeps allow-popups +
+// allow-popups-to-escape-sandbox so recipient links click through to new tabs
+// (<base target=_blank> makes that the default), AND sizes the iframe to its
+// full content height so the iframe never scrolls internally — the PARENT pane
+// (#email-body) scrolls instead. That is what makes Space / Shift-Space and
+// scroll-position memory work for HTML emails the same as for plain text: the
+// document-level keydown handler scrolls els.emailBody, not a cross-origin
+// iframe it can't reach.
+//
+// Compose-quote side (opts.autosize=true): sizes to fit too, but lives in a
+// non-scrolling host, so there is no scroll position to restore.
 function renderHtmlBodyIframe(container, html, opts) {
     const autosize = !!(opts && opts.autosize);
+    const scrollTop = (opts && opts.scrollTop) || 0;
+    // Disconnect a prior iframe's ResizeObserver so it can't pin the previous
+    // email's DOM in memory across navigations.
+    const oldIframe = container.querySelector('iframe.email-iframe');
+    if (oldIframe && oldIframe._ro) oldIframe._ro.disconnect();
     container.replaceChildren();
     const iframe = document.createElement('iframe');
     iframe.setAttribute(
         'sandbox',
-        autosize ? 'allow-same-origin' : 'allow-popups allow-popups-to-escape-sandbox'
+        autosize ? 'allow-same-origin' : 'allow-same-origin allow-popups allow-popups-to-escape-sandbox'
     );
     iframe.className = 'email-iframe';
     iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
-    if (autosize) {
-        iframe.addEventListener('load', () => {
-            try {
-                const h = iframe.contentDocument?.body?.scrollHeight;
-                if (h) iframe.style.height = h + 'px';
-            } catch (_) { /* allow-same-origin should always succeed */ }
-        });
-    }
+    iframe.addEventListener('load', () => {
+        sizeIframeToContent(iframe);
+        // Restore the saved scroll position now that the iframe is sized and
+        // the parent pane is scrollable. Compose-quote (autosize) sits in a
+        // non-scrolling host, so there is nothing to restore.
+        if (!autosize) container.scrollTop = scrollTop;
+    });
     container.appendChild(iframe);
+}
+
+// Size a sandboxed (allow-same-origin, no-scripts) iframe to its content's
+// full height so it never scrolls internally — the parent pane scrolls
+// instead, which is what keeps the document-level keyboard shortcuts working.
+// A ResizeObserver re-measures on content-size changes (late-loading images,
+// lazy media) so the parent's scroll height tracks the real email height
+// without jumping the user's scroll position.
+function sizeIframeToContent(iframe) {
+    try {
+        const body = iframe.contentDocument && iframe.contentDocument.body;
+        if (!body) return;
+        const measure = () => {
+            const h = body.scrollHeight;
+            if (h) iframe.style.height = h + 'px';
+        };
+        measure();
+        if (!iframe._sized) {
+            iframe._sized = true;
+            iframe._ro = new ResizeObserver(measure);
+            iframe._ro.observe(body);
+        }
+    } catch (_) { /* allow-same-origin should always succeed */ }
 }
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely

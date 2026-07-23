@@ -706,12 +706,14 @@ body {
 
 #email-body.html-content {
     white-space: normal;
-    /* HTML email is rendered inside a sandboxed iframe (.email-iframe); the
-       iframe handles its own scrolling and styling. The parent suppresses its
-       own scroll/padding so the iframe fills the pane. */
+    /* HTML email is rendered inside a sandboxed iframe (.email-iframe) sized
+       to its full content height, so the iframe never scrolls internally —
+       this parent pane scrolls instead. That keeps Space / Shift-Space and
+       scroll-position memory working for HTML emails the same as for plain
+       text. The parent drops its own padding so the iframe's body padding is
+       the only margin. */
     padding: 0;
-    overflow: hidden;
-    display: flex;
+    overflow-y: auto;
 }
 
 #email-body a {
@@ -724,7 +726,6 @@ body {
 }
 
 .email-iframe {
-    flex: 1;
     width: 100%;
     border: 0;
     display: block;

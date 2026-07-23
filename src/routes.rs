@@ -5928,10 +5928,13 @@ white   = '#fdf6e3'
 
     // Email HTML is rendered inside a sandboxed iframe (see
     // `renderHtmlBodyIframe` in static/app.js and static/mobile/app.js)
-    // instead of being passed through a JS sanitizer. The iframe's sandbox
-    // omits `allow-scripts` and `allow-same-origin`, so any script in the
-    // email cannot execute in the app origin — closing the whole class of
-    // HTML-sanitizer-bypass vulnerabilities.
+    // instead of being passed through a JS sanitizer. Every sandbox omits
+    // `allow-scripts`, so any script in the email cannot execute at all —
+    // closing the whole class of HTML-sanitizer-bypass vulnerabilities. The
+    // desktop read-side additionally grants `allow-same-origin` (safe
+    // precisely because scripts are absent: no JS runs in the iframe to
+    // exploit it) so the parent can size the iframe to its content and scroll
+    // it with Space / Shift-Space; mobile omits it.
 
     #[test]
     fn app_js_renders_email_body_in_sandboxed_iframe() {
@@ -5982,15 +5985,19 @@ white   = '#fdf6e3'
         // Strict invariant: `allow-scripts` must NEVER appear in any email-iframe
         // sandbox token list — that is what closes the entire XSS class. Both the
         // read-side iframe and the compose-quote autosize iframe must respect
-        // this. (Compose-quote uses `allow-same-origin` for scrollHeight
-        // measurement, which is safe specifically because scripts are absent.)
+        // this. Both now grant `allow-same-origin` — the read-side so the parent
+        // can size the iframe to its content and scroll it with Space /
+        // Shift-Space (restoring keyboard scrolling for HTML emails), and
+        // compose-quote for scrollHeight measurement. `allow-same-origin` is
+        // safe *precisely because* `allow-scripts` is absent: no JS runs in the
+        // iframe to exploit same-origin access.
         let pos = APP_JS
             .find("function renderHtmlBodyIframe")
             .expect("function renderHtmlBodyIframe must exist");
         let region = &APP_JS[pos..APP_JS.len().min(pos + 2000)];
         assert!(
-            region.contains("'allow-popups allow-popups-to-escape-sandbox'"),
-            "read-side iframe sandbox token list must be allow-popups+allow-popups-to-escape-sandbox"
+            region.contains("'allow-same-origin allow-popups allow-popups-to-escape-sandbox'"),
+            "read-side iframe sandbox must be allow-same-origin+allow-popups+allow-popups-to-escape-sandbox so the parent can scroll the email"
         );
         assert!(
             !region.contains("allow-scripts"),
