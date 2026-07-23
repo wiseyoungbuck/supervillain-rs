@@ -104,6 +104,51 @@ body {
     display: none;
 }
 
+/* Deploy-refresh banner (Linear / Monarch Money style): shown only when the
+   build-id poll detects a new deploy. The Refresh button hard-reloads; the
+   shell routes are no-cache so the reload pulls the new embedded bytes. */
+#deploy-banner {
+    background: var(--bg-secondary);
+    border-bottom: 2px solid var(--accent);
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+#deploy-banner.hidden {
+    display: none;
+}
+
+.deploy-banner-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.deploy-banner-icon {
+    color: var(--accent);
+    font-size: 16px;
+    font-weight: bold;
+    flex-shrink: 0;
+}
+
+#deploy-refresh-btn {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    margin-left: auto;
+}
+
+#deploy-refresh-btn:hover,
+#deploy-refresh-btn:focus-visible {
+    filter: brightness(1.15);
+    outline: none;
+}
+
 .error-banner-content {
     display: flex;
     align-items: flex-start;
@@ -706,12 +751,14 @@ body {
 
 #email-body.html-content {
     white-space: normal;
-    /* HTML email is rendered inside a sandboxed iframe (.email-iframe); the
-       iframe handles its own scrolling and styling. The parent suppresses its
-       own scroll/padding so the iframe fills the pane. */
+    /* HTML email is rendered inside a sandboxed iframe (.email-iframe) sized
+       to its full content height, so the iframe never scrolls internally —
+       this parent pane scrolls instead. That keeps Space / Shift-Space and
+       scroll-position memory working for HTML emails the same as for plain
+       text. The parent drops its own padding so the iframe's body padding is
+       the only margin. */
     padding: 0;
-    overflow: hidden;
-    display: flex;
+    overflow-y: auto;
 }
 
 #email-body a {
@@ -724,7 +771,6 @@ body {
 }
 
 .email-iframe {
-    flex: 1;
     width: 100%;
     border: 0;
     display: block;

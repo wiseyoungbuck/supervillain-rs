@@ -148,20 +148,41 @@ const APP_CSP: &str = "default-src 'self'; \
     base-uri 'none'; \
     form-action 'self'";
 
-fn html_headers() -> [(&'static str, &'static str); 2] {
+fn html_headers() -> [(&'static str, &'static str); 3] {
+    // no-cache: the app shell (index.html + app.js + style.css + api.js) is
+    // compiled into the binary via include_str!, so a merged fix is not live
+    // until rebuild+restart. Without this header the browser heuristically
+    // caches the shell and a plain location.reload() after a deploy serves
+    // the OLD bytes — the user never sees the fix. no-cache forces
+    // revalidation on every load so the browser re-asks and gets the new
+    // embedded bytes. The bytes are in memory, so the re-fetch is free.
+    // (Fonts/icons keep heuristic caching — they're binary and stable.)
     [
         ("content-type", "text/html; charset=utf-8"),
         ("content-security-policy", APP_CSP),
+        ("cache-control", "no-cache"),
     ]
 }
 
 async fn index_html() -> impl IntoResponse {
-    (html_headers(), INDEX_HTML)
+    // Stamp the build id into the shell so the client knows which build served
+    // this page — the deploy-refresh banner reads <meta name="build-id"> as
+    // its comparison baseline (see static/app.js startDeployPoll). Replacing
+    // the placeholder at serve time (not build time) keeps INDEX_HTML a single
+    // source via include_str!; the placeholder never reaches a client. The
+    // replace is a cheap scan of a ~15 KB string on the one HTML route.
+    let html = INDEX_HTML.replace("__SUPERVILLAIN_BUILD_ID__", env!("SUPERVILLAIN_BUILD_ID"));
+    (html_headers(), html)
 }
 
 async fn app_js() -> impl IntoResponse {
+    // no-cache: see html_headers — a reload after a deploy must revalidate and
+    // pull the new embedded bytes, not a stale heuristic cache copy.
     (
-        [("content-type", "application/javascript; charset=utf-8")],
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         APP_JS,
     )
 }
@@ -172,21 +193,38 @@ async fn app_js() -> impl IntoResponse {
 // not live until rebuild+restart, and this is how launch detects that (kata
 // tgax).
 async fn build_id() -> impl IntoResponse {
+    // no-store: this endpoint is THE deploy detector — the client polls it to
+    // learn a new build shipped. If a browser (or intermediate) cached it,
+    // the poll would never see the new id and the "click Refresh" banner
+    // would never fire. no-store forbids caching outright; no-cache would
+    // still allow a stale hit during the revalidation window.
     (
-        [("content-type", "text/plain; charset=utf-8")],
+        [
+            ("content-type", "text/plain; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
         env!("SUPERVILLAIN_BUILD_ID"),
     )
 }
 
 async fn api_js() -> impl IntoResponse {
     (
-        [("content-type", "application/javascript; charset=utf-8")],
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         API_JS,
     )
 }
 
 async fn style_css() -> impl IntoResponse {
-    ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
+    (
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        STYLE_CSS,
+    )
 }
 
 async fn mobile_html() -> impl IntoResponse {
@@ -638,6 +676,50 @@ async fn list_emails(
         .await?;
         (live, false)
     };
+
+    // fg52: fire-and-forget warm the first BODY_PREFETCH_PER_MAILBOX bodies
+    // of this list so the newest email opens from the cache even when it
+    // arrived since the last periodic warm pass (the inbox list revalidates
+    // stale against the provider and returns newer ids than the warmer
+    // filled — without this, opening #1 right after a reload hit the slow
+    // provider path). Gated on `is_cacheable` so only the default-sort
+    // (DateDesc) path warms — that's the only slot the periodic warmer
+    // keeps warm, so warming a non-default-sort list would be wasted. The
+    // `warm_bodies_for_list` helper skips ids already in `body_cache`, so
+    // repeated list views (stale-revalidation poll ticks) are no-ops.
+    // Spawned, never awaited: the list response must not block on warming.
+    if is_cacheable {
+        let warm_ids: Vec<String> = emails
+            .iter()
+            .take(crate::prefetch::BODY_PREFETCH_PER_MAILBOX)
+            .map(|e| e.id.clone())
+            .collect();
+        if !warm_ids.is_empty() {
+            let warm_state = state.clone();
+            let warm_account = account_id.clone();
+            tokio::spawn(async move {
+                // Clone the fetch inputs BEFORE the call so the closure can
+                // own them (move them into its `async move` future) without
+                // conflicting with the `&warm_account`/`&warm_ids` borrows
+                // the method call itself holds. The future the closure
+                // returns must own all the data it borrows — `FnOnce` drops
+                // the closure once the future is handed back.
+                let state_for_fetch = warm_state.clone();
+                let account_for_fetch = warm_account.clone();
+                warm_state
+                    .prefetch
+                    .warm_bodies_for_list(&warm_account, &warm_ids, move |missing| async move {
+                        crate::prefetch::fetch_bodies(
+                            &state_for_fetch,
+                            &account_for_fetch,
+                            &missing,
+                        )
+                        .await
+                    })
+                    .await;
+            });
+        }
+    }
 
     // Apply split filtering, scoped to this account's splits so "primary"
     // means "not matching any of *this account's* splits". Reuses the
@@ -2711,6 +2793,103 @@ mod tests {
     }
 
     // =========================================================================
+    // Deploy-refresh banner (Linear / Monarch Money style): the client polls
+    // /api/build-id and, when it changes, shows a fixed banner offering a
+    // one-click hard refresh. Static assets are compiled into the binary, so
+    // a merged fix is not live until rebuild+restart — this is how the user
+    // learns a deploy happened and gets the new code without a manual
+    // Ctrl+Shift+R. String-invariant tests per repo convention (no JS harness):
+    // they pin the shape of static/app.js rather than executing it.
+    // =========================================================================
+
+    #[test]
+    fn app_js_polls_build_id_and_shows_refresh_banner_on_change() {
+        // The detection loop: fetch /api/build-id, compare against the known
+        // id captured at boot, and on mismatch surface the deploy banner.
+        // Match code forms, not prose — an explanatory comment inside the
+        // same slice must not be able to satisfy these (roborev 336 #2).
+        assert!(
+            APP_JS.contains("/api/build-id"),
+            "app.js must poll /api/build-id to detect a deploy"
+        );
+        assert!(
+            APP_JS.contains("knownBuildId"),
+            "app.js must capture the boot build id (knownBuildId) to compare against"
+        );
+        assert!(
+            APP_JS.contains("deployBanner") || APP_JS.contains("deploy-banner"),
+            "app.js must surface a deploy banner element when the build id changes"
+        );
+    }
+
+    #[test]
+    fn deploy_refresh_button_hard_reloads_on_click() {
+        // The banner's button must hard-reload. With the app shell's no-cache
+        // headers (see app_shell_routes_force_revalidation_so_reload_picks_up_deploys),
+        // location.reload() revalidates and pulls the new embedded bytes —
+        // that IS the hard refresh. Pin the WIRING (the addEventListener that
+        // binds the button to hardRefresh), not just that location.reload()
+        // exists somewhere — a defined-but-unwired handler would pass a loose
+        // check but never fire (roborev 336 #2: match code forms, not prose).
+        let block = js_fn_body(APP_JS, "function showDeployBanner");
+        assert!(
+            block.contains("classList.remove('hidden')"),
+            "showDeployBanner must un-hide the banner — a hidden banner is no banner"
+        );
+        assert!(
+            APP_JS.contains("deployRefreshBtn.addEventListener('click', hardRefresh)"),
+            "the deploy Refresh button must be wired to hardRefresh — pin the binding, not just that location.reload exists"
+        );
+        assert!(
+            APP_JS.contains("location.reload()"),
+            "hardRefresh must call location.reload() — with no-cache shell headers that revalidates and pulls the new bytes"
+        );
+    }
+
+    #[test]
+    fn app_js_reads_boot_build_id_from_meta_tag() {
+        // The comparison baseline must be the build that served THIS page, not
+        // the first successful poll (which could fail mid-deploy and record a
+        // post-deploy id as the boot id, hiding the deploy). The build id is
+        // stamped server-side into <meta name="build-id"> (see
+        // index_html_stamps_build_id_meta); the client reads that meta as the
+        // boot id in startDeployPoll.
+        let block = js_fn_body(APP_JS, "function startDeployPoll");
+        assert!(
+            block.contains("meta[name=\"build-id\"]"),
+            "startDeployPoll must read the boot build id from <meta name=\"build-id\"> — the baseline must be the build that served the page, not the first poll"
+        );
+        assert!(
+            block.contains("knownBuildId = meta.content"),
+            "startDeployPoll must adopt the meta tag's content as knownBuildId"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_html_stamps_build_id_meta() {
+        // The served index.html must carry the real build id in a
+        // <meta name="build-id"> tag (placeholder replaced at serve time),
+        // and must NOT leak the unreplaced placeholder. This is the boot-id
+        // baseline the deploy-refresh banner compares against.
+        let resp = index_html().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains(&format!(
+                "<meta name=\"build-id\" content=\"{}\">",
+                env!("SUPERVILLAIN_BUILD_ID")
+            )),
+            "served index.html must stamp the real build id into the build-id meta tag"
+        );
+        assert!(
+            !text.contains("__SUPERVILLAIN_BUILD_ID__"),
+            "served index.html must not leak the unreplaced build-id placeholder"
+        );
+    }
+
+    // =========================================================================
     // Desktop sort control (kata 09ef) — buildEmailListUrl appends &sort=,
     // splitCacheKey discriminates by it (mirrors starredOnly), and
     // selectAccount resets it to the default like other per-session view state.
@@ -2965,6 +3144,43 @@ mod tests {
         assert!(
             !block.contains("None, true)"),
             "the fetch closure must pass the derived flag, not hardcode priority"
+        );
+    }
+
+    // =========================================================================
+    // fg52: instant open for the first 50 emails per mailbox. list_emails must
+    // fire-and-forget warm the top BODY_PREFETCH_PER_MAILBOX bodies of every
+    // resolved list so the newest email opens from the cache even when it
+    // arrived since the last periodic warm pass. String-invariant test per
+    // repo convention (no JS harness): pins the shape of routes.rs.
+    // =========================================================================
+
+    #[test]
+    fn list_emails_warms_top_fifty_bodies_fire_and_forget() {
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        let start = handler_src
+            .find("async fn list_emails(")
+            .expect("list_emails must exist");
+        let rest = &handler_src[start..];
+        // The handler is long; bound the slice generously but stay within the
+        // function (stop at the next top-level async fn).
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..end];
+        assert!(
+            block.contains("warm_bodies_for_list"),
+            "list_emails must warm bodies via prefetch::warm_bodies_for_list (fg52)"
+        );
+        assert!(
+            block.contains("BODY_PREFETCH_PER_MAILBOX"),
+            "list_emails must warm exactly BODY_PREFETCH_PER_MAILBOX ids, not a hardcoded literal (fg52)"
+        );
+        assert!(
+            block.contains("tokio::spawn"),
+            "the list-view body warm must be fire-and-forget (tokio::spawn) so the list response isn't blocked (fg52)"
         );
     }
 
@@ -3691,6 +3907,61 @@ mod tests {
             env!("SUPERVILLAIN_BUILD_ID"),
             "build-id body must be exactly the embedded id, no wrapping"
         );
+    }
+
+    // fg52-adjacent / deploy-refresh: the build-id poll must never be served
+    // from the browser HTTP cache, or the client would never notice a deploy
+    // (the very response that detects a new build id is the one that must
+    // always be fresh). no-store forbids caching outright; no-cache would
+    // still allow a stale hit during the revalidation window. This is the
+    // foundation of the "click Refresh after a deploy" feature.
+    #[tokio::test]
+    async fn build_id_route_is_never_cached() {
+        let resp = build_id().await.into_response();
+        let cc = resp
+            .headers()
+            .get("cache-control")
+            .expect("build-id must set Cache-Control so the poll is never stale")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            cc, "no-store",
+            "build-id must be no-store — a cached build-id hides the deploy the poll is trying to detect"
+        );
+    }
+
+    // The app shell (index.html, app.js, api.js, style.css) is compiled into
+    // the binary via include_str! — a merged fix is not live until rebuild +
+    // restart. Without cache headers the browser heuristically caches these,
+    // so a plain location.reload() after a deploy can serve the OLD app.js
+    // from cache and the user never sees the fix. no-cache forces
+    // revalidation on every load: the browser re-asks, the server hands back
+    // the new embedded bytes, the fix is live. The bytes are in memory so the
+    // re-fetch is free. (Fonts/icons keep heuristic caching — they're binary
+    // and stable, and busting them on every load is pointless churn.)
+    #[tokio::test]
+    async fn app_shell_routes_force_revalidation_so_reload_picks_up_deploys() {
+        for (label, resp) in [
+            ("index.html", index_html().await.into_response()),
+            ("app.js", app_js().await.into_response()),
+            ("api.js", api_js().await.into_response()),
+            ("style.css", style_css().await.into_response()),
+        ] {
+            let cc = resp
+                .headers()
+                .get("cache-control")
+                .unwrap_or_else(|| {
+                    panic!("{label} must set Cache-Control so a reload after a deploy revalidates")
+                })
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                cc, "no-cache",
+                "{label} must be no-cache — without it a reload serves stale embedded bytes from the browser cache after a deploy"
+            );
+        }
     }
 
     async fn assert_png_icon(resp: axum::response::Response, label: &str) {
@@ -5928,10 +6199,13 @@ white   = '#fdf6e3'
 
     // Email HTML is rendered inside a sandboxed iframe (see
     // `renderHtmlBodyIframe` in static/app.js and static/mobile/app.js)
-    // instead of being passed through a JS sanitizer. The iframe's sandbox
-    // omits `allow-scripts` and `allow-same-origin`, so any script in the
-    // email cannot execute in the app origin — closing the whole class of
-    // HTML-sanitizer-bypass vulnerabilities.
+    // instead of being passed through a JS sanitizer. Every sandbox omits
+    // `allow-scripts`, so any script in the email cannot execute at all —
+    // closing the whole class of HTML-sanitizer-bypass vulnerabilities. The
+    // desktop read-side additionally grants `allow-same-origin` (safe
+    // precisely because scripts are absent: no JS runs in the iframe to
+    // exploit it) so the parent can size the iframe to its content and scroll
+    // it with Space / Shift-Space; mobile omits it.
 
     #[test]
     fn app_js_renders_email_body_in_sandboxed_iframe() {
@@ -5982,15 +6256,19 @@ white   = '#fdf6e3'
         // Strict invariant: `allow-scripts` must NEVER appear in any email-iframe
         // sandbox token list — that is what closes the entire XSS class. Both the
         // read-side iframe and the compose-quote autosize iframe must respect
-        // this. (Compose-quote uses `allow-same-origin` for scrollHeight
-        // measurement, which is safe specifically because scripts are absent.)
+        // this. Both now grant `allow-same-origin` — the read-side so the parent
+        // can size the iframe to its content and scroll it with Space /
+        // Shift-Space (restoring keyboard scrolling for HTML emails), and
+        // compose-quote for scrollHeight measurement. `allow-same-origin` is
+        // safe *precisely because* `allow-scripts` is absent: no JS runs in the
+        // iframe to exploit same-origin access.
         let pos = APP_JS
             .find("function renderHtmlBodyIframe")
             .expect("function renderHtmlBodyIframe must exist");
         let region = &APP_JS[pos..APP_JS.len().min(pos + 2000)];
         assert!(
-            region.contains("'allow-popups allow-popups-to-escape-sandbox'"),
-            "read-side iframe sandbox token list must be allow-popups+allow-popups-to-escape-sandbox"
+            region.contains("'allow-same-origin allow-popups allow-popups-to-escape-sandbox'"),
+            "read-side iframe sandbox must be allow-same-origin+allow-popups+allow-popups-to-escape-sandbox so the parent can scroll the email"
         );
         assert!(
             !region.contains("allow-scripts"),
