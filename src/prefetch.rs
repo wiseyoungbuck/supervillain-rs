@@ -473,6 +473,52 @@ impl PrefetchCache {
         Ok(live)
     }
 
+    /// Fire-and-forget body warming for a freshly-viewed list (fg52). For each
+    /// id in `ids` not already in `body_cache`, call `fetch(missing)` and store
+    /// the results. Idempotent: a second call with the same ids is a no-op
+    /// (every id hits `get_body`). Used by `list_emails` so the first
+    /// `BODY_PREFETCH_PER_MAILBOX` bodies of a mailbox are warm even for mail
+    /// that arrived since the last periodic warm pass — that is what makes
+    /// the newest email open instantly after a reload instead of hitting the
+    /// slow provider path. The route wraps the call in `tokio::spawn` so the
+    /// list response is never blocked on warming.
+    ///
+    /// `fetch` receives ONLY the absent ids (never an already-cached one) so
+    /// repeated list views — the stale-snapshot revalidation poll ticks every
+    /// few seconds — are free: once the window is warm the closure never runs,
+    /// so the warmer doesn't hammer the provider on every tick.
+    pub async fn warm_bodies_for_list<F, Fut>(&self, account: &str, ids: &[String], fetch: F)
+    where
+        F: FnOnce(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<Email>, Error>>,
+    {
+        // Collect the absent ids. Each get_body is a cheap local read; this
+        // is the only per-tick cost when the window is already warm.
+        let mut missing = Vec::new();
+        for id in ids {
+            if self.get_body(account, id).await.is_none() {
+                missing.push(id.clone());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        // Best-effort: a provider error just skips this round — the periodic
+        // warmer (and the next list view) will retry. Never propagates so the
+        // spawned task can't panic the runtime on a transient failure.
+        match fetch(missing).await {
+            Ok(emails) => {
+                for email in emails {
+                    self.set_body(account, email.id.clone(), email).await;
+                }
+            }
+            Err(e) => tracing::debug!(
+                account = %account,
+                "list-view body warm failed (will retry): {e}"
+            ),
+        }
+    }
+
     pub async fn split_counts_or_fetch<F, Fut>(
         &self,
         account: &str,
@@ -747,13 +793,18 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
     // JSON several times per cycle (roborev 307 #5).
 }
 
-/// Top-N latest bodies to prefetch per mailbox per warm cycle. Sized to match
-/// a typical preview window — opening any recent message in any mailbox is a
-/// cache hit. If a user runs into Gmail quota issues, lower this first; if
-/// memory pressure is the problem, lower this *and* introduce per-cache
-/// eviction. Default 25 = ~22 MB resident per warm cycle for a 3-account
-/// 6-mailbox-per-account setup (see plan cost-analysis).
-pub(crate) const BODY_PREFETCH_PER_MAILBOX: usize = 25;
+/// Top-N latest bodies to prefetch per mailbox per warm cycle, AND the window
+/// `list_emails` keeps warm on every view (fg52). Sized to the "first 50
+/// emails open instantly" contract: opening any of the 50 newest messages in
+/// any mailbox is a cache hit even right after a reload, because the list-view
+/// warmer (see `warm_bodies_for_list`) refills the window for mail that
+/// arrived since the last periodic pass. If a user runs into Gmail quota
+/// issues, lower this first; if memory pressure is the problem, lower this
+/// *and* introduce per-cache eviction. 50 = ~44 MB resident per warm cycle for
+/// a 3-account, 6-mailbox-per-account setup (see plan cost-analysis). Was 25
+/// until fg52 — too narrow: brand-new #1 fell outside the window after a
+/// reload+revalidation and opened from the slow provider path.
+pub(crate) const BODY_PREFETCH_PER_MAILBOX: usize = 50;
 
 /// Store one warmed mailbox list (or log its failure). Returns false when
 /// the account entry's version changed mid-fetch — a user mutation ran, so
@@ -1014,7 +1065,7 @@ async fn store_warmed_bodies(
     true
 }
 
-async fn fetch_bodies(
+pub(crate) async fn fetch_bodies(
     state: &crate::types::AppState,
     account_id: &str,
     ids: &[String],
@@ -1946,6 +1997,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ====================================================================
+    // fg52: instant open for the first 50 emails per mailbox. The warmer's
+    // per-mailbox body window and the list-view body warm both hinge on
+    // BODY_PREFETCH_PER_MAILBOX and the warm_bodies_for_list helper.
+    // ====================================================================
+
+    #[tokio::test]
+    async fn body_prefetch_per_mailbox_is_fifty() {
+        // The "first 50 emails cached" contract (fg52). Was 25 — too narrow
+        // a window: brand-new mail fell outside it after a reload+
+        // revalidation, so the first email opened from the slow provider
+        // path instead of the cache.
+        assert_eq!(
+            BODY_PREFETCH_PER_MAILBOX, 50,
+            "BODY_PREFETCH_PER_MAILBOX must be 50 (fg52: first 50 emails cached per mailbox)"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_bodies_for_list_populates_absent_and_skips_present() {
+        // warm_bodies_for_list is the list-view body warmer: for a freshly
+        // resolved list it fetches ONLY ids not already in body_cache and
+        // stores them. This is what makes the newest email open instantly
+        // even when it arrived since the last periodic warm pass — the
+        // fire-and-forget spawn in list_emails races it into the cache
+        // ahead of the user opening it.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = PrefetchCache::new();
+        // msg-1 already cached — must NOT be re-fetched.
+        cache
+            .set_body("acc-1", "msg-1".into(), email("msg-1"))
+            .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let ids = vec![
+            "msg-1".to_string(),
+            "msg-2".to_string(),
+            "msg-3".to_string(),
+        ];
+        cache
+            .warm_bodies_for_list("acc-1", &ids, move |missing| {
+                let c = calls_for_closure.clone();
+                // Only the absent ids reach the fetch closure, and exactly
+                // those ids (no already-cached ids leak through).
+                assert_eq!(missing, vec!["msg-2".to_string(), "msg-3".to_string()]);
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![email("msg-2"), email("msg-3")])
+                }
+            })
+            .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fetch must fire once for the absent ids"
+        );
+        assert!(cache.get_body("acc-1", "msg-2").await.is_some());
+        assert!(cache.get_body("acc-1", "msg-3").await.is_some());
+
+        // Idempotent: a second call with the same ids is a no-op fetch.
+        cache
+            .warm_bodies_for_list("acc-1", &ids, |_| async {
+                panic!("all ids cached — fetch must not run")
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_bodies_for_list_no_fetch_when_all_cached() {
+        // Repeated list views (stale-snapshot revalidation polls every few
+        // seconds) must be free: when every requested id is already warm
+        // the fetch closure never runs, so the warmer doesn't hammer the
+        // provider on every poll tick.
+        let cache = PrefetchCache::new();
+        cache.set_body("acc-1", "a".into(), email("a")).await;
+        cache.set_body("acc-1", "b".into(), email("b")).await;
+        cache
+            .warm_bodies_for_list("acc-1", &["a".into(), "b".into()], |_| async {
+                panic!("all cached — fetch must not run")
+            })
+            .await;
+        // Sanity: bodies still present.
+        assert!(cache.get_body("acc-1", "a").await.is_some());
+        assert!(cache.get_body("acc-1", "b").await.is_some());
     }
 
     #[tokio::test]

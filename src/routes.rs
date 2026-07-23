@@ -639,6 +639,50 @@ async fn list_emails(
         (live, false)
     };
 
+    // fg52: fire-and-forget warm the first BODY_PREFETCH_PER_MAILBOX bodies
+    // of this list so the newest email opens from the cache even when it
+    // arrived since the last periodic warm pass (the inbox list revalidates
+    // stale against the provider and returns newer ids than the warmer
+    // filled — without this, opening #1 right after a reload hit the slow
+    // provider path). Gated on `is_cacheable` so only the default-sort
+    // (DateDesc) path warms — that's the only slot the periodic warmer
+    // keeps warm, so warming a non-default-sort list would be wasted. The
+    // `warm_bodies_for_list` helper skips ids already in `body_cache`, so
+    // repeated list views (stale-revalidation poll ticks) are no-ops.
+    // Spawned, never awaited: the list response must not block on warming.
+    if is_cacheable {
+        let warm_ids: Vec<String> = emails
+            .iter()
+            .take(crate::prefetch::BODY_PREFETCH_PER_MAILBOX)
+            .map(|e| e.id.clone())
+            .collect();
+        if !warm_ids.is_empty() {
+            let warm_state = state.clone();
+            let warm_account = account_id.clone();
+            tokio::spawn(async move {
+                // Clone the fetch inputs BEFORE the call so the closure can
+                // own them (move them into its `async move` future) without
+                // conflicting with the `&warm_account`/`&warm_ids` borrows
+                // the method call itself holds. The future the closure
+                // returns must own all the data it borrows — `FnOnce` drops
+                // the closure once the future is handed back.
+                let state_for_fetch = warm_state.clone();
+                let account_for_fetch = warm_account.clone();
+                warm_state
+                    .prefetch
+                    .warm_bodies_for_list(&warm_account, &warm_ids, move |missing| async move {
+                        crate::prefetch::fetch_bodies(
+                            &state_for_fetch,
+                            &account_for_fetch,
+                            &missing,
+                        )
+                        .await
+                    })
+                    .await;
+            });
+        }
+    }
+
     // Apply split filtering, scoped to this account's splits so "primary"
     // means "not matching any of *this account's* splits". Reuses the
     // config loaded above the fetch — no second load/scope pass.
@@ -2965,6 +3009,43 @@ mod tests {
         assert!(
             !block.contains("None, true)"),
             "the fetch closure must pass the derived flag, not hardcode priority"
+        );
+    }
+
+    // =========================================================================
+    // fg52: instant open for the first 50 emails per mailbox. list_emails must
+    // fire-and-forget warm the top BODY_PREFETCH_PER_MAILBOX bodies of every
+    // resolved list so the newest email opens from the cache even when it
+    // arrived since the last periodic warm pass. String-invariant test per
+    // repo convention (no JS harness): pins the shape of routes.rs.
+    // =========================================================================
+
+    #[test]
+    fn list_emails_warms_top_fifty_bodies_fire_and_forget() {
+        let src = include_str!("routes.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        let start = handler_src
+            .find("async fn list_emails(")
+            .expect("list_emails must exist");
+        let rest = &handler_src[start..];
+        // The handler is long; bound the slice generously but stay within the
+        // function (stop at the next top-level async fn).
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let block = &rest[..end];
+        assert!(
+            block.contains("warm_bodies_for_list"),
+            "list_emails must warm bodies via prefetch::warm_bodies_for_list (fg52)"
+        );
+        assert!(
+            block.contains("BODY_PREFETCH_PER_MAILBOX"),
+            "list_emails must warm exactly BODY_PREFETCH_PER_MAILBOX ids, not a hardcoded literal (fg52)"
+        );
+        assert!(
+            block.contains("tokio::spawn"),
+            "the list-view body warm must be fire-and-forget (tokio::spawn) so the list response isn't blocked (fg52)"
         );
     }
 
