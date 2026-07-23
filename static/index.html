@@ -7,9 +7,27 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
     <link rel="stylesheet" href="style.css">
+    <!-- The build id that served THIS page, stamped server-side by index_html
+         (placeholder replaced at serve time). The deploy-refresh banner reads
+         this as the boot build id so its comparison baseline is the build the
+         user is actually running — not the first successful poll, which could
+         fail mid-deploy and record a post-deploy id as the boot id. -->
+    <meta name="build-id" content="__SUPERVILLAIN_BUILD_ID__">
 </head>
 <body>
     <div id="app">
+        <!-- Deploy-refresh banner (Linear / Monarch Money style): the client
+             polls /api/build-id and shows this when a new version is deployed.
+             One click hard-refreshes (the shell routes are no-cache, so the
+             reload revalidates and pulls the new embedded bytes). -->
+        <div id="deploy-banner" class="hidden">
+            <div class="deploy-banner-content">
+                <span class="deploy-banner-icon">&#x21bb;</span>
+                <span>A new version is available.</span>
+                <button id="deploy-refresh-btn" type="button">Refresh</button>
+            </div>
+        </div>
+
         <!-- Account error banner (shown when accounts fail to connect at startup) -->
         <div id="account-error-banner" class="hidden">
             <div class="error-banner-content">

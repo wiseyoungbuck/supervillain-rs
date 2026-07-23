@@ -104,6 +104,51 @@ body {
     display: none;
 }
 
+/* Deploy-refresh banner (Linear / Monarch Money style): shown only when the
+   build-id poll detects a new deploy. The Refresh button hard-reloads; the
+   shell routes are no-cache so the reload pulls the new embedded bytes. */
+#deploy-banner {
+    background: var(--bg-secondary);
+    border-bottom: 2px solid var(--accent);
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+#deploy-banner.hidden {
+    display: none;
+}
+
+.deploy-banner-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.deploy-banner-icon {
+    color: var(--accent);
+    font-size: 16px;
+    font-weight: bold;
+    flex-shrink: 0;
+}
+
+#deploy-refresh-btn {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+    margin-left: auto;
+}
+
+#deploy-refresh-btn:hover,
+#deploy-refresh-btn:focus-visible {
+    filter: brightness(1.15);
+    outline: none;
+}
+
 .error-banner-content {
     display: flex;
     align-items: flex-start;

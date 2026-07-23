@@ -175,6 +175,8 @@ function init() {
     els.undoToast = document.getElementById('undo-toast');
     els.undoMessage = document.getElementById('undo-message');
     els.undoButton = document.getElementById('undo-button');
+    els.deployBanner = document.getElementById('deploy-banner');
+    els.deployRefreshBtn = document.getElementById('deploy-refresh-btn');
     els.splitTabs = document.getElementById('split-tabs');
     els.splitModal = document.getElementById('split-modal');
     els.splitName = document.getElementById('split-name');
@@ -472,6 +474,10 @@ function init() {
             return;
         }
         loadTheme();
+        // Re-check for a deploy on focus: a common flow is alt-tabbing away,
+        // upgrading, then alt-tabbing back — a poll here surfaces the banner
+        // immediately instead of waiting up to DEPLOY_POLL_INTERVAL_MS.
+        checkDeploy();
     });
 
     // Timezone listeners
@@ -499,6 +505,10 @@ function init() {
     loadAccounts();
     loadTimezone();
     loadTzZones();
+    // Start the deploy-detection poll so a banner appears when a new version
+    // is deployed (Linear / Monarch Money style). Captures the boot build id
+    // first, then re-checks on an interval and on window focus.
+    startDeployPoll();
 }
 
 // Theme
@@ -3051,6 +3061,112 @@ function showStatus(message, type = 'info') {
     setTimeout(() => {
         els.statusMessage.textContent = '';
     }, 3000);
+}
+
+// ---- Deploy-refresh banner (Linear / Monarch Money style) ----
+//
+// Static assets are compiled into the server binary via include_str!, so a
+// merged fix is not live until the server is rebuilt and restarted
+// (./scripts/upgrade.sh). The build id (git short sha from build.rs) changes
+// on every deploy, so polling /api/build-id detects a deploy without a
+// manual Ctrl+Shift+R. When the id changes, show a fixed banner offering a
+// one-click hard refresh. The shell routes are served with Cache-Control:
+// no-cache, so location.reload() revalidates and pulls the new embedded
+// bytes — that IS the hard refresh.
+
+// The build id the page booted with. Read from the <meta name="build-id">
+// tag stamped server-side by index_html (the build that served THIS page),
+// so the comparison baseline is the build the user is actually running —
+// not the first successful poll, which could fail mid-deploy and record a
+// post-deploy id as the boot id, hiding the deploy. null until startDeployPoll
+// reads the meta tag (e.g. a shell without the meta — older cached HTML).
+let knownBuildId = null;
+let deployPollTimer = null;
+
+// Re-check interval. A deploy while the tab is open should surface the
+// banner within this many seconds. The fetch is a sub-ms local read of a
+// tiny plain-text body, so 60s is cheap. Don't make this aggressive — every
+// poll is a request, and a long-idle tab polling every second is wasteful.
+const DEPLOY_POLL_INTERVAL_MS = 60_000;
+
+async function checkDeploy() {
+    // Banner already up — no more work. The interval is cleared in
+    // showDeployBanner, but the window-focus handler still calls this; the
+    // early return keeps the "polling stops once the banner is up" contract
+    // honest (no refetch, no re-show, just a cheap classList check).
+    if (els.deployBanner && !els.deployBanner.classList.contains('hidden')) return;
+    try {
+        // no-store on the endpoint guarantees the browser never hands back a
+        // stale id, so a mismatch always means a real deploy happened.
+        const id = await fetch('/api/build-id', { cache: 'no-store' }).then(r => r.text());
+        if (knownBuildId === null) {
+            // Fallback baseline, ONLY when the <meta name="build-id"> tag is
+            // absent (an older shell served before this code, or a mid-deploy
+            // HTML/JS version split). The meta tag is the preferred baseline
+            // because it's the build that served THIS page; this poll-based
+            // fallback restores deploy detection for the rest of the session
+            // instead of leaving it permanently blind. The mid-deploy-poll
+            // race (first poll fails, records a post-deploy id as the boot
+            // id) only exists in this fallback path — the meta path is
+            // deterministic, so this trade-off is confined to the no-meta
+            // case.
+            knownBuildId = id;
+            return;
+        }
+        if (id !== knownBuildId) {
+            showDeployBanner();
+        }
+    } catch (_) {
+        // A transient fetch failure (server mid-restart, network blip) is
+        // expected during a deploy — the next tick retries. Never surface the
+        // banner on a failure: a network error is not evidence of a new
+        // version, and a false banner that reloads into a still-restarting
+        // server would show a blank page.
+    }
+}
+
+function showDeployBanner() {
+    if (!els.deployBanner) return;
+    els.deployBanner.classList.remove('hidden');
+    // Stop polling once the banner is up — the user has been notified, no
+    // point in re-fetching the build id every minute until they click.
+    if (deployPollTimer) {
+        clearInterval(deployPollTimer);
+        deployPollTimer = null;
+    }
+}
+
+// The Refresh button's click handler. location.reload() is a hard refresh
+// here because the shell routes carry Cache-Control: no-cache — the browser
+// revalidates and, since the server's embedded bytes changed, pulls the new
+// app.js / style.css / index.html instead of serving a stale heuristic
+// cache copy.
+function hardRefresh() {
+    location.reload();
+}
+
+function startDeployPoll() {
+    if (!els.deployBanner) return; // shell without the banner element — skip
+    // Capture the build id this page actually booted with, stamped server-side
+    // in <meta name="build-id">. This is the comparison baseline — NOT the
+    // first successful poll (which could fail mid-deploy and record a
+    // post-deploy id as the boot id, hiding the deploy). Absent on an older
+    // cached shell; knownBuildId stays null and checkDeploy falls back to
+    // adopting the first successful poll as the baseline (see checkDeploy) so
+    // a no-meta session isn't permanently blind to deploys.
+    const meta = document.querySelector('meta[name="build-id"]');
+    if (meta) knownBuildId = meta.content;
+    // Wire the Refresh button here, after the deployBanner guard, so a
+    // mixed-version shell (stale index.html with no #deploy-refresh-btn +
+    // fresh app.js) can't throw a TypeError here and abort the rest of
+    // init(). The guard above already proved #deploy-banner exists; belt-
+    // and-suspenders the button too in case the HTML has the banner div but
+    // not the button.
+    if (els.deployRefreshBtn) {
+        els.deployRefreshBtn.addEventListener('click', hardRefresh);
+    }
+    checkDeploy();
+    deployPollTimer = setInterval(checkDeploy, DEPLOY_POLL_INTERVAL_MS);
 }
 
 

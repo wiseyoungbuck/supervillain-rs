@@ -148,20 +148,41 @@ const APP_CSP: &str = "default-src 'self'; \
     base-uri 'none'; \
     form-action 'self'";
 
-fn html_headers() -> [(&'static str, &'static str); 2] {
+fn html_headers() -> [(&'static str, &'static str); 3] {
+    // no-cache: the app shell (index.html + app.js + style.css + api.js) is
+    // compiled into the binary via include_str!, so a merged fix is not live
+    // until rebuild+restart. Without this header the browser heuristically
+    // caches the shell and a plain location.reload() after a deploy serves
+    // the OLD bytes — the user never sees the fix. no-cache forces
+    // revalidation on every load so the browser re-asks and gets the new
+    // embedded bytes. The bytes are in memory, so the re-fetch is free.
+    // (Fonts/icons keep heuristic caching — they're binary and stable.)
     [
         ("content-type", "text/html; charset=utf-8"),
         ("content-security-policy", APP_CSP),
+        ("cache-control", "no-cache"),
     ]
 }
 
 async fn index_html() -> impl IntoResponse {
-    (html_headers(), INDEX_HTML)
+    // Stamp the build id into the shell so the client knows which build served
+    // this page — the deploy-refresh banner reads <meta name="build-id"> as
+    // its comparison baseline (see static/app.js startDeployPoll). Replacing
+    // the placeholder at serve time (not build time) keeps INDEX_HTML a single
+    // source via include_str!; the placeholder never reaches a client. The
+    // replace is a cheap scan of a ~15 KB string on the one HTML route.
+    let html = INDEX_HTML.replace("__SUPERVILLAIN_BUILD_ID__", env!("SUPERVILLAIN_BUILD_ID"));
+    (html_headers(), html)
 }
 
 async fn app_js() -> impl IntoResponse {
+    // no-cache: see html_headers — a reload after a deploy must revalidate and
+    // pull the new embedded bytes, not a stale heuristic cache copy.
     (
-        [("content-type", "application/javascript; charset=utf-8")],
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         APP_JS,
     )
 }
@@ -172,21 +193,38 @@ async fn app_js() -> impl IntoResponse {
 // not live until rebuild+restart, and this is how launch detects that (kata
 // tgax).
 async fn build_id() -> impl IntoResponse {
+    // no-store: this endpoint is THE deploy detector — the client polls it to
+    // learn a new build shipped. If a browser (or intermediate) cached it,
+    // the poll would never see the new id and the "click Refresh" banner
+    // would never fire. no-store forbids caching outright; no-cache would
+    // still allow a stale hit during the revalidation window.
     (
-        [("content-type", "text/plain; charset=utf-8")],
+        [
+            ("content-type", "text/plain; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
         env!("SUPERVILLAIN_BUILD_ID"),
     )
 }
 
 async fn api_js() -> impl IntoResponse {
     (
-        [("content-type", "application/javascript; charset=utf-8")],
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         API_JS,
     )
 }
 
 async fn style_css() -> impl IntoResponse {
-    ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
+    (
+        [
+            ("content-type", "text/css; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
+        STYLE_CSS,
+    )
 }
 
 async fn mobile_html() -> impl IntoResponse {
@@ -2755,6 +2793,103 @@ mod tests {
     }
 
     // =========================================================================
+    // Deploy-refresh banner (Linear / Monarch Money style): the client polls
+    // /api/build-id and, when it changes, shows a fixed banner offering a
+    // one-click hard refresh. Static assets are compiled into the binary, so
+    // a merged fix is not live until rebuild+restart — this is how the user
+    // learns a deploy happened and gets the new code without a manual
+    // Ctrl+Shift+R. String-invariant tests per repo convention (no JS harness):
+    // they pin the shape of static/app.js rather than executing it.
+    // =========================================================================
+
+    #[test]
+    fn app_js_polls_build_id_and_shows_refresh_banner_on_change() {
+        // The detection loop: fetch /api/build-id, compare against the known
+        // id captured at boot, and on mismatch surface the deploy banner.
+        // Match code forms, not prose — an explanatory comment inside the
+        // same slice must not be able to satisfy these (roborev 336 #2).
+        assert!(
+            APP_JS.contains("/api/build-id"),
+            "app.js must poll /api/build-id to detect a deploy"
+        );
+        assert!(
+            APP_JS.contains("knownBuildId"),
+            "app.js must capture the boot build id (knownBuildId) to compare against"
+        );
+        assert!(
+            APP_JS.contains("deployBanner") || APP_JS.contains("deploy-banner"),
+            "app.js must surface a deploy banner element when the build id changes"
+        );
+    }
+
+    #[test]
+    fn deploy_refresh_button_hard_reloads_on_click() {
+        // The banner's button must hard-reload. With the app shell's no-cache
+        // headers (see app_shell_routes_force_revalidation_so_reload_picks_up_deploys),
+        // location.reload() revalidates and pulls the new embedded bytes —
+        // that IS the hard refresh. Pin the WIRING (the addEventListener that
+        // binds the button to hardRefresh), not just that location.reload()
+        // exists somewhere — a defined-but-unwired handler would pass a loose
+        // check but never fire (roborev 336 #2: match code forms, not prose).
+        let block = js_fn_body(APP_JS, "function showDeployBanner");
+        assert!(
+            block.contains("classList.remove('hidden')"),
+            "showDeployBanner must un-hide the banner — a hidden banner is no banner"
+        );
+        assert!(
+            APP_JS.contains("deployRefreshBtn.addEventListener('click', hardRefresh)"),
+            "the deploy Refresh button must be wired to hardRefresh — pin the binding, not just that location.reload exists"
+        );
+        assert!(
+            APP_JS.contains("location.reload()"),
+            "hardRefresh must call location.reload() — with no-cache shell headers that revalidates and pulls the new bytes"
+        );
+    }
+
+    #[test]
+    fn app_js_reads_boot_build_id_from_meta_tag() {
+        // The comparison baseline must be the build that served THIS page, not
+        // the first successful poll (which could fail mid-deploy and record a
+        // post-deploy id as the boot id, hiding the deploy). The build id is
+        // stamped server-side into <meta name="build-id"> (see
+        // index_html_stamps_build_id_meta); the client reads that meta as the
+        // boot id in startDeployPoll.
+        let block = js_fn_body(APP_JS, "function startDeployPoll");
+        assert!(
+            block.contains("meta[name=\"build-id\"]"),
+            "startDeployPoll must read the boot build id from <meta name=\"build-id\"> — the baseline must be the build that served the page, not the first poll"
+        );
+        assert!(
+            block.contains("knownBuildId = meta.content"),
+            "startDeployPoll must adopt the meta tag's content as knownBuildId"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_html_stamps_build_id_meta() {
+        // The served index.html must carry the real build id in a
+        // <meta name="build-id"> tag (placeholder replaced at serve time),
+        // and must NOT leak the unreplaced placeholder. This is the boot-id
+        // baseline the deploy-refresh banner compares against.
+        let resp = index_html().await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains(&format!(
+                "<meta name=\"build-id\" content=\"{}\">",
+                env!("SUPERVILLAIN_BUILD_ID")
+            )),
+            "served index.html must stamp the real build id into the build-id meta tag"
+        );
+        assert!(
+            !text.contains("__SUPERVILLAIN_BUILD_ID__"),
+            "served index.html must not leak the unreplaced build-id placeholder"
+        );
+    }
+
+    // =========================================================================
     // Desktop sort control (kata 09ef) — buildEmailListUrl appends &sort=,
     // splitCacheKey discriminates by it (mirrors starredOnly), and
     // selectAccount resets it to the default like other per-session view state.
@@ -3772,6 +3907,61 @@ mod tests {
             env!("SUPERVILLAIN_BUILD_ID"),
             "build-id body must be exactly the embedded id, no wrapping"
         );
+    }
+
+    // fg52-adjacent / deploy-refresh: the build-id poll must never be served
+    // from the browser HTTP cache, or the client would never notice a deploy
+    // (the very response that detects a new build id is the one that must
+    // always be fresh). no-store forbids caching outright; no-cache would
+    // still allow a stale hit during the revalidation window. This is the
+    // foundation of the "click Refresh after a deploy" feature.
+    #[tokio::test]
+    async fn build_id_route_is_never_cached() {
+        let resp = build_id().await.into_response();
+        let cc = resp
+            .headers()
+            .get("cache-control")
+            .expect("build-id must set Cache-Control so the poll is never stale")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            cc, "no-store",
+            "build-id must be no-store — a cached build-id hides the deploy the poll is trying to detect"
+        );
+    }
+
+    // The app shell (index.html, app.js, api.js, style.css) is compiled into
+    // the binary via include_str! — a merged fix is not live until rebuild +
+    // restart. Without cache headers the browser heuristically caches these,
+    // so a plain location.reload() after a deploy can serve the OLD app.js
+    // from cache and the user never sees the fix. no-cache forces
+    // revalidation on every load: the browser re-asks, the server hands back
+    // the new embedded bytes, the fix is live. The bytes are in memory so the
+    // re-fetch is free. (Fonts/icons keep heuristic caching — they're binary
+    // and stable, and busting them on every load is pointless churn.)
+    #[tokio::test]
+    async fn app_shell_routes_force_revalidation_so_reload_picks_up_deploys() {
+        for (label, resp) in [
+            ("index.html", index_html().await.into_response()),
+            ("app.js", app_js().await.into_response()),
+            ("api.js", api_js().await.into_response()),
+            ("style.css", style_css().await.into_response()),
+        ] {
+            let cc = resp
+                .headers()
+                .get("cache-control")
+                .unwrap_or_else(|| {
+                    panic!("{label} must set Cache-Control so a reload after a deploy revalidates")
+                })
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                cc, "no-cache",
+                "{label} must be no-cache — without it a reload serves stale embedded bytes from the browser cache after a deploy"
+            );
+        }
     }
 
     async fn assert_png_icon(resp: axum::response::Response, label: &str) {
