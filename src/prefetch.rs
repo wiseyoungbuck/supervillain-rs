@@ -800,7 +800,8 @@ pub async fn prefetch_account(state: Arc<crate::types::AppState>, account_id: &s
 /// warmer (see `warm_bodies_for_list`) refills the window for mail that
 /// arrived since the last periodic pass. If a user runs into Gmail quota
 /// issues, lower this first; if memory pressure is the problem, lower this
-/// *and* introduce per-cache eviction. 50 = ~44 MB resident per warm cycle for
+/// and/or `BODY_CACHE_MAX` (the per-account body_cache LRU cap, kata a5r8).
+/// 50 = ~44 MB resident per warm cycle for
 /// a 3-account, 6-mailbox-per-account setup (see plan cost-analysis). Was 25
 /// until fg52 — too narrow: brand-new #1 fell outside the window after a
 /// reload+revalidation and opened from the slow provider path.
