@@ -1487,10 +1487,10 @@ function formatEventTimeRange(dtstart, dtend) {
 // Redraws from scratch on every call (like renderAttachments, renderEmailList)
 // rather than mutating persistent DOM nodes the way desktop does. summary/
 // location/organizer are attacker-controlled ICS fields, so every one is
-// escapeHtml'd.
+// escapeHtml'd. RSVP actions render only for METHOD:REQUEST invitations.
 function renderCalendarCard(event) {
     const cancelled = event.method === 'CANCEL';
-    const showActions = !cancelled && event.method !== 'PUBLISH';
+    const showActions = event.method === 'REQUEST';
     const userStatus = event.user_rsvp_status;
 
     // Rescheduled invite: non-destructive "updated" banner (distinct from the

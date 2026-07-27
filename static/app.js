@@ -5426,6 +5426,7 @@ function getFileIcon(mimeType, filename) {
 function renderCalendarCard(event) {
     els.calendarEvent.classList.remove('hidden');
     const cancelled = event.method === 'CANCEL';
+    const showActions = event.method === 'REQUEST';
     const card = els.calendarEvent.querySelector('.calendar-card');
     card.classList.toggle('cancelled', cancelled);
 
@@ -5488,9 +5489,9 @@ function renderCalendarCard(event) {
     // can't resurrect a stale highlight from the incoming ICS's PARTSTAT.
     const userStatus = event.isUpdate ? null : (event.user_rsvp_status || getUserRsvpStatus(event));
 
-    // Hide RSVP actions for cancelled events
+    // Show RSVP actions only for invitations that request a response
     const actions = els.calendarEvent.querySelector('.calendar-actions');
-    if (cancelled) {
+    if (!showActions) {
         actions.style.display = 'none';
     } else {
         actions.style.display = '';
