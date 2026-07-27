@@ -7133,9 +7133,13 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_hides_rsvp_actions_for_cancelled_events() {
-        // Cancelled events should hide the RSVP buttons
-        let render_fn_pos = APP_JS.find("function renderCalendarCard").unwrap();
-        let render_fn = &APP_JS[render_fn_pos..render_fn_pos + 3000];
+        // Cancelled events should hide the RSVP buttons. Slice to the
+        // function's closing brace (js_fn_body) rather than a fixed byte
+        // window, so a documentation comment inside renderCalendarCard can't
+        // push the checked content past the window (the kata yane fix added
+        // such a comment documenting the statusIcon trusted-by-construction
+        // invariant).
+        let render_fn = js_fn_body(APP_JS, "function renderCalendarCard(");
         assert!(
             render_fn.contains("actions.style.display = 'none'"),
             "cancelled events should hide RSVP actions"
@@ -7230,6 +7234,66 @@ white   = '#fdf6e3'
         assert!(
             APP_JS.contains("escapeHtml("),
             "showAccountErrors should use escapeHtml for XSS prevention"
+        );
+    }
+
+    #[test]
+    fn app_js_start_reply_escapes_sender_in_quote_header() {
+        // hp8w: startReply builds the "On <date>, <name> wrote:" header and hands
+        // it to renderComposeQuote, which assigns it to innerHTML. The From name
+        // is attacker-controlled. startForward already escapes; startReply must
+        // too. Match code forms, not prose (roborev 336 #2).
+        let block = js_fn_body(APP_JS, "function startReply(");
+        assert!(
+            block.contains("escapeHtml(from?.name"),
+            "startReply must escapeHtml the From name/email in the quote header — \
+             renderComposeQuote assigns it to innerHTML"
+        );
+    }
+
+    #[test]
+    fn app_js_remove_account_compares_id_not_object() {
+        // hp8w collateral: state.currentAccount is an object; comparing it to an
+        // id string is always false, so the reset branch was dead.
+        let block = js_fn_body(APP_JS, "function removeAccountById(");
+        assert!(
+            block.contains("state.currentAccount?.id === id"),
+            "removeAccountById must compare state.currentAccount?.id to the id, \
+             not the account object (dead-branch bug)"
+        );
+    }
+
+    #[test]
+    fn app_js_show_status_cancels_prior_timer() {
+        // hp8w collateral: an older call's 3s timer must not blank a newer
+        // message. The fix cancels the prior timer and keeps one handle.
+        // The whole-file contains below is a precondition only — a module-level
+        // let can't live inside a function slice, so js_fn_body can't pin it. The
+        // load-bearing assertions are the two sliced ones (clearTimeout +
+        // setTimeout reassign) inside showStatus itself; those are what a comment
+        // cannot satisfy.
+        assert!(
+            APP_JS.contains("let statusTimer = null;"),
+            "showStatus needs a module-level timer handle"
+        );
+        let block = js_fn_body(APP_JS, "function showStatus(");
+        assert!(
+            block.contains("clearTimeout(statusTimer)")
+                && block.contains("statusTimer = setTimeout"),
+            "showStatus must clearTimeout the prior timer and reassign the handle"
+        );
+    }
+
+    #[test]
+    fn app_js_calendar_attendee_title_escapes_email() {
+        // yane: renderCalendarCard interpolates a.email into title="…". escapeHtml
+        // is insufficient in an attribute (no quote encoding), so the call site
+        // must use escapeAttr.
+        let block = js_fn_body(APP_JS, "function renderCalendarCard(");
+        assert!(
+            block.contains("escapeAttr(a.email)"),
+            "renderCalendarCard must escapeAttr the attendee email in the title \
+             attribute — a crafted email breaks out of an unescaped attribute"
         );
     }
 
