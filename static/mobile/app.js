@@ -613,6 +613,27 @@ function renderSplitTabs() {
     }).join('');
 }
 
+// Mirror of desktop's adjustSplitCounts (static/app.js:948): the split
+// count is a projection of the list, so it moves iff the list moves.
+// Called at every list-mutating site (emailAction, performUndo) with a
+// mirror on every failure path — a failed request leaves the counts where
+// they started. A no-op when state.splitCounts is {} (non-inbox contexts
+// never load counts), which is how they opt out without a separate guard.
+// kata fpjj.
+function adjustSplitCounts(delta) {
+    if (state.splitCounts.all != null) {
+        const next = state.splitCounts.all + delta;
+        if (next < 0) console.warn('split count underflow: all', state.splitCounts.all, delta);
+        state.splitCounts.all = Math.max(0, next);
+    }
+    if (state.currentSplit && state.currentSplit !== 'all' && state.splitCounts[state.currentSplit] != null) {
+        const next = state.splitCounts[state.currentSplit] + delta;
+        if (next < 0) console.warn('split count underflow:', state.currentSplit, state.splitCounts[state.currentSplit], delta);
+        state.splitCounts[state.currentSplit] = Math.max(0, next);
+    }
+    renderSplitTabs();
+}
+
 function selectSplit(splitId) {
     if (state.currentSplit === splitId) return;
     abortListLoad();
@@ -887,6 +908,7 @@ async function performUndo() {
     if (sameMailbox) {
         const index = Math.min(entry.index, state.emails.length);
         state.emails.splice(index, 0, entry.email);
+        adjustSplitCounts(+1);
         if (state.screen === Screen.LIST) renderEmailList();
     }
 
@@ -910,7 +932,10 @@ async function performUndo() {
         // (sameMailbox was false).
         if (sameMailbox) {
             const idx = state.emails.indexOf(entry.email);
-            if (idx !== -1) state.emails.splice(idx, 1);
+            if (idx !== -1) {
+                state.emails.splice(idx, 1);
+                adjustSplitCounts(-1);
+            }
             if (state.screen === Screen.LIST) renderEmailList();
         }
         state.undoStack.push(entry);
@@ -926,6 +951,7 @@ async function emailAction(type, emailId) {
 
     // Optimistic: remove from the list immediately.
     state.emails.splice(index, 1);
+    adjustSplitCounts(-1);
     const undoEntry = pushUndo(type, email, index);
     renderEmailList();
 
@@ -960,7 +986,10 @@ async function emailAction(type, emailId) {
         // A fast Undo tap may have optimistically re-inserted this email
         // already (performUndo runs its insert before awaiting entry.settled)
         // — in that case the list is already correct; don't double-insert.
-        if (!state.emails.includes(email)) state.emails.splice(index, 0, email);
+        if (!state.emails.includes(email)) {
+            state.emails.splice(index, 0, email);
+            adjustSplitCounts(+1);
+        }
         renderEmailList();
         showError(type === 'archive' ? 'Archive' : 'Trash', err);
     }
