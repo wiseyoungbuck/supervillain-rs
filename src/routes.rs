@@ -7234,6 +7234,53 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn app_js_start_reply_escapes_sender_in_quote_header() {
+        // hp8w: startReply builds the "On <date>, <name> wrote:" header and hands
+        // it to renderComposeQuote, which assigns it to innerHTML. The From name
+        // is attacker-controlled. startForward already escapes; startReply must
+        // too. Match code forms, not prose (roborev 336 #2).
+        let block = js_fn_body(APP_JS, "function startReply(");
+        assert!(
+            block.contains("escapeHtml(from?.name"),
+            "startReply must escapeHtml the From name/email in the quote header — \
+             renderComposeQuote assigns it to innerHTML"
+        );
+    }
+
+    #[test]
+    fn app_js_remove_account_compares_id_not_object() {
+        // hp8w collateral: state.currentAccount is an object; comparing it to an
+        // id string is always false, so the reset branch was dead.
+        let block = js_fn_body(APP_JS, "function removeAccountById(");
+        assert!(
+            block.contains("state.currentAccount?.id === id"),
+            "removeAccountById must compare state.currentAccount?.id to the id, \
+             not the account object (dead-branch bug)"
+        );
+    }
+
+    #[test]
+    fn app_js_show_status_cancels_prior_timer() {
+        // hp8w collateral: an older call's 3s timer must not blank a newer
+        // message. The fix cancels the prior timer and keeps one handle.
+        // The whole-file contains below is a precondition only — a module-level
+        // let can't live inside a function slice, so js_fn_body can't pin it. The
+        // load-bearing assertions are the two sliced ones (clearTimeout +
+        // setTimeout reassign) inside showStatus itself; those are what a comment
+        // cannot satisfy.
+        assert!(
+            APP_JS.contains("let statusTimer = null;"),
+            "showStatus needs a module-level timer handle"
+        );
+        let block = js_fn_body(APP_JS, "function showStatus(");
+        assert!(
+            block.contains("clearTimeout(statusTimer)")
+                && block.contains("statusTimer = setTimeout"),
+            "showStatus must clearTimeout the prior timer and reassign the handle"
+        );
+    }
+
+    #[test]
     fn app_js_renders_pending_accounts_in_selector() {
         // Pending (configured-but-unauthorized) accounts are now included in
         // GET /api/accounts; the sidebar must label them instead of rendering

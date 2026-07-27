@@ -3054,11 +3054,15 @@ function handleWizardKey(e) {
     }
 }
 
+let statusTimer = null;   // single cancellable handle so an older showStatus
+                          // timer can't blank a newer message (kata hp8w)
+
 function showStatus(message, type = 'info') {
+    clearTimeout(statusTimer);
     els.statusMessage.textContent = message;
     els.statusMessage.style.color = type === 'error' ? 'var(--danger)' :
                                     type === 'success' ? 'var(--success)' : 'var(--fg-muted)';
-    setTimeout(() => {
+    statusTimer = setTimeout(() => {
         els.statusMessage.textContent = '';
     }, 3000);
 }
@@ -3880,7 +3884,11 @@ function startReply(replyAll) {
 
     autoSelectFromAddress(email);
 
-    const header = `On ${formatDate(email.receivedAt)}, ${from?.name || from?.email} wrote:`;
+    // escapeHtml the From name/email: renderComposeQuote assigns this header
+    // to innerHTML, and from?.name is attacker-controlled (a display name like
+    // <img src=x onerror=...> would execute on Reply). startForward already
+    // escapes the same field; this matches it (kata hp8w).
+    const header = `On ${formatDate(email.receivedAt)}, ${escapeHtml(from?.name || from?.email || '')} wrote:`;
     renderComposeQuote(header, quotedHtml, quotedText);
 
     showView('compose');
@@ -4546,7 +4554,10 @@ async function removeAccountById(id) {
             state.selectedAccountId = null;
             state.settingsMode = 'view';
         }
-        if (state.currentAccount === id) {
+        // state.currentAccount is an object, not an id string — compare its
+        // .id, else this reset branch is dead and deleting the in-use account
+        // leaves dangling state (kata hp8w).
+        if (state.currentAccount?.id === id) {
             state.currentAccount = null;
             state.currentEmail = null;
             state.emails = [];

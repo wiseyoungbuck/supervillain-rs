@@ -150,10 +150,13 @@ async fn main() {
 }
 
 /// Bind address: `SUPERVILLAIN_BIND` env var, defaulting to loopback.
-/// Binding beyond loopback (e.g. `0.0.0.0:8000` for LAN/tailnet access,
-/// as scripts/upgrade.sh and the launcher do) is an explicit per-deploy
-/// opt-in — there is no authentication layer, so a non-loopback bind
-/// trusts every host that can reach the interface (roborev 273).
+/// Binding beyond loopback (e.g. `SUPERVILLAIN_BIND=0.0.0.0:8000` for
+/// LAN/tailnet access) is an explicit per-deploy opt-in — there is no
+/// authentication layer, so a non-loopback bind trusts every host that
+/// can reach the interface (roborev 273). The launcher and upgrade.sh
+/// both default to `127.0.0.1:8000`; serve over a tailnet or reverse
+/// proxy instead of widening the bind (see README, "Serving over the
+/// tailnet (HTTPS)").
 fn bind_addr(env_value: Option<&str>) -> String {
     match env_value.map(str::trim) {
         Some(v) if !v.is_empty() => v.to_string(),
