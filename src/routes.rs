@@ -8901,6 +8901,52 @@ white   = '#fdf6e3'
             "performUndo must decrement split counts in the revert path — a failed move-back must leave counts where they started"
         );
     }
+
+    // --- kata 8n1v: mobile send/list/download safety contracts ---
+
+    #[test]
+    fn mobile_send_blocks_failed_attachments() {
+        let block = js_fn_body(MOBILE_APP_JS, "async function doSendComposedEmail(");
+        assert!(
+            block.contains("a.status === 'error'"),
+            "send must stop when an attachment upload failed instead of silently omitting it"
+        );
+    }
+
+    #[test]
+    fn mobile_pull_to_refresh_aborts_an_in_flight_list_load_first() {
+        let start = MOBILE_APP_JS
+            .find("const pullToRefreshRecognizer = {")
+            .expect("pullToRefreshRecognizer must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest
+            .find("const rowSwipeRecognizer = {")
+            .expect("rowSwipeRecognizer must follow pullToRefreshRecognizer");
+        let block = &rest[..end];
+        let abort = block
+            .find("abortListLoad()")
+            .expect("pull-to-refresh must abort an in-flight list load");
+        let reload = block
+            .find("loadEmails()")
+            .expect("pull-to-refresh must reload emails");
+        assert!(
+            abort < reload,
+            "pull-to-refresh must abort the previous list load before starting its reload"
+        );
+    }
+
+    #[test]
+    fn mobile_download_all_attachments_keeps_user_activation() {
+        let block = js_fn_body(MOBILE_APP_JS, "function downloadAllAttachments(");
+        assert!(
+            block.contains(".click()"),
+            "downloadAllAttachments must click attachment links"
+        );
+        assert!(
+            !block.contains("setTimeout"),
+            "attachment clicks must be synchronous so Safari retains user activation"
+        );
+    }
 }
 
 // External dep for theme path
