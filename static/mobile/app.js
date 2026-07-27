@@ -1422,14 +1422,12 @@ function renderAttachments(attachments, emailId) {
     return header + items;
 }
 
-// Sequential anchor clicks with a small stagger — mirrors desktop's
-// downloadAllAttachments. Each anchor targets _blank, so this opens one new
-// tab per attachment (a popup blocker may cap how many actually go through).
+// Click every anchor synchronously while the download-all tap still carries
+// user activation. Each anchor targets _blank, so this opens one new tab per
+// attachment (a popup blocker may cap how many actually go through).
 function downloadAllAttachments() {
     const links = document.querySelectorAll('#detail-attachments .att-item');
-    links.forEach((a, i) => {
-        setTimeout(() => a.click(), i * 200);
-    });
+    links.forEach(a => a.click());
 }
 
 function formatDetailDate(isoString) {
@@ -2081,6 +2079,10 @@ async function doSendComposedEmail() {
         showError('Send', new Error('wait for uploads to finish'));
         return;
     }
+    if (state.pendingAttachments.some(a => a.status === 'error')) {
+        showError('Send', new Error('remove or retry failed attachments'));
+        return;
+    }
 
     const quotedText = state.replyContext?.quotedText;
     const quotedHtml = state.replyContext?.quotedHtml;
@@ -2538,6 +2540,7 @@ const pullToRefreshRecognizer = {
         if (h > 60) {
             indicator.style.height = '40px';
             indicator.textContent = 'Refreshing...';
+            abortListLoad();
             loadEmails();
         } else {
             finishPullRefresh();
