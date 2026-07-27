@@ -8788,6 +8788,81 @@ white   = '#fdf6e3'
             "init must release the guard in a finally block"
         );
     }
+
+    // --- kata fpjj: mobile split-tab badges stay in sync with the list ---
+    //
+    // Mobile renders split-tab badges from state.splitCounts, but the only
+    // writer was loadSplitCounts() (a GET /split-counts fetch on split/mailbox
+    // reload). The list-mutating paths — emailAction and performUndo — splice
+    // the list optimistically but never touched the counts, so badges sat
+    // stale until a full reload. Desktop already solved this with
+    // adjustSplitCounts(delta) (static/app.js:948), called at every
+    // list-mutating site with a mirror on every failure path. The invariant,
+    // stated plainly: the split count is a projection of the list — it moves
+    // iff the list moves, on every path, including the path where a
+    // concurrent undo already moved it. A failed request leaves the counts
+    // exactly where they started.
+    //
+    // These three tests pin the unit and its two call sites' failure
+    // symmetry. They do NOT pin gate placement (the sameMailbox guard on
+    // performUndo, the !includes guard on emailAction's revert) — that's
+    // covered by manual repro, which is the honest division: a contract test
+    // asserts on code forms inside the exact function slice so an explanatory
+    // comment can't satisfy it (roborev 336 #2), but placement within
+    // conditionals is a runtime concern the slice can't see.
+
+    #[test]
+    fn mobile_adjust_split_counts_mirrors_desktop_semantics() {
+        // Unit contract: adjustSplitCounts must exist on mobile with
+        // desktop's semantics — clamp each touched bucket at 0 (a race can
+        // drive a count negative; a negative badge is a worse lie than a
+        // stale one) and re-render the tabs. A no-op when state.splitCounts
+        // is {} (non-inbox contexts), which is how those contexts opt out
+        // without a separate guard.
+        let block = js_fn_body(MOBILE_APP_JS, "function adjustSplitCounts(");
+        assert!(
+            block.contains("Math.max(0,"),
+            "adjustSplitCounts must clamp counts at zero — a race must not render a negative badge"
+        );
+        assert!(
+            block.contains("renderSplitTabs()"),
+            "adjustSplitCounts must re-render the tabs — the badge is a projection of state.splitCounts"
+        );
+    }
+
+    #[test]
+    fn mobile_email_action_adjusts_split_counts_with_failure_symmetry() {
+        // emailAction is the archive/trash path. Optimistic removal decrements
+        // the count (-1) next to the splice; the catch revert increments (+1)
+        // so a failed request leaves the count where it started. Both signs
+        // must be present — one without the other is the bug in either
+        // direction (stale-on-success or drift-on-failure).
+        let block = js_fn_body(MOBILE_APP_JS, "async function emailAction(");
+        assert!(
+            block.contains("adjustSplitCounts(-1)"),
+            "emailAction must decrement split counts on the optimistic removal — the list and its badge projection move together"
+        );
+        assert!(
+            block.contains("adjustSplitCounts(+1)"),
+            "emailAction must increment split counts in the revert path — a failed request must leave counts where they started"
+        );
+    }
+
+    #[test]
+    fn mobile_perform_undo_adjusts_split_counts_with_failure_symmetry() {
+        // performUndo is the undo path. Optimistic re-insert increments (+1)
+        // next to the splice; the catch revert decrements (-1). Mirror of
+        // emailAction with signs flipped, same symmetry invariant.
+        let block = js_fn_body(MOBILE_APP_JS, "async function performUndo(");
+        assert!(
+            block.contains("adjustSplitCounts(+1)"),
+            "performUndo must increment split counts on the optimistic re-insert — the list and its badge projection move together"
+        );
+        assert!(
+            block.contains("adjustSplitCounts(-1)"),
+            "performUndo must decrement split counts in the revert path — a failed move-back must leave counts where they started"
+        );
+    }
 }
 
 // External dep for theme path
