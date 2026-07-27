@@ -6898,18 +6898,18 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_user_status_not_block_scoped() {
-        // userStatus must be declared before the cancelled if/else, not inside the else block
+        // userStatus must be declared before the action gate, not inside its else block
         let pos = APP_JS
             .find("const userStatus = event.isUpdate ? null : (event.user_rsvp_status")
             .expect("should declare userStatus");
         let after = &APP_JS[pos..];
-        let cancelled_pos = after
-            .find("if (cancelled)")
-            .expect("should have cancelled check");
-        // userStatus declaration should come BEFORE the cancelled check
+        let action_gate_pos = after
+            .find("if (!showActions)")
+            .expect("should have RSVP action gate");
+        // userStatus declaration should come BEFORE the action visibility branch
         assert!(
-            cancelled_pos > 0,
-            "userStatus should be declared before the cancelled if/else block"
+            action_gate_pos > 0,
+            "userStatus should be declared before the RSVP action branch"
         );
     }
 
@@ -7277,17 +7277,11 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn app_js_hides_rsvp_actions_for_cancelled_events() {
-        // Cancelled events should hide the RSVP buttons. Slice to the
-        // function's closing brace (js_fn_body) rather than a fixed byte
-        // window, so a documentation comment inside renderCalendarCard can't
-        // push the checked content past the window (the kata yane fix added
-        // such a comment documenting the statusIcon trusted-by-construction
-        // invariant).
+    fn app_js_shows_rsvp_actions_only_for_request_events() {
         let render_fn = js_fn_body(APP_JS, "function renderCalendarCard(");
         assert!(
-            render_fn.contains("actions.style.display = 'none'"),
-            "cancelled events should hide RSVP actions"
+            render_fn.contains("const showActions = event.method === 'REQUEST';"),
+            "desktop RSVP actions must use a REQUEST-only allowlist"
         );
     }
 
@@ -8035,19 +8029,11 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn mobile_app_js_calendar_card_hides_actions_for_cancelled_and_publish() {
-        let start = MOBILE_APP_JS
-            .find("function renderCalendarCard(")
-            .expect("renderCalendarCard must exist");
-        let render_fn = &MOBILE_APP_JS[start..start + 2600];
+    fn mobile_app_js_shows_rsvp_actions_only_for_request_events() {
+        let render_fn = js_fn_body(MOBILE_APP_JS, "function renderCalendarCard(");
         assert!(
-            render_fn.contains("=== 'CANCEL'"),
-            "cancelled events must hide RSVP actions, mirroring desktop"
-        );
-        assert!(
-            render_fn.contains("!== 'PUBLISH'"),
-            "PUBLISH events (no attendee to respond as — server never sets \
-             user_rsvp_status for them, see routes.rs get_email) must also hide RSVP actions"
+            render_fn.contains("const showActions = event.method === 'REQUEST';"),
+            "mobile RSVP actions must use a REQUEST-only allowlist"
         );
     }
 
