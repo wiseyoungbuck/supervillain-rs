@@ -6520,6 +6520,44 @@ white   = '#fdf6e3'
         );
     }
 
+    // ceph remaining gap (pinned-body late image): under height-pinned sender
+    // CSS (html,body{height:100%}, common in email templates) a late-loading
+    // image grows body.scrollHeight but NOT body's border-box, so the
+    // ResizeObserver above never fires and the iframe stays clipped at the
+    // partial "top 10%" height the load burst measured. The fix re-measures on
+    // each image's load/error event (independent of the body border-box the RO
+    // watches). These code-shaped asserts pin the fix so a future edit can't
+    // silently drop it; the real runtime behavior is proven by the Node test
+    // tests/email_iframe_test.cjs (wired into cargo test via
+    // tests/email_iframe_test.rs), which extracts this function and drives it
+    // against a mock DOM.
+    #[test]
+    fn app_js_size_iframe_remeasures_on_image_load_for_pinned_body() {
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        assert!(
+            block.contains("querySelectorAll('img')"),
+            "sizeIframeToContent must query the iframe's images so a late-loading image can trigger a re-measure (ceph pinned-body gap)"
+        );
+        assert!(
+            block.contains("addEventListener('load', grow"),
+            "sizeIframeToContent must re-measure via the grow (only-grow) path on image load — a late image must fit, never clip (ceph pinned-body gap)"
+        );
+        assert!(
+            block.contains("addEventListener('error', observerFn"),
+            "sizeIframeToContent must route image error through the settled observer path so a broken image can reclaim reserved height (ceph pinned-body gap)"
+        );
+        assert!(
+            block.contains("AbortController") && block.contains("{ signal: ac.signal }"),
+            "sizeIframeToContent must gate image listeners on an AbortController signal so re-render can remove them and avoid pinning the previous email's DOM across navigations (ceph pinned-body gap)"
+        );
+        // The cleanup must actually fire on re-render, mirroring _ro.disconnect().
+        let render = js_fn_body(APP_JS, "function renderHtmlBodyIframe");
+        assert!(
+            render.contains("_imgLoadAc.abort()"),
+            "renderHtmlBodyIframe must abort the prior iframe's _imgLoadAc so never-firing images can't pin the previous email's DOM across navigations (ceph pinned-body gap)"
+        );
+    }
+
     #[test]
     fn mobile_app_js_renders_email_body_in_sandboxed_iframe() {
         assert!(

@@ -4966,6 +4966,10 @@ function renderHtmlBodyIframe(container, html, opts) {
     // email's DOM in memory across navigations.
     const oldIframe = container.querySelector('iframe.email-iframe');
     if (oldIframe && oldIframe._ro) oldIframe._ro.disconnect();
+    // Abort the prior iframe's image load/error listeners so never-firing
+    // images can't pin the previous email's DOM in memory across navigations
+    // (mirrors the _ro.disconnect() above; kata ceph remaining gap).
+    if (oldIframe && oldIframe._imgLoadAc) oldIframe._imgLoadAc.abort();
     container.replaceChildren();
     const iframe = document.createElement('iframe');
     iframe.setAttribute(
@@ -5244,6 +5248,31 @@ function sizeIframeToContent(iframe) {
             iframe._sized = true;
         } catch (_) { /* allow-same-origin should always succeed */ }
     }
+    // ceph remaining gap: a late-loading image (no explicit dimensions) grows
+    // body.scrollHeight but, under height-pinned sender CSS (html,body{height:
+    // 100%} — common in email templates), does NOT change body's border-box, so
+    // the ResizeObserver above never fires and the iframe stays clipped at the
+    // partial "top 10%" height the load burst measured. Re-measure on each
+    // image's load (grow-only burst: a late image must fit) and error (settled
+    // observer path: a broken image reclaiming reserved height may shrink)
+    // event — these fire independent of the body border-box the RO watches, so
+    // they catch the pinned-body case the RO cannot. An AbortController removes
+    // every listener at once on re-render (renderHtmlBodyIframe aborts
+    // _imgLoadAc) so never-firing images can't pin the previous email's DOM.
+    try {
+        const idoc = iframe.contentDocument;
+        if (idoc && idoc.querySelectorAll) {
+            const imgs = idoc.querySelectorAll('img');
+            if (imgs && imgs.length) {
+                const ac = new AbortController();
+                iframe._imgLoadAc = ac;
+                imgs.forEach((img) => {
+                    img.addEventListener('load', grow, { signal: ac.signal });
+                    img.addEventListener('error', observerFn, { signal: ac.signal });
+                });
+            }
+        }
+    } catch (_) { /* allow-same-origin should always succeed */ }
 }
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
