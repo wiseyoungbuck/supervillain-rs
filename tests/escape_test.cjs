@@ -61,6 +61,24 @@ function loadEscapeHtml() {
     return new Function('document', code)(makeDocument());
 }
 
+// escapeAttr builds on escapeHtml (escapeHtml, then encode " and '), so load
+// both together. Mirrors loadEscapeHtml's extraction + new Function pattern.
+function loadEscapeAttr() {
+    const htmlStart = APP_JS.indexOf('function escapeHtml(');
+    assert.notStrictEqual(htmlStart, -1, 'function escapeHtml( must exist in app.js');
+    const htmlClose = APP_JS.indexOf('\n}', htmlStart);
+    assert.notStrictEqual(htmlClose, -1, 'escapeHtml must close with a column-0 brace');
+    const attrStart = APP_JS.indexOf('function escapeAttr(');
+    assert.notStrictEqual(attrStart, -1, 'function escapeAttr( must exist in app.js');
+    const attrClose = APP_JS.indexOf('\n}', attrStart);
+    assert.notStrictEqual(attrClose, -1, 'escapeAttr must close with a column-0 brace');
+    const code = APP_JS.slice(htmlStart, htmlClose + 2) + '\n'
+               + APP_JS.slice(attrStart, attrClose + 2)
+               + '\nreturn { escapeAttr };';
+    // eslint-disable-next-line no-new-func
+    return new Function('document', code)(makeDocument());
+}
+
 test('escapeHtml neutralizes a script-tag payload (hp8w class)', () => {
     const { escapeHtml } = loadEscapeHtml();
     const out = escapeHtml('<img src=x onerror=alert(1)>');
@@ -75,4 +93,29 @@ test('escapeHtml neutralizes an entity-breaking payload', () => {
     const { escapeHtml } = loadEscapeHtml();
     const out = escapeHtml('a&b<c>d');
     assert.equal(out, 'a&amp;b&lt;c&gt;d');
+});
+
+test('escapeAttr neutralizes an attribute-breakout payload (yane class)', () => {
+    const { escapeAttr } = loadEscapeAttr();
+    // Double-quote breakout is the yane vector (" onmouseover="alert(1)). But
+    // an attribute can also be SINGLE-quoted, and escapeAttr's .replace(/'/g,
+    // '&#39;') is exactly the branch a regression could silently drop — so the
+    // payload carries BOTH quote kinds and both breakouts are asserted away.
+    const out = escapeAttr('" onmouseover="alert(1) \' onmouseover=\'alert(2)');
+    assert.ok(out.includes('&quot;'), 'double quotes must be encoded');
+    assert.ok(out.includes('&#39;'), 'single quotes must be encoded');
+    assert.ok(!out.includes('"onmouseover"'), 'no double-quote breakout pair survives');
+    assert.ok(!out.includes("'onmouseover'"), 'no single-quote breakout pair survives');
+    // no raw quotes of either kind survive
+    assert.equal((out.match(/["']/g) || []).length, 0);
+});
+
+test('escapeAttr composes on top of escapeHtml (tags inside an attribute)', () => {
+    // A tag-breakout payload ("><img ...>) in an attribute must have BOTH its
+    // tags neutralized (escapeHtml) AND its quotes encoded (escapeAttr) — the
+    // composed defense that the yane call site relies on.
+    const { escapeAttr } = loadEscapeAttr();
+    const out = escapeAttr('"><img src=x onerror=alert(1)>');
+    assert.ok(!out.includes('<img'), 'no live tag survives inside the attribute');
+    assert.ok(out.includes('&quot;'), 'the quote that broke out is encoded');
 });

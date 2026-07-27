@@ -5440,7 +5440,14 @@ function renderCalendarCard(event) {
         const attendeeList = event.attendees.map(a => {
             const name = a.name || a.email;
             const statusIcon = getStatusIcon(a.status);
-            return `<span class="attendee" title="${a.email}">${statusIcon} ${escapeHtml(name)}</span>`;
+            // statusIcon is trusted-by-construction (getStatusIcon returns one
+            // of four fixed <span> constants we control) — only a.email and
+            // name are attacker-controlled. a.email sits in an attribute, so it
+            // needs escapeAttr (escapeHtml doesn't encode quotes, and a crafted
+            // email like " onmouseover="alert(1) breaks out of title="…" at
+            // parse time — no hover required); name is text content, so
+            // escapeHtml suffices (kata yane).
+            return `<span class="attendee" title="${escapeAttr(a.email)}">${statusIcon} ${escapeHtml(name)}</span>`;
         }).join(', ');
         els.calAttendees.innerHTML = `<span class="label">Attendees:</span> ${attendeeList}`;
         els.calAttendees.style.display = 'block';

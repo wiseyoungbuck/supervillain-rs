@@ -7133,9 +7133,13 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_hides_rsvp_actions_for_cancelled_events() {
-        // Cancelled events should hide the RSVP buttons
-        let render_fn_pos = APP_JS.find("function renderCalendarCard").unwrap();
-        let render_fn = &APP_JS[render_fn_pos..render_fn_pos + 3000];
+        // Cancelled events should hide the RSVP buttons. Slice to the
+        // function's closing brace (js_fn_body) rather than a fixed byte
+        // window, so a documentation comment inside renderCalendarCard can't
+        // push the checked content past the window (the kata yane fix added
+        // such a comment documenting the statusIcon trusted-by-construction
+        // invariant).
+        let render_fn = js_fn_body(APP_JS, "function renderCalendarCard(");
         assert!(
             render_fn.contains("actions.style.display = 'none'"),
             "cancelled events should hide RSVP actions"
@@ -7277,6 +7281,19 @@ white   = '#fdf6e3'
             block.contains("clearTimeout(statusTimer)")
                 && block.contains("statusTimer = setTimeout"),
             "showStatus must clearTimeout the prior timer and reassign the handle"
+        );
+    }
+
+    #[test]
+    fn app_js_calendar_attendee_title_escapes_email() {
+        // yane: renderCalendarCard interpolates a.email into title="…". escapeHtml
+        // is insufficient in an attribute (no quote encoding), so the call site
+        // must use escapeAttr.
+        let block = js_fn_body(APP_JS, "function renderCalendarCard(");
+        assert!(
+            block.contains("escapeAttr(a.email)"),
+            "renderCalendarCard must escapeAttr the attendee email in the title \
+             attribute — a crafted email breaks out of an unescaped attribute"
         );
     }
 
