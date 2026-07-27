@@ -47,6 +47,42 @@ const FONT_JBM_BOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Bold.
 // Router
 // =============================================================================
 
+/// Response compression for the app shell + API JSON (kata 7dmx).
+///
+/// gzip only, applied as a layer on the whole router in `main`. The win is the
+/// phone-over-tailnet path: app.js (242 KB) → 67 KB, style.css (45 KB) → 8.5 KB,
+/// index.html (34 KB) → 6.5 KB — the text shell drops ~407 KB → ~83 KB, a
+/// ~324 KB saving on the cold-load transfer that matters over wireless.
+///
+/// Trade-off, stated honestly (measured, not assumed): gzip(app.js, level 6)
+/// costs ~2.9 ms of server CPU per request, which is MORE than app.js's ~0.13 ms
+/// JS parse — so over loopback-on-desktop, where the transfer saving is worth
+/// nothing (loopback is memory-speed), compression is a small net CPU cost,
+/// not a freebie. It's accepted because (a) that ~3 ms is paid only on a cold
+/// 200 response — the shell is `Cache-Control: no-cache`, so warm loads
+/// revalidate to a 304 with no body and no gzip — and (b) ~3 ms once per cold
+/// load is imperceptible against the ~100 ms human-perception threshold, while
+/// the phone path saves ~40-160 ms of transfer. If a future baseline shows even
+/// that cold-load cost matters on desktop, the answer is build-time
+/// pre-compression (a separate ticket — it would need a build.rs step, which
+/// breaks the no-build property this change deliberately preserves).
+///
+/// The behavioral test in tests/compression_test.rs pins that this layer
+/// actually gzips text on Accept-Encoding: gzip AND that the route headers the
+/// static routes depend on (Cache-Control: no-cache, the mobile_sw
+/// Service-Worker-Allowed scope header) survive the layer — tower-http must not
+/// strip them.
+pub fn compression_layer() -> tower_http::compression::CompressionLayer {
+    use tower_http::compression::CompressionLayer;
+    // gzip only (not brotli/deflate): universal client support, and per-request
+    // brotli's CPU cost would tax desktop-over-loopback (which gains nothing
+    // from compression) — the phone-over-tailnet path is the motivation
+    // (kata 7dmx), and gzip already takes app.js 243 KB → ~65 KB. Explicit
+    // .gzip(true) rather than relying on CompressionLayer::new()'s default
+    // algorithm set — pin the one we've measured.
+    CompressionLayer::new().gzip(true).no_br().no_deflate()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(accounts::router())
@@ -2036,6 +2072,11 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
+    // main.rs is the binary entry; embedding it here lets the form test pin
+    // that it actually wires the compression layer (the behavioral test in
+    // tests/compression_test.rs pins the layer gzips; this pins it's applied).
+    const MAIN_RS: &str = include_str!("main.rs");
+
     #[tokio::test]
     async fn index_html_contains_html() {
         let resp = index_html().await.into_response();
@@ -2089,6 +2130,68 @@ mod tests {
             .await
             .unwrap();
         assert!(!body.is_empty(), "style.css should not be empty");
+    }
+
+    #[test]
+    fn index_html_scripts_are_deferred() {
+        // 7dmx: the desktop shell's classic scripts (api.js, app.js) are
+        // parser-blocking — the browser must fetch+parse+execute app.js (243 KB)
+        // before DOMContentLoaded fires. `defer` lets the parser continue past
+        // them so the shell paints sooner; deferred classic scripts still
+        // execute in document order (api.js before app.js) and before
+        // DOMContentLoaded, so init()'s getElementById calls and its
+        // 'DOMContentLoaded' listener still run correctly. Mobile's app.js is
+        // type="module" (implicitly deferred) and is not affected.
+        assert!(
+            INDEX_HTML.contains(r#"<script src="api.js" defer>"#),
+            "desktop api.js must be deferred so it doesn't block the parser"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"<script src="app.js" defer>"#),
+            "desktop app.js (243 KB) must be deferred — it's the biggest parser block"
+        );
+    }
+
+    #[test]
+    fn index_html_preloads_body_font() {
+        // 7dmx: the body font (JetBrains Mono Regular, ~92 KB) is discovered
+        // only after style.css parses its @font-face. A <link rel=preload> in
+        // <head> starts the fetch in parallel with the CSS parse so text in a
+        // monospace fallback can swap in sooner. crossorigin is required for
+        // font preloads (fonts fetch in CORS mode). font-display: swap (pinned
+        // by style_css_font_face_uses_swap) makes the fallback show immediately.
+        assert!(
+            INDEX_HTML.contains(r#"rel="preload" href="/fonts/JetBrainsMono-Regular.woff2""#)
+                && INDEX_HTML.contains(r#"as="font""#)
+                && INDEX_HTML.contains(r#"crossorigin"#),
+            "index.html must preload the body font (Regular woff2) with as=font crossorigin"
+        );
+    }
+
+    #[test]
+    fn style_css_font_face_uses_swap() {
+        // 7dmx regression pin: font-display: swap makes text show in a
+        // monospace fallback immediately and swap when the font arrives (no
+        // FOIT for ~282 KB of font load). All three weights must keep it — a
+        // future edit that drops it on one face re-introduces invisible text.
+        let count = STYLE_CSS.matches("font-display: swap").count();
+        assert!(
+            count >= 3,
+            "all three @font-face rules must use font-display: swap (found {count})"
+        );
+    }
+
+    #[test]
+    fn main_wires_compression_layer() {
+        // 7dmx: the compression layer must actually be applied to the router
+        // in main, not just defined. The behavioral test in
+        // tests/compression_test.rs pins that the layer gzips + preserves
+        // headers; this pins that main wires it in (a layer defined but not
+        // applied compresses nothing).
+        assert!(
+            MAIN_RS.contains("compression_layer()"),
+            "main.rs must apply routes::compression_layer() to the router"
+        );
     }
 
     #[test]
@@ -3744,8 +3847,12 @@ mod tests {
 
     #[test]
     fn shared_api_js_loaded_by_both_bundles() {
+        // The desktop script tag is deferred (kata 7dmx) — `<script ... defer>`.
+        // defer preserves document-order execution (api.js before app.js) and
+        // runs before DOMContentLoaded, so the "load api.js before app.js"
+        // intent this test pins is unchanged; only the literal carries defer.
         assert!(
-            INDEX_HTML.contains(r#"<script src="api.js"></script>"#),
+            INDEX_HTML.contains(r#"<script src="api.js" defer></script>"#),
             "desktop index.html must load the shared api.js before app.js"
         );
         assert!(

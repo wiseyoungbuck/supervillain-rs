@@ -35,8 +35,19 @@ percent-encoding = "2"
 # inbound display, but outgoing mail goes to recipients whose clients may render
 # unsafely (defense in depth for the people we send to).
 ammonia = "4"
+# Response compression for the app shell + API JSON. Already a transitive dep
+# of axum 0.8 (resolved at 0.6.8); declaring it direct with compression-gzip
+# is a no-version-bump feature add. gzip (not brotli): universal client support,
+# and per-request brotli's CPU cost would tax desktop-over-loopback (which gains
+# nothing from compression) — the phone-over-tailnet path is the motivation
+# (kata 7dmx), and gzip takes app.js 242 KB → 67 KB (−72%), style.css −81%.
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 
 [dev-dependencies]
 tempfile = "3"
 # test-util enables tokio::time::pause for deterministic interval testing.
 tokio = { version = "1", features = ["test-util"] }
+# ServiceExt::oneshot for the compression behavioral test (tests/compression_test.rs).
+# Already a transitive dep of axum (resolved at 0.5.3); the `util` feature is the
+# only add.
+tower = { version = "0.5", features = ["util"] }
