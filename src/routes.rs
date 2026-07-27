@@ -8272,6 +8272,27 @@ white   = '#fdf6e3'
         );
     }
 
+    #[test]
+    fn desktop_unsub_reads_server_response_fields() {
+        // 9rg8: the server returns { success, archived, sender } but the desktop
+        // client reads archivedCount and opens unsubscribeUrl — both undefined.
+        // Assert the function uses the real response shape and has no dead
+        // unsubscribeUrl branch.
+        let block = js_fn_body(APP_JS, "async function unsubscribeAndArchiveAll(");
+        assert!(
+            block.contains(".archived"),
+            "desktop unsubscribeAndArchiveAll must read result.archived (the real server field), not result.archivedCount"
+        );
+        assert!(
+            !block.contains("archivedCount"),
+            "desktop unsubscribeAndArchiveAll must not reference archivedCount — the server never sends it"
+        );
+        assert!(
+            !block.contains("unsubscribeUrl"),
+            "desktop unsubscribeAndArchiveAll must not branch on unsubscribeUrl — the server never sends it and no List-Unsubscribe extraction exists"
+        );
+    }
+
     // =========================================================================
     // Offline banner (kata 115b, task A12)
     // =========================================================================

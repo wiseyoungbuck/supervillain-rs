@@ -3790,12 +3790,7 @@ async function unsubscribeAndArchiveAll() {
     try {
         const result = await api('POST', `/emails/${id}/unsubscribe-and-archive-all`);
 
-        if (result.unsubscribeUrl) {
-            window.open(result.unsubscribeUrl, '_blank');
-            showStatus(`Archived ${result.archivedCount} emails from ${result.sender}. Unsubscribe page opened.`, 'success');
-        } else {
-            showStatus(`Archived ${result.archivedCount} emails from ${result.sender}. No unsubscribe link found.`, 'warning');
-        }
+        showStatus(`Archived ${result.archived} emails from ${result.sender}.`, 'success');
         loadSplitCounts(); // resync with server truth
         maybeRefillEmails();
     } catch (err) {
