@@ -1933,11 +1933,15 @@ function renderMailboxes() {
         })
         .map(m => `
             <div class="mailbox-item ${state.currentMailbox?.id === m.id ? 'active' : ''}"
-                 data-id="${m.id}">
-                <span>${m.name}</span>
+                 data-id="${escapeAttr(m.id)}">
+                <span>${escapeHtml(m.name)}</span>
                 ${m.unreadEmails > 0 ? `<span class="unread-count">${m.unreadEmails}</span>` : ''}
             </div>
         `).join('');
+    // 1p0d: m.name / m.id are attacker-controlled (IMAP / shared / delegated
+    // mailbox names). escapeHtml the text content; escapeAttr the data-id
+    // attribute — escapeHtml alone doesn't encode quotes, so a crafted id
+    // could break out of the attribute.
 
     els.mailboxList.querySelectorAll('.mailbox-item').forEach(el => {
         el.addEventListener('click', () => {
