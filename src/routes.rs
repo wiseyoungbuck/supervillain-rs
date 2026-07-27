@@ -7443,6 +7443,30 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn app_js_render_mailboxes_escapes_name_and_id() {
+        // 1p0d: renderMailboxes interpolates ${m.name} (text content) and
+        // data-id="${m.id}" (attribute) raw into innerHTML, unlike every
+        // other list renderer. A folder/label name containing HTML (IMAP /
+        // shared / delegated mailbox) renders as live HTML in the sidebar.
+        // The name is text content so escapeHtml suffices; the id lives in a
+        // data-id attribute, where escapeHtml alone doesn't encode quotes, so
+        // the call site must use escapeAttr. Match code forms, not prose
+        // (roborev 336 #2).
+        let block = js_fn_body(APP_JS, "function renderMailboxes(");
+        assert!(
+            block.contains("escapeHtml(m.name)"),
+            "renderMailboxes must escapeHtml the mailbox name — it is \
+             attacker-controlled text content interpolated into innerHTML"
+        );
+        assert!(
+            block.contains("escapeAttr(m.id)"),
+            "renderMailboxes must escapeAttr the mailbox id in data-id — \
+             escapeHtml doesn't encode quotes, so a crafted id breaks out \
+             of the attribute"
+        );
+    }
+
+    #[test]
     fn app_js_renders_pending_accounts_in_selector() {
         // Pending (configured-but-unauthorized) accounts are now included in
         // GET /api/accounts; the sidebar must label them instead of rendering
