@@ -7,6 +7,13 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
     <link rel="stylesheet" href="style.css">
+    <!-- Preload the body font (kata 7dmx): the Regular weight is discovered
+         only after style.css parses its @font-face, so without this the ~92 KB
+         woff2 fetch starts late. rel=preload in <head> starts it in parallel
+         with the CSS parse; font-display: swap (in style.css) shows a
+         monospace fallback immediately and swaps in when this arrives.
+         crossorigin is required — fonts fetch in CORS mode. -->
+    <link rel="preload" href="/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
     <!-- The build id that served THIS page, stamped server-side by index_html
          (placeholder replaced at serve time). The deploy-refresh banner reads
          this as the boot build id so its comparison baseline is the build the
@@ -532,7 +539,14 @@
         </div>
     </div>
 
-    <script src="api.js"></script>
-    <script src="app.js"></script>
+    <!-- defer (kata 7dmx): classic scripts are parser-blocking — the browser
+         must fetch+parse+execute app.js (243 KB) before DOMContentLoaded.
+         defer lets the parser continue so the shell paints sooner. Deferred
+         classic scripts execute in document order (api.js before app.js) and
+         before DOMContentLoaded, so init()'s getElementById calls and its
+         'DOMContentLoaded' listener still run correctly. Mobile's app.js is
+         type="module" (implicitly deferred) and is unaffected. -->
+    <script src="api.js" defer></script>
+    <script src="app.js" defer></script>
 </body>
 </html>

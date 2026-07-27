@@ -134,7 +134,7 @@ async fn main() {
     // split-count requests.
     prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
 
-    let app = routes::router(state);
+    let app = routes::router(state).layer(routes::compression_layer());
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));
