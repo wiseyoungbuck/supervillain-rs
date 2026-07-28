@@ -73,7 +73,7 @@ test('sefy: compose view exposes Send and Close Draft', () => {
     const state = makeState({ view: 'compose' });
     const a = actionsFor(state, () => []);
     assert.ok(a.includes('send'), "compose view must offer Send (action 'send')");
-    assert.ok(a.includes('discard-draft'), "compose view must offer Close Draft (action 'discard-draft')");
+    assert.ok(a.includes('close-draft'), "compose view must offer Close Draft (action 'close-draft')");
 });
 
 test('sefy: detail view with a calendar event exposes an RSVP action', () => {
@@ -171,4 +171,22 @@ test('sefy: Remove Account is settings-only (not offered on list/detail) (robore
             `${view} view must not offer Remove Account — account teardown is settings-only (roborev 375)`,
         );
     }
+});
+
+test('sefy: unknown view falls back to the defensive global set (roborev 378 #6)', () => {
+    // commandsForView's default branch is the defensive fallback for an
+    // unrecognized view — the global set with no view-native commands. Pin
+    // that it returns the global actions and omits reply/rsvp/archive so a
+    // future view can't accidentally inherit a named branch's commands via
+    // the default (roborev 378 #6).
+    const state = makeState({ view: 'bogus', selectedIndex: 0, currentEmail: {} });
+    const a = actionsFor(state, () => []);
+    assert.ok(a.includes('compose'), 'default branch must offer the global Compose command');
+    assert.ok(a.includes('help'), 'default branch must offer the global Help command');
+    assert.ok(!a.includes('reply'), 'default branch must not offer Reply — that is detail-only');
+    assert.ok(
+        !a.some((x) => x.startsWith('rsvp')),
+        'default branch must not offer RSVP — that is detail + calendar-gated',
+    );
+    assert.ok(!a.includes('archive'), 'default branch must not offer Archive — that is view-native');
 });

@@ -3238,6 +3238,20 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Command palette shortcut (kata sefy): hoisted ABOVE the per-view
+    // early returns so Cmd+K reaches the palette from every screen —
+    // settings (wizard/insert/normal) and compose insert included — not
+    // just list/detail normal mode. The overlay checks above (help,
+    // palette, search, split modal) still take precedence, so Cmd+K never
+    // opens over an already-open overlay. Without this hoist the settings
+    // and compose branches of commandsForView were unreachable at runtime
+    // and the palette's show/hide invariant silently failed (roborev 378 #1/#2).
+    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        openCommandPalette();
+        e.preventDefault();
+        return;
+    }
+
     // Settings: wizard owns its own key logic across steps and modes.
     if (state.view === 'settings' && state.wizardActive) {
         handleWizardKey(e);
@@ -3342,13 +3356,6 @@ function handleKeyDown(e) {
     // Ctrl+1-9: jump to split tab
     if (e.ctrlKey && e.key >= '1' && e.key <= '9') {
         selectSplitByIndex(parseInt(e.key) - 1);
-        e.preventDefault();
-        return;
-    }
-
-    // Command palette shortcut
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        openCommandPalette();
         e.preventDefault();
         return;
     }
@@ -4482,7 +4489,13 @@ function openCommandPalette() {
 
 function closeCommandPalette() {
     els.commandPalette.classList.add('hidden');
-    setMode('normal');
+    // Only fall back to normal if the executed command didn't set its own
+    // mode — e.g. 'search' sets 'search', 'compose' ends in 'insert' via
+    // the compose-field focus listener. Unconditionally resetting to
+    // 'normal' clobbered openSearch's 'search' mode (the mode indicator
+    // read NORMAL while the search bar was open) and any future mode-gated
+    // logic would misfire on the palette path (roborev 378 #4).
+    if (state.mode === 'command') setMode('normal');
 }
 
 // Context-aware command palette (kata sefy, Superhuman Rule #5: make
@@ -4578,7 +4591,7 @@ function commandsForView(view) {
             // deletion and deliver persistence (roborev 375, Medium).
             return [
                 { name: 'Send', desc: 'Send email', shortcut: '\u2318\u23ce', action: 'send' },
-                { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'discard-draft' },
+                { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'close-draft' },
                 { name: 'Attach', desc: 'Attach a file', shortcut: 'a', action: 'attach' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
             ];
@@ -4632,7 +4645,7 @@ function executeCommand(action) {
         // path (Esc, here named escapeCompose), and the attachment picker
         // ('a' / Ctrl+Shift+A). No new handlers.
         case 'send': sendEmail(); break;
-        case 'discard-draft': escapeCompose(); break;
+        case 'close-draft': escapeCompose(); break;
         case 'attach': els.composeFileInput.click(); break;
         // RSVP (kata sefy): the detail palette offers these only behind the
         // calendarEvent gate; rsvpToEvent is the same function y/n/m call.

@@ -9097,14 +9097,18 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn palette_compose_view_exposes_send_and_discard() {
+    fn palette_compose_view_exposes_send_and_close_draft() {
         // Compose is the one screen the flat list served worst: no Send, no
-        // Discard Draft, no Attach — the only actions you want while drafting.
+        // Close Draft, no Attach — the only actions you want while drafting.
         // The compose branch of commandsForView must yield a Send command
-        // (action 'send') and a Close Draft command (action 'discard-draft'),
+        // (action 'send') and a Close Draft command (action 'close-draft'),
         // neither of which exists today (sefy RED). Assert against the compose
         // branch slice (not the whole body) so a future refactor that moves
         // Send into the detail branch can't keep this green (roborev 375).
+        // The action id is 'close-draft' (not 'discard-draft') because the
+        // command keeps the draft saved (kata wm57) — naming it 'discard'
+        // would invite a future "fix" to actually delete the draft
+        // (roborev 378 #3).
         let body = js_fn_body(APP_JS, "function commandsForView(");
         let compose = case_branch(body, "compose");
         assert!(
@@ -9112,8 +9116,8 @@ white   = '#fdf6e3'
             "the compose branch must expose a Send command (action 'send') (sefy)"
         );
         assert!(
-            compose.contains("action: 'discard-draft'"),
-            "the compose branch must expose a Close Draft command (action 'discard-draft') (sefy)"
+            compose.contains("action: 'close-draft'"),
+            "the compose branch must expose a Close Draft command (action 'close-draft') (sefy)"
         );
     }
 
@@ -9191,6 +9195,31 @@ white   = '#fdf6e3'
         assert!(
             list.contains("delete-split:"),
             "the list branch must emit a `delete-split:` action per split — splits are visible only on the list view, so Delete-Split belongs there (sefy/roborev 375)"
+        );
+    }
+
+    #[test]
+    fn palette_cmdk_reachable_from_every_view() {
+        // The palette's show/hide invariant (commandsForView agrees with the
+        // keydown gates) only holds if Cmd+K can actually open the palette on
+        // every view. The per-view early returns in handleKeyDown (settings
+        // wizard/insert/normal, compose insert) used to fire before the Cmd+K
+        // check, so the settings and compose branches of commandsForView
+        // were unreachable at runtime — dead code certified as live by the
+        // behavioral tests, which call getCommands() directly (roborev 378 #1/#2).
+        // Pin that the Cmd+K check (the openCommandPalette call) precedes the
+        // first per-view early return in handleKeyDown, so a future move of
+        // the check back below the per-view returns fails loudly.
+        let body = js_fn_body(APP_JS, "function handleKeyDown(");
+        let cmdk = body
+            .find("openCommandPalette()")
+            .expect("handleKeyDown must call openCommandPalette on Cmd+K (sefy)");
+        let first_per_view_return = body
+            .find("state.view === 'settings'")
+            .expect("handleKeyDown must have per-view early returns to gate (sefy)");
+        assert!(
+            cmdk < first_per_view_return,
+            "the Cmd+K check must precede the per-view early returns in handleKeyDown so the palette is reachable on every screen (roborev 378 #1/#2)"
         );
     }
 }
