@@ -7,8 +7,18 @@ static/Gemini_Generated_Image_*.png
 .antigravitycli/
 .claude/scheduled_tasks.lock
 
+# Playwright e2e toolchain (tests/e2e/ specs are committed; the toolchain is
+# machine-local and installed on demand by tests/e2e_test.rs via npx).
+node_modules/
+/test-results/
+/playwright-report/
+/playwright/.cache/
+blob-report/
+
 # Share Claude Code permission allowlist across collaborators; the user's
 # global gitignore excludes .claude/settings.local.json by default, so
 # this rule re-includes it for this repo.
 !.claude/settings.local.json
 .kata.local.toml
+!package.json
+!package-lock.json
