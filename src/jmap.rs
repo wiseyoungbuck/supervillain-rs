@@ -1726,12 +1726,42 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     Ok(Some(ics_data))
 }
 
+/// `Err(CalendarAuthUnconfigured)` if no CalDAV app password is configured.
+/// Called at the top of every CalDAV function so a missing credential is
+/// surfaced as a named, actionable error *before* any HTTP request — not
+/// swallowed as a 401 + `Ok(false)` + `warn!` (the bug that rotted silently for
+/// months). Returns the `caldav_auth_header` (`Basic <base64(user:pass)>`) for
+/// the call to send.
+fn require_caldav_auth(s: &JmapSession) -> Result<&str, Error> {
+    if s.caldav_auth_header.is_empty() {
+        Err(Error::CalendarAuthUnconfigured)
+    } else {
+        Ok(&s.caldav_auth_header)
+    }
+}
+
+/// Turn a non-2xx CalDAV response into an honest `Err` (not `Ok(false)`).
+/// 401/403 → `Error::Auth`: the app password is present but wrong/revoked, an
+/// actionable auth failure the UI surfaces as 401. Anything else →
+/// `Error::Internal` with the status. The response body is logged at WARN for
+/// operator debugging — it never reaches the client, since both `Error::Auth`
+/// and `Error::Internal` redact their detail in `IntoResponse`.
+fn caldav_failure(method: &str, url: &str, status: reqwest::StatusCode, body: &str) -> Error {
+    tracing::warn!("CalDAV {method} {url} failed: {status} — {body}");
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        Error::Auth(format!("CalDAV {method} rejected ({status})"))
+    } else {
+        Error::Internal(format!("CalDAV {method} {url} failed: {status}"))
+    }
+}
+
 /// Fetch the current calendar event from CalDAV by UID.
 /// Returns a parsed CalendarEvent, or None if the event doesn't exist.
 pub async fn get_calendar_event(
     s: &JmapSession,
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
         "{}/dav/calendars/user/{}/Default/{}.ics",
         s.caldav_base, s.username, uid
@@ -1740,12 +1770,19 @@ pub async fn get_calendar_event(
     let resp = s
         .client
         .get(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
         .await?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    // 404 = not stored yet is a legitimate "no event", not a failure — the
+    // get_email caller degrades to the email ICS. Other non-2xx surface.
+    if status.as_u16() == 404 {
         return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("GET", &caldav_url, status, &body));
     }
 
     let ics_data = resp.text().await?;
@@ -1758,6 +1795,8 @@ pub async fn add_to_calendar(
     uid: &str,
     only_if_new: bool,
 ) -> Result<bool, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     // Strip METHOD before storing — RFC 4791: stored calendar objects must not
     // contain METHOD (it's an iTIP transport property, not a storage property)
     let ics_data = calendar::strip_method(ics_data);
@@ -1773,7 +1812,7 @@ pub async fn add_to_calendar(
     let mut req = s
         .client
         .put(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .header("Content-Type", "text/calendar; charset=utf-8");
 
     // If-None-Match: * means "only create, don't overwrite existing"
@@ -1784,16 +1823,26 @@ pub async fn add_to_calendar(
     let resp = req.body(ics_data).send().await?;
 
     let status = resp.status();
+    // If-None-Match: * + 412 Precondition Failed means the event already
+    // exists. For only_if_new (the only path that sends the header) that's the
+    // desired idempotent outcome — the event is in the calendar — not a
+    // failure. Returning Ok(true) keeps the auto-add caller from logging a
+    // spurious error on the benign lost-race; the explicit-add caller
+    // (only_if_new = false, no If-None-Match) never sees a 412.
+    if only_if_new && status.as_u16() == 412 {
+        return Ok(true);
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("CalDAV PUT {caldav_url} failed: {status} — {body}");
-        return Ok(false);
+        return Err(caldav_failure("PUT", &caldav_url, status, &body));
     }
 
     Ok(true)
 }
 
 pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
         "{}/dav/calendars/user/{}/Default/{}.ics",
         s.caldav_base,
@@ -1804,21 +1853,37 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
     let resp = s
         .client
         .delete(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
         .await?;
 
     let status = resp.status();
+    // DELETE is idempotent: 404 (already gone) is the desired end state, not a
+    // failure. Surfacing it as Err would make a CANCEL for an already-removed
+    // event or a double-decline 500.
+    if status.as_u16() == 404 {
+        return Ok(true);
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("CalDAV DELETE {caldav_url} failed: {status} — {body}");
-        return Ok(false);
+        return Err(caldav_failure("DELETE", &caldav_url, status, &body));
     }
 
     Ok(true)
 }
 
-pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -> Option<String> {
+/// Read a stored event's attendee PARTSTAT for `attendee_email` from CalDAV.
+/// Returns `Ok(None)` when the event isn't stored (404) or has no matching
+/// attendee; `Err(CalendarAuthUnconfigured)` when no app password is set; and
+/// `Err` (auth/internal) on other non-2xx — surfacing the failure rather than
+/// the old silent `None`.
+pub async fn get_rsvp_status(
+    s: &JmapSession,
+    uid: &str,
+    attendee_email: &str,
+) -> Result<Option<String>, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
         "{}/dav/calendars/user/{}/Default/{}.ics",
         s.caldav_base,
@@ -1826,33 +1891,24 @@ pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -
         percent_encode_path(uid)
     );
 
-    let resp = match s
+    let resp = s
         .client
         .get(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("CalDAV GET failed for {uid}: {e}");
-            return None;
-        }
-    };
+        .await?;
 
-    if !resp.status().is_success() {
-        return None;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("GET", &caldav_url, status, &body));
     }
 
-    let ics_data = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("CalDAV GET body read failed for {uid}: {e}");
-            return None;
-        }
-    };
-
-    attendee_status_from_ics(&ics_data, attendee_email)
+    let ics_data = resp.text().await?;
+    Ok(attendee_status_from_ics(&ics_data, attendee_email))
 }
 
 /// Parse ICS data and extract a specific attendee's PARTSTAT.
@@ -4035,6 +4091,51 @@ END:VCALENDAR";
             rec[1].authorization.as_deref(),
             Some(expected.as_str()),
             "remove_from_calendar must use Basic auth with the app password"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_get_rsvp_status_uses_basic_auth_and_refuses_without_app_password() {
+        // `get_rsvp_status` is the fourth CalDAV call (kata m5yp "done when":
+        // all four must use Basic + surface CalendarAuthUnconfigured). With an
+        // app password it sends Basic; without, it returns
+        // Err(CalendarAuthUnconfigured) and issues no request.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base.clone();
+        let expected = caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass");
+
+        let _ = get_rsvp_status(&sess, "uid-m5yp", "user@fastmail.com").await;
+        {
+            let rec = recorded.lock().unwrap();
+            assert_eq!(rec.len(), 1, "one CalDAV GET expected, got {rec:?}");
+            assert_eq!(rec[0].method, "GET");
+            assert_eq!(
+                rec[0].authorization.as_deref(),
+                Some(expected.as_str()),
+                "get_rsvp_status must use Basic auth with the app password"
+            );
+        }
+
+        // Now without an app password: named error, no HTTP.
+        let (base2, recorded2) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, Vec::new()).await;
+        let mut sess2 = JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
+        sess2.caldav_base = base2;
+        let result = get_rsvp_status(&sess2, "uid-m5yp", "user@fastmail.com").await;
+        let err = result.expect_err("missing app password must surface, not Ok(None)");
+        assert!(
+            matches!(err, Error::CalendarAuthUnconfigured),
+            "expected CalendarAuthUnconfigured, got {err:?}"
+        );
+        assert!(
+            recorded2.lock().unwrap().is_empty(),
+            "no HTTP request may be issued when the app password is unconfigured"
         );
     }
 }

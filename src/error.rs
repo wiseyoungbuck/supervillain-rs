@@ -51,6 +51,15 @@ impl fmt::Display for Error {
     }
 }
 
+/// The actionable client-facing message for `Error::CalendarAuthUnconfigured`.
+/// Used both by `IntoResponse` (the 400 body for the explicit RSVP / add-to-
+/// calendar routes) and by the fire-and-forget spawned calendar writers in
+/// `get_email` (which can't return an HTTP response, so they push this to the
+/// account-error banner instead). One constant so the banner and the 400
+/// body can't drift.
+pub const CALENDAR_AUTH_UNCONFIGURED_MSG: &str =
+    "Fastmail calendar sync needs an app password — add one in Settings";
+
 impl std::error::Error for Error {}
 
 impl From<reqwest::Error> for Error {
@@ -85,7 +94,7 @@ impl IntoResponse for Error {
             // actionable instead of opaque.
             Error::CalendarAuthUnconfigured => (
                 StatusCode::BAD_REQUEST,
-                "Fastmail calendar sync needs an app password — add one in Settings".to_string(),
+                CALENDAR_AUTH_UNCONFIGURED_MSG.to_string(),
             ),
             Error::NotConnected => (
                 StatusCode::SERVICE_UNAVAILABLE,

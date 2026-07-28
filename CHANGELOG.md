@@ -4,6 +4,27 @@ Retrospective record of shipped work. Append-only; phases bundle features that
 shipped together for sequencing reasons, not necessarily for architectural
 ones.
 
+## Fastmail CalDAV uses an app password (Basic), not the API token
+
+Fastmail's CalDAV endpoint rejects the JMAP/MCP-only API token (Bearer) with
+"Not a valid protocol for this access token," so every calendar write
+silently 401'd — accepted invites never reached the Morgen-synced calendar.
+The two credentials are now modeled honestly: `AccountConfig::Fastmail` gains
+an `app-password` field and `JmapSession` carries a separate
+`caldav_auth_header` (`Basic <base64(username:app_password)>`) plus a
+`caldav_base` URL field (one constant, not four inline literals). All four
+CalDAV functions (`add_to_calendar`, `remove_from_calendar`,
+`get_calendar_event`, `get_rsvp_status`) authenticate with Basic. A missing
+app password returns a named `Error::CalendarAuthUnconfigured` *before* any
+HTTP request and surfaces to the UI (the RSVP / add-to-calendar response via
+`?`; the auto-add-on-open spawned tasks via the account-error banner, deduped)
+instead of the old `Ok(false)` + `warn!` swallow that reported success while
+the write failed. Non-2xx CalDAV responses now surface as `Err` (401/403 →
+`Auth`, else `Internal`) rather than `Ok(false)`; the benign 412 "already
+exists" (only_if_new) and 404-on-delete cases stay `Ok`. Existing configs
+without `app-password` load fine and surface the error on the first calendar
+write. The settings form and add-account wizard gained an App password input.
+
 ## Configurable bind address, loopback by default
 
 The server binds `127.0.0.1:8000` unless `SUPERVILLAIN_BIND` says otherwise —

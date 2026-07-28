@@ -923,7 +923,14 @@ async fn get_email(
                             if let Err(e) =
                                 provider::add_to_calendar(&s, &ics_clone, &uid, true).await
                             {
-                                tracing::warn!("Calendar auto-add failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "auto-add",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -944,7 +951,14 @@ async fn get_email(
                             if let Err(e) =
                                 provider::add_to_calendar(&s, &ics_clone, &uid, false).await
                             {
-                                tracing::warn!("Calendar update failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "update",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -980,7 +994,14 @@ async fn get_email(
                         if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                             let s = s_lock.read().await;
                             if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
-                                tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "auto-remove",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1376,6 +1397,37 @@ fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str
         }
     }
     fallback.to_string()
+}
+
+/// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
+/// (the auto-add / update / auto-remove tasks in `get_email`). These tasks
+/// have no HTTP response to attach to, so a config-state failure
+/// (`CalendarAuthUnconfigured`) is pushed to the account-error banner —
+/// deduped via `push_error_if_absent` so every email open against a
+/// misconfigured account doesn't stack another identical banner — while
+/// genuinely transient errors (network, 5xx) stay as a `warn!` log line.
+/// This is the auto-add-on-open half of the kata m5yp swallow fix; the
+/// RSVP / explicit-add half propagates through the route's `?`.
+async fn surface_caldav_spawn_failure(
+    state: &AppState,
+    account: &str,
+    uid: &str,
+    op: &str,
+    err: Error,
+) {
+    if matches!(err, Error::CalendarAuthUnconfigured) {
+        accounts::push_error_if_absent(
+            state,
+            crate::types::AccountError {
+                account: account.to_string(),
+                provider: "fastmail".into(),
+                error: crate::error::CALENDAR_AUTH_UNCONFIGURED_MSG.into(),
+            },
+        )
+        .await;
+    } else {
+        tracing::warn!("Calendar {op} failed for {uid}: {err}");
+    }
 }
 
 async fn rsvp(
@@ -2694,6 +2746,47 @@ mod tests {
         assert!(
             INDEX_HTML.contains(r#"data-provider="outlook,gmail""#),
             "OAuth shared fields must declare visibility via data-provider"
+        );
+    }
+
+    #[test]
+    fn fastmail_settings_and_wizard_have_app_password_input() {
+        // kata m5yp: CalDAV needs a separate app password (the API token is
+        // JMAP-only). The edit form and the wizard must both collect it, and
+        // app.js must send it in the upsert payload — otherwise the user can
+        // never configure the credential the calendar write now requires.
+        assert!(
+            INDEX_HTML.contains(r#"id="acct-app-password""#),
+            "account edit form must have an App password input for Fastmail"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="wiz-app-password""#),
+            "add-account wizard must have an App password input for Fastmail"
+        );
+        // Both inputs must be gated to the fastmail provider via data-provider
+        // / data-wiz-field so they don't render for Outlook/Gmail.
+        let acct_field = INDEX_HTML
+            .split(r#"id="acct-app-password""#)
+            .next()
+            .unwrap_or("")
+            .rsplit_once("data-provider=")
+            .map(|(_, attrs)| attrs.split('"').nth(1).unwrap_or(""))
+            .unwrap_or("");
+        assert_eq!(
+            acct_field, "fastmail",
+            "acct-app-password must be data-provider=\"fastmail\""
+        );
+        assert!(
+            APP_JS.contains("'app-password': els.acctAppPassword.value"),
+            "saveAccount must send app-password in the Fastmail payload"
+        );
+        assert!(
+            APP_JS.contains(r#"'wiz-app-password':  'app-password'"#),
+            "wizard field map must route wiz-app-password into the app-password cache key"
+        );
+        assert!(
+            APP_JS.contains(r#"'app-password':  'App password'"#),
+            "wizard field labels must include App password"
         );
     }
 

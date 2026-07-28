@@ -20,8 +20,9 @@ supervillain
 First run opens `http://127.0.0.1:8000` and launches the **add-account wizard**:
 
 1. **Pick a provider** — Gmail, Outlook, or Fastmail (`1`/`2`/`3` or click).
-2. **Paste your keys** — Fastmail needs an API token from *Settings > Privacy &
-   Security > Integrations*; Gmail and Outlook need an OAuth Client ID (and
+2. **Paste your keys** — Fastmail needs an **API token** (JMAP) *and* an
+   **app password** (CalDAV/calendar sync) from *Settings > Privacy &
+   Security*; Gmail and Outlook need an OAuth Client ID (and
    Client Secret for Gmail) — see
    [Google Cloud setup](#google-cloud-app-registration) or
    [Azure AD setup](#azure-ad-app-registration).
@@ -195,7 +196,8 @@ default-account = fastmail
 [fastmail]
 provider = fastmail
 username = you@fastmail.com
-api-token = fmu1-xxxxxxxxxxxxxxxx
+api-token = fmu1-xxxxxxxxxxxxxxxx     # JMAP (Bearer)
+app-password = xxxx-xxxx-xxxx-xxxx    # CalDAV (Basic); optional but calendar sync needs it
 
 [outlook]
 provider = outlook
@@ -468,7 +470,7 @@ Each provider module exports plain functions (`jmap::query_emails()`, `outlook::
 | Backend | Rust, Axum 0.8, Tokio, reqwest, chrono + chrono-tz, iana-time-zone |
 | Frontend | Vanilla JS, CSS3 (no framework, no build step), `Intl.DateTimeFormat` for TZ-aware rendering |
 | Protocols | JMAP ([RFC 8620](https://www.rfc-editor.org/rfc/rfc8620), [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621)), Microsoft Graph (Outlook), Gmail REST + Google Calendar v3, iCalendar / iTIP ([RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) / [5546](https://www.rfc-editor.org/rfc/rfc5546)) |
-| Auth | Bearer token (Fastmail), OAuth2 PKCE (Outlook, Gmail) |
+| Auth | Bearer token (Fastmail JMAP) + Basic app password (Fastmail CalDAV), OAuth2 PKCE (Outlook, Gmail) |
 | Providers | Fastmail, Outlook, Gmail — full email + calendar parity across all three |
 
 ## API
@@ -557,7 +559,7 @@ when `seen_system` doesn't match the current OS TZ.
 **Upsert an account** (`POST /api/accounts/{id}` — new id creates, existing updates):
 
 ```json
-{ "provider": "fastmail", "username": "you@fastmail.com", "api-token": "fmu1-..." }
+{ "provider": "fastmail", "username": "you@fastmail.com", "api-token": "fmu1-...", "app-password": "xxxx-xxxx-xxxx-xxxx" }
 ```
 ```json
 { "id": "fastmail", "provider": "fastmail", "email": "you@fastmail.com",

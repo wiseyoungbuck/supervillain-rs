@@ -501,16 +501,16 @@ pub async fn rsvp(
                 );
             }
 
-            // CalDAV: decline = remove, accept/tentative = upsert with updated PARTSTAT
+            // CalDAV: decline = remove, accept/tentative = upsert with updated
+            // PARTSTAT. Propagate the error (kata m5yp): a missing/wrong app
+            // password must surface to the RSVP response via the route's `?`,
+            // not be `warn!`-ed past an `Ok(())` so the UI reports success
+            // while Morgen never sees the event.
             if *status == RsvpStatus::Declined {
-                if let Err(e) = jmap::remove_from_calendar(s, &event.uid).await {
-                    tracing::warn!("CalDAV delete failed for {}: {e}", event.uid);
-                }
+                jmap::remove_from_calendar(s, &event.uid).await?;
             } else {
                 let updated_ics = calendar::update_partstat(ics_data, attendee_email, status);
-                if let Err(e) = jmap::add_to_calendar(s, &updated_ics, &event.uid, false).await {
-                    tracing::warn!("CalDAV write failed for {}: {e}", event.uid);
-                }
+                jmap::add_to_calendar(s, &updated_ics, &event.uid, false).await?;
             }
         }
         ProviderSession::Outlook(s) => {

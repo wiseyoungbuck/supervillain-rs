@@ -1159,6 +1159,22 @@ pub async fn push_error(state: &AppState, err: AccountError) {
     state.account_errors.write().await.push(err);
 }
 
+/// Push `err` to the banner unless an identical one is already present. Used
+/// by fire-and-forget spawned calendar writers (`get_email`'s auto-add /
+/// update / auto-remove tasks) that can't surface a CalDAV failure to a
+/// specific HTTP response — without dedup, every email open against an
+/// account missing an app password would stack another identical banner.
+/// Identical = same `account` + `provider` + `error` text.
+pub async fn push_error_if_absent(state: &AppState, err: AccountError) {
+    let mut errors = state.account_errors.write().await;
+    let already = errors
+        .iter()
+        .any(|e| e.account == err.account && e.provider == err.provider && e.error == err.error);
+    if !already {
+        errors.push(err);
+    }
+}
+
 /// Apply a default-when-empty rule to the registry. Pure helper so the
 /// "empty default → promote new account" branch is testable.
 fn promote_default_if_empty(reg: &mut AccountRegistry, id: &str) {
@@ -1659,6 +1675,137 @@ mod tests {
                 assert_eq!(email.as_deref(), Some("alice@gmail.com"));
             }
             _ => panic!("expected gmail"),
+        }
+    }
+
+    #[test]
+    fn app_password_round_trips_through_ini_and_is_omitted_when_absent() {
+        // Set: serialize emits `app-password = ...`, parse reads it back.
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "fm".to_string(),
+            AccountConfig::Fastmail {
+                username: "alice@fm.com".into(),
+                api_token: "fmu1-tok".into(),
+                app_password: Some("ap-pass-123".into()),
+                signature: None,
+            },
+        );
+        let cfg = ConfigFile {
+            default_account: None,
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        assert!(
+            s.contains("app-password = ap-pass-123"),
+            "serialize must emit app-password when set: {s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty());
+        match parsed.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(app_password.as_deref(), Some("ap-pass-123"));
+            }
+            _ => panic!("expected fastmail"),
+        }
+
+        // Absent: serialize omits the line entirely (no misleading empty
+        // `app-password =`), and parse reads it as None.
+        let cfg_absent = ConfigFile {
+            default_account: None,
+            accounts: {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "fm".to_string(),
+                    AccountConfig::Fastmail {
+                        username: "alice@fm.com".into(),
+                        api_token: "fmu1-tok".into(),
+                        app_password: None,
+                        signature: None,
+                    },
+                );
+                m
+            },
+        };
+        let s_absent = serialize_config(&cfg_absent);
+        assert!(
+            !s_absent.contains("app-password"),
+            "serialize must omit app-password when unset: {s_absent}"
+        );
+        let (parsed_absent, errors) = parse_config_str(&s_absent);
+        assert!(errors.is_empty());
+        match parsed_absent.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(*app_password, None);
+            }
+            _ => panic!("expected fastmail"),
+        }
+    }
+
+    #[test]
+    fn app_password_absent_in_legacy_config_loads_as_none_not_crash() {
+        // Backward compat: a config predating app-password (no line at all)
+        // must parse to None, not error. Calendar writes surface
+        // CalendarAuthUnconfigured on first use instead of failing at load.
+        let (cfg, errors) = parse_config_str(
+            "[fm]\nprovider = fastmail\nusername = alice@fm.com\napi-token = fmu1-tok\n",
+        );
+        assert!(
+            errors.is_empty(),
+            "legacy config must parse clean: {errors:?}"
+        );
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(*app_password, None);
+            }
+            _ => panic!("expected fastmail"),
+        }
+    }
+
+    #[test]
+    fn merge_secrets_preserves_app_password_on_empty_and_replaces_on_set() {
+        // Empty incoming app-password = "keep existing" (settings form never
+        // echoes secrets). Non-empty = replace.
+        let existing = AccountConfig::Fastmail {
+            username: "alice@fm.com".into(),
+            api_token: "fmu1-tok".into(),
+            app_password: Some("old-pass".into()),
+            signature: None,
+        };
+        let incoming_keep = AccountConfig::Fastmail {
+            username: "alice@fm.com".into(),
+            api_token: String::new(),
+            app_password: None,
+            signature: None,
+        };
+        let merged_keep = merge_secrets(&existing, incoming_keep);
+        match merged_keep {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(
+                    app_password.as_deref(),
+                    Some("old-pass"),
+                    "empty incoming must preserve"
+                );
+            }
+            _ => panic!("expected fastmail"),
+        }
+
+        let incoming_replace = AccountConfig::Fastmail {
+            username: "alice@fm.com".into(),
+            api_token: String::new(),
+            app_password: Some("new-pass".into()),
+            signature: None,
+        };
+        let merged_replace = merge_secrets(&existing, incoming_replace);
+        match merged_replace {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(
+                    app_password.as_deref(),
+                    Some("new-pass"),
+                    "non-empty incoming must replace"
+                );
+            }
+            _ => panic!("expected fastmail"),
         }
     }
 
