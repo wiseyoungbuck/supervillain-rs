@@ -49,10 +49,22 @@ function workspaceBinary() {
     return 'supervillain';
   }
   const builtAt = fs.statSync(built).mtimeMs;
+  // The binary embeds the whole frontend at compile time (include_str! of
+  // static/*.js etc.), so the scan must cover static/ — the dominant edit
+  // type for what these specs assert — plus build.rs, and recurse: a nested
+  // edit (src/platform/*.rs, static/mobile/*.js) doesn't bump its parent
+  // directory's mtime (roborev 390).
   let newestSrc = 0;
-  for (const f of fs.readdirSync(path.join(__dirname, 'src'))) {
-    const m = fs.statSync(path.join(__dirname, 'src', f)).mtimeMs;
-    if (m > newestSrc) newestSrc = m;
+  for (const root of ['src', 'static', 'build.rs']) {
+    const rootPath = path.join(__dirname, root);
+    if (!fs.existsSync(rootPath)) continue;
+    const entries = fs.statSync(rootPath).isDirectory()
+      ? fs.readdirSync(rootPath, { recursive: true }).map((f) => path.join(rootPath, f))
+      : [rootPath];
+    for (const f of entries) {
+      const st = fs.statSync(f);
+      if (st.isFile() && st.mtimeMs > newestSrc) newestSrc = st.mtimeMs;
+    }
   }
   console.log(`[e2e] SUT: ${built}`);
   if (newestSrc > builtAt) {

@@ -5391,7 +5391,16 @@ function sizeIframeToContent(iframe) {
                 }
             } else if (h > cur) {
                 // Burst: only-grow, no epsilon guard (a genuine small
-                // correction must apply — see mode doc above).
+                // correction must apply — see mode doc above). A burst grow is
+                // a REAL content grow (image load / rAF / load — the downward
+                // ratchet never produces one), so it also ends the shrink
+                // episode: under pinned-body sender CSS the observer never
+                // fires and image events are the only cues, so without this
+                // reset a second legit erroring-image burst would get no
+                // escape-hatch re-measure and its blank space would persist
+                // for the life of the view (roborev 390).
+                iframe._shrinkStreak = 0;
+                iframe._shrinkEscapeCount = 0;
                 iframe.style.height = h + 'px';
             }
         } catch (_) { /* allow-same-origin should always succeed */ }
