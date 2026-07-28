@@ -2200,27 +2200,57 @@ mod tests {
     #[test]
     fn app_js_load_accounts_dismisses_boot_splash() {
         // qknk: loadAccounts is the first network fetch; the splash must
-        // dismiss on its success path (and its catch — pinned by the e2e
-        // behavior, this contract pins that the call exists in the slice).
-        // Slice the whole function so an explanatory comment alone can't
-        // satisfy it (roborev 336 #2).
+        // dismiss on BOTH its success path AND its catch path — a boot error
+        // that leaves the splash hung as a permanent mask is the failure this
+        // ticket explicitly calls out. Slicing the whole function and
+        // asserting the catch-path call (not just any hideBootSplash() in the
+        // slice) is the honest pin: deleting the catch-path call while keeping
+        // the success-path call must fail this test. The e2e spec
+        // (qknk-boot-splash-failure.spec.cjs) pins the same behavior in a real
+        // browser; this pins the code form so a comment can't satisfy it.
         let block = js_fn_body(APP_JS, "async function loadAccounts(");
         assert!(
             block.contains("hideBootSplash()"),
-            "desktop loadAccounts must call hideBootSplash() so the splash \
-             dismisses once the first account fetch resolves"
+            "desktop loadAccounts must call hideBootSplash() on success so the \
+             splash dismisses once the first account fetch resolves"
+        );
+        assert!(
+            block.contains("} catch (err) {")
+                && block[block.find("} catch (err) {").unwrap()..].contains("hideBootSplash()"),
+            "desktop loadAccounts must call hideBootSplash() in its catch block \
+             so a boot failure dismisses the splash instead of hanging on it forever"
+        );
+    }
+
+    #[test]
+    fn mobile_init_catch_dismisses_boot_splash_on_failure() {
+        // qknk: mobile's loadAccounts calls hideBootSplash() on its success
+        // path, but the FAILURE-path dismiss lives in init()'s try/catch
+        // AROUND the loadAccounts() call (mobile app.js: `try { await
+        // loadAccounts(); } catch (err) { hideBootSplash(); ... }`). Slice
+        // init and assert the catch-path call — the mobile_app_js_load_accounts
+        // test below only slices loadAccounts (success path); without this,
+        // deleting the init-catch dismiss would pass that test but re-introduce
+        // the permanent-mask bug on a mobile boot failure.
+        let block = js_fn_body(MOBILE_APP_JS, "async function init(");
+        assert!(
+            block.contains("} catch (err) {")
+                && block[block.find("} catch (err) {").unwrap()..].contains("hideBootSplash()"),
+            "mobile init must call hideBootSplash() in the catch around \
+             loadAccounts() so a boot failure dismisses the splash instead of \
+             hanging on it forever"
         );
     }
 
     #[test]
     fn mobile_app_js_load_accounts_dismisses_boot_splash() {
-        // qknk: same contract for the mobile shell — its loadAccounts is the
-        // first fetch and must dismiss the splash on resolution.
+        // qknk: mobile's loadAccounts success path must dismiss the splash
+        // (the failure path is pinned by mobile_init_catch_dismisses_boot_splash_on_failure).
         let block = js_fn_body(MOBILE_APP_JS, "async function loadAccounts(");
         assert!(
             block.contains("hideBootSplash()"),
-            "mobile loadAccounts must call hideBootSplash() so the splash \
-             dismisses once the first account fetch resolves"
+            "mobile loadAccounts must call hideBootSplash() on its success path \
+             so the splash dismisses once the first account fetch resolves"
         );
     }
 
