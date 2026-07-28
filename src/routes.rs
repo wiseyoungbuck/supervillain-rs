@@ -3098,6 +3098,7 @@ mod tests {
                 accounts::AccountConfig::Fastmail {
                     username: format!("{id}@example.com"),
                     api_token: "tok".into(),
+                    app_password: None,
                     signature: None,
                 },
             );
@@ -8976,6 +8977,76 @@ white   = '#fdf6e3'
         assert!(
             !block.contains("setTimeout"),
             "attachment clicks must be synchronous so Safari retains user activation"
+        );
+    }
+
+    // =========================================================================
+    // kata m5yp — route/provider boundary must surface CalDAV auth failure
+    //
+    // The RSVP and add-to-calendar route handlers propagate provider errors
+    // via `?`. Today the Fastmail arms of `provider::rsvp` / `add_to_calendar`
+    // swallow the CalDAV failure with `warn!` + Ok, so a missing app password
+    // never reaches the HTTP response. This test pins the contract those
+    // handlers rely on: a Fastmail session with no app password must yield
+    // Err(CalendarAuthUnconfigured) out of the provider layer (and issue no
+    // HTTP), so the `?` in the route actually surfaces it to the UI.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn route_layer_surfaces_caldav_auth_failure() {
+        let (base, recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+        let mut sess = crate::jmap::JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
+        sess.caldav_base = base;
+        // account_id = None so the RSVP flow's send_email short-circuits with
+        // NotConnected (warned, swallowed by provider::rsvp) without any
+        // network — isolating the test to the CalDAV-write failure path.
+        let mut session = provider::ProviderSession::Fastmail(Box::new(sess));
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
+                   DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        // add-to-calendar route path: provider::add_to_calendar must propagate.
+        let add_err = provider::add_to_calendar(&session, ics, "uid-m5yp", false)
+            .await
+            .expect_err(
+                "provider::add_to_calendar must surface CalendarAuthUnconfigured, not Ok(false)+warn!",
+            );
+        assert!(
+            matches!(add_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {add_err:?}"
+        );
+
+        // CANCEL / decline route path: provider::remove_from_calendar too.
+        let rm_err = provider::remove_from_calendar(&session, "uid-m5yp")
+            .await
+            .expect_err("provider::remove_from_calendar must surface CalendarAuthUnconfigured");
+        assert!(
+            matches!(rm_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {rm_err:?}"
+        );
+
+        // RSVP route path: provider::rsvp must propagate the CalDAV failure
+        // instead of `warn!`-ing it and returning Ok(()).
+        let event = test_calendar_event(vec!["user@fastmail.com"]);
+        let rsvp_err = provider::rsvp(
+            &mut session,
+            ics,
+            &event,
+            "user@fastmail.com",
+            &RsvpStatus::Accepted,
+            chrono_tz::Tz::UTC,
+        )
+        .await
+        .expect_err("provider::rsvp must surface CalendarAuthUnconfigured, not swallow it");
+        assert!(
+            matches!(rsvp_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {rsvp_err:?}"
+        );
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "no CalDAV HTTP request may be issued when the app password is unconfigured"
         );
     }
 }

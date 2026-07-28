@@ -13,7 +13,20 @@ pub enum Error {
     BadRequest(String),
     Conflict(String),
     Internal(String),
-    RateLimited { retry_after: Option<Duration> },
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+    /// A CalDAV calendar operation was attempted against a Fastmail account
+    /// that has no `app-password` configured.
+    ///
+    /// Fastmail's CalDAV endpoint rejects the JMAP/MCP-only API token (Bearer)
+    /// with "Not a valid protocol for this access token." CalDAV requires a
+    /// separate app password sent as HTTP Basic auth. A missing app password
+    /// is a config-state problem the user can act on (add an App password in
+    /// Settings), not a transient network blip — so the CalDAV functions
+    /// return this *before* issuing any HTTP request, and the caller surfaces
+    /// it to the UI instead of `warn!`-ing past an `Ok(false)`.
+    CalendarAuthUnconfigured,
 }
 
 impl fmt::Display for Error {
@@ -25,6 +38,10 @@ impl fmt::Display for Error {
             Error::NotFound(msg) => write!(f, "not found: {msg}"),
             Error::BadRequest(msg) => write!(f, "bad request: {msg}"),
             Error::Conflict(msg) => write!(f, "conflict: {msg}"),
+            Error::CalendarAuthUnconfigured => write!(
+                f,
+                "calendar auth unconfigured: Fastmail app password not set"
+            ),
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
             Error::RateLimited { retry_after } => match retry_after {
                 Some(d) => write!(f, "rate limited — retry after {}s", d.as_secs()),
@@ -62,6 +79,14 @@ impl IntoResponse for Error {
             Error::NotFound(msg) => (StatusCode::NOT_FOUND, format!("not found: {msg}")),
             Error::BadRequest(msg) => (StatusCode::BAD_REQUEST, format!("bad request: {msg}")),
             Error::Conflict(msg) => (StatusCode::CONFLICT, format!("conflict: {msg}")),
+            // Config-state, not auth: the credential is absent rather than
+            // rejected. 400 (not 401) so the UI treats it as a fixable setup
+            // step, and the message names the field to add so the banner is
+            // actionable instead of opaque.
+            Error::CalendarAuthUnconfigured => (
+                StatusCode::BAD_REQUEST,
+                "Fastmail calendar sync needs an app password — add one in Settings".to_string(),
+            ),
             Error::NotConnected => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "not connected to email server".into(),
@@ -170,6 +195,23 @@ mod tests {
         let (_, body) = response_status_and_body(Error::Auth("token fmu1-abc123xyz".into())).await;
         assert!(!body.contains("fmu1-abc123xyz"));
         assert!(body.contains("authentication failed"));
+    }
+
+    #[tokio::test]
+    async fn calendar_auth_unconfigured_returns_400_with_actionable_message() {
+        // Config-state, not auth: 400 (not 401) so the UI treats it as a
+        // fixable setup step. The message must name the field to add so the
+        // banner is actionable, and must not leak any secret.
+        let (status, body) = response_status_and_body(Error::CalendarAuthUnconfigured).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("app password"),
+            "body must name the field: {body}"
+        );
+        assert!(
+            body.contains("Settings"),
+            "body must point at Settings: {body}"
+        );
     }
 
     #[tokio::test]

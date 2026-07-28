@@ -574,7 +574,8 @@ mod tests {
     fn make_fastmail_session() -> ProviderSession {
         ProviderSession::Fastmail(Box::new(JmapSession::new(
             "user@fastmail.com",
-            "Bearer token",
+            "token",
+            Some("app-pass"),
         )))
     }
 

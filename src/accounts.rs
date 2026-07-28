@@ -30,6 +30,16 @@ pub enum AccountConfig {
         username: String,
         #[serde(rename = "api-token")]
         api_token: String,
+        /// Fastmail **app password** for CalDAV / CardDAV / IMAP / SMTP — the
+        /// credential CalDAV actually accepts (HTTP Basic auth). This is a
+        /// *different* secret from `api_token` (Bearer, JMAP/MCP-only):
+        /// Fastmail's API tokens have no CalDAV type, so a Bearer api-token
+        /// sent to `caldav.fastmail.com` is rejected with "Not a valid
+        /// protocol for this access token." `None`/empty both mean "not
+        /// configured" — calendar operations then surface
+        /// `Error::CalendarAuthUnconfigured` instead of failing silently.
+        #[serde(rename = "app-password", default)]
+        app_password: Option<String>,
         /// Per-account plain-text signature, prefilled into compose (never
         /// re-injected at send time). `None`/empty both mean "no signature" —
         /// see `AccountConfig::signature()`.
@@ -332,6 +342,13 @@ fn account_from_props(
         "fastmail" => Ok(AccountConfig::Fastmail {
             username: require("username")?,
             api_token: require("api-token")?,
+            // Optional: legacy configs predate this field. Empty/absent →
+            // None; calendar writes surface CalendarAuthUnconfigured on
+            // first use instead of crashing at load.
+            app_password: props
+                .get("app-password")
+                .map(|s| unescape_ini_multiline(s))
+                .filter(|s| !s.is_empty()),
             signature,
         }),
         "outlook" => Ok(AccountConfig::Outlook {
@@ -386,10 +403,17 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
         AccountConfig::Fastmail {
             username,
             api_token,
+            app_password,
             ..
         } => {
             lines.push(format!("username = {username}"));
             lines.push(format!("api-token = {api_token}"));
+            // Omit the line entirely when unset so a round-trip through a
+            // config without an app password is byte-stable, and so the file
+            // doesn't carry a misleading empty `app-password =`.
+            if let Some(p) = app_password {
+                lines.push(format!("app-password = {p}"));
+            }
         }
         AccountConfig::Outlook {
             client_id, email, ..
@@ -876,10 +900,15 @@ pub fn check_provider_change(
 pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountConfig {
     match (existing, new) {
         (
-            AccountConfig::Fastmail { api_token: old, .. },
+            AccountConfig::Fastmail {
+                api_token: old,
+                app_password: old_app,
+                ..
+            },
             AccountConfig::Fastmail {
                 username,
                 api_token: incoming,
+                app_password: incoming_app,
                 signature,
             },
         ) => AccountConfig::Fastmail {
@@ -888,6 +917,14 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 old.clone()
             } else {
                 incoming
+            },
+            // Same keep-on-empty rule as api-token: the settings form never
+            // echoes secrets, so an empty incoming app-password means "leave
+            // the stored one alone" rather than "clear it".
+            app_password: if incoming_app.as_deref().is_some_and(|p| !p.is_empty()) {
+                incoming_app
+            } else {
+                old_app.clone()
             },
             signature,
         },
@@ -1192,10 +1229,11 @@ async fn upsert_account(
             AccountConfig::Fastmail {
                 username,
                 api_token,
+                app_password,
                 ..
             } => {
                 let mut sess =
-                    crate::jmap::JmapSession::new(username, &format!("Bearer {api_token}"));
+                    crate::jmap::JmapSession::new(username, api_token, app_password.as_deref());
                 crate::jmap::connect(&mut sess)
                     .await
                     .map_err(|e| Error::BadRequest(format!("connection failed: {e}")))?;
@@ -1546,6 +1584,7 @@ mod tests {
         AccountConfig::Fastmail {
             username: username.into(),
             api_token: token.into(),
+            app_password: None,
             signature: None,
         }
     }
@@ -1635,6 +1674,7 @@ mod tests {
             AccountConfig::Fastmail {
                 username: "alice@fm.com".into(),
                 api_token: "tok".into(),
+                app_password: None,
                 signature: Some("Best,\nAlice\nAcme Inc.".into()),
             },
         );
@@ -1724,6 +1764,7 @@ mod tests {
                 AccountConfig::Fastmail {
                     username: "u@fm.com".into(),
                     api_token: "tok".into(),
+                    app_password: None,
                     signature: Some(sig.into()),
                 },
             );
@@ -1777,6 +1818,7 @@ mod tests {
                 AccountConfig::Fastmail {
                     username: "u@fm.com".into(),
                     api_token: "tok".into(),
+                    app_password: None,
                     signature: Some(sig.into()),
                 },
             );
@@ -1801,6 +1843,7 @@ mod tests {
         let acct = AccountConfig::Fastmail {
             username: "u@fm.com".into(),
             api_token: "tok".into(),
+            app_password: None,
             signature: Some(String::new()),
         };
         assert_eq!(acct.signature(), None);
@@ -2247,6 +2290,7 @@ api-token = tok
             AccountConfig::Fastmail {
                 username: "u@fm.com".into(),
                 api_token: "tok".into(),
+                app_password: None,
                 signature: Some("Best,\nAlice".into()),
             },
         );
@@ -2267,6 +2311,7 @@ api-token = tok
             AccountConfig::Fastmail {
                 username: "u@fm.com".into(),
                 api_token: "tok".into(),
+                app_password: None,
                 signature: Some(String::new()),
             },
         );
@@ -2600,6 +2645,7 @@ api-token = tok
             username: "u@fm.com".into(),
             // Empty api-token: merge_secrets must preserve the existing one.
             api_token: String::new(),
+            app_password: None,
             signature: Some("Cheers,\nBob".into()),
         };
 
@@ -2936,7 +2982,8 @@ api-token = tok
         // the account id is still present and unchanged.
         ProviderSession::Fastmail(Box::new(crate::jmap::JmapSession::new(
             username,
-            "Bearer test-token",
+            "test-token",
+            None,
         )))
     }
 
@@ -3107,6 +3154,7 @@ api-token = tok
             let incoming = AccountConfig::Fastmail {
                 username: "u@fm.com".into(),
                 api_token: String::new(), // empty => "keep whatever is current"
+                app_password: None,
                 signature: Some("from-A".into()),
             };
             upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
@@ -3121,6 +3169,7 @@ api-token = tok
         let incoming_b = AccountConfig::Fastmail {
             username: "u@fm.com".into(),
             api_token: "secret-from-B".into(),
+            app_password: None,
             signature: None,
         };
         upsert_account(
