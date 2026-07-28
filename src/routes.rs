@@ -9174,6 +9174,25 @@ white   = '#fdf6e3'
             "RSVP commands must come after (inside) the calendarEvent gate, not before it (sefy)"
         );
     }
+
+    #[test]
+    fn palette_list_view_exposes_delete_split_when_splits_exist() {
+        // deleteSplit's only call site is executeCommand's `delete-split:`
+        // dispatch arm, reachable only if commandsForView emits a
+        // `delete-split:<id>` command. The split tabs only render on the
+        // list/inbox view (renderSplitTabs early-returns otherwise), so
+        // deleting a split is a list-screen action — Superhuman Rule #5:
+        // the command belongs where the thing it acts on is visible. The
+        // list branch must emit a `delete-split:` action literal (one per
+        // split) so the palette can offer it; without it, deleteSplit is
+        // dead code and the user has no way to delete a split (roborev 375).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let list = case_branch(body, "list");
+        assert!(
+            list.contains("delete-split:"),
+            "the list branch must emit a `delete-split:` action per split — splits are visible only on the list view, so Delete-Split belongs there (sefy/roborev 375)"
+        );
+    }
 }
 
 // External dep for theme path
