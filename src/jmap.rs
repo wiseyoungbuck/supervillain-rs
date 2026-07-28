@@ -1781,7 +1781,9 @@ pub async fn get_calendar_event(
     let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
         "{}/dav/calendars/user/{}/Default/{}.ics",
-        s.caldav_base, s.username, uid
+        s.caldav_base,
+        s.username,
+        percent_encode_path(uid)
     );
 
     let resp = s
@@ -4154,5 +4156,47 @@ END:VCALENDAR";
             recorded2.lock().unwrap().is_empty(),
             "no HTTP request may be issued when the app password is unconfigured"
         );
+    }
+
+    #[tokio::test]
+    async fn caldav_url_encodes_reserved_uid_chars_consistently_across_put_get_delete() {
+        // roborev 376: get_calendar_event used to interpolate the raw uid while
+        // its siblings percent-encoded it, so a UID with reserved chars (space,
+        // '/', '@' — legal in iCalendar) was stored by PUT under the encoded
+        // name but looked up by GET under the raw one → perpetual 404 → the
+        // first-time auto-add re-ran on every email open. All four must encode
+        // identically so PUT and GET address the same resource.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+        // UID with a space and an '@' — both must be percent-encoded in the path.
+        let uid = "uid with space@google.com";
+        let encoded = percent_encode_path(uid);
+        assert!(encoded.contains("%20") && encoded.contains("%40"));
+
+        let _ = add_to_calendar(&sess, TEST_ICS, uid, false).await;
+        let _ = get_calendar_event(&sess, uid).await;
+        let _ = remove_from_calendar(&sess, uid).await;
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 3, "PUT + GET + DELETE expected, got {rec:?}");
+        for r in rec.iter() {
+            assert!(
+                r.path.ends_with(&format!("/Default/{encoded}.ics")),
+                "{} {:?} must address the encoded UID, not the raw one: {}",
+                r.method,
+                r.path,
+                uid
+            );
+            assert!(
+                !r.path.contains(' '),
+                "raw space must not appear in the path"
+            );
+        }
     }
 }

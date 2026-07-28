@@ -473,6 +473,15 @@ pub async fn rsvp(
 ) -> Result<(), Error> {
     match s {
         ProviderSession::Fastmail(s) => {
+            // Fail fast before any outward-facing side effect (kata m5yp,
+            // roborev 376 #2): a missing app password makes the CalDAV write
+            // fail, so don't email the organizer an acceptance the calendar
+            // can't back — each retry would otherwise send another duplicate
+            // iTIP REPLY. The credential is knowable from the session before
+            // any network I/O, so surface it here with zero side effects.
+            if s.caldav_auth_header.is_empty() {
+                return Err(Error::CalendarAuthUnconfigured);
+            }
             // Send iTIP reply email to organizer, with DTSTART quoted in the user's
             // primary timezone instead of UTC-Z.
             let rsvp_ics = calendar::generate_rsvp_with_tz(event, attendee_email, status, reply_tz);

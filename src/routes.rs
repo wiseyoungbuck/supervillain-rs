@@ -9142,6 +9142,81 @@ white   = '#fdf6e3'
             "no CalDAV HTTP request may be issued when the app password is unconfigured"
         );
     }
+
+    #[tokio::test]
+    async fn rsvp_does_not_email_organizer_when_app_password_unconfigured() {
+        // roborev 376 #2: a missing app password must fail the RSVP *before*
+        // the iTIP reply is emailed, not after — otherwise every retry sends
+        // the organizer another duplicate acceptance for an action the user
+        // sees as failed. We wire a JMAP session whose api_url points at a
+        // loopback so send_email WOULD post the iTIP if it were reached; the
+        // fail-fast must keep that loopback at zero requests.
+        let (jmap_base, jmap_recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+        let (caldav_base, caldav_recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+
+        let mut sess = crate::jmap::JmapSession::new("user@fastmail.com", "fmu1-token", None);
+        // Wire enough JMAP state that send_email would reach its HTTP POST
+        // (api_url + account_id + identity_id + drafts/sent mailboxes) — so
+        // that "zero requests" is a meaningful proof the fail-fast ran, not
+        // just a side effect of send_email short-circuiting earlier.
+        sess.api_url = Some(jmap_base.clone());
+        sess.account_id = Some("acct-1".into());
+        sess.identity_id = Some("ident-1".into());
+        sess.mailbox_cache.insert(
+            "drafts".into(),
+            Mailbox {
+                id: "mb-drafts".into(),
+                name: "Drafts".into(),
+                role: Some("drafts".into()),
+                total_emails: 0,
+                unread_emails: 0,
+                parent_id: None,
+            },
+        );
+        sess.mailbox_cache.insert(
+            "sent".into(),
+            Mailbox {
+                id: "mb-sent".into(),
+                name: "Sent".into(),
+                role: Some("sent".into()),
+                total_emails: 0,
+                unread_emails: 0,
+                parent_id: None,
+            },
+        );
+        sess.caldav_base = caldav_base;
+        let mut session = provider::ProviderSession::Fastmail(Box::new(sess));
+
+        let event = test_calendar_event(vec!["user@fastmail.com"]);
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
+                   DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let err = provider::rsvp(
+            &mut session,
+            ics,
+            &event,
+            "user@fastmail.com",
+            &RsvpStatus::Accepted,
+            chrono_tz::Tz::UTC,
+        )
+        .await
+        .expect_err("missing app password must fail the RSVP");
+        assert!(
+            matches!(err, Error::CalendarAuthUnconfigured),
+            "expected CalendarAuthUnconfigured, got {err:?}"
+        );
+        // No iTIP reply emailed (JMAP loopback untouched)...
+        assert!(
+            jmap_recorded.lock().unwrap().is_empty(),
+            "RSVP must not email the organizer when the CalDAV credential is unconfigured"
+        );
+        // ...and no CalDAV write attempted either.
+        assert!(
+            caldav_recorded.lock().unwrap().is_empty(),
+            "no CalDAV HTTP request may be issued when the app password is unconfigured"
+        );
+    }
 }
 
 // External dep for theme path

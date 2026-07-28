@@ -1333,15 +1333,30 @@ async fn upsert_account(
             ..
         } = &cfg
     {
-        if let Some(lock) = state.accounts.read().await.sessions.get(&id).cloned() {
+        // Clone the SessionLock and DROP the registry read guard before
+        // awaiting the session write lock — holding the registry read across
+        // `lock.write().await` would block every other route's
+        // `resolve_session` read for up to a 30s provider HTTP call held by a
+        // session reader (roborev 376 #3). The guard drops at the semicolon.
+        let lock = state.accounts.read().await.sessions.get(&id).cloned();
+        let mut recomputed = false;
+        if let Some(lock) = lock {
             let mut sess_guard = lock.write().await;
             if let ProviderSession::Fastmail(s) = &mut *sess_guard
                 && s.username == *username
             {
                 s.set_credentials(api_token, app_password.as_deref());
+                recomputed = true;
             }
         }
-        clear_errors_for(&state, &id).await;
+        // Only retire the banner when the live session actually picked up the
+        // new credentials. A username change is a different account: the live
+        // session keeps the old username/headers until a restart (no reconnect
+        // runs on update), so clearing the banner would tell the user a still-
+        // broken calendar is fixed (roborev 376 #4).
+        if recomputed {
+            clear_errors_for(&state, &id).await;
+        }
     }
     if needs_auth {
         push_error(
@@ -2965,6 +2980,65 @@ api-token = tok
             }
             _ => panic!("expected fastmail"),
         }
+    }
+
+    /// roborev 376 #4: a username change is a different account — the live
+    /// session keeps the old username/headers until restart (no reconnect runs
+    /// on update), so `clear_errors_for` must NOT run, or the banner tells the
+    /// user a still-broken calendar is fixed. The recompute is skipped (the
+    /// session's username differs from the merged config's), so the banner
+    /// stays.
+    #[tokio::test]
+    async fn upsert_account_update_with_changed_username_does_not_clear_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("old@fm.com", "tok"));
+        reg.default_account = "fm".into();
+        reg.sessions.insert(
+            "fm".into(),
+            SessionLock::new(tokio::sync::RwLock::new(ProviderSession::Fastmail(
+                Box::new(crate::jmap::JmapSession::new("old@fm.com", "tok", None)),
+            ))),
+        );
+        let state = test_app_state(reg, config_path.clone(), tokens_dir);
+        push_error(
+            &state,
+            AccountError {
+                account: "fm".into(),
+                provider: "fastmail".into(),
+                error: crate::error::CALENDAR_AUTH_UNCONFIGURED_MSG.into(),
+            },
+        )
+        .await;
+
+        // Update: change the username AND add an app password. The live
+        // session's username ("old@fm.com") != merged config's ("new@fm.com"),
+        // so set_credentials is skipped and the banner must NOT clear.
+        let incoming = AccountConfig::Fastmail {
+            username: "new@fm.com".into(),
+            api_token: String::new(),
+            app_password: Some("app-pass".into()),
+            signature: None,
+        };
+        let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
+            .await
+            .expect("update must succeed");
+
+        let errors = state.account_errors.read().await;
+        assert_eq!(
+            errors.len(),
+            1,
+            "banner must stay when the live session wasn't recomputed (username changed)"
+        );
+        assert!(
+            errors[0].error.contains("app password"),
+            "the retained banner must still name the app password: {:?}",
+            errors[0].error
+        );
     }
 
     #[test]
