@@ -613,7 +613,7 @@ function renderSplitTabs() {
     }).join('');
 }
 
-// Mirror of desktop's adjustSplitCounts (static/app.js:948): the split
+// Mirror of desktop's adjustSplitCounts (static/app.js): the split
 // count is a projection of the list, so it moves iff the list moves.
 // Called at every list-mutating site (emailAction, performUndo) with a
 // mirror on every failure path — a failed request leaves the counts where
