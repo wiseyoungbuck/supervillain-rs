@@ -1092,7 +1092,35 @@ fn build_draft_email(
         "calendar_ics and html_body are mutually exclusive"
     );
     if let Some(ref calendar_ics) = sub.calendar_ics {
-        // iTIP REPLY: multipart/mixed with text/plain + text/calendar
+        // iTIP REPLY: multipart/mixed with text/plain + text/calendar.
+        //
+        // kata vt0m: RFC 8621 §4.1.4 — a part's `type` is the Content-Type
+        // media type with "parameters stripped" (a bare token), so
+        // `method=REPLY` cannot live there (Fastmail rejects
+        // `"text/calendar; method=REPLY"` as `invalidProperties` on
+        // `bodyStructure/subParts[1]/type`). It also cannot travel via a
+        // blob's upload Content-Type — a blob is raw octets (§4.1.4) and the
+        // part's Content-Type is generated from the part's own properties,
+        // not the blob. The RFC-sanctioned channel is `header:Content-Type`
+        // on the EmailBodyPart (§4.1.4: the client may send per-header
+        // properties). Per §4.6 ("there MUST NOT be two properties that
+        // represent the same header field"), setting `header:Content-Type`
+        // means the part MUST omit `type` (derived from that header) — so the
+        // calendar part carries only `partId` + `header:Content-Type`, and
+        // the ICS stays inline in `bodyValues` (the partId resolves there).
+        // charset=utf-8 is declared per RFC 5545 §8.1: iCalendar's default
+        // charset is UTF-8 (not the generic text/* us-ascii default), and the
+        // charset Content-Type parameter MUST be used in MIME transports to
+        // specify it — so the parameter is correctness-required for the
+        // calendar part, not belt-and-braces. The value's encoding still
+        // follows §4.6 (server-chosen for bodyValues); this asserts the
+        // server emits UTF-8 for the ICS (normal Fastmail/Cyrus behavior).
+        // The live verification gate should confirm with a non-ASCII invite
+        // (e.g. an accented event title), not only ASCII.
+        // The leading space in the header value is load-bearing: RFC 8621
+        // §4.1.1 Raw form is the octets following the terminating colon, so
+        // the space is what yields `Content-Type: text/calendar…` rather
+        // than the unconventional `Content-Type:text/calendar…` on the wire.
         m.insert(
             "bodyValues".into(),
             serde_json::json!({
@@ -1106,7 +1134,7 @@ fn build_draft_email(
                 "type": "multipart/mixed",
                 "subParts": [
                     { "partId": "body", "type": "text/plain" },
-                    { "partId": "calendar", "type": "text/calendar; method=REPLY" }
+                    { "partId": "calendar", "header:Content-Type": " text/calendar; method=REPLY; charset=utf-8" }
                 ]
             }),
         );
@@ -3306,6 +3334,59 @@ END:VCALENDAR";
     // --- build_draft_email calendar_ics tests ---
 
     #[test]
+    fn calendar_part_carries_method_reply_on_content_type_header() {
+        // kata vt0m: see build_draft_email's calendar branch for the full
+        // RFC 8621 rationale (why `type` can't carry parameters, why a blob
+        // upload doesn't work, and the §4.6 duplicate-header rule). This test
+        // pins the resulting invariant: the calendar part must set
+        // `header:Content-Type` carrying method=REPLY (and charset=utf-8) and
+        // must omit `type`. Fails today: no `header:Content-Type`; `type`
+        // carries the malformed `text/calendar; method=REPLY`.
+        let sub = EmailSubmission {
+            to: vec!["organizer@example.com".into()],
+            cc: vec![],
+            subject: "Re: Team Standup".into(),
+            text_body: "Bob has accepted the invitation: Team Standup".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
+        };
+        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
+        let sub_parts = draft["bodyStructure"]["subParts"]
+            .as_array()
+            .expect("calendar draft must have subParts");
+        let cal_part = sub_parts
+            .iter()
+            .find(|p| p.get("partId").and_then(|v| v.as_str()) == Some("calendar"))
+            .expect("calendar part must exist with partId 'calendar'");
+        let ct = cal_part
+            .get("header:Content-Type")
+            .and_then(|v| v.as_str())
+            .expect(
+                "calendar part must set header:Content-Type (RFC 8621 §4.1.4) to carry \
+                 method=REPLY on the wire — not the `type` field, not a blob upload (kata vt0m)",
+            );
+        assert!(
+            ct.starts_with(" text/calendar;") && ct.contains("method=REPLY"),
+            "header:Content-Type {ct:?} must be ` text/calendar;` (leading space per RFC 8621 §4.1.1 \
+             Raw form; `;` pins the media-type token boundary) with method=REPLY (kata vt0m)"
+        );
+        assert!(
+            ct.contains("charset=utf-8"),
+            "header:Content-Type {ct:?} must declare charset=utf-8 — text/* parts otherwise \
+             default to us-ascii and non-ASCII ICS is mislabeled (kata vt0m)"
+        );
+        assert!(
+            cal_part.get("type").is_none(),
+            "calendar part must NOT set `type` when header:Content-Type is set — RFC 8621 §4.6 \
+             forbids two properties for the same header field (kata vt0m)"
+        );
+    }
+
+    #[test]
     fn draft_with_calendar_ics_has_multipart_mixed() {
         let sub = EmailSubmission {
             to: vec!["organizer@example.com".into()],
@@ -3329,7 +3410,11 @@ END:VCALENDAR";
             .expect("Should have subParts");
         assert_eq!(sub_parts.len(), 2);
         assert_eq!(sub_parts[0]["type"], "text/plain");
-        assert_eq!(sub_parts[1]["type"], "text/calendar; method=REPLY");
+        assert_eq!(sub_parts[1]["partId"], "calendar");
+        // The header:Content-Type invariants (method=REPLY, charset=utf-8,
+        // no `type`) are pinned by
+        // calendar_part_carries_method_reply_on_content_type_header; this
+        // test stays scoped to the multipart/mixed shape and part count.
     }
 
     #[test]
@@ -3469,10 +3554,18 @@ END:VCALENDAR";
         let parts = draft["bodyStructure"]["subParts"]
             .as_array()
             .expect("subParts");
-        // text/plain + text/calendar + attachment (appended, not double-wrapped)
+        // text/plain + text/calendar (header:Content-Type, no `type`) + attachment (appended, not double-wrapped)
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["type"], "text/plain");
-        assert_eq!(parts[1]["type"], "text/calendar; method=REPLY");
+        // kata vt0m: calendar part uses header:Content-Type, not `type`.
+        assert_eq!(parts[1]["partId"], "calendar");
+        assert!(parts[1].get("type").is_none());
+        assert!(
+            parts[1]["header:Content-Type"]
+                .as_str()
+                .expect("header:Content-Type")
+                .contains("method=REPLY")
+        );
         assert_eq!(parts[2]["type"], "application/pdf");
     }
 
