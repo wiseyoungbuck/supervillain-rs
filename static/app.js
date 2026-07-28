@@ -3238,6 +3238,20 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Command palette shortcut (kata sefy): hoisted ABOVE the per-view
+    // early returns so Cmd+K reaches the palette from every screen —
+    // settings (wizard/insert/normal) and compose insert included — not
+    // just list/detail normal mode. The overlay checks above (help,
+    // palette, search, split modal) still take precedence, so Cmd+K never
+    // opens over an already-open overlay. Without this hoist the settings
+    // and compose branches of commandsForView were unreachable at runtime
+    // and the palette's show/hide invariant silently failed (roborev 378 #1/#2).
+    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        openCommandPalette();
+        e.preventDefault();
+        return;
+    }
+
     // Settings: wizard owns its own key logic across steps and modes.
     if (state.view === 'settings' && state.wizardActive) {
         handleWizardKey(e);
@@ -3342,13 +3356,6 @@ function handleKeyDown(e) {
     // Ctrl+1-9: jump to split tab
     if (e.ctrlKey && e.key >= '1' && e.key <= '9') {
         selectSplitByIndex(parseInt(e.key) - 1);
-        e.preventDefault();
-        return;
-    }
-
-    // Command palette shortcut
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        openCommandPalette();
         e.preventDefault();
         return;
     }
@@ -3471,9 +3478,7 @@ function handleNormalModeKey(e) {
                 // Cancel-with-keep: persist the last edits, then leave the
                 // draft saved on the server (kata wm57). clearCompose stops
                 // tracking it without deleting.
-                flushAutosave();
-                clearCompose();
-                showView('list');
+                escapeCompose();
             }
             break;
 
@@ -3952,6 +3957,17 @@ function startForward() {
 function composeSignaturePrefill() {
     const sig = state.currentAccount?.signature;
     return sig ? `\n\n-- \n${sig}` : '';
+}
+
+// The compose discard path (kata sefy): flush the last edits to the draft,
+// stop tracking it without deleting, and return to the list. This is the
+// exact sequence the Escape/'q' keybinding runs in handleNormalModeKey —
+// extracted so the command palette's 'Close Draft' action calls the SAME
+// function the keybinding calls rather than duplicating the three steps.
+function escapeCompose() {
+    flushAutosave();
+    clearCompose();
+    showView('list');
 }
 
 function clearCompose() {
@@ -4473,50 +4489,147 @@ function openCommandPalette() {
 
 function closeCommandPalette() {
     els.commandPalette.classList.add('hidden');
-    setMode('normal');
+    // Only fall back to normal if the executed command didn't set its own
+    // mode — e.g. 'search' sets 'search', 'compose' ends in 'insert' via
+    // the compose-field focus listener. Unconditionally resetting to
+    // 'normal' clobbered openSearch's 'search' mode (the mode indicator
+    // read NORMAL while the search bar was open) and any future mode-gated
+    // logic would misfire on the palette path (roborev 378 #4).
+    if (state.mode === 'command') setMode('normal');
+}
+
+// Context-aware command palette (kata sefy, Superhuman Rule #5: make
+// commands contextually relevant). One switch on state.view decides what
+// shows and in what order — the same field the keydown handler already
+// switches on — so the palette's show/hide agrees with the keydown gates
+// and never offers an action that then no-ops. No registry, no enum;
+// state.view already exists and already drives per-view key handling.
+function commandsForView(view) {
+    switch (view) {
+        case 'detail': {
+            // View-native first: the actions that only make sense on an open
+            // email, ranked with Reply on top (the Superhuman boost).
+            const cmds = [
+                { name: 'Reply', desc: 'Reply to sender', shortcut: 'r', action: 'reply' },
+                { name: 'Reply All', desc: 'Reply to all', shortcut: 'a', action: 'reply-all' },
+                { name: 'Forward', desc: 'Forward email', shortcut: 'f', action: 'forward' },
+                { name: 'Archive', desc: 'Archive email', shortcut: 'e', action: 'archive' },
+                { name: 'Trash', desc: 'Move to trash', shortcut: '#', action: 'trash' },
+                { name: 'Star', desc: 'Toggle star', shortcut: 's', action: 'toggle-flag' },
+                { name: 'Mark Unread', desc: 'Toggle unread', shortcut: 'u', action: 'toggle-unread' },
+            ];
+            // RSVP only when the open email is a calendar invite — mirror the
+            // y/n/m keybinding gate (keydown handler ~:3492) so the palette
+            // never offers an RSVP that then no-ops.
+            if (state.currentEmail?.calendarEvent) {
+                cmds.push(
+                    { name: 'Accept', desc: 'RSVP accept', shortcut: 'y', action: 'rsvp-accept' },
+                    { name: 'Decline', desc: 'RSVP decline', shortcut: 'n', action: 'rsvp-decline' },
+                    { name: 'Tentative', desc: 'RSVP tentative', shortcut: 'm', action: 'rsvp-tentative' },
+                );
+            }
+            // Global tail (Superhuman Rule #5: most commands available from
+            // everywhere), ranked below the view-native ones.
+            cmds.push(
+                { name: 'Compose', desc: 'New email', shortcut: 'c', action: 'compose' },
+                { name: 'Refresh', desc: 'Reload emails', shortcut: 'R', action: 'refresh' },
+                { name: 'Search', desc: 'Search emails', shortcut: '/', action: 'search' },
+                { name: 'Go to Inbox', desc: 'Switch to inbox', shortcut: '', action: 'inbox' },
+                { name: 'Go to Archive', desc: 'Switch to archive', shortcut: '', action: 'go-archive' },
+                { name: 'Go to Trash', desc: 'Switch to trash', shortcut: '', action: 'go-trash' },
+                { name: 'New Split', desc: 'Create split inbox', shortcut: '', action: 'new-split' },
+                { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
+                { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
+            );
+            return cmds;
+        }
+        case 'list': {
+            // List's primary actions are the global set; the row actions
+            // (archive/trash/star/unread) only apply with a selection —
+            // visibleRows()[state.selectedIndex] is the same selection the
+            // keydown handler's j/k/o/e/#/s/u act on.
+            const cmds = [
+                { name: 'Compose', desc: 'New email', shortcut: 'c', action: 'compose' },
+                { name: 'Refresh', desc: 'Reload emails', shortcut: 'R', action: 'refresh' },
+                { name: 'Search', desc: 'Search emails', shortcut: '/', action: 'search' },
+                { name: 'Go to Inbox', desc: 'Switch to inbox', shortcut: '', action: 'inbox' },
+                { name: 'Go to Archive', desc: 'Switch to archive', shortcut: '', action: 'go-archive' },
+                { name: 'Go to Trash', desc: 'Switch to trash', shortcut: '', action: 'go-trash' },
+                { name: 'New Split', desc: 'Create split inbox', shortcut: '', action: 'new-split' },
+                { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
+            ];
+            if (visibleRows()[state.selectedIndex]) {
+                cmds.push(
+                    { name: 'Archive', desc: 'Archive email', shortcut: 'e', action: 'archive' },
+                    { name: 'Trash', desc: 'Move to trash', shortcut: '#', action: 'trash' },
+                    { name: 'Star', desc: 'Toggle star', shortcut: 's', action: 'toggle-flag' },
+                    { name: 'Mark Unread', desc: 'Toggle unread', shortcut: 'u', action: 'toggle-unread' },
+                );
+            }
+            // Per-split Delete commands: splits show as tabs on the list
+            // view, so deleting one is a list-screen action. The old flat
+            // getCommands emitted these globally; the context pass dropped
+            // them, leaving deleteSplit unreachable (roborev 375, High).
+            state.splits.forEach(split => {
+                cmds.push({
+                    name: `Delete Split: ${split.name}`,
+                    desc: `Remove the "${split.name}" split`,
+                    shortcut: '',
+                    action: `delete-split:${split.id}`,
+                });
+            });
+            cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
+            return cmds;
+        }
+        case 'compose':
+            // Compose is a low-action surface: only the draft-only commands
+            // (Superhuman's literal examples — Send / Close Draft / Attach)
+            // plus a thin Help tail. These map to the same functions the
+            // Ctrl+Enter / Esc / 'a' keybindings already call. Labeled 'Close
+            // Draft' (not 'Discard') because escapeCompose keeps the draft
+            // saved on the server (kata wm57) — 'Discard' would promise
+            // deletion and deliver persistence (roborev 375, Medium).
+            return [
+                { name: 'Send', desc: 'Send email', shortcut: '\u2318\u23ce', action: 'send' },
+                { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'close-draft' },
+                { name: 'Attach', desc: 'Attach a file', shortcut: 'a', action: 'attach' },
+                { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
+            ];
+        case 'settings': {
+            // Settings is a low-action surface: account management + Help only.
+            const cmds = [
+                { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
+            ];
+            state.accounts.forEach(acct => {
+                const label = acct.email || acct.id;
+                cmds.push({
+                    name: `Remove Account: ${label}`,
+                    desc: `Disconnect and delete cached tokens for ${label}`,
+                    shortcut: '',
+                    action: `remove-account:${acct.id}`,
+                });
+            });
+            cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
+            return cmds;
+        }
+        default:
+            // Unknown view (defensive): the global set, view-native-agnostic.
+            return [
+                { name: 'Compose', desc: 'New email', shortcut: 'c', action: 'compose' },
+                { name: 'Refresh', desc: 'Reload emails', shortcut: 'R', action: 'refresh' },
+                { name: 'Search', desc: 'Search emails', shortcut: '/', action: 'search' },
+                { name: 'Go to Inbox', desc: 'Switch to inbox', shortcut: '', action: 'inbox' },
+                { name: 'Go to Archive', desc: 'Switch to archive', shortcut: '', action: 'go-archive' },
+                { name: 'Go to Trash', desc: 'Switch to trash', shortcut: '', action: 'go-trash' },
+                { name: 'New Split', desc: 'Create split inbox', shortcut: '', action: 'new-split' },
+                { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
+                { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
+            ];
+    }
 }
 
 function getCommands() {
-    const commands = [
-        { name: 'Archive', desc: 'Archive email', shortcut: 'e', action: 'archive' },
-        { name: 'Trash', desc: 'Move to trash', shortcut: '#', action: 'trash' },
-        { name: 'Reply', desc: 'Reply to sender', shortcut: 'r', action: 'reply' },
-        { name: 'Reply All', desc: 'Reply to all', shortcut: 'a', action: 'reply-all' },
-        { name: 'Compose', desc: 'New email', shortcut: 'c', action: 'compose' },
-        { name: 'Forward', desc: 'Forward email', shortcut: 'f', action: 'forward' },
-        { name: 'Mark Unread', desc: 'Toggle unread', shortcut: 'u', action: 'toggle-unread' },
-        { name: 'Star', desc: 'Toggle star', shortcut: 's', action: 'toggle-flag' },
-        { name: 'Refresh', desc: 'Reload emails', shortcut: 'R', action: 'refresh' },
-        { name: 'Go to Inbox', desc: 'Switch to inbox', shortcut: '', action: 'inbox' },
-        { name: 'Go to Archive', desc: 'Switch to archive', shortcut: '', action: 'go-archive' },
-        { name: 'Go to Trash', desc: 'Switch to trash', shortcut: '', action: 'go-trash' },
-        { name: 'New Split', desc: 'Create split inbox', shortcut: '', action: 'new-split' },
-        { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
-        { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
-    ];
-
-    // Add delete commands for each existing split
-    state.splits.forEach(split => {
-        commands.push({
-            name: `Delete Split: ${split.name}`,
-            desc: `Remove the "${split.name}" split`,
-            shortcut: '',
-            action: `delete-split:${split.id}`,
-        });
-    });
-
-    // Add remove commands for each existing account
-    state.accounts.forEach(acct => {
-        const label = acct.email || acct.id;
-        commands.push({
-            name: `Remove Account: ${label}`,
-            desc: `Disconnect and delete cached tokens for ${label}`,
-            shortcut: '',
-            action: `remove-account:${acct.id}`,
-        });
-    });
-
-    return commands;
+    return commandsForView(state.view);
 }
 
 function executeCommand(action) {
@@ -4527,6 +4640,19 @@ function executeCommand(action) {
         case 'reply-all': startReply(true); break;
         case 'compose': startCompose(); break;
         case 'forward': startForward(); break;
+        // Compose-screen commands (kata sefy): each calls the SAME function the
+        // compose keybinding calls — sendEmail() (Ctrl/Cmd+Enter), the discard
+        // path (Esc, here named escapeCompose), and the attachment picker
+        // ('a' / Ctrl+Shift+A). No new handlers.
+        case 'send': sendEmail(); break;
+        case 'close-draft': escapeCompose(); break;
+        case 'attach': els.composeFileInput.click(); break;
+        // RSVP (kata sefy): the detail palette offers these only behind the
+        // calendarEvent gate; rsvpToEvent is the same function y/n/m call.
+        case 'rsvp-accept': rsvpToEvent('ACCEPTED'); break;
+        case 'rsvp-decline': rsvpToEvent('DECLINED'); break;
+        case 'rsvp-tentative': rsvpToEvent('TENTATIVE'); break;
+        case 'search': openSearch(); break;
         case 'toggle-unread': toggleUnreadSelected(); break;
         case 'toggle-flag': toggleFlagSelected(); break;
         case 'refresh': loadEmails(); break;

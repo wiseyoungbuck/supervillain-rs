@@ -8951,7 +8951,7 @@ white   = '#fdf6e3'
     // reload). The list-mutating paths — emailAction and performUndo — splice
     // the list optimistically but never touched the counts, so badges sat
     // stale until a full reload. Desktop already solved this with
-    // adjustSplitCounts(delta) (static/app.js:948), called at every
+    // adjustSplitCounts(delta) (static/app.js), called at every
     // list-mutating site with a mirror on every failure path. The invariant,
     // stated plainly: the split count is a projection of the list — it moves
     // iff the list moves, on every path, including the path where a
@@ -8982,6 +8982,27 @@ white   = '#fdf6e3'
         assert!(
             block.contains("renderSplitTabs()"),
             "adjustSplitCounts must re-render the tabs — the badge is a projection of state.splitCounts"
+        );
+    }
+
+    #[test]
+    fn mobile_adjust_split_counts_is_a_byte_identical_port_of_desktop() {
+        // The unit test above pins two code forms; this one pins the
+        // stronger invariant the design actually claims — that mobile's
+        // adjustSplitCounts is a verbatim port of desktop's (static/app.js),
+        // so the two cannot silently drift (a guard, a clamp, or a warn
+        // message diverging with no test noticing). The 1v8z one-file
+        // guardrail means we duplicate rather than share the function; this
+        // test is the price of that duplication — it makes the "exact
+        // mirror" claim load-bearing instead of aspirational. kata fpjj
+        // (roborev drift-pinning finding).
+        let desktop = js_fn_body(APP_JS, "function adjustSplitCounts(");
+        let mobile = js_fn_body(MOBILE_APP_JS, "function adjustSplitCounts(");
+        assert_eq!(
+            desktop, mobile,
+            "mobile's adjustSplitCounts must stay byte-identical to desktop's — \
+             if you change one, change both, or this test is the signal that \
+             you meant to diverge"
         );
     }
 
@@ -9062,6 +9083,173 @@ white   = '#fdf6e3'
         assert!(
             !block.contains("setTimeout"),
             "attachment clicks must be synchronous so Safari retains user activation"
+        );
+    }
+
+    // ======================================================================
+    // Command palette context-awareness (kata sefy)
+    // ----------------------------------------------------------------------
+    // getCommands() used to return one flat global list and never read
+    // state.view, so the palette offered the same 15 commands on every
+    // screen — "Reply" while composing, no "Send" while drafting. Superhuman's
+    // Rule #5 (make commands contextually relevant) needs a context pass:
+    // hide what's irrelevant to the active screen and boost what matters.
+    // These contract tests pin the code shape of that pass; the runtime
+    // behavior per view is pinned by tests/palette_test.cjs (wired in via
+    // tests/palette_test.rs, mirroring the ceph harness).
+    // ======================================================================
+
+    /// Slice one `case 'X':` branch out of `commandsForView`'s switch: from the
+    /// case label to the next sibling `case '...':` at the same 8-space indent
+    /// (or the body end). Mirrors `js_fn_body`'s column-0-brace assumption —
+    /// every case in `commandsForView` sits at 8-space indent, so
+    /// `"\n        case '"` is the only sibling-case marker in the region.
+    fn case_branch<'a>(body: &'a str, case_label: &str) -> &'a str {
+        let needle = format!("case '{}':", case_label);
+        let start = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("case '{}' must exist in commandsForView", case_label));
+        let rest = &body[start..];
+        let end = rest.find("\n        case '").unwrap_or(rest.len());
+        &body[start..start + end]
+    }
+
+    #[test]
+    fn palette_get_commands_reads_state_view() {
+        // The context pass is a switch on state.view inside getCommands —
+        // today the function builds a flat literal and never references
+        // state.view, so this fails until the pass is added (sefy RED).
+        let body = js_fn_body(APP_JS, "function getCommands(");
+        assert!(
+            body.contains("state.view"),
+            "getCommands must read state.view so the palette is context-aware (sefy)"
+        );
+    }
+
+    #[test]
+    fn palette_compose_view_exposes_send_and_close_draft() {
+        // Compose is the one screen the flat list served worst: no Send, no
+        // Close Draft, no Attach — the only actions you want while drafting.
+        // The compose branch of commandsForView must yield a Send command
+        // (action 'send') and a Close Draft command (action 'close-draft'),
+        // neither of which exists today (sefy RED). Assert against the compose
+        // branch slice (not the whole body) so a future refactor that moves
+        // Send into the detail branch can't keep this green (roborev 375).
+        // The action id is 'close-draft' (not 'discard-draft') because the
+        // command keeps the draft saved (kata wm57) — naming it 'discard'
+        // would invite a future "fix" to actually delete the draft
+        // (roborev 378 #3).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let compose = case_branch(body, "compose");
+        assert!(
+            compose.contains("action: 'send'"),
+            "the compose branch must expose a Send command (action 'send') (sefy)"
+        );
+        assert!(
+            compose.contains("action: 'close-draft'"),
+            "the compose branch must expose a Close Draft command (action 'close-draft') (sefy)"
+        );
+    }
+
+    #[test]
+    fn palette_detail_view_ranks_reply_above_compose() {
+        // On detail, Reply is what you want first; Compose is a global action
+        // that belongs below it. The detail branch must order a Reply-family
+        // command before the Compose command — today there is no view branch
+        // at all, so the flat list's accidental order is unpinned (sefy RED).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let detail = case_branch(body, "detail");
+        let reply_idx = detail
+            .find("action: 'reply'")
+            .expect("detail branch must include a Reply command (sefy)");
+        let compose_idx = detail
+            .find("action: 'compose'")
+            .expect("detail branch must include a Compose command (sefy)");
+        assert!(
+            reply_idx < compose_idx,
+            "the detail branch must rank a Reply-family command above Compose (sefy)"
+        );
+    }
+
+    #[test]
+    fn palette_list_view_omits_reply_when_no_selection() {
+        // Reply is a detail-view action (you reply to an open email). The list
+        // branch must never offer it — today Reply sits in the flat global
+        // list and shows on every screen, list included (sefy RED).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let list = case_branch(body, "list");
+        assert!(
+            !list.contains("action: 'reply'"),
+            "the list branch must not offer Reply — Reply is detail-only; the row-actions gate is on a selection, not Reply (sefy)"
+        );
+    }
+
+    #[test]
+    fn palette_rsvp_commands_are_calendar_gated() {
+        // The y/n/m keybindings only RSVP when state.currentEmail?.calendarEvent
+        // (keydown handler ~:3492). The palette must mirror that gate or it
+        // will offer Accept/Decline/Tentative that then no-op — a promise
+        // broken, worse than today's flat list. The detail branch's RSVP
+        // commands must live inside a calendarEvent guard (sefy RED).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let detail = case_branch(body, "detail");
+        assert!(
+            detail.contains("state.currentEmail?.calendarEvent"),
+            "the detail branch must gate RSVP on state.currentEmail?.calendarEvent, mirroring the y/n/m keybindings (sefy)"
+        );
+        let gate_idx = detail
+            .find("state.currentEmail?.calendarEvent")
+            .expect("calendarEvent gate must exist (sefy)");
+        let rsvp_idx = detail
+            .find("rsvp")
+            .expect("detail branch must define RSVP commands behind the gate (sefy)");
+        assert!(
+            rsvp_idx > gate_idx,
+            "RSVP commands must come after (inside) the calendarEvent gate, not before it (sefy)"
+        );
+    }
+
+    #[test]
+    fn palette_list_view_exposes_delete_split_when_splits_exist() {
+        // deleteSplit's only call site is executeCommand's `delete-split:`
+        // dispatch arm, reachable only if commandsForView emits a
+        // `delete-split:<id>` command. The split tabs only render on the
+        // list/inbox view (renderSplitTabs early-returns otherwise), so
+        // deleting a split is a list-screen action — Superhuman Rule #5:
+        // the command belongs where the thing it acts on is visible. The
+        // list branch must emit a `delete-split:` action literal (one per
+        // split) so the palette can offer it; without it, deleteSplit is
+        // dead code and the user has no way to delete a split (roborev 375).
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        let list = case_branch(body, "list");
+        assert!(
+            list.contains("delete-split:"),
+            "the list branch must emit a `delete-split:` action per split — splits are visible only on the list view, so Delete-Split belongs there (sefy/roborev 375)"
+        );
+    }
+
+    #[test]
+    fn palette_cmdk_reachable_from_every_view() {
+        // The palette's show/hide invariant (commandsForView agrees with the
+        // keydown gates) only holds if Cmd+K can actually open the palette on
+        // every view. The per-view early returns in handleKeyDown (settings
+        // wizard/insert/normal, compose insert) used to fire before the Cmd+K
+        // check, so the settings and compose branches of commandsForView
+        // were unreachable at runtime — dead code certified as live by the
+        // behavioral tests, which call getCommands() directly (roborev 378 #1/#2).
+        // Pin that the Cmd+K check (the openCommandPalette call) precedes the
+        // first per-view early return in handleKeyDown, so a future move of
+        // the check back below the per-view returns fails loudly.
+        let body = js_fn_body(APP_JS, "function handleKeyDown(");
+        let cmdk = body
+            .find("openCommandPalette()")
+            .expect("handleKeyDown must call openCommandPalette on Cmd+K (sefy)");
+        let first_per_view_return = body
+            .find("state.view === 'settings'")
+            .expect("handleKeyDown must have per-view early returns to gate (sefy)");
+        assert!(
+            cmdk < first_per_view_return,
+            "the Cmd+K check must precede the per-view early returns in handleKeyDown so the palette is reachable on every screen (roborev 378 #1/#2)"
         );
     }
 }
