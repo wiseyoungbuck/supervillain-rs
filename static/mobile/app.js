@@ -292,6 +292,23 @@ function cacheEmail(email) {
 // Accounts
 // ============================================================================
 
+// Dismiss the cold-boot splash (kata qknk). #boot-splash is shipped in the
+// initial HTML so it paints on the first frame; this fades it out (~150ms via
+// the CSS transition on .hide) and removes it from the DOM once the first
+// meaningful boot state is ready (loadAccounts resolving). One-shot: a no-op
+// once the splash is gone, so it's safe to call from every loadAccounts path.
+function hideBootSplash() {
+    const splash = document.getElementById('boot-splash');
+    if (!splash) return;
+    splash.classList.add('hide');
+    const drop = () => splash.remove();
+    splash.addEventListener('transitionend', drop, { once: true });
+    // Fallback if transitionend never fires — remove after the fade window.
+    // remove() is a no-op on an already-detached element, so the two paths
+    // can't conflict.
+    setTimeout(drop, 200);
+}
+
 async function loadAccounts() {
     const data = await apiGlobal('GET', '/accounts');
     state.accounts = data.accounts || [];
@@ -299,6 +316,10 @@ async function loadAccounts() {
     if (nonSetupErrors.length) {
         showError('Accounts', new Error(nonSetupErrors.map(e => e.provider + ': ' + e.message).join('; ')));
     }
+    // Boot's first fetch resolved — dismiss the splash so the (now active)
+    // app-shell is visible. selectAccount/restoreFromSnapshot run next in
+    // init() and fill the list.
+    hideBootSplash();
 }
 
 function connectedAccounts() {
@@ -2975,6 +2996,11 @@ async function init() {
         try {
             await loadAccounts();
         } catch (err) {
+            // A boot error dismisses the splash so the error/offline banner is
+            // visible instead of hanging on the splash forever. Placed before
+            // the early return so both the degraded-restore and the error
+            // paths dismiss it.
+            hideBootSplash();
             // Server unreachable (offline relaunch — the SW never caches /api/*,
             // so there's no cached account list either). A DEGRADED restore still
             // beats a dead end: render the snapshot list with the account
