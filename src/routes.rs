@@ -6628,6 +6628,15 @@ white   = '#fdf6e3'
             block.contains("_shrinkEscapeCount"),
             "sizeIframeToContent's escape hatch must be bounded per episode (_shrinkEscapeCount) — a suppressed vh-ratchet is quiescent, so an unbounded 1200ms re-measure restarts the collapse cycle forever (roborev 389)"
         );
+        // Scoped pin for the burst-branch episode reset: the settled-path
+        // reset appears EARLIER in the closure, so slicing from the burst
+        // guard onward isolates the burst branch — the whole-block contains()
+        // asserts above would still pass with the burst reset deleted.
+        let burst_onward = &block[block.find("h > cur").expect("burst guard present")..];
+        assert!(
+            burst_onward.contains("_shrinkEscapeCount = 0"),
+            "the burst grow branch (h > cur) must reset _shrinkEscapeCount — under pinned-body sender CSS image events are the only cues, and without this reset a later erroring-image burst gets no escape-hatch re-measure (roborev 390)"
+        );
     }
 
     // ceph remaining gap (pinned-body late image): under height-pinned sender

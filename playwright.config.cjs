@@ -54,16 +54,22 @@ function workspaceBinary() {
   // type for what these specs assert — plus build.rs, and recurse: a nested
   // edit (src/platform/*.rs, static/mobile/*.js) doesn't bump its parent
   // directory's mtime (roborev 390).
+  // throwIfNoEntry:false — this is a purely diagnostic check running at
+  // config-load time; a dangling symlink or a file deleted mid-scan (editor
+  // swap file) must at worst skew the warning, never abort the suite
+  // (roborev 391). Cargo.toml/Cargo.lock included: a dependency bump also
+  // leaves target/debug stale.
   let newestSrc = 0;
-  for (const root of ['src', 'static', 'build.rs']) {
+  for (const root of ['src', 'static', 'build.rs', 'Cargo.toml', 'Cargo.lock']) {
     const rootPath = path.join(__dirname, root);
-    if (!fs.existsSync(rootPath)) continue;
-    const entries = fs.statSync(rootPath).isDirectory()
+    const rootSt = fs.statSync(rootPath, { throwIfNoEntry: false });
+    if (!rootSt) continue;
+    const entries = rootSt.isDirectory()
       ? fs.readdirSync(rootPath, { recursive: true }).map((f) => path.join(rootPath, f))
       : [rootPath];
     for (const f of entries) {
-      const st = fs.statSync(f);
-      if (st.isFile() && st.mtimeMs > newestSrc) newestSrc = st.mtimeMs;
+      const st = fs.statSync(f, { throwIfNoEntry: false });
+      if (st && st.isFile() && st.mtimeMs > newestSrc) newestSrc = st.mtimeMs;
     }
   }
   console.log(`[e2e] SUT: ${built}`);
