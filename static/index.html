@@ -20,8 +20,72 @@
          user is actually running — not the first successful poll, which could
          fail mid-deploy and record a post-deploy id as the boot id. -->
     <meta name="build-id" content="__SUPERVILLAIN_BUILD_ID__">
+
+    <!-- Boot splash (kata qknk): a branded loading state painted from the
+         initial HTML so the shell doesn't look hung during the 1-4s gap
+         between first paint and loadAccounts() resolving. Its critical CSS is
+         inlined here (not in style.css) so the splash paints on the very first
+         frame without waiting on style.css to fetch/parse, and it fetches NO
+         image/webfont — the wordmark uses the system monospace fallback.
+         var() with a hardcoded fallback keeps the splash on-theme once
+         style.css has parsed (--accent etc. are defined there) while still
+         rendering correctly on the first frame, before those variables exist.
+         hideBootSplash() in app.js fades it out (~150ms) and removes it once
+         the first account fetch resolves. -->
+    <style>
+        #boot-splash {
+            position: fixed;
+            inset: 0;
+            z-index: 2147483647;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg, #000000);
+            color: var(--fg, #00ff00);
+            font-family: monospace;
+            opacity: 1;
+            transition: opacity 150ms ease-out;
+        }
+        /* .hide starts the fade; pointer-events:none lets clicks pass through
+           to the app underneath during the ~150ms fade so the dismissing splash
+           never blocks interaction (and never intercepts the e2e clicks that
+           fire the moment the mailbox list renders). */
+        #boot-splash.hide { opacity: 0; pointer-events: none; }
+        #boot-splash-inner {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 18px;
+        }
+        #boot-splash-wordmark {
+            font-size: 20px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            color: var(--fg, #00ff00);
+        }
+        #boot-splash-spinner {
+            width: 22px;
+            height: 22px;
+            border: 2px solid var(--border, #003300);
+            border-top-color: var(--accent, #00ffff);
+            border-radius: 50%;
+            animation: boot-splash-spin 1s linear infinite;
+        }
+        @keyframes boot-splash-spin { to { transform: rotate(360deg); } }
+    </style>
 </head>
 <body>
+    <!-- Boot splash (kata qknk): painted from the initial HTML before app.js
+         (deferred) runs, so it covers the cold-boot gap from the first frame.
+         Dismissed by hideBootSplash() in app.js once loadAccounts() resolves.
+         See the <style> block in <head> for the rationale. -->
+    <div id="boot-splash" aria-label="Loading Supervillain" role="status">
+        <div id="boot-splash-inner">
+            <div id="boot-splash-wordmark">Supervillain</div>
+            <div id="boot-splash-spinner"></div>
+        </div>
+    </div>
+
     <div id="app">
         <!-- Deploy-refresh banner (Linear / Monarch Money style): the client
              polls /api/build-id and shows this when a new version is deployed.

@@ -1133,9 +1133,71 @@
             min-width: 32px;
             min-height: 32px;
         }
+
+        /* Boot splash (kata qknk): a branded loading state painted from the
+           initial HTML so the shell doesn't look hung during the gap between
+           first paint and loadAccounts() resolving. Inlined here (mobile's
+           <head> already inlines its CSS) so it paints on the first frame
+           without waiting on any external resource, and it fetches NO
+           image/webfont — the wordmark uses the system monospace fallback.
+           var() with a hardcoded fallback keeps the splash on-theme once the
+           :root variables above are parsed while still rendering correctly on
+           the first frame. hideBootSplash() in app.js fades it out (~150ms)
+           and removes it once the first account fetch resolves. */
+        #boot-splash {
+            position: fixed;
+            inset: 0;
+            z-index: 2147483647;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--bg, #1a1a2e);
+            color: var(--text, #e0e0e0);
+            font-family: monospace;
+            opacity: 1;
+            transition: opacity 150ms ease-out;
+        }
+        /* .hide starts the fade; pointer-events:none lets clicks pass through
+           to the app underneath during the ~150ms fade so the dismissing splash
+           never blocks interaction. */
+        #boot-splash.hide { opacity: 0; pointer-events: none; }
+        #boot-splash-inner {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+        #boot-splash-wordmark {
+            font-size: 17px;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: var(--text, #e0e0e0);
+        }
+        #boot-splash-spinner {
+            width: 22px;
+            height: 22px;
+            border: 2px solid var(--border, #2a2a4a);
+            border-top-color: var(--accent, #e94560);
+            border-radius: 50%;
+            animation: boot-splash-spin 1s linear infinite;
+        }
+        @keyframes boot-splash-spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
+    <!-- Boot splash (kata qknk): painted from the initial HTML before app.js
+         (type=module, implicitly deferred) runs, so it covers the cold-boot
+         gap from the first frame. Dismissed by hideBootSplash() in app.js once
+         loadAccounts() resolves. See the <style> block in <head> for the
+         rationale. Sits above #app-shell (which is display:none until init()
+         adds .active) so it covers the blank pre-boot surface. -->
+    <div id="boot-splash" aria-label="Loading Supervillain" role="status">
+        <div id="boot-splash-inner">
+            <div id="boot-splash-wordmark">Supervillain</div>
+            <div id="boot-splash-spinner"></div>
+        </div>
+    </div>
+
     <!-- App shell (shown once accounts load) -->
     <div id="app-shell">
         <div id="app-header">

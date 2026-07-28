@@ -731,6 +731,24 @@ function apiWithMeta(method, path, body = null, signal = null) {
     return makeApi(state.currentAccount?.id).withMeta(method, path, body, signal);
 }
 
+// Dismiss the cold-boot splash (kata qknk). #boot-splash is shipped in the
+// initial HTML so it paints on the first frame; this fades it out (~150ms via
+// the CSS transition on .hide) and removes it from the DOM once the first
+// meaningful boot state is ready (loadAccounts resolving). One-shot: a no-op
+// once the splash is gone, so it's safe to call from every loadAccounts path
+// (refresh, account add, etc.).
+function hideBootSplash() {
+    const splash = document.getElementById('boot-splash');
+    if (!splash) return;
+    splash.classList.add('hide');
+    const drop = () => splash.remove();
+    splash.addEventListener('transitionend', drop, { once: true });
+    // Fallback if transitionend never fires (e.g. the element is detached
+    // mid-transition) — remove after the fade window. remove() is a no-op on
+    // an already-detached element, so the two paths can't conflict.
+    setTimeout(drop, 200);
+}
+
 async function loadAccounts() {
     try {
         const data = await fetch('/api/accounts').then(r => r.json());
@@ -751,6 +769,7 @@ async function loadAccounts() {
             state.emails = [];
             els.mailboxName.textContent = 'NO ACCOUNTS';
             openSettings({ firstRun: true });
+            hideBootSplash();
             return;
         }
 
@@ -773,8 +792,15 @@ async function loadAccounts() {
         // If we were already in settings (e.g. just completed first-run save),
         // re-render to show the new account list rather than the firstRun pane.
         if (state.view === 'settings') renderSettings();
+        // Boot resolved — dismiss the splash so the (now populated) shell is
+        // visible. selectAccount/openSettings above have run, so the shell's
+        // own loading states (e.g. #email-list .loading) take over from here.
+        hideBootSplash();
     } catch (err) {
         showStatus('Failed to load accounts: ' + err.message, 'error');
+        // A boot error dismisses the splash so the error banner/status is
+        // visible instead of hanging on the splash forever.
+        hideBootSplash();
     }
 }
 

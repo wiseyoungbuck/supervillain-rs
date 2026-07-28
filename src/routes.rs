@@ -2168,6 +2168,62 @@ mod tests {
         );
     }
 
+    // --- kata qknk: branded splash during cold boot (contract tests) ---
+    // The splash div lives in the INITIAL html so the browser paints it on
+    // the first frame (app.js is deferred and runs only at DOMContentLoaded,
+    // after first paint). hideBootSplash() dismisses it once the first account
+    // fetch resolves — see the e2e spec (tests/e2e/qknk-boot-splash.spec.cjs)
+    // for the behavioral pin. These four pin the code SHAPE the behavior rests
+    // on: both shells ship the div, and both loadAccounts paths dismiss it.
+
+    #[test]
+    fn index_html_has_boot_splash() {
+        // qknk: the desktop shell must ship a #boot-splash element in the
+        // initial html so it paints before app.js runs and covers the
+        // init() -> loadAccounts() gap.
+        assert!(
+            INDEX_HTML.contains(r#"id="boot-splash""#),
+            "desktop index.html must include a #boot-splash element in the initial html"
+        );
+    }
+
+    #[test]
+    fn mobile_html_has_boot_splash() {
+        // qknk: the mobile shell has the same cold-boot gap (its app.js is
+        // type=module, implicitly deferred) and needs the same splash.
+        assert!(
+            MOBILE_HTML.contains(r#"id="boot-splash""#),
+            "mobile index.html must include a #boot-splash element in the initial html"
+        );
+    }
+
+    #[test]
+    fn app_js_load_accounts_dismisses_boot_splash() {
+        // qknk: loadAccounts is the first network fetch; the splash must
+        // dismiss on its success path (and its catch — pinned by the e2e
+        // behavior, this contract pins that the call exists in the slice).
+        // Slice the whole function so an explanatory comment alone can't
+        // satisfy it (roborev 336 #2).
+        let block = js_fn_body(APP_JS, "async function loadAccounts(");
+        assert!(
+            block.contains("hideBootSplash()"),
+            "desktop loadAccounts must call hideBootSplash() so the splash \
+             dismisses once the first account fetch resolves"
+        );
+    }
+
+    #[test]
+    fn mobile_app_js_load_accounts_dismisses_boot_splash() {
+        // qknk: same contract for the mobile shell — its loadAccounts is the
+        // first fetch and must dismiss the splash on resolution.
+        let block = js_fn_body(MOBILE_APP_JS, "async function loadAccounts(");
+        assert!(
+            block.contains("hideBootSplash()"),
+            "mobile loadAccounts must call hideBootSplash() so the splash \
+             dismisses once the first account fetch resolves"
+        );
+    }
+
     #[test]
     fn style_css_font_face_uses_swap() {
         // 7dmx regression pin: font-display: swap makes text show in a
