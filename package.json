@@ -1,0 +1,11 @@
+{
+  "name": "supervillain-e2e",
+  "private": true,
+  "description": "Playwright end-to-end browser tests for the leftover behavior the Rust contract tests and node mock-DOM tests can't see (rendered DOM after boot, real click/activation, live server round-trip). Scoped to the manual-repro criteria of kata 1p0d / 9rg8 / nt9e / 8n1v. Run via cargo test (tests/e2e_test.rs shells out to npx playwright test and skips — does not fail — if node or browsers are absent, mirroring tests/escape_test.rs).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}
