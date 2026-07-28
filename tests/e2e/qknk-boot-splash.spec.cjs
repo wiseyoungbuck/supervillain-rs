@@ -78,6 +78,11 @@ test('qknk: the splash dismisses when boot resolves', async ({ page }) => {
     },
   });
 
+  // Arm the build-id wait BEFORE goto so the initial checkDeploy() round trip
+  // can't be missed — the deploy-banner pin below must only assert after the
+  // fetch that could flip the banner has actually resolved (roborev 389).
+  const buildIdRoundTrip = page.waitForResponse('**/api/build-id');
+
   // domcontentloaded returns the instant deferred app.js has fired the
   // (delayed) accounts fetch — before the 500ms window has elapsed.
   await page.goto('/', { waitUntil: 'domcontentloaded' });
@@ -105,6 +110,9 @@ test('qknk: the splash dismisses when boot resolves', async ({ page }) => {
   // server's id matches the <meta name="build-id"> the same binary stamped
   // into the shell. A past fixture mocked it to a literal, so every spec ran
   // in a permanent "deploy pending" UI state (banner up, poll dead, layout
-  // shifted). This assertion fails if such a mock ever comes back.
+  // shifted). Await the round trip first so the assertion runs AFTER the
+  // fetch that could flip the banner — without this, a slow re-introduced
+  // mock could sneak past the boot-time hidden class (roborev 389).
+  await buildIdRoundTrip;
   await expect(page.locator('#deploy-banner')).toHaveClass(/hidden/);
 });

@@ -39,9 +39,26 @@ function tempConfigDir() {
 // The system under test: prefer the workspace build so specs assert against
 // HEAD (cargo test guarantees target/debug exists); fall back to PATH only for
 // direct `npx playwright test` runs on a machine without a workspace build.
+// Always log the choice, and warn when the workspace build predates the newest
+// src/ file — a direct npx run against a weeks-old target/debug would silently
+// re-create the "specs assert the wrong binary" skew in the other direction.
 function workspaceBinary() {
   const built = path.join(__dirname, 'target', 'debug', 'supervillain');
-  return fs.existsSync(built) ? built : 'supervillain';
+  if (!fs.existsSync(built)) {
+    console.log('[e2e] SUT: `supervillain` from PATH (no workspace target/debug build)');
+    return 'supervillain';
+  }
+  const builtAt = fs.statSync(built).mtimeMs;
+  let newestSrc = 0;
+  for (const f of fs.readdirSync(path.join(__dirname, 'src'))) {
+    const m = fs.statSync(path.join(__dirname, 'src', f)).mtimeMs;
+    if (m > newestSrc) newestSrc = m;
+  }
+  console.log(`[e2e] SUT: ${built}`);
+  if (newestSrc > builtAt) {
+    console.warn('[e2e] WARNING: target/debug/supervillain is older than src/ — specs are asserting a stale build; run `cargo build` (or `cargo test`) first');
+  }
+  return built;
 }
 
 module.exports = defineConfig({

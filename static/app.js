@@ -5296,17 +5296,26 @@ function sizeIframeToContent(iframe) {
                     iframe._shrinkStreak = (iframe._shrinkStreak || 0) + 1;
                     if (iframe._shrinkStreak > 2) {
                         iframe._pendingShrink = undefined;
-                        // Escape hatch (mirrors the suppressed-grow confirm):
-                        // three LEGIT shrinks within ~1s (several erroring
-                        // images) also trip the streak, and with no further
-                        // observer ticks the trailing blank space would
-                        // persist forever. Schedule a single-pending
-                        // re-measure past the 1s quiet-gap reset: a legit
-                        // shrink is quiet by then, so the streak resets and
-                        // the space is reclaimed; a real ratchet fires again
-                        // before the confirm and re-suppresses — bounded, no
-                        // perpetual loop (ceph shrink parity).
-                        if (!iframe._pendingShrinkConfirm) {
+                        // Escape hatch (mirrors the suppressed-grow confirm,
+                        // but bounded per episode): three LEGIT shrinks within
+                        // ~1s (several erroring images) also trip the streak,
+                        // and with no further observer ticks the trailing
+                        // blank space would persist forever. Schedule a
+                        // single-pending re-measure past the 1s quiet-gap
+                        // reset so that case reclaims its space. UNLIKE the
+                        // grow side, a suppressed ratchet here is QUIESCENT
+                        // (once shrink writes stop, the vh-sized body's
+                        // border-box stops changing, so no observer tick can
+                        // fire first) — an unbounded re-arm would reset the
+                        // streak every 1200ms and restart the collapse cycle
+                        // indefinitely. The legit case needs exactly ONE
+                        // re-measure, so cap the hatch at one use per episode;
+                        // only a real grow (content actually changed) resets
+                        // the counter (roborev 389).
+                        if (!iframe._pendingShrinkConfirm
+                            && !(iframe._shrinkEscapeCount >= 1)) {
+                            iframe._shrinkEscapeCount =
+                                (iframe._shrinkEscapeCount || 0) + 1;
                             iframe._pendingShrinkConfirm = true;
                             setTimeout(() => {
                                 iframe._pendingShrinkConfirm = false;
@@ -5321,9 +5330,12 @@ function sizeIframeToContent(iframe) {
                 } else {
                     // Grow on a settled path — clears any pending shrink (the
                     // content grew, the earlier smaller read was transient) and
-                    // resets the shrink streak (a real grow breaks the ratchet).
+                    // resets the shrink streak AND the escape-hatch counter (a
+                    // real grow ends the shrink episode; the next legit shrink
+                    // run gets its one re-measure again).
                     iframe._pendingShrink = undefined;
                     iframe._shrinkStreak = 0;
+                    iframe._shrinkEscapeCount = 0;
                     if (mode === 'observer'
                         && h - cur < EMAIL_IFRAME_RATCHET_EPSILON) {
                         // Sub-epsilon grow on the RECURRING path: could be the

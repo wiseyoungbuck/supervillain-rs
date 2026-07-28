@@ -6602,9 +6602,17 @@ white   = '#fdf6e3'
     // schedule a single-pending delayed re-measure LONGER than the 1s
     // quiet-gap reset — without it, three legit shrinks in ~1s (several
     // erroring images) suppress with no further ticks and the trailing blank
-    // space persists forever (Space pages past the end); the re-measure lands
-    // after the quiet gap, resets the streak, and reclaims the space, while a
-    // real ratchet fires again first and re-suppresses.
+    // space persists forever (Space pages past the end).
+    //
+    // The escape hatch must ALSO be bounded per episode (roborev 389): unlike
+    // the grow side, a suppressed shrink ratchet is QUIESCENT (no observer
+    // ticks — the vh-sized body's border-box stops changing once shrink writes
+    // stop), so the 1200ms re-measure always lands after the quiet gap, resets
+    // the streak, and would restart the collapse cycle indefinitely (~two
+    // geometric steps per ~1.6s toward the near-zero in-flow floor). The legit
+    // erroring-image case needs exactly one re-measure; an escape counter
+    // (_shrinkEscapeCount), refusing to re-arm after the first use and reset
+    // only by a real grow, caps the ratchet at a couple of extra steps.
     #[test]
     fn app_js_size_iframe_shrink_path_mirrors_grow_side_guards() {
         let block = js_fn_body(APP_JS, "function sizeIframeToContent");
@@ -6615,6 +6623,10 @@ white   = '#fdf6e3'
         assert!(
             block.contains("}, 1200)"),
             "sizeIframeToContent's shrink suppression must schedule a single-pending re-measure after the 1s quiet gap (1200ms) so a legit shrink whose ticks stopped still reclaims trailing blank space (ceph shrink parity)"
+        );
+        assert!(
+            block.contains("_shrinkEscapeCount"),
+            "sizeIframeToContent's escape hatch must be bounded per episode (_shrinkEscapeCount) — a suppressed vh-ratchet is quiescent, so an unbounded 1200ms re-measure restarts the collapse cycle forever (roborev 389)"
         );
     }
 
