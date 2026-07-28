@@ -160,17 +160,6 @@ impl JmapSession {
     /// `Error::CalendarAuthUnconfigured` on first use rather than failing at
     /// construction — existing configs without an app password load fine.
     pub fn new(username: &str, api_token: &str, app_password: Option<&str>) -> Self {
-        use base64::Engine;
-        let caldav_auth_header = match app_password.filter(|p| !p.is_empty()) {
-            Some(p) => {
-                let creds = format!("{username}:{p}");
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode(creds)
-                )
-            }
-            None => String::new(),
-        };
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -178,7 +167,7 @@ impl JmapSession {
                 .expect("failed to create HTTP client"),
             username: username.into(),
             auth_header: format!("Bearer {api_token}"),
-            caldav_auth_header,
+            caldav_auth_header: basic_auth_header(username, app_password),
             caldav_base: "https://caldav.fastmail.com".into(),
             api_url: None,
             account_id: None,
@@ -194,6 +183,34 @@ impl JmapSession {
                 3,
             )),
         }
+    }
+
+    /// Recompute `auth_header` and `caldav_auth_header` from fresh credentials,
+    /// in place on the live session. Used when a Fastmail account is updated
+    /// (Settings save) so a rotated api-token / newly-added app password takes
+    /// effect without a restart — the JMAP session state (api_url, account_id,
+    /// mailbox_cache) is account-level and stays valid across a credential
+    /// rotation, so no reconnect is needed. The username is unchanged on this
+    /// path (a username change is a different account and rebuilds via
+    /// `new`/`connect`), so `self.username` is reused for the Basic header.
+    pub fn set_credentials(&mut self, api_token: &str, app_password: Option<&str>) {
+        self.auth_header = format!("Bearer {api_token}");
+        self.caldav_auth_header = basic_auth_header(&self.username, app_password);
+    }
+}
+
+/// `Basic <base64(username:app_password)>` for CalDAV, or empty when no app
+/// password is configured (the CalDAV functions then return
+/// `Error::CalendarAuthUnconfigured` without sending it). Shared by
+/// `JmapSession::new` and `set_credentials` so the encoding can't drift.
+fn basic_auth_header(username: &str, app_password: Option<&str>) -> String {
+    use base64::Engine;
+    match app_password.filter(|p| !p.is_empty()) {
+        Some(p) => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{p}"))
+        ),
+        None => String::new(),
     }
 }
 

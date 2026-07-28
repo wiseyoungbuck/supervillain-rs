@@ -1314,6 +1314,35 @@ async fn upsert_account(
     };
 
     clear_setup_sentinel(&state).await;
+    // On a Fastmail *update*, recompute the LIVE session's credentials in
+    // place (kata m5yp). Without this, saving a newly-added app password in
+    // Settings persists the config but leaves the running session's
+    // `caldav_auth_header` empty, so calendar ops keep failing
+    // `CalendarAuthUnconfigured` until restart — the banner's own
+    // remediation ("add one in Settings") wouldn't actually work. JMAP
+    // session state (api_url, account_id, mailbox_cache) is account-level,
+    // so a credential rotation needs no reconnect. A username change is a
+    // different account (rebuilt via `new`/`connect`) and stays on the
+    // existing flow. Also retire the account's banner so a corrected config
+    // doesn't keep telling the user to fix what they just fixed.
+    if !was_new
+        && let AccountConfig::Fastmail {
+            username,
+            api_token,
+            app_password,
+            ..
+        } = &cfg
+    {
+        if let Some(lock) = state.accounts.read().await.sessions.get(&id).cloned() {
+            let mut sess_guard = lock.write().await;
+            if let ProviderSession::Fastmail(s) = &mut *sess_guard
+                && s.username == *username
+            {
+                s.set_credentials(api_token, app_password.as_deref());
+            }
+        }
+        clear_errors_for(&state, &id).await;
+    }
     if needs_auth {
         push_error(
             &state,
@@ -2821,6 +2850,121 @@ api-token = tok
             parsed.accounts.get("fm").unwrap().signature(),
             Some("Cheers,\nBob")
         );
+    }
+
+    /// kata m5yp: saving a newly-added app password for an existing Fastmail
+    /// account must recompute the LIVE session's CalDAV credential (so
+    /// calendar ops work without a restart) and retire the
+    /// CalendarAuthUnconfigured banner (so the user isn't told to fix what
+    /// they just fixed). Without this, the banner's own remediation
+    /// instruction doesn't take effect in a running session (roborev 376 #2).
+    #[tokio::test]
+    async fn upsert_account_update_recomputes_live_session_credentials_and_clears_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        // Existing Fastmail account with NO app password: the live session's
+        // caldav_auth_header is empty, and a CalendarAuthUnconfigured banner
+        // is showing (the auto-add path would have pushed it).
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "tok"));
+        reg.default_account = "fm".into();
+        reg.sessions.insert(
+            "fm".into(),
+            SessionLock::new(tokio::sync::RwLock::new(ProviderSession::Fastmail(
+                Box::new(crate::jmap::JmapSession::new("u@fm.com", "tok", None)),
+            ))),
+        );
+        let state = test_app_state(reg, config_path.clone(), tokens_dir);
+        push_error(
+            &state,
+            AccountError {
+                account: "fm".into(),
+                provider: "fastmail".into(),
+                error: crate::error::CALENDAR_AUTH_UNCONFIGURED_MSG.into(),
+            },
+        )
+        .await;
+        // Sanity: banner showing, live session has no CalDAV header.
+        assert!(!state.account_errors.read().await.is_empty());
+        {
+            let lock = state
+                .accounts
+                .read()
+                .await
+                .sessions
+                .get("fm")
+                .cloned()
+                .unwrap();
+            let g = lock.read().await;
+            match &*g {
+                ProviderSession::Fastmail(s) => assert!(
+                    s.caldav_auth_header.is_empty(),
+                    "precondition: live session starts with no CalDAV header"
+                ),
+                _ => panic!("expected fastmail"),
+            }
+        }
+
+        // Update: add an app password, leave api-token blank (preserve).
+        let incoming = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: String::new(),
+            app_password: Some("new-app-pass".into()),
+            signature: None,
+        };
+        let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
+            .await
+            .expect("Fastmail update must succeed");
+
+        // The live session's CalDAV header is recomputed in place — no
+        // restart. Independent base64 so a bug in the helper can't mask it.
+        let expected_basic = {
+            use base64::Engine;
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("u@fm.com:new-app-pass")
+            )
+        };
+        {
+            let lock = state
+                .accounts
+                .read()
+                .await
+                .sessions
+                .get("fm")
+                .cloned()
+                .unwrap();
+            let g = lock.read().await;
+            match &*g {
+                ProviderSession::Fastmail(s) => {
+                    assert_eq!(
+                        s.caldav_auth_header, expected_basic,
+                        "live session must pick up the new app password without a restart"
+                    );
+                    assert_eq!(
+                        s.auth_header, "Bearer tok",
+                        "JMAP bearer header preserved (api-token was kept on empty incoming)"
+                    );
+                }
+                _ => panic!("expected fastmail"),
+            }
+        }
+        // The banner retired — the user fixed what it told them to fix.
+        assert!(
+            state.account_errors.read().await.is_empty(),
+            "corrected config must retire the CalendarAuthUnconfigured banner"
+        );
+        // Persisted to disk too.
+        let (parsed, _) = parse_config(&config_path);
+        match parsed.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail { app_password, .. } => {
+                assert_eq!(app_password.as_deref(), Some("new-app-pass"));
+            }
+            _ => panic!("expected fastmail"),
+        }
     }
 
     #[test]
