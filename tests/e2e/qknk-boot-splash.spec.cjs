@@ -99,4 +99,12 @@ test('qknk: the splash dismisses when boot resolves', async ({ page }) => {
   // toHaveCount(0) auto-retries past the fade-out window, so this is robust to
   // the exact removal timing. Guards the "splash never dismisses" regression.
   await expect(page.locator('#boot-splash')).toHaveCount(0);
+
+  // Steady-state pin: the deploy banner must NOT be showing after a normal
+  // boot. The fixtures deliberately do not mock /api/build-id — the real
+  // server's id matches the <meta name="build-id"> the same binary stamped
+  // into the shell. A past fixture mocked it to a literal, so every spec ran
+  // in a permanent "deploy pending" UI state (banner up, poll dead, layout
+  // shifted). This assertion fails if such a mock ever comes back.
+  await expect(page.locator('#deploy-banner')).toHaveClass(/hidden/);
 });

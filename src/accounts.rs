@@ -1234,7 +1234,20 @@ async fn upsert_account(
                     .map_err(|e| Error::BadRequest(e.into()))?;
                 (false, merge_secrets(&existing, incoming))
             }
-            None => (true, incoming),
+            None => {
+                if !is_new {
+                    // Mirror of the create-vs-create Conflict above: the
+                    // account this update targeted was deleted between the
+                    // advisory read and this write lock. Falling through to
+                    // the create arm would silently resurrect it — with the
+                    // create-only side effects (session build, needs_auth
+                    // flag) skipped, leaving a session-less zombie account.
+                    return Err(Error::Conflict(format!(
+                        "account '{id}' was deleted while the update was in flight"
+                    )));
+                }
+                (true, incoming)
+            }
         };
 
         if let Err(errs) = validate_account(&cfg, &id) {
@@ -3153,5 +3166,59 @@ api-token = tok
             }
             other => panic!("expected fastmail, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn upsert_concurrent_delete_is_surfaced_not_silently_resurrected() {
+        // Update-vs-delete sibling of the create-vs-create Conflict guard in
+        // `upsert_account`: task A's advisory read sees the account (update
+        // path), a concurrent DELETE lands before A takes the write lock,
+        // and the unguarded code fell into the create arm — silently
+        // resurrecting the account the user just deleted, via a path that
+        // skipped the create-only side effects (session build / needs_auth
+        // flag), yielding a session-less, unflagged account.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config");
+        let tokens_dir = dir.path().join("tokens");
+
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".into(), fastmail("u@fm.com", "orig-secret"));
+        reg.default_account = "fm".into();
+        let state = test_app_state(reg, config_path, tokens_dir);
+
+        let pause = std::sync::Arc::new(tokio::sync::Notify::new());
+        let state_a = state.clone();
+        let pause_a = pause.clone();
+        let task_a = tokio::spawn(UPSERT_RACE_PAUSE.scope(pause_a, async move {
+            let incoming = AccountConfig::Fastmail {
+                username: "u@fm.com".into(),
+                api_token: String::new(), // empty => "keep whatever is current"
+                signature: Some("from-A".into()),
+            };
+            upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
+        }));
+
+        // Let task A run up to (and block on) its pause point, then delete
+        // the account out from under it.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        delete_account(State(state.clone()), AxumPath("fm".into()))
+            .await
+            .expect("delete succeeds");
+
+        pause.notify_one();
+        let result = task_a.await.expect("task A join");
+        assert!(
+            matches!(result, Err(Error::Conflict(_))),
+            "an update whose target was deleted mid-flight must surface a conflict, not silently re-create"
+        );
+
+        let reg = state.accounts.read().await;
+        assert!(
+            !reg.account_configs.contains_key("fm"),
+            "the deleted account must stay deleted — no resurrection via the update path"
+        );
     }
 }

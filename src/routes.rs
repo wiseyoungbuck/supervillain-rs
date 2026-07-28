@@ -268,15 +268,27 @@ async fn mobile_html() -> impl IntoResponse {
 }
 
 async fn mobile_app_js() -> impl IntoResponse {
+    // no-cache: see html_headers. The mobile SW is network-first, but both its
+    // fetch(event.request) and install-time cache.addAll() go through the
+    // browser HTTP cache — without this header, heuristic caching can hand the
+    // SW stale bytes after a deploy, and the phone (the whole point of the
+    // deploy-freshness work) keeps running old code.
     (
-        [("content-type", "application/javascript; charset=utf-8")],
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         MOBILE_APP_JS,
     )
 }
 
 async fn mobile_manifest() -> impl IntoResponse {
+    // no-cache: same deploy-freshness contract as the rest of the mobile shell.
     (
-        [("content-type", "application/manifest+json; charset=utf-8")],
+        [
+            ("content-type", "application/manifest+json; charset=utf-8"),
+            ("cache-control", "no-cache"),
+        ],
         MOBILE_MANIFEST,
     )
 }
@@ -4110,6 +4122,12 @@ mod tests {
             ("app.js", app_js().await.into_response()),
             ("api.js", api_js().await.into_response()),
             ("style.css", style_css().await.into_response()),
+            ("mobile/index.html", mobile_html().await.into_response()),
+            ("mobile/app.js", mobile_app_js().await.into_response()),
+            (
+                "mobile/manifest.json",
+                mobile_manifest().await.into_response(),
+            ),
         ] {
             let cc = resp
                 .headers()
@@ -6573,6 +6591,30 @@ white   = '#fdf6e3'
         assert!(
             block.contains("}, 600)"),
             "sizeIframeToContent's suppressed-grow confirm must wait >500ms (600ms) so it clears the quiet-gap reset and applies a real grow instead of re-suppressing forever (ceph)"
+        );
+    }
+
+    // ceph shrink-path parity (branch design review, job 377): the shrink side
+    // must mirror the grow side's two timer guards. (a) The 200ms delayed
+    // confirm needs a single-pending flag — without it, a re-arm during the
+    // window stacks timers and an earlier timer can confirm a newer pending
+    // value after <200ms of stability. (b) Suppression (streak > 2) must
+    // schedule a single-pending delayed re-measure LONGER than the 1s
+    // quiet-gap reset — without it, three legit shrinks in ~1s (several
+    // erroring images) suppress with no further ticks and the trailing blank
+    // space persists forever (Space pages past the end); the re-measure lands
+    // after the quiet gap, resets the streak, and reclaims the space, while a
+    // real ratchet fires again first and re-suppresses.
+    #[test]
+    fn app_js_size_iframe_shrink_path_mirrors_grow_side_guards() {
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        assert!(
+            block.contains("_pendingShrinkConfirm"),
+            "sizeIframeToContent must guard the shrink confirm with a single-pending flag (_pendingShrinkConfirm) — re-arms during the 200ms window must not stack timers (ceph shrink parity)"
+        );
+        assert!(
+            block.contains("}, 1200)"),
+            "sizeIframeToContent's shrink suppression must schedule a single-pending re-measure after the 1s quiet gap (1200ms) so a legit shrink whose ticks stopped still reclaims trailing blank space (ceph shrink parity)"
         );
     }
 

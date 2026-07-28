@@ -5261,14 +5261,24 @@ function sizeIframeToContent(iframe) {
                     if (prev === undefined || Math.abs(prev - h) >= 1) {
                         // First smaller read, or a different value than the
                         // pending one — record and schedule a confirmation.
+                        // Single-pending guard (mirrors _pendingGrowConfirm):
+                        // a re-arm during the 200ms window must update the
+                        // pending VALUE but not stack a second timer, or an
+                        // earlier timer confirms a newer value after <200ms
+                        // of stability (ceph shrink parity).
                         iframe._pendingShrink = h;
-                        setTimeout(() => {
-                            // Re-measure via the observer path; if the value is
-                            // still ~h, it's stable and the shrink applies. If
-                            // layout changed again, _pendingShrink was updated
-                            // by that read and this confirm is a no-op.
-                            observerFn();
-                        }, 200);
+                        if (!iframe._pendingShrinkConfirm) {
+                            iframe._pendingShrinkConfirm = true;
+                            setTimeout(() => {
+                                // Re-measure via the observer path; if the
+                                // value is still ~h, it's stable and the
+                                // shrink applies. If layout changed again,
+                                // _pendingShrink was updated by that read and
+                                // this confirm is a no-op.
+                                iframe._pendingShrinkConfirm = false;
+                                observerFn();
+                            }, 200);
+                        }
                         return;
                     }
                     // Stable confirmed shrink (this read ~= the pending one).
@@ -5286,6 +5296,23 @@ function sizeIframeToContent(iframe) {
                     iframe._shrinkStreak = (iframe._shrinkStreak || 0) + 1;
                     if (iframe._shrinkStreak > 2) {
                         iframe._pendingShrink = undefined;
+                        // Escape hatch (mirrors the suppressed-grow confirm):
+                        // three LEGIT shrinks within ~1s (several erroring
+                        // images) also trip the streak, and with no further
+                        // observer ticks the trailing blank space would
+                        // persist forever. Schedule a single-pending
+                        // re-measure past the 1s quiet-gap reset: a legit
+                        // shrink is quiet by then, so the streak resets and
+                        // the space is reclaimed; a real ratchet fires again
+                        // before the confirm and re-suppresses — bounded, no
+                        // perpetual loop (ceph shrink parity).
+                        if (!iframe._pendingShrinkConfirm) {
+                            iframe._pendingShrinkConfirm = true;
+                            setTimeout(() => {
+                                iframe._pendingShrinkConfirm = false;
+                                observerFn();
+                            }, 1200);
+                        }
                         return; // ratchet — stop collapsing
                     }
                     iframe._pendingShrink = undefined;
@@ -5331,9 +5358,11 @@ function sizeIframeToContent(iframe) {
                             // it fires again before the 600ms confirm and re-
                             // suppresses — bounded to ~epsilon per 600ms period
                             // (no perpetual loop: a single pending confirm per
-                            // iframe, cleared if a real observer tick supersedes
-                            // it). A real grow with no further ratchet ticks
-                            // confirms and applies (roborev on ceph).
+                            // iframe — only the timer callback clears the flag;
+                            // an intervening real observer tick just fires a
+                            // benign redundant re-measure). A real grow with no
+                            // further ratchet ticks confirms and applies
+                            // (roborev on ceph).
                             if (!iframe._pendingGrowConfirm) {
                                 iframe._pendingGrowConfirm = true;
                                 setTimeout(() => {

@@ -1,8 +1,9 @@
 // Playwright config for the supervillain e2e suite (kata 1p0d/9rg8/nt9e/8n1v).
 //
 // Design (honest about the trade-off):
-//   - The server is the REAL installed `supervillain` binary, booted against a
-//     temp XDG_CONFIG_HOME so no real accounts/tokens are touched. It serves the
+//   - The server is the REAL `supervillain` binary (the workspace target/debug
+//     build when present, so specs test HEAD), booted against a temp
+//     XDG_CONFIG_HOME so no real accounts/tokens are touched. It serves the
 //     real embedded index.html / app.js / style.css — the exact bytes a user
 //     gets — so the specs assert against the real rendered DOM.
 //   - Every /api/* call is mocked at the network layer via page.route() in each
@@ -35,10 +36,19 @@ function tempConfigDir() {
   return dir;
 }
 
+// The system under test: prefer the workspace build so specs assert against
+// HEAD (cargo test guarantees target/debug exists); fall back to PATH only for
+// direct `npx playwright test` runs on a machine without a workspace build.
+function workspaceBinary() {
+  const built = path.join(__dirname, 'target', 'debug', 'supervillain');
+  return fs.existsSync(built) ? built : 'supervillain';
+}
+
 module.exports = defineConfig({
   testDir: './tests/e2e',
   fullyParallel: false, // one server at a time; specs are fast and sequential
-  forbidConsole: false, // the app logs provider warnings on empty config; expected
+  // Note: the app logs provider warnings on an empty config during boot;
+  // that's expected and specs must not assert console silence.
   reporter: [['list']],
   use: {
     baseURL: 'http://127.0.0.1:8765',
@@ -52,12 +62,17 @@ module.exports = defineConfig({
     },
   ],
   webServer: {
-    // The real installed binary, against an empty temp config. --no-browser so
-    // it doesn't try to open a browser. The server is the SUT — its /api
-    // responses are mocked per-spec, but the shell (index.html/app.js/style.css)
-    // it serves is the real thing under test. Dedicated port 8765 so the suite
-    // never collides with a running dev/deploy server on the default 8000.
-    command: 'supervillain --no-browser',
+    // The freshly built workspace binary, against an empty temp config.
+    // --no-browser so it doesn't try to open a browser. The server is the SUT —
+    // its /api responses are mocked per-spec, but the shell
+    // (index.html/app.js/style.css) it serves is the real thing under test.
+    // target/debug is preferred so `cargo test --test e2e_test` (which builds
+    // it) asserts specs against HEAD, not against whatever was last
+    // `cargo install`ed — otherwise test outcomes track deploy state instead of
+    // the working tree. PATH fallback only for direct `npx playwright test`
+    // runs without a workspace build. Dedicated port 8765 so the suite never
+    // collides with a running dev/deploy server on the default 8000.
+    command: `${workspaceBinary()} --no-browser`,
     port: 8765,
     timeout: 30_000,
     reuseExistingServer: false,
