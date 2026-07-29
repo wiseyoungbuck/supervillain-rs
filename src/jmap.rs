@@ -1130,13 +1130,17 @@ fn base64_mime_lines(data: &[u8]) -> String {
 }
 
 /// RFC 2047 B-encode a Subject that contains non-ASCII (event summaries are
-/// user text — "Réunion d'équipe"); ASCII subjects pass through bare.
-/// Chunking at ≤45 UTF-8 bytes (on char boundaries) keeps every
-/// encoded-word within RFC 2047's 75-char limit; continuation words fold
-/// onto their own header lines.
+/// user text — "Réunion d'équipe"); short ASCII subjects pass through bare.
+/// Long ASCII subjects also take the encoded-word path — the chunking
+/// doubles as line folding, keeping `Subject: ` + value within RFC 5322's
+/// 78-char SHOULD limit (roborev 416 #3). Chunking at ≤42 UTF-8 bytes (on
+/// char boundaries) makes each encoded-word 68 chars — within RFC 2047's
+/// 75-char word limit, and short enough that the first word plus the
+/// `Subject: ` prefix stays ≤78; continuation words fold onto their own
+/// header lines.
 fn encode_subject(raw: &str) -> String {
     let s = strip_crlf(raw);
-    if s.is_ascii() {
+    if s.is_ascii() && s.len() + "Subject: ".len() <= 78 {
         return s;
     }
     fn encoded_word(chunk: &str) -> String {
@@ -1149,7 +1153,7 @@ fn encode_subject(raw: &str) -> String {
     let mut words: Vec<String> = Vec::new();
     let mut chunk = String::new();
     for ch in s.chars() {
-        if chunk.len() + ch.len_utf8() > 45 {
+        if chunk.len() + ch.len_utf8() > 42 {
             words.push(encoded_word(&chunk));
             chunk.clear();
         }
@@ -1217,6 +1221,32 @@ fn build_itip_reply_mime(sub: &EmailSubmission, from_addr: &str) -> String {
     )
 }
 
+/// True when the ICS is an iTIP REPLY (line-anchored, case-insensitive;
+/// `lines()` leaves a trailing `\r` on CRLF input, hence the trim). This is
+/// `send_email`'s routing key: a REPLY must carry `method=REPLY` on its MIME
+/// Content-Type, which Email/set cannot express, so it goes out as a
+/// client-built message via Email/import. Everything else (invites'
+/// METHOD:REQUEST, with cc/attachments) stays on the Email/set path.
+fn is_itip_reply_ics(ics: &str) -> bool {
+    ics.lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("METHOD:REPLY"))
+}
+
+/// Human-readable detail for a failed create in a `/set`-style method
+/// response: prefer `notCreated`, but fall back to the whole method-response
+/// argument — a method-level failure is `["error", {"type": …}, id]`, where
+/// `notCreated` doesn't exist and the argument IS the error object
+/// (roborev 416 #4).
+fn create_failure_detail(resp: &serde_json::Value, index: usize) -> String {
+    let args = &resp["methodResponses"][index][1];
+    let not_created = &args["notCreated"];
+    if not_created.is_null() {
+        args.to_string()
+    } else {
+        not_created.to_string()
+    }
+}
+
 /// SMTP envelope recipients for a submission: to + cc + bcc.
 fn envelope_rcpt_to(sub: &EmailSubmission) -> Vec<serde_json::Value> {
     let mut rcpt_to: Vec<serde_json::Value> = sub
@@ -1246,15 +1276,18 @@ async fn send_itip_reply(
     drafts_id: &str,
     sent_id: &str,
 ) -> Result<Option<String>, Error> {
-    // rsvp() is the only producer of calendar_ics submissions and sets none
-    // of these; the minimal From/To/Subject builder would silently drop them.
-    debug_assert!(
-        sub.cc.is_empty()
-            && sub.bcc.is_none()
-            && sub.attachments.is_empty()
-            && sub.in_reply_to.is_none(),
-        "send_itip_reply builds a minimal From/To/Subject message"
-    );
+    // rsvp() is the only producer of METHOD:REPLY submissions and sets none
+    // of these. Fail loudly rather than let the minimal From/To/Subject
+    // builder silently drop a future caller's data (roborev 416 #1).
+    if !sub.cc.is_empty()
+        || sub.bcc.as_ref().is_some_and(|b| !b.is_empty())
+        || !sub.attachments.is_empty()
+        || sub.in_reply_to.is_some()
+    {
+        return Err(Error::Internal(
+            "send_itip_reply supports only to/subject/text_body/calendar_ics".into(),
+        ));
+    }
     let mime = build_itip_reply_mime(sub, from_addr);
     let (blob_id, _) = upload_blob(s, "message/rfc822", mime.as_bytes()).await?;
 
@@ -1304,25 +1337,17 @@ async fn send_itip_reply(
 
     let imported = &resp["methodResponses"][0][1]["created"]["e"];
     if imported.is_null() {
-        let not_created = &resp["methodResponses"][0][1]["notCreated"];
-        let detail = if not_created.is_null() {
-            "no detail".into()
-        } else {
-            not_created.to_string()
-        };
-        return Err(Error::Internal(format!("Email import failed: {detail}")));
+        return Err(Error::Internal(format!(
+            "Email import failed: {}",
+            create_failure_detail(&resp, 0)
+        )));
     }
 
     let submission = &resp["methodResponses"][1][1]["created"]["send"];
     if submission.is_null() {
-        let not_created = &resp["methodResponses"][1][1]["notCreated"];
-        let detail = if not_created.is_null() {
-            "no detail".into()
-        } else {
-            not_created.to_string()
-        };
         return Err(Error::Internal(format!(
-            "Email submission failed: {detail}"
+            "Email submission failed: {}",
+            create_failure_detail(&resp, 1)
         )));
     }
 
@@ -1358,16 +1383,44 @@ fn build_draft_email(
     // appear at the top level.  We always set bodyStructure, so content is
     // defined entirely through bodyStructure + bodyValues with partId refs.
 
-    // calendar_ics never reaches this builder: an iTIP reply cannot be
-    // expressed as Email/set bodyStructure at all — no part property carries
-    // the MIME `method=REPLY` parameter (kata vt0m, verified against live
-    // Fastmail) — so `send_email` routes it through `send_itip_reply`
-    // (Email/import) before this is called.
     debug_assert!(
-        sub.calendar_ics.is_none(),
-        "calendar_ics is sent via send_itip_reply (Email/import), not build_draft_email"
+        sub.calendar_ics.is_none() || sub.html_body.is_none(),
+        "calendar_ics and html_body are mutually exclusive"
     );
-    if let Some(ref html) = sub.html_body {
+    if let Some(ref calendar_ics) = sub.calendar_ics {
+        // Invites (METHOD:REQUEST), from send_invite_handler — with cc and
+        // attachments intact (roborev 416 #1). iTIP REPLYs never reach this
+        // builder: their MIME Content-Type must carry `method=REPLY`, which
+        // Email/set cannot express, so `send_email` routes them through
+        // `send_itip_reply` (Email/import) first. For invites the part uses
+        // a bare `type` — the only calendar shape Email/set accepts
+        // (parameters in `type`, a `charset` property, and `header:*` are
+        // all rejected as invalidProperties; verified against live Fastmail
+        // 2026-07-29, kata vt0m). The wire gets `text/calendar;
+        // charset=utf-8` with no method parameter; recipients read
+        // METHOD:REQUEST from the ICS body itself.
+        debug_assert!(
+            !is_itip_reply_ics(calendar_ics),
+            "iTIP REPLY goes through send_itip_reply, not build_draft_email"
+        );
+        m.insert(
+            "bodyValues".into(),
+            serde_json::json!({
+                "body": { "value": sub.text_body },
+                "calendar": { "value": calendar_ics }
+            }),
+        );
+        m.insert(
+            "bodyStructure".into(),
+            serde_json::json!({
+                "type": "multipart/mixed",
+                "subParts": [
+                    { "partId": "body", "type": "text/plain" },
+                    { "partId": "calendar", "type": "text/calendar" }
+                ]
+            }),
+        );
+    } else if let Some(ref html) = sub.html_body {
         m.insert(
             "bodyValues".into(),
             serde_json::json!({
@@ -1417,20 +1470,34 @@ fn build_draft_email(
             })
             .collect();
 
-        // Text or HTML body: wrap in multipart/mixed with the attachments.
-        // (The stage-1 structure is never already multipart/mixed — the
-        // calendar case that used to produce one goes through
-        // send_itip_reply, not this builder.)
         let body_structure = m.remove("bodyStructure").unwrap();
-        let mut sub_parts = vec![body_structure];
-        sub_parts.extend(attachment_parts);
-        m.insert(
-            "bodyStructure".into(),
-            serde_json::json!({
-                "type": "multipart/mixed",
-                "subParts": sub_parts
-            }),
-        );
+        if body_structure["type"] == "multipart/mixed" {
+            // Invite (calendar) case: append attachment parts to the
+            // existing multipart/mixed rather than double-wrapping.
+            let mut sub_parts = body_structure["subParts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            sub_parts.extend(attachment_parts);
+            m.insert(
+                "bodyStructure".into(),
+                serde_json::json!({
+                    "type": "multipart/mixed",
+                    "subParts": sub_parts
+                }),
+            );
+        } else {
+            // Text or HTML: wrap in new multipart/mixed
+            let mut sub_parts = vec![body_structure];
+            sub_parts.extend(attachment_parts);
+            m.insert(
+                "bodyStructure".into(),
+                serde_json::json!({
+                    "type": "multipart/mixed",
+                    "subParts": sub_parts
+                }),
+            );
+        }
     }
 
     if !sub.cc.is_empty() {
@@ -1523,10 +1590,12 @@ pub async fn send_email(
         .id
         .clone();
 
-    // iTIP replies can't be expressed as Email/set bodyStructure — no part
+    // iTIP REPLYs can't be expressed as Email/set bodyStructure — no part
     // property carries the MIME `method=REPLY` parameter (kata vt0m) — so
-    // they go out as a client-built RFC822 message via Email/import.
-    if sub.calendar_ics.is_some() {
+    // they go out as a client-built RFC822 message via Email/import. Only
+    // REPLYs: invites (METHOD:REQUEST, with cc/attachments) stay on the
+    // Email/set path below (roborev 416 #1/#2).
+    if sub.calendar_ics.as_deref().is_some_and(is_itip_reply_ics) {
         return send_itip_reply(
             s,
             sub,
@@ -1590,25 +1659,17 @@ pub async fn send_email(
     // Check for errors
     let email_created = &resp["methodResponses"][0][1]["created"]["draft"];
     if email_created.is_null() {
-        let not_created = &resp["methodResponses"][0][1]["notCreated"];
-        let detail = if not_created.is_null() {
-            "no detail".into()
-        } else {
-            not_created.to_string()
-        };
-        return Err(Error::Internal(format!("Email creation failed: {detail}")));
+        return Err(Error::Internal(format!(
+            "Email creation failed: {}",
+            create_failure_detail(&resp, 0)
+        )));
     }
 
     let submission = &resp["methodResponses"][1][1]["created"]["send"];
     if submission.is_null() {
-        let not_created = &resp["methodResponses"][1][1]["notCreated"];
-        let detail = if not_created.is_null() {
-            "no detail".into()
-        } else {
-            not_created.to_string()
-        };
         return Err(Error::Internal(format!(
-            "Email submission failed: {detail}"
+            "Email submission failed: {}",
+            create_failure_detail(&resp, 1)
         )));
     }
 
@@ -4252,11 +4313,190 @@ END:VCALENDAR";
     }
 
     #[test]
-    #[should_panic(expected = "calendar_ics is sent via send_itip_reply")]
-    fn build_draft_email_rejects_calendar_ics() {
-        // send_email routes calendar_ics through send_itip_reply before this
-        // builder runs; reaching it with calendar_ics set is a routing bug.
+    #[should_panic(expected = "iTIP REPLY goes through send_itip_reply")]
+    fn build_draft_email_rejects_method_reply_ics() {
+        // send_email routes METHOD:REPLY through send_itip_reply before this
+        // builder runs; reaching it with a REPLY ICS is a routing bug.
         build_draft_email(&itip_submission(), "bob@example.com", "mb-drafts");
+    }
+
+    #[test]
+    #[should_panic(expected = "calendar_ics and html_body are mutually exclusive")]
+    fn draft_rejects_calendar_ics_with_html_body() {
+        let mut sub = invite_submission();
+        sub.html_body = Some("<p>Should not coexist</p>".into());
+        build_draft_email(&sub, "bob@example.com", "mb-drafts");
+    }
+
+    // --- invite path: METHOD:REQUEST stays on Email/set (roborev 416 #1/#2) ---
+
+    /// An invite as `send_invite_handler` builds it: METHOD:REQUEST ICS plus
+    /// cc and attachments from the request body.
+    fn invite_submission() -> EmailSubmission {
+        EmailSubmission {
+            to: vec!["guest@example.com".into()],
+            cc: vec!["observer@example.com".into()],
+            subject: "Team Standup".into(),
+            text_body: "You're invited".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![pdf_attachment()],
+            calendar_ics: Some(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
+                 SUMMARY:Team Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                    .into(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_with_request_ics_stays_on_email_set_and_keeps_cc_and_attachments() {
+        // roborev 416 (High): rsvp() is NOT the only calendar_ics producer —
+        // send_invite_handler sends METHOD:REQUEST invites with cc and
+        // attachments. Those must NOT take the iTIP-REPLY import path (which
+        // would drop cc/attachments and mislabel the MIME method=REPLY);
+        // they stay on Email/set with a bare `type: "text/calendar"` — the
+        // only calendar shape Email/set accepts (verified live 2026-07-29).
+        let canned = serde_json::json!({
+            "methodResponses": [
+                ["Email/set", {"created": {"draft": {"id": "E1"}}}, "0"],
+                ["EmailSubmission/set", {"created": {"send": {"emailId": "E1"}}}, "1"]
+            ]
+        });
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
+                .await;
+        let mut s = JmapSession::new("bob@example.com", "test-token", None);
+        s.api_url = Some(format!("{base}/jmap"));
+        s.upload_url = Some(format!("{base}/upload/{{accountId}}"));
+        s.account_id = Some("acc1".into());
+        s.identity_id = Some("ident1".into());
+        for (id, name, role) in [
+            ("mb-drafts", "Drafts", "drafts"),
+            ("mb-sent", "Sent", "sent"),
+        ] {
+            s.mailbox_cache.insert(
+                id.into(),
+                Mailbox {
+                    id: id.into(),
+                    name: name.into(),
+                    role: Some(role.into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            );
+        }
+
+        let result = send_email(
+            &mut s,
+            &invite_submission(),
+            "bob@example.com",
+            Some("ident1"),
+        )
+        .await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert!(
+            !reqs.iter().any(|r| r.path.starts_with("/upload/")),
+            "an invite must not take the import path"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_no_rejected_part_shapes(&body);
+        let calls = &body["methodCalls"];
+        assert_eq!(calls[0][0], "Email/set");
+        let draft = &calls[0][1]["create"]["draft"];
+        assert_eq!(draft["cc"][0]["email"], "observer@example.com");
+        let parts = draft["bodyStructure"]["subParts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "text + calendar + attachment: {parts:?}");
+        assert_eq!(parts[0]["type"], "text/plain");
+        assert_eq!(parts[1]["partId"], "calendar");
+        assert_eq!(
+            parts[1]["type"], "text/calendar",
+            "invite calendar part uses the bare accepted type"
+        );
+        assert_eq!(parts[2]["blobId"], "blob-pdf-123");
+        assert_eq!(
+            draft["bodyValues"]["calendar"]["value"],
+            invite_submission().calendar_ics.unwrap()
+        );
+    }
+
+    #[test]
+    fn itip_mime_long_ascii_subject_is_folded_within_line_limits() {
+        // roborev 416 #3: ASCII subjects from third-party ICS can be
+        // arbitrarily long; they must not produce a header line beyond
+        // RFC 5322 limits.
+        let mut sub = itip_submission();
+        sub.subject = format!("Re: {}", "x".repeat(400));
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        for line in mime.lines() {
+            assert!(
+                line.len() <= 78,
+                "header line exceeds RFC 5322 SHOULD limit ({}): {line:?}",
+                line.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn itip_reply_surfaces_method_level_jmap_error() {
+        // roborev 416 #4: a method-level failure is ["error", {...}] — no
+        // notCreated — and must surface the error object, not "no detail".
+        let canned = serde_json::json!({
+            "blobId": "blob-rfc822-1",
+            "size": 1,
+            "methodResponses": [
+                ["error", {"type": "serverFail", "description": "boom"}, "0"]
+            ]
+        });
+        let (base, _recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
+                .await;
+        let mut s = JmapSession::new("bob@example.com", "test-token", None);
+        s.api_url = Some(format!("{base}/jmap"));
+        s.upload_url = Some(format!("{base}/upload/{{accountId}}"));
+        s.account_id = Some("acc1".into());
+        s.identity_id = Some("ident1".into());
+        for (id, name, role) in [
+            ("mb-drafts", "Drafts", "drafts"),
+            ("mb-sent", "Sent", "sent"),
+        ] {
+            s.mailbox_cache.insert(
+                id.into(),
+                Mailbox {
+                    id: id.into(),
+                    name: name.into(),
+                    role: Some(role.into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            );
+        }
+        let err = send_email(
+            &mut s,
+            &itip_submission(),
+            "bob@example.com",
+            Some("ident1"),
+        )
+        .await
+        .expect_err("method-level error must fail the send");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("serverFail"),
+            "error must carry the JMAP error detail, got: {msg}"
+        );
     }
 
     // --- build_draft_email attachment tests ---
