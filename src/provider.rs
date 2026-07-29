@@ -473,6 +473,15 @@ pub async fn rsvp(
 ) -> Result<(), Error> {
     match s {
         ProviderSession::Fastmail(s) => {
+            // Fail fast before any outward-facing side effect (kata m5yp,
+            // roborev 376 #2): a missing app password makes the CalDAV write
+            // fail, so don't email the organizer an acceptance the calendar
+            // can't back — each retry would otherwise send another duplicate
+            // iTIP REPLY. The credential is knowable from the session before
+            // any network I/O, so surface it here with zero side effects.
+            if s.caldav_auth_header.is_empty() {
+                return Err(Error::CalendarAuthUnconfigured);
+            }
             // Send iTIP reply email to organizer, with DTSTART quoted in the user's
             // primary timezone instead of UTC-Z.
             let rsvp_ics = calendar::generate_rsvp_with_tz(event, attendee_email, status, reply_tz);
@@ -501,16 +510,16 @@ pub async fn rsvp(
                 );
             }
 
-            // CalDAV: decline = remove, accept/tentative = upsert with updated PARTSTAT
+            // CalDAV: decline = remove, accept/tentative = upsert with updated
+            // PARTSTAT. Propagate the error (kata m5yp): a missing/wrong app
+            // password must surface to the RSVP response via the route's `?`,
+            // not be `warn!`-ed past an `Ok(())` so the UI reports success
+            // while Morgen never sees the event.
             if *status == RsvpStatus::Declined {
-                if let Err(e) = jmap::remove_from_calendar(s, &event.uid).await {
-                    tracing::warn!("CalDAV delete failed for {}: {e}", event.uid);
-                }
+                jmap::remove_from_calendar(s, &event.uid).await?;
             } else {
                 let updated_ics = calendar::update_partstat(ics_data, attendee_email, status);
-                if let Err(e) = jmap::add_to_calendar(s, &updated_ics, &event.uid, false).await {
-                    tracing::warn!("CalDAV write failed for {}: {e}", event.uid);
-                }
+                jmap::add_to_calendar(s, &updated_ics, &event.uid, false).await?;
             }
         }
         ProviderSession::Outlook(s) => {
@@ -574,7 +583,8 @@ mod tests {
     fn make_fastmail_session() -> ProviderSession {
         ProviderSession::Fastmail(Box::new(JmapSession::new(
             "user@fastmail.com",
-            "Bearer token",
+            "token",
+            Some("app-pass"),
         )))
     }
 

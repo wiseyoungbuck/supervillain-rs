@@ -123,7 +123,18 @@ struct JmapEmailRaw {
 pub struct JmapSession {
     pub client: reqwest::Client,
     pub username: String,
+    /// `Bearer <api-token>` — sent to `api.fastmail.com` for JMAP. API tokens
+    /// are JMAP/MCP-only; Fastmail rejects them at the CalDAV endpoint.
     pub auth_header: String,
+    /// `Basic <base64(username:app_password)>` — sent to `caldav.fastmail.com`
+    /// for CalDAV, which requires an app password (not an API token). Empty
+    /// when no app password is configured; the CalDAV functions then return
+    /// `Error::CalendarAuthUnconfigured` without issuing any request.
+    pub caldav_auth_header: String,
+    /// CalDAV base URL. Defaults to `https://caldav.fastmail.com`; a field so
+    /// the constant lives in one place (not four inline string literals) and
+    /// tests can point it at a loopback recorder.
+    pub caldav_base: String,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
     pub upload_url: Option<String>,
@@ -140,14 +151,24 @@ pub struct JmapSession {
 }
 
 impl JmapSession {
-    pub fn new(username: &str, auth_header: &str) -> Self {
+    /// Build a session holding both Fastmail auth headers.
+    ///
+    /// `api_token` → `auth_header` (`Bearer`, for JMAP at `api.fastmail.com`).
+    /// `app_password` → `caldav_auth_header` (`Basic`, for CalDAV at
+    /// `caldav.fastmail.com`). `app_password = None` leaves
+    /// `caldav_auth_header` empty; the CalDAV functions surface
+    /// `Error::CalendarAuthUnconfigured` on first use rather than failing at
+    /// construction — existing configs without an app password load fine.
+    pub fn new(username: &str, api_token: &str, app_password: Option<&str>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to create HTTP client"),
             username: username.into(),
-            auth_header: auth_header.into(),
+            auth_header: format!("Bearer {api_token}"),
+            caldav_auth_header: basic_auth_header(username, app_password),
+            caldav_base: "https://caldav.fastmail.com".into(),
             api_url: None,
             account_id: None,
             upload_url: None,
@@ -162,6 +183,34 @@ impl JmapSession {
                 3,
             )),
         }
+    }
+
+    /// Recompute `auth_header` and `caldav_auth_header` from fresh credentials,
+    /// in place on the live session. Used when a Fastmail account is updated
+    /// (Settings save) so a rotated api-token / newly-added app password takes
+    /// effect without a restart — the JMAP session state (api_url, account_id,
+    /// mailbox_cache) is account-level and stays valid across a credential
+    /// rotation, so no reconnect is needed. The username is unchanged on this
+    /// path (a username change is a different account and rebuilds via
+    /// `new`/`connect`), so `self.username` is reused for the Basic header.
+    pub fn set_credentials(&mut self, api_token: &str, app_password: Option<&str>) {
+        self.auth_header = format!("Bearer {api_token}");
+        self.caldav_auth_header = basic_auth_header(&self.username, app_password);
+    }
+}
+
+/// `Basic <base64(username:app_password)>` for CalDAV, or empty when no app
+/// password is configured (the CalDAV functions then return
+/// `Error::CalendarAuthUnconfigured` without sending it). Shared by
+/// `JmapSession::new` and `set_credentials` so the encoding can't drift.
+fn basic_auth_header(username: &str, app_password: Option<&str>) -> String {
+    use base64::Engine;
+    match app_password.filter(|p| !p.is_empty()) {
+        Some(p) => format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{p}"))
+        ),
+        None => String::new(),
     }
 }
 
@@ -1722,26 +1771,65 @@ pub async fn get_calendar_data(s: &JmapSession, email_id: &str) -> Result<Option
     Ok(Some(ics_data))
 }
 
+/// `Err(CalendarAuthUnconfigured)` if no CalDAV app password is configured.
+/// Called at the top of every CalDAV function so a missing credential is
+/// surfaced as a named, actionable error *before* any HTTP request — not
+/// swallowed as a 401 + `Ok(false)` + `warn!` (the bug that rotted silently for
+/// months). Returns the `caldav_auth_header` (`Basic <base64(user:pass)>`) for
+/// the call to send.
+fn require_caldav_auth(s: &JmapSession) -> Result<&str, Error> {
+    if s.caldav_auth_header.is_empty() {
+        Err(Error::CalendarAuthUnconfigured)
+    } else {
+        Ok(&s.caldav_auth_header)
+    }
+}
+
+/// Turn a non-2xx CalDAV response into an honest `Err` (not `Ok(false)`).
+/// 401/403 → `Error::Auth`: the app password is present but wrong/revoked, an
+/// actionable auth failure the UI surfaces as 401. Anything else →
+/// `Error::Internal` with the status. The response body is logged at WARN for
+/// operator debugging — it never reaches the client, since both `Error::Auth`
+/// and `Error::Internal` redact their detail in `IntoResponse`.
+fn caldav_failure(method: &str, url: &str, status: reqwest::StatusCode, body: &str) -> Error {
+    tracing::warn!("CalDAV {method} {url} failed: {status} — {body}");
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        Error::Auth(format!("CalDAV {method} rejected ({status})"))
+    } else {
+        Error::Internal(format!("CalDAV {method} {url} failed: {status}"))
+    }
+}
+
 /// Fetch the current calendar event from CalDAV by UID.
 /// Returns a parsed CalendarEvent, or None if the event doesn't exist.
 pub async fn get_calendar_event(
     s: &JmapSession,
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
-        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
-        s.username, uid
+        "{}/dav/calendars/user/{}/Default/{}.ics",
+        s.caldav_base,
+        s.username,
+        percent_encode_path(uid)
     );
 
     let resp = s
         .client
         .get(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
         .await?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    // 404 = not stored yet is a legitimate "no event", not a failure — the
+    // get_email caller degrades to the email ICS. Other non-2xx surface.
+    if status.as_u16() == 404 {
         return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("GET", &caldav_url, status, &body));
     }
 
     let ics_data = resp.text().await?;
@@ -1754,13 +1842,16 @@ pub async fn add_to_calendar(
     uid: &str,
     only_if_new: bool,
 ) -> Result<bool, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     // Strip METHOD before storing — RFC 4791: stored calendar objects must not
     // contain METHOD (it's an iTIP transport property, not a storage property)
     let ics_data = calendar::strip_method(ics_data);
 
     // CalDAV PUT to Fastmail calendar, using event UID as filename for idempotency
     let caldav_url = format!(
-        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        "{}/dav/calendars/user/{}/Default/{}.ics",
+        s.caldav_base,
         s.username,
         percent_encode_path(uid)
     );
@@ -1768,7 +1859,7 @@ pub async fn add_to_calendar(
     let mut req = s
         .client
         .put(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .header("Content-Type", "text/calendar; charset=utf-8");
 
     // If-None-Match: * means "only create, don't overwrite existing"
@@ -1779,18 +1870,29 @@ pub async fn add_to_calendar(
     let resp = req.body(ics_data).send().await?;
 
     let status = resp.status();
+    // If-None-Match: * + 412 Precondition Failed means the event already
+    // exists. For only_if_new (the only path that sends the header) that's the
+    // desired idempotent outcome — the event is in the calendar — not a
+    // failure. Returning Ok(true) keeps the auto-add caller from logging a
+    // spurious error on the benign lost-race; the explicit-add caller
+    // (only_if_new = false, no If-None-Match) never sees a 412.
+    if only_if_new && status.as_u16() == 412 {
+        return Ok(true);
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("CalDAV PUT {caldav_url} failed: {status} — {body}");
-        return Ok(false);
+        return Err(caldav_failure("PUT", &caldav_url, status, &body));
     }
 
     Ok(true)
 }
 
 pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
-        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        "{}/dav/calendars/user/{}/Default/{}.ics",
+        s.caldav_base,
         s.username,
         percent_encode_path(uid)
     );
@@ -1798,54 +1900,62 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
     let resp = s
         .client
         .delete(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
         .await?;
 
     let status = resp.status();
+    // DELETE is idempotent: 404 (already gone) is the desired end state, not a
+    // failure. Surfacing it as Err would make a CANCEL for an already-removed
+    // event or a double-decline 500.
+    if status.as_u16() == 404 {
+        return Ok(true);
+    }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("CalDAV DELETE {caldav_url} failed: {status} — {body}");
-        return Ok(false);
+        return Err(caldav_failure("DELETE", &caldav_url, status, &body));
     }
 
     Ok(true)
 }
 
-pub async fn get_rsvp_status(s: &JmapSession, uid: &str, attendee_email: &str) -> Option<String> {
+/// Read a stored event's attendee PARTSTAT for `attendee_email` from CalDAV.
+/// Returns `Ok(None)` when the event isn't stored (404) or has no matching
+/// attendee; `Err(CalendarAuthUnconfigured)` when no app password is set; and
+/// `Err` (auth/internal) on other non-2xx — surfacing the failure rather than
+/// the old silent `None`.
+pub async fn get_rsvp_status(
+    s: &JmapSession,
+    uid: &str,
+    attendee_email: &str,
+) -> Result<Option<String>, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
     let caldav_url = format!(
-        "https://caldav.fastmail.com/dav/calendars/user/{}/Default/{}.ics",
+        "{}/dav/calendars/user/{}/Default/{}.ics",
+        s.caldav_base,
         s.username,
         percent_encode_path(uid)
     );
 
-    let resp = match s
+    let resp = s
         .client
         .get(&caldav_url)
-        .header("Authorization", &s.auth_header)
+        .header("Authorization", auth)
         .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("CalDAV GET failed for {uid}: {e}");
-            return None;
-        }
-    };
+        .await?;
 
-    if !resp.status().is_success() {
-        return None;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("GET", &caldav_url, status, &body));
     }
 
-    let ics_data = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("CalDAV GET body read failed for {uid}: {e}");
-            return None;
-        }
-    };
-
-    attendee_status_from_ics(&ics_data, attendee_email)
+    let ics_data = resp.text().await?;
+    Ok(attendee_status_from_ics(&ics_data, attendee_email))
 }
 
 /// Parse ICS data and extract a specific attendee's PARTSTAT.
@@ -1901,6 +2011,79 @@ fn uuid_v4() -> String {
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// A real loopback HTTP recorder for CalDAV behavioral tests.
+///
+/// No mocking framework: `tokio::net::TcpListener` + `axum::serve` (the same
+/// real-HTTP pattern the codebase already uses in `outlook.rs` tests). Every
+/// incoming request is appended to the shared `recorded` buffer with its
+/// method, path, `Authorization` header, and body; the server responds to
+/// *every* method/path with the canned `status` + `body` so a test can drive
+/// PUT / GET / DELETE against one endpoint and then assert on the recorded
+/// headers. A test points `JmapSession::caldav_base` at the returned URL so
+/// the CalDAV functions hit the recorder instead of `caldav.fastmail.com`.
+#[cfg(test)]
+pub(crate) mod caldav_recorder {
+    use std::sync::{Arc, Mutex};
+
+    /// One request as seen by the loopback server.
+    #[derive(Clone, Debug)]
+    pub struct RecordedRequest {
+        pub method: String,
+        pub path: String,
+        pub authorization: Option<String>,
+        pub body: Vec<u8>,
+    }
+
+    /// Spawn the recorder. Returns `(base_url, recorded_buffer)`.
+    pub async fn spawn(
+        status: axum::http::StatusCode,
+        body: Vec<u8>,
+    ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let recorded: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_handler = recorded.clone();
+        let body_for_handler = body.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let recorded = recorded_for_handler.clone();
+            let body = body_for_handler.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let authorization = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let req_body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default()
+                    .to_vec();
+                recorded.lock().unwrap().push(RecordedRequest {
+                    method,
+                    path,
+                    authorization,
+                    body: req_body,
+                });
+                (status, axum::body::Bytes::from(body))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), recorded)
+    }
+
+    /// Convenience: the `Basic <base64(username:app_password)>` header the
+    /// CalDAV functions are expected to send, so a test doesn't re-derive
+    /// the encoding (and can't drift from the production encoding).
+    pub fn expected_basic_header(username: &str, app_password: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{app_password}"))
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3874,5 +4057,239 @@ END:VCALENDAR";
         let part: BodyStructurePart = serde_json::from_value(json).unwrap();
         assert_eq!(part.size, 0);
         assert!(part.sub_parts.is_empty());
+    }
+
+    // =========================================================================
+    // kata m5yp — Fastmail CalDAV must use Basic auth with an app password
+    // (the API token is JMAP/MCP-only and Fastmail rejects it at the CalDAV
+    // endpoint). Behavioral RED/GREEN tests against a real loopback HTTP
+    // recorder — no mocking framework. See `caldav_recorder` above.
+    // =========================================================================
+
+    const TEST_ICS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
+         DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[tokio::test]
+    async fn caldav_put_uses_basic_auth_with_app_password() {
+        // RED today: add_to_calendar sends `Bearer <api-token>` (the JMAP
+        // header) to caldav.fastmail.com, so the loopback records either
+        // nothing (request goes to the real host) or a Bearer header — never
+        // `Basic <base64(username:app_password)>`.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::CREATED, Vec::new()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let result = add_to_calendar(&sess, TEST_ICS, "uid-m5yp", false).await;
+        assert!(
+            result.is_ok(),
+            "add_to_calendar should succeed against the loopback: {result:?}"
+        );
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1, "exactly one CalDAV PUT expected, got {rec:?}");
+        assert_eq!(rec[0].method, "PUT");
+        // URL built from caldav_base + username + uid, not a hardcoded host.
+        assert!(
+            rec[0]
+                .path
+                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
+            "CalDAV PUT path must be built from the session's username + uid: {}",
+            rec[0].path
+        );
+        let auth = rec[0]
+            .authorization
+            .as_deref()
+            .expect("CalDAV PUT must send an Authorization header");
+        assert_eq!(
+            auth,
+            caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass"),
+            "CalDAV PUT must use Basic auth with the app password, not the Bearer api-token"
+        );
+        assert!(
+            !auth.contains("Bearer"),
+            "CalDAV PUT must not send the Bearer api-token"
+        );
+        // METHOD:PUMPED — strip_method must remove the iTIP transport property
+        // before storage (RFC 4791). Body is the stored ICS, so no METHOD line.
+        let body = std::str::from_utf8(&rec[0].body).unwrap_or("");
+        assert!(
+            !body.contains("METHOD:"),
+            "stored ICS must have METHOD stripped"
+        );
+        assert!(
+            body.contains("BEGIN:VEVENT"),
+            "stored ICS body must be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_write_without_app_password_is_surfaced_not_swallowed() {
+        // RED today: add_to_calendar issues the PUT anyway (Bearer), gets a
+        // 401 from the real host, and returns Ok(false) — the caller warns
+        // and the UI reports success. Must instead return
+        // Err(CalendarAuthUnconfigured) without issuing any HTTP request.
+        let (base, recorded) = caldav_recorder::spawn(axum::http::StatusCode::OK, Vec::new()).await;
+        let mut sess = JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
+        sess.caldav_base = base;
+
+        let result = add_to_calendar(&sess, TEST_ICS, "uid-m5yp", false).await;
+        let err = result.expect_err(
+            "missing app password must surface as Err(CalendarAuthUnconfigured), not Ok(false)",
+        );
+        assert!(
+            matches!(err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {err:?}"
+        );
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "no HTTP request may be issued when the app password is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_get_and_delete_use_same_basic_auth() {
+        // Sibling calls can't regress to the Bearer api-token. RED today:
+        // both send `Bearer <api-token>`.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+        let expected = caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass");
+
+        let _ = get_calendar_event(&sess, "uid-m5yp").await;
+        let _ = remove_from_calendar(&sess, "uid-m5yp").await;
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 2, "expected one GET and one DELETE, got {rec:?}");
+        assert_eq!(rec[0].method, "GET");
+        assert!(
+            rec[0]
+                .path
+                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
+            "get_calendar_event path must be built from username + uid: {}",
+            rec[0].path
+        );
+        assert_eq!(
+            rec[0].authorization.as_deref(),
+            Some(expected.as_str()),
+            "get_calendar_event must use Basic auth with the app password"
+        );
+        assert!(
+            !rec[0]
+                .authorization
+                .as_deref()
+                .unwrap_or("")
+                .contains("Bearer"),
+            "get_calendar_event must not send the Bearer api-token"
+        );
+        assert_eq!(rec[1].method, "DELETE");
+        assert!(
+            rec[1]
+                .path
+                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
+            "remove_from_calendar path must be built from username + uid: {}",
+            rec[1].path
+        );
+        assert_eq!(
+            rec[1].authorization.as_deref(),
+            Some(expected.as_str()),
+            "remove_from_calendar must use Basic auth with the app password"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_get_rsvp_status_uses_basic_auth_and_refuses_without_app_password() {
+        // `get_rsvp_status` is the fourth CalDAV call (kata m5yp "done when":
+        // all four must use Basic + surface CalendarAuthUnconfigured). With an
+        // app password it sends Basic; without, it returns
+        // Err(CalendarAuthUnconfigured) and issues no request.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base.clone();
+        let expected = caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass");
+
+        let _ = get_rsvp_status(&sess, "uid-m5yp", "user@fastmail.com").await;
+        {
+            let rec = recorded.lock().unwrap();
+            assert_eq!(rec.len(), 1, "one CalDAV GET expected, got {rec:?}");
+            assert_eq!(rec[0].method, "GET");
+            assert_eq!(
+                rec[0].authorization.as_deref(),
+                Some(expected.as_str()),
+                "get_rsvp_status must use Basic auth with the app password"
+            );
+        }
+
+        // Now without an app password: named error, no HTTP.
+        let (base2, recorded2) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, Vec::new()).await;
+        let mut sess2 = JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
+        sess2.caldav_base = base2;
+        let result = get_rsvp_status(&sess2, "uid-m5yp", "user@fastmail.com").await;
+        let err = result.expect_err("missing app password must surface, not Ok(None)");
+        assert!(
+            matches!(err, Error::CalendarAuthUnconfigured),
+            "expected CalendarAuthUnconfigured, got {err:?}"
+        );
+        assert!(
+            recorded2.lock().unwrap().is_empty(),
+            "no HTTP request may be issued when the app password is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_url_encodes_reserved_uid_chars_consistently_across_put_get_delete() {
+        // roborev 376: get_calendar_event used to interpolate the raw uid while
+        // its siblings percent-encoded it, so a UID with reserved chars (space,
+        // '/', '@' — legal in iCalendar) was stored by PUT under the encoded
+        // name but looked up by GET under the raw one → perpetual 404 → the
+        // first-time auto-add re-ran on every email open. All four must encode
+        // identically so PUT and GET address the same resource.
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+        // UID with a space and an '@' — both must be percent-encoded in the path.
+        let uid = "uid with space@google.com";
+        let encoded = percent_encode_path(uid);
+        assert!(encoded.contains("%20") && encoded.contains("%40"));
+
+        let _ = add_to_calendar(&sess, TEST_ICS, uid, false).await;
+        let _ = get_calendar_event(&sess, uid).await;
+        let _ = remove_from_calendar(&sess, uid).await;
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 3, "PUT + GET + DELETE expected, got {rec:?}");
+        for r in rec.iter() {
+            assert!(
+                r.path.ends_with(&format!("/Default/{encoded}.ics")),
+                "{} {:?} must address the encoded UID, not the raw one: {}",
+                r.method,
+                r.path,
+                uid
+            );
+            assert!(
+                !r.path.contains(' '),
+                "raw space must not appear in the path"
+            );
+        }
     }
 }

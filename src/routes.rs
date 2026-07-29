@@ -990,7 +990,14 @@ async fn get_email(
                             if let Err(e) =
                                 provider::add_to_calendar(&s, &ics_clone, &uid, true).await
                             {
-                                tracing::warn!("Calendar auto-add failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "auto-add",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1020,7 +1027,14 @@ async fn get_email(
                             if let Err(e) =
                                 provider::add_to_calendar(&s, &ics_clone, &uid, false).await
                             {
-                                tracing::warn!("Calendar update failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "update",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1056,7 +1070,14 @@ async fn get_email(
                         if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                             let s = s_lock.read().await;
                             if let Err(e) = provider::remove_from_calendar(&s, &uid).await {
-                                tracing::warn!("Calendar auto-remove failed for {uid}: {e}");
+                                surface_caldav_spawn_failure(
+                                    &state_clone,
+                                    &acct,
+                                    &uid,
+                                    "auto-remove",
+                                    e,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1452,6 +1473,37 @@ fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str
         }
     }
     fallback.to_string()
+}
+
+/// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
+/// (the auto-add / update / auto-remove tasks in `get_email`). These tasks
+/// have no HTTP response to attach to, so a config-state failure
+/// (`CalendarAuthUnconfigured`) is pushed to the account-error banner —
+/// deduped via `push_error_if_absent` so every email open against a
+/// misconfigured account doesn't stack another identical banner — while
+/// genuinely transient errors (network, 5xx) stay as a `warn!` log line.
+/// This is the auto-add-on-open half of the kata m5yp swallow fix; the
+/// RSVP / explicit-add half propagates through the route's `?`.
+async fn surface_caldav_spawn_failure(
+    state: &AppState,
+    account: &str,
+    uid: &str,
+    op: &str,
+    err: Error,
+) {
+    if matches!(err, Error::CalendarAuthUnconfigured) {
+        accounts::push_error_if_absent(
+            state,
+            crate::types::AccountError {
+                account: account.to_string(),
+                provider: "fastmail".into(),
+                error: crate::error::CALENDAR_AUTH_UNCONFIGURED_MSG.into(),
+            },
+        )
+        .await;
+    } else {
+        tracing::warn!("Calendar {op} failed for {uid}: {err}");
+    }
 }
 
 async fn rsvp(
@@ -2867,6 +2919,47 @@ mod tests {
     }
 
     #[test]
+    fn fastmail_settings_and_wizard_have_app_password_input() {
+        // kata m5yp: CalDAV needs a separate app password (the API token is
+        // JMAP-only). The edit form and the wizard must both collect it, and
+        // app.js must send it in the upsert payload — otherwise the user can
+        // never configure the credential the calendar write now requires.
+        assert!(
+            INDEX_HTML.contains(r#"id="acct-app-password""#),
+            "account edit form must have an App password input for Fastmail"
+        );
+        assert!(
+            INDEX_HTML.contains(r#"id="wiz-app-password""#),
+            "add-account wizard must have an App password input for Fastmail"
+        );
+        // Both inputs must be gated to the fastmail provider via data-provider
+        // / data-wiz-field so they don't render for Outlook/Gmail.
+        let acct_field = INDEX_HTML
+            .split(r#"id="acct-app-password""#)
+            .next()
+            .unwrap_or("")
+            .rsplit_once("data-provider=")
+            .map(|(_, attrs)| attrs.split('"').nth(1).unwrap_or(""))
+            .unwrap_or("");
+        assert_eq!(
+            acct_field, "fastmail",
+            "acct-app-password must be data-provider=\"fastmail\""
+        );
+        assert!(
+            APP_JS.contains("'app-password': els.acctAppPassword.value"),
+            "saveAccount must send app-password in the Fastmail payload"
+        );
+        assert!(
+            APP_JS.contains(r#"'wiz-app-password':  'app-password'"#),
+            "wizard field map must route wiz-app-password into the app-password cache key"
+        );
+        assert!(
+            APP_JS.contains(r#"'app-password':  'App password'"#),
+            "wizard field labels must include App password"
+        );
+    }
+
+    #[test]
     fn settings_styles_present() {
         assert!(STYLE_CSS.contains(".account-pane"));
         assert!(STYLE_CSS.contains(".secret-input"));
@@ -3267,6 +3360,7 @@ mod tests {
                 accounts::AccountConfig::Fastmail {
                     username: format!("{id}@example.com"),
                     api_token: "tok".into(),
+                    app_password: None,
                     signature: None,
                 },
             );
@@ -9734,6 +9828,151 @@ white   = '#fdf6e3'
         assert!(
             body.contains("acctConfirmDelete.querySelectorAll('button')"),
             "the Tab focus trap must query the dialog buttons and cycle focus — pin the action, not just the Tab check (roborev 412)"
+        );
+    }
+
+    // =========================================================================
+    // kata m5yp — route/provider boundary must surface CalDAV auth failure
+    //
+    // The RSVP and add-to-calendar route handlers propagate provider errors
+    // via `?`. Today the Fastmail arms of `provider::rsvp` / `add_to_calendar`
+    // swallow the CalDAV failure with `warn!` + Ok, so a missing app password
+    // never reaches the HTTP response. This test pins the contract those
+    // handlers rely on: a Fastmail session with no app password must yield
+    // Err(CalendarAuthUnconfigured) out of the provider layer (and issue no
+    // HTTP), so the `?` in the route actually surfaces it to the UI.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn route_layer_surfaces_caldav_auth_failure() {
+        let (base, recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+        let mut sess = crate::jmap::JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
+        sess.caldav_base = base;
+        // account_id = None so the RSVP flow's send_email short-circuits with
+        // NotConnected (warned, swallowed by provider::rsvp) without any
+        // network — isolating the test to the CalDAV-write failure path.
+        let mut session = provider::ProviderSession::Fastmail(Box::new(sess));
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
+                   DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        // add-to-calendar route path: provider::add_to_calendar must propagate.
+        let add_err = provider::add_to_calendar(&session, ics, "uid-m5yp", false)
+            .await
+            .expect_err(
+                "provider::add_to_calendar must surface CalendarAuthUnconfigured, not Ok(false)+warn!",
+            );
+        assert!(
+            matches!(add_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {add_err:?}"
+        );
+
+        // CANCEL / decline route path: provider::remove_from_calendar too.
+        let rm_err = provider::remove_from_calendar(&session, "uid-m5yp")
+            .await
+            .expect_err("provider::remove_from_calendar must surface CalendarAuthUnconfigured");
+        assert!(
+            matches!(rm_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {rm_err:?}"
+        );
+
+        // RSVP route path: provider::rsvp must propagate the CalDAV failure
+        // instead of `warn!`-ing it and returning Ok(()).
+        let event = test_calendar_event(vec!["user@fastmail.com"]);
+        let rsvp_err = provider::rsvp(
+            &mut session,
+            ics,
+            &event,
+            "user@fastmail.com",
+            &RsvpStatus::Accepted,
+            chrono_tz::Tz::UTC,
+        )
+        .await
+        .expect_err("provider::rsvp must surface CalendarAuthUnconfigured, not swallow it");
+        assert!(
+            matches!(rsvp_err, Error::CalendarAuthUnconfigured),
+            "expected Error::CalendarAuthUnconfigured, got {rsvp_err:?}"
+        );
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "no CalDAV HTTP request may be issued when the app password is unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_does_not_email_organizer_when_app_password_unconfigured() {
+        // roborev 376 #2: a missing app password must fail the RSVP *before*
+        // the iTIP reply is emailed, not after — otherwise every retry sends
+        // the organizer another duplicate acceptance for an action the user
+        // sees as failed. We wire a JMAP session whose api_url points at a
+        // loopback so send_email WOULD post the iTIP if it were reached; the
+        // fail-fast must keep that loopback at zero requests.
+        let (jmap_base, jmap_recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+        let (caldav_base, caldav_recorded) =
+            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+
+        let mut sess = crate::jmap::JmapSession::new("user@fastmail.com", "fmu1-token", None);
+        // Wire enough JMAP state that send_email would reach its HTTP POST
+        // (api_url + account_id + identity_id + drafts/sent mailboxes) — so
+        // that "zero requests" is a meaningful proof the fail-fast ran, not
+        // just a side effect of send_email short-circuiting earlier.
+        sess.api_url = Some(jmap_base.clone());
+        sess.account_id = Some("acct-1".into());
+        sess.identity_id = Some("ident-1".into());
+        sess.mailbox_cache.insert(
+            "drafts".into(),
+            Mailbox {
+                id: "mb-drafts".into(),
+                name: "Drafts".into(),
+                role: Some("drafts".into()),
+                total_emails: 0,
+                unread_emails: 0,
+                parent_id: None,
+            },
+        );
+        sess.mailbox_cache.insert(
+            "sent".into(),
+            Mailbox {
+                id: "mb-sent".into(),
+                name: "Sent".into(),
+                role: Some("sent".into()),
+                total_emails: 0,
+                unread_emails: 0,
+                parent_id: None,
+            },
+        );
+        sess.caldav_base = caldav_base;
+        let mut session = provider::ProviderSession::Fastmail(Box::new(sess));
+
+        let event = test_calendar_event(vec!["user@fastmail.com"]);
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
+                   DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let err = provider::rsvp(
+            &mut session,
+            ics,
+            &event,
+            "user@fastmail.com",
+            &RsvpStatus::Accepted,
+            chrono_tz::Tz::UTC,
+        )
+        .await
+        .expect_err("missing app password must fail the RSVP");
+        assert!(
+            matches!(err, Error::CalendarAuthUnconfigured),
+            "expected CalendarAuthUnconfigured, got {err:?}"
+        );
+        // No iTIP reply emailed (JMAP loopback untouched)...
+        assert!(
+            jmap_recorded.lock().unwrap().is_empty(),
+            "RSVP must not email the organizer when the CalDAV credential is unconfigured"
+        );
+        // ...and no CalDAV write attempted either.
+        assert!(
+            caldav_recorded.lock().unwrap().is_empty(),
+            "no CalDAV HTTP request may be issued when the app password is unconfigured"
         );
     }
 }

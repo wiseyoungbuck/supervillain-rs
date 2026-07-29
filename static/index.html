@@ -276,6 +276,14 @@
                                             </div>
                                             <div class="wiz-cached-hint hidden" id="wiz-api-token-hint"></div>
                                         </div>
+                                        <div class="wiz-field" data-wiz-field="app-password">
+                                            <label for="wiz-app-password">App password</label>
+                                            <div class="wiz-secret">
+                                                <input type="password" id="wiz-app-password" autocomplete="new-password" placeholder="Fastmail app password">
+                                                <button type="button" class="wiz-reveal" data-wiz-reveal="wiz-app-password">show</button>
+                                            </div>
+                                            <div class="wiz-cached-hint hidden" id="wiz-app-password-hint"></div>
+                                        </div>
                                         <div class="wiz-error hidden" id="wiz-error" role="alert" aria-live="polite"></div>
                                         <div class="wiz-actions">
                                             <button type="button" class="wiz-btn" data-wiz-action="back-to-1">&larr; Back</button>
@@ -364,6 +372,13 @@
                                 <div class="secret-input">
                                     <input type="password" id="acct-api-token" autocomplete="new-password" placeholder="fmu1-...">
                                     <button type="button" class="reveal-btn" data-target="acct-api-token">reveal</button>
+                                </div>
+                            </div>
+                            <div class="modal-field" data-provider="fastmail">
+                                <label>App Password:</label>
+                                <div class="secret-input">
+                                    <input type="password" id="acct-app-password" autocomplete="new-password" placeholder="Fastmail app password (CalDAV)">
+                                    <button type="button" class="reveal-btn" data-target="acct-app-password">reveal</button>
                                 </div>
                             </div>
                             <div class="modal-field" data-provider="outlook,gmail">

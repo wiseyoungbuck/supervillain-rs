@@ -238,6 +238,7 @@ function init() {
     els.acctUsername = document.getElementById('acct-username');
     els.acctEmail = document.getElementById('acct-email');
     els.acctApiToken = document.getElementById('acct-api-token');
+    els.acctAppPassword = document.getElementById('acct-app-password');
     els.acctClientId = document.getElementById('acct-client-id');
     els.acctClientSecret = document.getElementById('acct-client-secret');
     els.acctSignature = document.getElementById('acct-signature');
@@ -438,6 +439,7 @@ function init() {
         'wiz-client-secret': 'client-secret',
         'wiz-username':      'username',
         'wiz-api-token':     'api-token',
+        'wiz-app-password':  'app-password',
     };
     Object.keys(wizFieldMap).forEach(id => {
         const el = document.getElementById(id);
@@ -450,7 +452,8 @@ function init() {
                 state.wizardCache[provider].nameTouched = true;
                 checkWizOverwrite();
             }
-            if (id === 'wiz-client-secret' || id === 'wiz-api-token') updateWizCachedHints();
+            if (id === 'wiz-client-secret' || id === 'wiz-api-token' || id === 'wiz-app-password')
+                updateWizCachedHints();
         });
     });
     document.querySelectorAll('#wiz [data-wiz-action]').forEach(btn => {
@@ -2459,6 +2462,8 @@ function renderSettings() {
         // Secrets are never echoed: blank = preserve existing.
         els.acctApiToken.value = '';
         els.acctApiToken.placeholder = 'unchanged (leave blank to keep)';
+        els.acctAppPassword.value = '';
+        els.acctAppPassword.placeholder = 'unchanged (leave blank to keep)';
         els.acctClientSecret.value = '';
         els.acctClientSecret.placeholder = 'unchanged (leave blank to keep)';
         // client-id is not a secret — backend returns it on the existing record.
@@ -2479,6 +2484,8 @@ function renderSettings() {
         els.acctEmail.value = '';
         els.acctApiToken.value = '';
         els.acctApiToken.placeholder = 'fmu1-...';
+        els.acctAppPassword.value = '';
+        els.acctAppPassword.placeholder = 'Fastmail app password (CalDAV)';
         els.acctClientId.value = '';
         els.acctClientId.placeholder = '';
         els.acctClientSecret.value = '';
@@ -2514,6 +2521,9 @@ async function saveAccount() {
             provider: 'fastmail',
             username: els.acctUsername.value.trim(),
             'api-token': els.acctApiToken.value, // empty → server preserves on update
+            // CalDAV credential (Basic auth), distinct from the JMAP api-token.
+            // Empty → server preserves on update; absent/empty both mean "not set".
+            'app-password': els.acctAppPassword.value,
         };
     } else if (provider === 'outlook') {
         payload = {
@@ -2676,6 +2686,7 @@ function closeWizard() {
         Object.values(state.wizardCache).forEach(c => {
             c['client-secret'] = '';
             c['api-token']    = '';
+            c['app-password'] = '';
         });
     }
     state.wizardActive = false;
@@ -2737,12 +2748,13 @@ function wizSuggestName(provider) {
 // Provider descriptor table — single source of truth for everything that
 // changes between providers. Adding a new provider is one entry here, plus
 // the API-side support.
-const WIZ_ALL_FIELDS = ['client-id', 'client-secret', 'username', 'api-token'];
+const WIZ_ALL_FIELDS = ['client-id', 'client-secret', 'username', 'api-token', 'app-password'];
 const WIZ_FIELD_LABELS = {
     'client-id':     'Client ID',
     'client-secret': 'Client secret',
     'username':      'Email',
     'api-token':     'API token',
+    'app-password':  'App password',
 };
 const WIZ_DESCRIPTORS = {
     gmail: {
@@ -2784,17 +2796,17 @@ const WIZ_DESCRIPTORS = {
     },
     fastmail: {
         label: 'Fastmail',
-        title: 'Paste your Fastmail API token',
-        blurb: `Fastmail doesn&rsquo;t use OAuth &mdash; you generate a scoped <em>JMAP + CalDAV</em> token in your Fastmail account settings.`,
+        title: 'Paste your Fastmail credentials',
+        blurb: `Fastmail doesn&rsquo;t use OAuth. You need two separate credentials: an <em>API token</em> (JMAP) and an <em>app password</em> (CalDAV/calendar sync) &mdash; Fastmail&rsquo;s API tokens can&rsquo;t be used for CalDAV.`,
         host: null,           // no browser/loopback step
-        fields: ['username', 'api-token'],
-        placeholders: { username: 'you@fastmail.com', 'api-token': 'fmu1-...' },
+        fields: ['username', 'api-token', 'app-password'],
+        placeholders: { username: 'you@fastmail.com', 'api-token': 'fmu1-...', 'app-password': 'Fastmail app password' },
         instructionsHtml: `
-            <div class="wiz-why-head">Get your Fastmail API token (~1&nbsp;min)</div>
+            <div class="wiz-why-head">Get your Fastmail credentials (~2&nbsp;min)</div>
             <ol class="wiz-steps">
-                <li>Open <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; API tokens</a>.</li>
-                <li>Click <strong>New API token</strong>. Required scopes: <strong>JMAP</strong> and <strong>CalDAV</strong>.</li>
-                <li>Copy the token (Fastmail only shows it once) and paste it below along with your email.</li>
+                <li>Open <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; API tokens</a> and click <strong>New API token</strong>. Pick <strong>JMAP</strong> as the type and copy the token (Fastmail only shows it once) into <strong>API token</strong> below.</li>
+                <li>Open <a href="https://app.fastmail.com/settings/security/passwords" target="_blank" rel="noopener">Fastmail &rarr; Settings &rarr; Privacy &amp; Security &rarr; App passwords</a> and <strong>New app password</strong> with the default <strong>Mail, Contacts &amp; Calendars</strong> scope (CalDAV/CardDAV/IMAP/SMTP). Copy it into <strong>App password</strong> below.</li>
+                <li>Enter your email above. Both credentials are stored locally in your mode-0600 config; neither is ever sent anywhere except Fastmail.</li>
             </ol>`,
     },
 };
@@ -2832,6 +2844,7 @@ function updateWizCachedHints() {
     };
     setHint('wiz-client-secret-hint', cache['client-secret']);
     setHint('wiz-api-token-hint',    cache['api-token']);
+    setHint('wiz-app-password-hint', cache['app-password']);
 }
 
 function checkWizOverwrite() {
