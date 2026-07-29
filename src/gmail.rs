@@ -1797,6 +1797,11 @@ async fn fetch_attachment_bytes(
     att_id: &str,
 ) -> Result<Vec<u8>, Error> {
     let token = access_token(session).await?;
+    // Both ids are provider-issued today, but encode here so every caller
+    // gets the guard for free if a future change widens an input's trust
+    // boundary (same invariant as `lookup_parent_message_id`).
+    let msg_id = encode_path_segment(msg_id);
+    let att_id = encode_path_segment(att_id);
     let url = format!(
         "{}/messages/{msg_id}/attachments/{att_id}",
         session.gmail_base
