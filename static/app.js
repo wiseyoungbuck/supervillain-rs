@@ -2292,9 +2292,9 @@ function renderCommandPalette() {
 
     els.commandResults.innerHTML = filtered.map((cmd, idx) => `
         <div class="command-item ${idx === state.commandPaletteIndex ? 'selected' : ''}"
-             data-action="${cmd.action}">
-            <span>${cmd.name}</span>
-            <span class="shortcut">${cmd.shortcut}</span>
+             data-action="${escapeAttr(cmd.action)}">
+            <span>${escapeHtml(cmd.name)}</span>
+            <span class="shortcut">${escapeHtml(cmd.shortcut)}</span>
         </div>
     `).join('');
 
@@ -2558,10 +2558,30 @@ function showFormError(msg) {
 }
 
 function toggleConfirmDelete() {
+    const willShow = els.acctConfirmDelete.classList.contains('hidden');
     els.acctConfirmDelete.classList.toggle('hidden');
+    // Focus the "no" button (safe-by-default) when the dialog opens so a
+    // keyboard user who opened it with 'd' can confirm/cancel with Enter/Space
+    // natively — the modal guard in handleSettingsNormalKey swallows other
+    // keys but returns without preventDefault, so native button activation and
+    // Tab between buttons still work. "no" is the default so a reflexive Enter
+    // cancels the destructive delete rather than confirming it (roborev 410).
+    if (willShow) {
+        const noBtn = els.acctConfirmDelete.querySelector('[data-confirm="no"]');
+        if (noBtn) noBtn.focus();
+    }
 }
 
 async function actuallyDeleteAccount() {
+    // Dismiss the confirm dialog immediately on confirm — the delete is
+    // now the user's intent, so the modal shouldn't linger. Without this the
+    // dialog's `hidden` class stays false and the confirmOpen-based guards
+    // (handleSettingsNormalKey's early-return, the hoisted Cmd+K check) leave
+    // the settings keyboard dead and the palette unopenable after a confirmed
+    // delete (sefy-final/roborev 409). Hide BEFORE the selectedAccountId
+    // early-return so dismissal happens even if no account is selected
+    // (roborev 410).
+    els.acctConfirmDelete.classList.add('hidden');
     if (!state.selectedAccountId) return;
     try {
         await api('DELETE', `/accounts/${encodeURIComponent(state.selectedAccountId)}`);
@@ -3044,12 +3064,18 @@ async function wizFinish() {
 function handleWizardKey(e) {
     const step = state.wizardStep;
     const inField = !!e.target.closest && e.target.matches('input, select, textarea');
+    const bareKey = !e.ctrlKey && !e.metaKey && !e.altKey;
+    // Enter is intentionally NOT bareKey-guarded: chorded Enter (Ctrl/Cmd+Enter)
+    // reads as submit/advance, matching the app's Ctrl+Enter=send convention
+    // (step 2 uses Ctrl+Enter as submit explicitly). Only the bare-letter/digit
+    // nav keys (j/k/1/2/3/a/A) must exclude the chord so Ctrl+J/A/1 fall through
+    // (sefy-final/roborev 405).
 
     if (step === 1) {
         if (e.key === 'Escape')                           { closeWizard(); e.preventDefault(); }
-        else if (e.key === 'j' || e.key === 'ArrowDown')  { focusWizProvider(state.wizardProviderIdx + 1); e.preventDefault(); }
-        else if (e.key === 'k' || e.key === 'ArrowUp')    { focusWizProvider(state.wizardProviderIdx - 1); e.preventDefault(); }
-        else if (e.key === '1' || e.key === '2' || e.key === '3') {
+        else if (bareKey && (e.key === 'j' || e.key === 'ArrowDown'))  { focusWizProvider(state.wizardProviderIdx + 1); e.preventDefault(); }
+        else if (bareKey && (e.key === 'k' || e.key === 'ArrowUp'))    { focusWizProvider(state.wizardProviderIdx - 1); e.preventDefault(); }
+        else if (bareKey && (e.key === '1' || e.key === '2' || e.key === '3')) {
             focusWizProvider(Number(e.key) - 1); wizGoTo(2); e.preventDefault();
         }
         else if (e.key === 'Enter')                       { wizGoTo(2); e.preventDefault(); }
@@ -3079,7 +3105,7 @@ function handleWizardKey(e) {
     if (step === 4) {
         if (inField) return;
         if (e.key === 'Enter')                           { wizFinish(); e.preventDefault(); }
-        else if (e.key === 'a' || e.key === 'A')         { wizGoTo(1); e.preventDefault(); }
+        else if (bareKey && (e.key === 'a' || e.key === 'A'))         { wizGoTo(1); e.preventDefault(); }
         else if (e.key === 'Escape')                     { closeWizard(); e.preventDefault(); }
     }
 }
@@ -3246,7 +3272,7 @@ function handleKeyDown(e) {
     // opens over an already-open overlay. Without this hoist the settings
     // and compose branches of commandsForView were unreachable at runtime
     // and the palette's show/hide invariant silently failed (roborev 378 #1/#2).
-    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === 'k' && els.acctConfirmDelete.classList.contains('hidden')) {
         openCommandPalette();
         e.preventDefault();
         return;
@@ -3368,29 +3394,61 @@ function handleKeyDown(e) {
 
 function handleSettingsNormalKey(e) {
     const key = e.key;
+    const confirmOpen = !els.acctConfirmDelete.classList.contains('hidden');
     if (key === 'Escape') {
-        if (!els.acctConfirmDelete.classList.contains('hidden')) {
+        if (confirmOpen) {
             els.acctConfirmDelete.classList.add('hidden');
             return;
         }
         closeSettings();
         return;
     }
-    if (key === 'a') {
+    // While the delete-confirm dialog is modal, ignore everything but Escape
+    // (handled above) and Tab (focus-trapped below) so j/k/d/D/Enter don't act
+    // on the account list underneath (sefy-final/roborev 398).
+    if (confirmOpen) {
+        // Focus trap: Tab/Shift+Tab cycles between the yes/no buttons so focus
+        // can't escape into the settings form underneath the modal. The guard
+        // returns without preventDefault for other keys so native button
+        // activation (Enter/Space on the focused button) still works
+        // (sefy-final/roborev 411).
+        if (e.key === 'Tab') {
+            e.preventDefault();
+            const buttons = Array.from(els.acctConfirmDelete.querySelectorAll('button'));
+            if (buttons.length) {
+                const idx = buttons.findIndex(b => b === document.activeElement);
+                if (idx === -1) {
+                    // Focus escaped the dialog (or no button was focused) —
+                    // restore safe-by-default: focus "no" so a reflexive Enter
+                    // cancels, not confirms, the destructive delete (roborev 412).
+                    const noBtn = els.acctConfirmDelete.querySelector('[data-confirm="no"]');
+                    if (noBtn) noBtn.focus();
+                } else {
+                    buttons[(idx + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
+                }
+            }
+        }
+        return;
+    }
+    // Bare-letter matches only — Ctrl/Cmd/Alt chords (Ctrl+A select-all, Ctrl+D
+    // bookmark, Ctrl+J/K) must fall through to the browser, not fire settings
+    // actions (mirrors the wizard bareKey guard, sefy-final/roborev 401).
+    const bareKey = !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (bareKey && key === 'a') {
         beginAddAccount();
         e.preventDefault();
         return;
     }
     if (state.selectedAccountId) {
-        if (key === 'd') {
+        if (bareKey && key === 'd') {
             toggleConfirmDelete();
             return;
         }
-        if (key === 'D') {
+        if (bareKey && key === 'D') {
             setDefaultAccount(state.selectedAccountId);
             return;
         }
-        if (key === 'Enter') {
+        if (bareKey && key === 'Enter') {
             // Enter edit mode by focusing the first editable field.
             state.settingsMode = 'edit';
             renderSettings();
@@ -3405,7 +3463,7 @@ function handleSettingsNormalKey(e) {
             return;
         }
     }
-    if (key === 'j' || key === 'k') {
+    if (bareKey && (key === 'j' || key === 'k')) {
         const dir = key === 'j' ? 1 : -1;
         const ids = state.accounts.map(a => a.id);
         if (!ids.length) return;

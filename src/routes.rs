@@ -9565,6 +9565,177 @@ white   = '#fdf6e3'
             "the Cmd+K check must precede the per-view early returns in handleKeyDown so the palette is reachable on every screen (roborev 378 #1/#2)"
         );
     }
+
+    #[test]
+    fn palette_render_escapes_command_markup() {
+        // sefy-final/roborev 393-394: command name/shortcut (rendered into
+        // innerHTML) built from user/server-controlled strings (split.name in
+        // `Delete Split: ...`, acct.email in `Remove Account: ...`) were
+        // interpolated unescaped — a split name or account email containing
+        // markup renders as HTML in the palette, and a quote in cmd.action
+        // (embeds acct.id/split.id) breaks out of the data-action attribute.
+        // (cmd.desc is filter-only, never rendered, so not an escaping target.)
+        // escapeHtml (text spans) + escapeAttr (attribute) are the codebase
+        // convention (sefy-final port).
+        let body = js_fn_body(APP_JS, "function renderCommandPalette(");
+        assert!(
+            body.contains("escapeHtml(cmd.name)"),
+            "renderCommandPalette must escapeHtml cmd.name (text context) before innerHTML — cmd.name carries user/server-controlled split.name/acct.email (sefy-final/roborev 393)"
+        );
+        assert!(
+            body.contains("escapeHtml(cmd.shortcut)"),
+            "renderCommandPalette must escapeHtml cmd.shortcut before innerHTML — pin both text spans, not just name (sefy-final/roborev 406)"
+        );
+        assert!(
+            body.contains("escapeAttr(cmd.action)"),
+            "renderCommandPalette must escapeAttr the data-action attribute — escapeHtml (div.textContent) does not encode quotes, so a quote in cmd.action breaks out of the attribute (sefy-final/roborev 394)"
+        );
+    }
+
+    #[test]
+    fn palette_cmdk_case_normalized() {
+        // sefy-final/roborev 395: the Cmd+K check matched only lowercase 'k',
+        // so with Caps Lock or Shift held (e.key === 'K') the palette silently
+        // failed to open. The check must normalize with toLowerCase.
+        let body = js_fn_body(APP_JS, "function handleKeyDown(");
+        assert!(
+            body.contains("!e.shiftKey && e.key.toLowerCase() === 'k'"),
+            "the Cmd+K check must normalize e.key with toLowerCase (so Caps Lock/Shift's 'K' opens it) AND exclude !e.shiftKey so Ctrl+Shift+K (Firefox devtools) doesn't pop the palette underneath (sefy-final/roborev 395/407)"
+        );
+    }
+
+    #[test]
+    fn palette_cmdk_skips_delete_confirm_dialog() {
+        // sefy-final/roborev 398-399: the hoisted Cmd+K check opens the palette
+        // over the modal account delete-confirm dialog — the dialog isn't in
+        // the top-level overlay checks (help/palette/search/split-modal), so
+        // the hoisted check must guard on the confirm dialog being hidden
+        // (mirrors the other overlay exclusions).
+        let body = js_fn_body(APP_JS, "function handleKeyDown(");
+        assert!(
+            body.contains("els.acctConfirmDelete.classList.contains('hidden')"),
+            "the hoisted Cmd+K check must guard on acctConfirmDelete being hidden so the palette doesn't open over the modal delete-confirm dialog (sefy-final/roborev 398)"
+        );
+    }
+
+    #[test]
+    fn palette_wizard_bare_keys_modifier_guarded() {
+        // sefy-final/roborev 397-399: handleWizardKey's bare-letter/digit
+        // matches (j/k/1/2/3/a/A) didn't exclude the Cmd/Ctrl chord, so Ctrl+J
+        // (downloads), Ctrl+A (select-all), Ctrl+1 etc. were swallowed as
+        // wizard navigation. The matches must be bareKey-guarded (mirrors the
+        // compose normal-mode handler).
+        let body = js_fn_body(APP_JS, "function handleWizardKey(");
+        // Assert code forms, not the bare token "bareKey" — a comment could
+        // contain the word. Pin the guard on an actual match (roborev 404).
+        assert!(
+            body.contains("bareKey && (e.key === 'j' || e.key === 'ArrowDown')"),
+            "handleWizardKey must bareKey-guard the whole j/ArrowDown disjunction (and k/ArrowUp) so Ctrl/Cmd+ArrowDown/Up document-navigation isn't swallowed as wizard nav (sefy-final/roborev 397-399/406)"
+        );
+        // Count-based: pin that ALL bare-letter/digit guards are present, not
+        // just one representative — a partial revert dropping a single guard
+        // would pass the contains check above alone (roborev 408). Four guards:
+        // j/ArrowDown, k/ArrowUp, 1/2/3, a/A.
+        assert!(
+            body.matches("bareKey &&").count() >= 4,
+            "handleWizardKey must bareKey-guard every bare-letter/digit match (j/k/1-3/a/A) — expected >=4 bareKey && guards (roborev 408)"
+        );
+    }
+
+    #[test]
+    fn palette_settings_bare_keys_and_confirm_modal() {
+        // sefy-final/roborev 398-401: handleSettingsNormalKey's bare-letter
+        // matches (a/d/D/j/k/Enter) didn't exclude the Cmd/Ctrl chord (Ctrl+A
+        // select-all → beginAddAccount, Ctrl+D bookmark → delete-confirm), and
+        // while the delete-confirm dialog is open those keys still acted on
+        // the account list underneath (the dialog wasn't modal). The matches
+        // must be bareKey-guarded, and the handler must early-return (except
+        // Escape) while the confirm dialog is open.
+        let body = js_fn_body(APP_JS, "function handleSettingsNormalKey(");
+        // Assert code forms, not the bare tokens — a comment could contain
+        // "bareKey"/"confirmOpen". Pin the guard on an actual match and the
+        // modal early-return (roborev 404).
+        assert!(
+            body.contains("bareKey && key === 'a'"),
+            "handleSettingsNormalKey must bareKey-guard its bare-letter matches (a/d/D/j/k/Enter) so Ctrl/Cmd chords aren't swallowed as settings actions (sefy-final/roborev 401)"
+        );
+        // Count-based: `if (confirmOpen) {` appears twice in the handler —
+        // once in the Escape branch, once as the modal early-return guard. Pin
+        // both so a revert dropping the modal guard block (but keeping the
+        // Escape check) fails (roborev 413).
+        assert!(
+            body.matches("if (confirmOpen) {").count() >= 2,
+            "handleSettingsNormalKey must early-return (except Escape) while the delete-confirm dialog is open so j/k/d/D/Enter don't act on the account list underneath the modal (sefy-final/roborev 398)"
+        );
+        // Count-based: pin that ALL bare-key guards are present, not just 'a'
+        // — a partial revert dropping a single guard would pass the contains
+        // check above alone (roborev 408). Five guards: a, d, D, Enter, j/k.
+        assert!(
+            body.matches("bareKey &&").count() >= 5,
+            "handleSettingsNormalKey must bareKey-guard every bare-letter match (a/d/D/Enter/j/k) — expected >=5 bareKey && guards (roborev 408)"
+        );
+    }
+
+    #[test]
+    fn palette_delete_confirm_hidden_on_confirm() {
+        // roborev 409: the confirm-dialog class-based guards
+        // (handleSettingsNormalKey's `if (confirmOpen) return` and the hoisted
+        // Cmd+K check's `acctConfirmDelete.classList.contains('hidden')` gate)
+        // turn the stale-open confirm dialog into a dead keyboard UNLESS the
+        // dialog is re-hidden when the user confirms. actuallyDeleteAccount
+        // (the 'yes' branch's action) must hide the dialog, or after a
+        // confirmed delete every settings key is dead and the palette won't
+        // open until the user happens to press Escape (sefy-final/roborev 409).
+        let body = js_fn_body(APP_JS, "async function actuallyDeleteAccount(");
+        assert!(
+            body.contains("acctConfirmDelete.classList.add('hidden')"),
+            "actuallyDeleteAccount must hide the confirm dialog on confirm — the confirmOpen-based guards otherwise leave the settings keyboard dead after a confirmed delete (sefy-final/roborev 409)"
+        );
+        // Pin ordering: the hide must precede the selectedAccountId early-return
+        // so dismissal happens even with no selection (roborev 410).
+        let hide_idx = body
+            .find("acctConfirmDelete.classList.add('hidden')")
+            .expect("hide call must exist (roborev 409)");
+        let return_idx = body
+            .find("if (!state.selectedAccountId)")
+            .expect("selectedAccountId early-return must exist");
+        assert!(
+            hide_idx < return_idx,
+            "actuallyDeleteAccount must hide the confirm dialog BEFORE the selectedAccountId early-return — else a visible dialog with no selection stays open in the dead-keyboard state (roborev 410)"
+        );
+    }
+
+    #[test]
+    fn palette_delete_confirm_focuses_no_button_on_open() {
+        // roborev 410: making the confirm dialog keyboard-modal (only Escape
+        // and native button activation reach it) removed any direct keyboard
+        // path to confirm — toggleConfirmDelete must focus a button when the
+        // dialog opens so Enter/Space activate it natively. Safe-by-default:
+        // focus "no" so a reflexive Enter cancels the destructive delete
+        // (sefy-final/roborev 410).
+        let body = js_fn_body(APP_JS, "function toggleConfirmDelete(");
+        assert!(
+            body.contains("data-confirm=\"no\"") && body.contains(".focus()"),
+            "toggleConfirmDelete must focus the 'no' button (safe-by-default) when the dialog opens so a keyboard user can confirm/cancel with Enter/Space natively (roborev 410)"
+        );
+    }
+
+    #[test]
+    fn palette_delete_confirm_traps_tab_focus() {
+        // roborev 411: the delete-confirm dialog is keyboard-modal but Tab
+        // could walk focus out into the settings form underneath. The modal
+        // guard must trap Tab (preventDefault + cycle focus between the
+        // yes/no buttons) so focus can't escape the dialog (sefy-final/roborev 411).
+        let body = js_fn_body(APP_JS, "function handleSettingsNormalKey(");
+        assert!(
+            body.contains("e.key === 'Tab'"),
+            "handleSettingsNormalKey must intercept Tab while the delete-confirm dialog is open (focus trap) so focus can't escape into the settings form (sefy-final/roborev 411)"
+        );
+        assert!(
+            body.contains("acctConfirmDelete.querySelectorAll('button')"),
+            "the Tab focus trap must query the dialog buttons and cycle focus — pin the action, not just the Tab check (roborev 412)"
+        );
+    }
 }
 
 // External dep for theme path
