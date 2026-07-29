@@ -1,8 +1,9 @@
 // Playwright config for the supervillain e2e suite (kata 1p0d/9rg8/nt9e/8n1v).
 //
 // Design (honest about the trade-off):
-//   - The server is the REAL installed `supervillain` binary, booted against a
-//     temp XDG_CONFIG_HOME so no real accounts/tokens are touched. It serves the
+//   - The server is the REAL `supervillain` binary (the workspace target/debug
+//     build when present, so specs test HEAD), booted against a temp
+//     XDG_CONFIG_HOME so no real accounts/tokens are touched. It serves the
 //     real embedded index.html / app.js / style.css — the exact bytes a user
 //     gets — so the specs assert against the real rendered DOM.
 //   - Every /api/* call is mocked at the network layer via page.route() in each
@@ -35,10 +36,54 @@ function tempConfigDir() {
   return dir;
 }
 
+// The system under test: prefer the workspace build so specs assert against
+// HEAD (cargo test guarantees target/debug exists); fall back to PATH only for
+// direct `npx playwright test` runs on a machine without a workspace build.
+// Always log the choice, and warn when the workspace build predates the newest
+// src/ file — a direct npx run against a weeks-old target/debug would silently
+// re-create the "specs assert the wrong binary" skew in the other direction.
+function workspaceBinary() {
+  const built = path.join(__dirname, 'target', 'debug', 'supervillain');
+  if (!fs.existsSync(built)) {
+    console.log('[e2e] SUT: `supervillain` from PATH (no workspace target/debug build)');
+    return 'supervillain';
+  }
+  const builtAt = fs.statSync(built).mtimeMs;
+  // The binary embeds the whole frontend at compile time (include_str! of
+  // static/*.js etc.), so the scan must cover static/ — the dominant edit
+  // type for what these specs assert — plus build.rs, and recurse: a nested
+  // edit (src/platform/*.rs, static/mobile/*.js) doesn't bump its parent
+  // directory's mtime (roborev 390).
+  // throwIfNoEntry:false — this is a purely diagnostic check running at
+  // config-load time; a dangling symlink or a file deleted mid-scan (editor
+  // swap file) must at worst skew the warning, never abort the suite
+  // (roborev 391). Cargo.toml/Cargo.lock included: a dependency bump also
+  // leaves target/debug stale.
+  let newestSrc = 0;
+  for (const root of ['src', 'static', 'build.rs', 'Cargo.toml', 'Cargo.lock']) {
+    const rootPath = path.join(__dirname, root);
+    const rootSt = fs.statSync(rootPath, { throwIfNoEntry: false });
+    if (!rootSt) continue;
+    const entries = rootSt.isDirectory()
+      ? fs.readdirSync(rootPath, { recursive: true }).map((f) => path.join(rootPath, f))
+      : [rootPath];
+    for (const f of entries) {
+      const st = fs.statSync(f, { throwIfNoEntry: false });
+      if (st && st.isFile() && st.mtimeMs > newestSrc) newestSrc = st.mtimeMs;
+    }
+  }
+  console.log(`[e2e] SUT: ${built}`);
+  if (newestSrc > builtAt) {
+    console.warn('[e2e] WARNING: target/debug/supervillain is older than src/ — specs are asserting a stale build; run `cargo build` (or `cargo test`) first');
+  }
+  return built;
+}
+
 module.exports = defineConfig({
   testDir: './tests/e2e',
   fullyParallel: false, // one server at a time; specs are fast and sequential
-  forbidConsole: false, // the app logs provider warnings on empty config; expected
+  // Note: the app logs provider warnings on an empty config during boot;
+  // that's expected and specs must not assert console silence.
   reporter: [['list']],
   use: {
     baseURL: 'http://127.0.0.1:8765',
@@ -52,12 +97,17 @@ module.exports = defineConfig({
     },
   ],
   webServer: {
-    // The real installed binary, against an empty temp config. --no-browser so
-    // it doesn't try to open a browser. The server is the SUT — its /api
-    // responses are mocked per-spec, but the shell (index.html/app.js/style.css)
-    // it serves is the real thing under test. Dedicated port 8765 so the suite
-    // never collides with a running dev/deploy server on the default 8000.
-    command: 'supervillain --no-browser',
+    // The freshly built workspace binary, against an empty temp config.
+    // --no-browser so it doesn't try to open a browser. The server is the SUT —
+    // its /api responses are mocked per-spec, but the shell
+    // (index.html/app.js/style.css) it serves is the real thing under test.
+    // target/debug is preferred so `cargo test --test e2e_test` (which builds
+    // it) asserts specs against HEAD, not against whatever was last
+    // `cargo install`ed — otherwise test outcomes track deploy state instead of
+    // the working tree. PATH fallback only for direct `npx playwright test`
+    // runs without a workspace build. Dedicated port 8765 so the suite never
+    // collides with a running dev/deploy server on the default 8000.
+    command: `${workspaceBinary()} --no-browser`,
     port: 8765,
     timeout: 30_000,
     reuseExistingServer: false,

@@ -108,15 +108,19 @@ async function mockApi(page, { mailboxes = MAILBOXES_WITH_XSS, emails = ONE_EMAI
     const email = byId[id] || emails.find((e) => e.id === id) || emails[0];
     return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(email) });
   });
-  // identities, splits, split-counts, theme, timezone, build-id: empty/defaults
+  // identities, splits, split-counts, theme, timezone: empty/defaults
   // so boot doesn't 404 (the app tolerates empty; we just need no errors thrown).
+  // /api/build-id is deliberately NOT mocked: the real server serves it with no
+  // provider dependency, and it must match the <meta name="build-id"> the same
+  // binary stamped into the shell. Mocking it to a literal made the ids
+  // mismatch, so every spec booted with the deploy banner showing — an
+  // unintended UI state that killed the deploy poll and shifted layout.
   await page.route('**/api/identities**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
   await page.route('**/api/splits**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
   await page.route('**/api/split-counts**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));
   await page.route('**/api/theme', (route) => route.fulfill({ status: 200, contentType: 'text/css', body: '' }));
   await page.route('**/api/timezone**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));
   await page.route('**/api/timezone/zones', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
-  await page.route('**/api/build-id', (route) => route.fulfill({ status: 200, contentType: 'text/plain', body: 'e2e-test-build' }));
   // Mutation routes the app fires as side-effects of opening/acting on emails.
   // Mock them as 204/no-content so they don't 404 and surface error toasts that
   // would pollute the status line the specs assert against.

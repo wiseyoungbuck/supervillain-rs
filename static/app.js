@@ -5274,14 +5274,24 @@ function sizeIframeToContent(iframe) {
                     if (prev === undefined || Math.abs(prev - h) >= 1) {
                         // First smaller read, or a different value than the
                         // pending one — record and schedule a confirmation.
+                        // Single-pending guard (mirrors _pendingGrowConfirm):
+                        // a re-arm during the 200ms window must update the
+                        // pending VALUE but not stack a second timer, or an
+                        // earlier timer confirms a newer value after <200ms
+                        // of stability (ceph shrink parity).
                         iframe._pendingShrink = h;
-                        setTimeout(() => {
-                            // Re-measure via the observer path; if the value is
-                            // still ~h, it's stable and the shrink applies. If
-                            // layout changed again, _pendingShrink was updated
-                            // by that read and this confirm is a no-op.
-                            observerFn();
-                        }, 200);
+                        if (!iframe._pendingShrinkConfirm) {
+                            iframe._pendingShrinkConfirm = true;
+                            setTimeout(() => {
+                                // Re-measure via the observer path; if the
+                                // value is still ~h, it's stable and the
+                                // shrink applies. If layout changed again,
+                                // _pendingShrink was updated by that read and
+                                // this confirm is a no-op.
+                                iframe._pendingShrinkConfirm = false;
+                                observerFn();
+                            }, 200);
+                        }
                         return;
                     }
                     // Stable confirmed shrink (this read ~= the pending one).
@@ -5299,6 +5309,32 @@ function sizeIframeToContent(iframe) {
                     iframe._shrinkStreak = (iframe._shrinkStreak || 0) + 1;
                     if (iframe._shrinkStreak > 2) {
                         iframe._pendingShrink = undefined;
+                        // Escape hatch (mirrors the suppressed-grow confirm,
+                        // but bounded per episode): three LEGIT shrinks within
+                        // ~1s (several erroring images) also trip the streak,
+                        // and with no further observer ticks the trailing
+                        // blank space would persist forever. Schedule a
+                        // single-pending re-measure past the 1s quiet-gap
+                        // reset so that case reclaims its space. UNLIKE the
+                        // grow side, a suppressed ratchet here is QUIESCENT
+                        // (once shrink writes stop, the vh-sized body's
+                        // border-box stops changing, so no observer tick can
+                        // fire first) — an unbounded re-arm would reset the
+                        // streak every 1200ms and restart the collapse cycle
+                        // indefinitely. The legit case needs exactly ONE
+                        // re-measure, so cap the hatch at one use per episode;
+                        // only a real grow (content actually changed) resets
+                        // the counter (roborev 389).
+                        if (!iframe._pendingShrinkConfirm
+                            && !(iframe._shrinkEscapeCount >= 1)) {
+                            iframe._shrinkEscapeCount =
+                                (iframe._shrinkEscapeCount || 0) + 1;
+                            iframe._pendingShrinkConfirm = true;
+                            setTimeout(() => {
+                                iframe._pendingShrinkConfirm = false;
+                                observerFn();
+                            }, 1200);
+                        }
                         return; // ratchet — stop collapsing
                     }
                     iframe._pendingShrink = undefined;
@@ -5307,9 +5343,12 @@ function sizeIframeToContent(iframe) {
                 } else {
                     // Grow on a settled path — clears any pending shrink (the
                     // content grew, the earlier smaller read was transient) and
-                    // resets the shrink streak (a real grow breaks the ratchet).
+                    // resets the shrink streak AND the escape-hatch counter (a
+                    // real grow ends the shrink episode; the next legit shrink
+                    // run gets its one re-measure again).
                     iframe._pendingShrink = undefined;
                     iframe._shrinkStreak = 0;
+                    iframe._shrinkEscapeCount = 0;
                     if (mode === 'observer'
                         && h - cur < EMAIL_IFRAME_RATCHET_EPSILON) {
                         // Sub-epsilon grow on the RECURRING path: could be the
@@ -5344,9 +5383,11 @@ function sizeIframeToContent(iframe) {
                             // it fires again before the 600ms confirm and re-
                             // suppresses — bounded to ~epsilon per 600ms period
                             // (no perpetual loop: a single pending confirm per
-                            // iframe, cleared if a real observer tick supersedes
-                            // it). A real grow with no further ratchet ticks
-                            // confirms and applies (roborev on ceph).
+                            // iframe — only the timer callback clears the flag;
+                            // an intervening real observer tick just fires a
+                            // benign redundant re-measure). A real grow with no
+                            // further ratchet ticks confirms and applies
+                            // (roborev on ceph).
                             if (!iframe._pendingGrowConfirm) {
                                 iframe._pendingGrowConfirm = true;
                                 setTimeout(() => {
@@ -5363,7 +5404,16 @@ function sizeIframeToContent(iframe) {
                 }
             } else if (h > cur) {
                 // Burst: only-grow, no epsilon guard (a genuine small
-                // correction must apply — see mode doc above).
+                // correction must apply — see mode doc above). A burst grow is
+                // a REAL content grow (image load / rAF / load — the downward
+                // ratchet never produces one), so it also ends the shrink
+                // episode: under pinned-body sender CSS the observer never
+                // fires and image events are the only cues, so without this
+                // reset a second legit erroring-image burst would get no
+                // escape-hatch re-measure and its blank space would persist
+                // for the life of the view (roborev 390).
+                iframe._shrinkStreak = 0;
+                iframe._shrinkEscapeCount = 0;
                 iframe.style.height = h + 'px';
             }
         } catch (_) { /* allow-same-origin should always succeed */ }

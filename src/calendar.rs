@@ -1392,6 +1392,19 @@ END:VCALENDAR";
         assert_eq!(extract_mailto(line), "alice@example.com");
     }
 
+    /// An unbalanced quote before the value colon (real-world broken ICS
+    /// emitters exist) marks the rest of the line as quoted, so the address
+    /// after the colon is skipped and the extraction fails CLOSED (empty).
+    /// This is a deliberate trade: dropping a malformed line's address is
+    /// acceptable; re-opening the quoted-CN spoof hole (the s2s8 fix above)
+    /// by "fixing" unbalanced quotes to fail open is not. This test pins
+    /// that choice so a future change has to make it consciously.
+    #[test]
+    fn extract_mailto_fails_closed_on_unbalanced_quote() {
+        let line = "ORGANIZER;CN=\"Broken Emitter:mailto:alice@example.com";
+        assert_eq!(extract_mailto(line), "");
+    }
+
     #[test]
     fn parse_user_rsvp_status_is_none() {
         let event = parse_ics(SAMPLE_ICS).unwrap();
