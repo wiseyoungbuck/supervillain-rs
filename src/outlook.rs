@@ -590,6 +590,20 @@ fn escape_search_string(s: &str) -> String {
     s.replace('\\', r"\\").replace('"', r#"\""#)
 }
 
+/// True when an attachment content type is an iCalendar payload. Pure.
+///
+/// Exchange exposes the ICS of a processed meeting request (an
+/// `eventMessageRequest`) as a `fileAttachment` with contentType
+/// `application/ics` — NOT `text/calendar` (verified live against Exchange
+/// Online with a native Google Calendar invite, kata wca3). Unprocessed
+/// forwards can also carry `text/calendar; method=REQUEST` with parameters.
+/// An exact `text/calendar` match therefore missed every real invite, which
+/// made the whole Outlook RSVP flow unreachable from the UI.
+fn is_calendar_mime(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or("").trim();
+    essence.eq_ignore_ascii_case("text/calendar") || essence.eq_ignore_ascii_case("application/ics")
+}
+
 /// Parse a Graph `Message` resource JSON into our canonical `Email`. Pure —
 /// `fetch_body=false` means we got the metadata-only Graph response (skip
 /// body extraction) which matches our `get_emails(fetch_body: bool)` API.
@@ -637,9 +651,7 @@ pub(crate) fn parse_graph_message(
     let attachments = parse_graph_attachments(&id, &json["attachments"]);
     let has_attachment =
         json["hasAttachments"].as_bool().unwrap_or(false) || !attachments.is_empty();
-    let has_calendar = attachments
-        .iter()
-        .any(|a| a.mime_type.eq_ignore_ascii_case("text/calendar"));
+    let has_calendar = attachments.iter().any(|a| is_calendar_mime(&a.mime_type));
 
     // Graph's message size field is "size" — not Gmail's "sizeEstimate".
     let size = json["size"].as_i64().unwrap_or(0);
@@ -1527,15 +1539,31 @@ pub async fn get_emails(
     Ok(indexed.into_iter().map(|(_, e)| e).collect())
 }
 
-/// Extract the ICS bytes from a message's `text/calendar` attachment, if
-/// any. Bridges the inbox view to the existing calendar RSVP flow.
+/// Pick the calendar attachment's ID out of a Graph attachments-list
+/// response. Pure — separated from `get_calendar_data` for testability.
+fn find_calendar_attachment_id(attachments_json: &serde_json::Value) -> Option<String> {
+    attachments_json["value"].as_array().and_then(|arr| {
+        arr.iter().find_map(|a| {
+            let ct = a["contentType"].as_str()?;
+            if is_calendar_mime(ct) {
+                a["id"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Extract the ICS bytes from a message's calendar attachment
+/// (`text/calendar` or Exchange's `application/ics`), if any. Bridges the
+/// inbox view to the existing calendar RSVP flow.
 pub async fn get_calendar_data(
     session: &OutlookSession,
     email_id: &str,
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     let encoded = crate::provider_utils::encode_path_segment(email_id);
-    // List attachments first to find the text/calendar one.
+    // List attachments first to find the calendar one.
     let list_url = format!("{GRAPH_BASE}/me/messages/{encoded}/attachments?$select=id,contentType");
     let resp = session
         .client
@@ -1553,17 +1581,7 @@ pub async fn get_calendar_data(
         ));
     }
     let parsed: serde_json::Value = resp.json().await?;
-    let calendar_att_id = parsed["value"].as_array().and_then(|arr| {
-        arr.iter().find_map(|a| {
-            let ct = a["contentType"].as_str()?;
-            if ct.eq_ignore_ascii_case("text/calendar") {
-                a["id"].as_str().map(String::from)
-            } else {
-                None
-            }
-        })
-    });
-    let Some(att_id) = calendar_att_id else {
+    let Some(att_id) = find_calendar_attachment_id(&parsed) else {
         return Ok(None);
     };
 
@@ -2699,9 +2717,9 @@ async fn send_graph_json(
 /// other ID-in-path interpolation in this file; an unencoded `/` inside the
 /// ID would otherwise split the path and hit the wrong (or a nonexistent)
 /// Graph route.
-fn build_event_action_url(event_id: &str, action: &str) -> String {
+fn build_event_action_url(graph_base: &str, event_id: &str, action: &str) -> String {
     format!(
-        "{GRAPH_BASE}/me/events/{}/{action}",
+        "{graph_base}/me/events/{}/{action}",
         crate::provider_utils::encode_path_segment(event_id)
     )
 }
@@ -2717,10 +2735,29 @@ fn build_event_delete_url(event_id: &str) -> String {
 
 /// Find a Graph event ID by iCalUId
 async fn find_event_by_uid(session: &OutlookSession, uid: &str) -> Result<Option<String>, Error> {
+    find_event_by_uid_at(session, GRAPH_BASE, uid).await
+}
+
+/// Core of `find_event_by_uid`, parameterized on the Graph base URL so tests
+/// can point it at a local loopback server (same pattern as
+/// `ensure_token_at`).
+///
+/// For an invite Exchange processed, the stored `iCalUId` is an Exchange
+/// GlobalObjectID (a hex blob embedding the original ICS UID), yet the
+/// `$filter=iCalUId eq '<ics-uid>'` still matches — Graph normalizes the
+/// comparison (verified live against a Google Calendar invite, kata wca3).
+/// Events *created by us* via `POST /me/events` are never found here: Graph
+/// ignores a caller-supplied `iCalUId` and generates its own (also verified
+/// live), so there is no way to tag a created copy with the ICS UID.
+async fn find_event_by_uid_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     // Escape single quotes in UID to prevent OData filter injection
     let safe_uid = uid.replace('\'', "''");
-    let url = format!("{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id",);
+    let url = format!("{graph_base}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id",);
     let resp = send_graph_json(
         session.client.get(&url).bearer_auth(&token),
         "events.filter",
@@ -2741,10 +2778,26 @@ pub async fn add_to_calendar(
     _ics_data: &str,
     event: &CalendarEvent,
 ) -> Result<bool, Error> {
+    add_to_calendar_at(session, GRAPH_BASE, event).await
+}
+
+/// Core of `add_to_calendar`, parameterized on the Graph base URL for
+/// loopback tests. The existence check runs first so a re-add of an
+/// Exchange-processed invite is a no-op; if that lookup fails (e.g. a
+/// transient 429/5xx), the error propagates instead of reading as "not
+/// found" — a mis-read that used to POST a duplicate event (kata 8qdw).
+/// A failed create is an `Err`, not a logged-and-swallowed `Ok(false)`:
+/// every caller treats this bool as "is the event on the calendar", and
+/// answering that question with a warn-log helps nobody (kata wca3).
+async fn add_to_calendar_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    event: &CalendarEvent,
+) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
     // Check if event already exists
-    if let Some(_existing_id) = find_event_by_uid(session, &event.uid).await? {
+    if let Some(_existing_id) = find_event_by_uid_at(session, graph_base, &event.uid).await? {
         tracing::debug!("Event {} already exists in Outlook calendar", event.uid);
         return Ok(true);
     }
@@ -2753,33 +2806,56 @@ pub async fn add_to_calendar(
 
     let resp = session
         .client
-        .post(format!("{GRAPH_BASE}/me/events"))
+        .post(format!("{graph_base}/me/events"))
         .bearer_auth(&token)
         .json(&body)
         .send()
         .await?;
 
-    if resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
         tracing::info!("Added event {} to Outlook calendar", event.uid);
         Ok(true)
     } else {
-        let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph POST /me/events failed ({status}): {text}");
-        Ok(false)
+        Err(classify_outlook_error("events.create", status, &text))
     }
 }
 
 /// Respond to a calendar event (accept/decline/tentative).
 /// Graph sends the RSVP email automatically when sendResponse=true.
+///
+/// Verified end-to-end against a cross-provider (Google Calendar) organizer,
+/// kata wca3: Exchange emails a genuine iTIP `METHOD:REPLY` — original UID,
+/// `PARTSTAT` matching the action, `DTSTART;TZID=...` with a full VTIMEZONE —
+/// which the organizer's calendar auto-processes, and the user's own copy
+/// flips to the responded status. No supplementary iTIP send is needed.
+///
+/// `Ok(false)` means exactly one thing: no event with this UID is on the
+/// calendar (Exchange never processed the invite), so Graph has nothing to
+/// respond to. A Graph rejection of the action itself (e.g. 400 "you're the
+/// meeting organizer" for a self-created copy) is an `Err`, not `Ok(false)` —
+/// the caller must be able to tell "nothing to respond to" from "the
+/// response failed" (kata wca3).
 pub async fn respond_to_event(
     session: &OutlookSession,
     uid: &str,
     status: &crate::types::RsvpStatus,
 ) -> Result<bool, Error> {
+    respond_to_event_at(session, GRAPH_BASE, uid, status).await
+}
+
+/// Core of `respond_to_event`, parameterized on the Graph base URL for
+/// loopback tests.
+async fn respond_to_event_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+    status: &crate::types::RsvpStatus,
+) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
-    let event_id = match find_event_by_uid(session, uid).await? {
+    let event_id = match find_event_by_uid_at(session, graph_base, uid).await? {
         Some(id) => id,
         None => {
             tracing::warn!("Cannot RSVP: event {uid} not found in Outlook calendar");
@@ -2795,20 +2871,23 @@ pub async fn respond_to_event(
 
     let resp = session
         .client
-        .post(build_event_action_url(&event_id, action))
+        .post(build_event_action_url(graph_base, &event_id, action))
         .bearer_auth(&token)
         .json(&serde_json::json!({"sendResponse": true}))
         .send()
         .await?;
 
-    if resp.status().is_success() {
+    let status_code = resp.status();
+    if status_code.is_success() {
         tracing::info!("RSVP {action} for event {uid} via Graph");
         Ok(true)
     } else {
-        let status_code = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph RSVP {action} failed ({status_code}): {text}");
-        Ok(false)
+        Err(classify_outlook_error(
+            &format!("events.{action}"),
+            status_code,
+            &text,
+        ))
     }
 }
 
@@ -2963,7 +3042,23 @@ pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result
     }
 }
 
-/// Build a Microsoft Graph event JSON from a CalendarEvent
+/// Build a Microsoft Graph event JSON from a CalendarEvent.
+///
+/// Two deliberate omissions, both verified live against Exchange Online
+/// (kata wca3):
+///
+/// - **No `attendees`.** `POST /me/events` with attendees makes Exchange
+///   email real meeting invitations to every listed address, from this user,
+///   as organizer. This copy exists purely to put someone else's meeting on
+///   the user's own calendar — re-inviting the whole attendee list to a
+///   bogus duplicate is actively harmful.
+/// - **No `iCalUId`.** Graph ignores a caller-supplied value and generates
+///   its own, so sending the ICS UID would be a placebo; created copies are
+///   inherently invisible to `find_event_by_uid`.
+///
+/// Times are sent as UTC instants with `timeZone: "UTC"`; Outlook renders
+/// them in the viewing client's display timezone, so the wall time the user
+/// sees is correct without preserving the original TZID.
 fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
     let mut body = serde_json::json!({
         "subject": event.summary,
@@ -2993,23 +3088,6 @@ fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
 
     if let Some(ref location) = event.location {
         body["location"] = serde_json::json!({"displayName": location});
-    }
-
-    if !event.attendees.is_empty() {
-        let attendees: Vec<serde_json::Value> = event
-            .attendees
-            .iter()
-            .map(|a| {
-                serde_json::json!({
-                    "emailAddress": {
-                        "address": a.email,
-                        "name": a.name.as_deref().unwrap_or("")
-                    },
-                    "type": "required"
-                })
-            })
-            .collect();
-        body["attendees"] = serde_json::json!(attendees);
     }
 
     body
@@ -3196,7 +3274,11 @@ mod tests {
     }
 
     #[test]
-    fn build_graph_event_with_attendees() {
+    fn build_graph_event_omits_attendees() {
+        // kata wca3 (verified live): POST /me/events with attendees makes
+        // Exchange email real invitations from this user to every listed
+        // address. The created copy is for the user's own calendar only, so
+        // the ICS attendee list must never reach the create body.
         let event = CalendarEvent {
             uid: "test".into(),
             summary: "Standup".into(),
@@ -3225,11 +3307,13 @@ mod tests {
             is_update: false,
         };
         let json = build_graph_event(&event);
-        let attendees = json["attendees"].as_array().unwrap();
-        assert_eq!(attendees.len(), 2);
-        assert_eq!(attendees[0]["emailAddress"]["address"], "alice@co.com");
-        assert_eq!(attendees[0]["emailAddress"]["name"], "Alice");
-        assert_eq!(attendees[1]["emailAddress"]["name"], "");
+        assert!(
+            json.get("attendees").is_none(),
+            "attendees must not be sent — Exchange emails invitations to them"
+        );
+        // Graph ignores caller-supplied iCalUId (verified live) — sending it
+        // would be a placebo, so we deliberately don't.
+        assert!(json.get("iCalUId").is_none());
     }
 
     #[test]
@@ -3527,7 +3611,7 @@ mod tests {
 
     #[test]
     fn build_event_action_url_encodes_slash_in_event_id() {
-        let url = build_event_action_url("AAMkAG/weird+id", "accept");
+        let url = build_event_action_url(GRAPH_BASE, "AAMkAG/weird+id", "accept");
         assert!(
             !url.contains("AAMkAG/weird"),
             "unencoded slash must not survive into the path: {url}"
@@ -3549,7 +3633,7 @@ mod tests {
 
     #[test]
     fn build_event_action_url_passthrough_for_normal_id() {
-        let url = build_event_action_url("AAMkAGI1AAA", "decline");
+        let url = build_event_action_url(GRAPH_BASE, "AAMkAGI1AAA", "decline");
         assert_eq!(url, format!("{GRAPH_BASE}/me/events/AAMkAGI1AAA/decline"));
     }
 
@@ -3971,6 +4055,293 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["value"][0]["id"].as_str(), Some("evt-1"));
+    }
+
+    // ---- Outlook RSVP round-trip pinning (kata wca3) ----
+    //
+    // Loopback recorder for the Graph calendar calls: every request's
+    // (method, path+query, JSON body) is captured, and the `respond`
+    // closure scripts the reply per request. Same no-mock-framework style
+    // as `spawn_test_server`; the `_at` URL-injection variants mirror
+    // `ensure_token_at`.
+    //
+    // The RSVP semantics these tests pin were verified live against
+    // Exchange Online + a Google Calendar organizer (evidence in kata
+    // wca3): an Exchange-processed invite is found by `$filter=iCalUId eq
+    // '<ics-uid>'`, `POST .../{accept|tentativelyAccept|decline}` with
+    // `{"sendResponse": true}` makes Exchange email the organizer a real
+    // iTIP METHOD:REPLY (TZ-correct, auto-processed by Google Calendar),
+    // and the user's own calendar copy flips to the responded status.
+
+    type RecordedRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    async fn spawn_graph_recorder<F>(respond: F) -> (String, RecordedRequests)
+    where
+        F: Fn(&str, &str) -> (axum::http::StatusCode, serde_json::Value)
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let requests: RecordedRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let reqs = reqs.clone();
+            let respond = respond.clone();
+            async move {
+                let method = req.method().to_string();
+                let path_and_query = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.to_string())
+                    .unwrap_or_default();
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                let (status, json) = respond(&method, &path_and_query);
+                reqs.lock().unwrap().push((method, path_and_query, body));
+                (status, axum::Json(json))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// Session whose access token is fresh, so `access_token()` skips the
+    /// refresh flow (which would hit the real TOKEN_URL) and the calendar
+    /// calls go straight to the loopback recorder.
+    fn make_rsvp_session(token_path: PathBuf) -> OutlookSession {
+        let mut session = make_outlook_session_with_token_file(token_path);
+        session.token.get_mut().token_expiry = Utc::now() + chrono::Duration::hours(1);
+        session
+    }
+
+    /// A cross-provider invite as it reaches the RSVP path: parsed from ICS
+    /// with a TZID wall time, so the tests pin the wall-time→UTC-instant
+    /// conversion end to end (15:00 America/Chicago in July == 20:00Z).
+    fn probe_calendar_event() -> CalendarEvent {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "METHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:wca3-pin@example.test\r\n",
+            "DTSTART;TZID=America/Chicago:20260730T150000\r\n",
+            "DTEND;TZID=America/Chicago:20260730T153000\r\n",
+            "SUMMARY:wca3 pin\r\n",
+            "ORGANIZER:mailto:organizer@gmail.example\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@outlook.example\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        crate::calendar::parse_ics(ics).expect("probe ICS parses")
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_checks_uid_then_posts_utc_instant_without_attendees() {
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                assert_eq!(path, "/me/events");
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-1"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+        let event = probe_calendar_event();
+
+        let added = add_to_calendar_at(&session, &base, &event).await.unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "lookup then create: {reqs:?}");
+        assert_eq!(reqs[0].0, "GET");
+        assert!(
+            reqs[0].1.starts_with("/me/events?") && reqs[0].1.contains("iCalUId"),
+            "existence check must filter by iCalUId: {}",
+            reqs[0].1
+        );
+        assert!(reqs[0].1.contains("wca3-pin@example.test"));
+        let (method, path, body) = &reqs[1];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/me/events");
+        // 15:00 America/Chicago (CDT, UTC-5) == 20:00 UTC — the instant must
+        // survive the ICS→Graph conversion.
+        assert_eq!(body["start"]["dateTime"], "2026-07-30T20:00:00");
+        assert_eq!(body["start"]["timeZone"], "UTC");
+        assert_eq!(body["end"]["dateTime"], "2026-07-30T20:30:00");
+        assert_eq!(body["subject"], "wca3 pin");
+        assert!(
+            body.get("attendees").is_none(),
+            "create body must not carry attendees — Exchange would email them"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_skips_create_when_event_exists() {
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"value": [{"id": "existing-1"}]}),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event())
+            .await
+            .unwrap();
+
+        assert!(added, "already-present is success (idempotent add)");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "an Exchange-processed invite must not be re-created: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_transient_lookup_error_yields_err_and_no_duplicate_post() {
+        // kata 8qdw pinned under the RSVP path: a 429/5xx on the iCalUId
+        // lookup must surface as Err — not read as "event not found" and
+        // POST a duplicate.
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": {"code": "ServiceUnavailable", "message": "try later"}}),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let result = add_to_calendar_at(&session, &base, &probe_calendar_event()).await;
+
+        assert!(result.is_err(), "transient lookup failure must be Err");
+        let reqs = requests.lock().unwrap();
+        assert!(
+            !reqs
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p == "/me/events"),
+            "no create may fire after a failed lookup: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_posts_action_with_send_response_true() {
+        for (status, action) in [
+            (crate::types::RsvpStatus::Accepted, "accept"),
+            (crate::types::RsvpStatus::Tentative, "tentativelyAccept"),
+            (crate::types::RsvpStatus::Declined, "decline"),
+        ] {
+            let (base, requests) = spawn_graph_recorder(|method, _path| {
+                if method == "GET" {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": [{"id": "evt-42"}]}),
+                    )
+                } else {
+                    (axum::http::StatusCode::ACCEPTED, serde_json::json!({}))
+                }
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let session = make_rsvp_session(dir.path().join("t.json"));
+
+            let responded = respond_to_event_at(&session, &base, "wca3-pin@example.test", &status)
+                .await
+                .unwrap();
+
+            assert!(responded);
+            let reqs = requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "lookup then respond: {reqs:?}");
+            let (method, path, body) = &reqs[1];
+            assert_eq!(method, "POST");
+            assert_eq!(
+                path,
+                &format!("/me/events/evt-42/{action}"),
+                "RSVP action path for {status:?}"
+            );
+            // sendResponse:true is what makes Exchange email the organizer
+            // the iTIP REPLY — the entire cross-provider notification hangs
+            // on this field.
+            assert_eq!(body, &serde_json::json!({"sendResponse": true}));
+        }
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_returns_false_when_event_not_found() {
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let responded = respond_to_event_at(
+            &session,
+            &base,
+            "missing@example.test",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !responded,
+            "no event ⇒ Ok(false), the caller's cue that Exchange never processed the invite"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1, "no action POST may fire");
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_graph_rejection_is_err_not_false() {
+        // Graph 400s an accept on a self-created copy ("you're the meeting
+        // organizer" — reproduced live, kata wca3). That's a failed response,
+        // which must be distinguishable from "nothing to respond to".
+        let (base, _requests) = spawn_graph_recorder(|method, _path| {
+            if method == "GET" {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "evt-42"}]}),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": {"code": "ErrorInvalidRequest",
+                        "message": "You can't respond to this meeting because you're the meeting organizer."}}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let result = respond_to_event_at(
+            &session,
+            &base,
+            "wca3-pin@example.test",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a rejected RSVP must be Err, not Ok(false)"
+        );
     }
 
     // ---- ensure_token_at (kata 0ch3) ----
@@ -4478,6 +4849,62 @@ mod tests {
         }]);
         let m = parse_graph_message(&j, true);
         assert!(m.has_calendar);
+    }
+
+    #[test]
+    fn parse_graph_message_application_ics_attachment_sets_has_calendar() {
+        // kata wca3 (verified live): Exchange exposes the ICS of a processed
+        // meeting request as contentType "application/ics", not
+        // "text/calendar". Matching only the latter made every real invite
+        // invisible — no RSVP UI, and /rsvp 404'd on "No calendar data".
+        let mut j = graph_message_minimal();
+        j["hasAttachments"] = serde_json::json!(true);
+        j["attachments"] = serde_json::json!([{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "id": "ATT_ICS",
+            "name": "invite.ics",
+            "contentType": "application/ics",
+            "size": 1585
+        }]);
+        let m = parse_graph_message(&j, true);
+        assert!(m.has_calendar);
+    }
+
+    #[test]
+    fn is_calendar_mime_matches_ics_variants_only() {
+        for ct in [
+            "text/calendar",
+            "TEXT/CALENDAR",
+            "application/ics",
+            "Application/ICS",
+            "text/calendar; charset=\"UTF-8\"; method=REQUEST",
+            "application/ics; name=invite.ics",
+        ] {
+            assert!(is_calendar_mime(ct), "{ct} should be calendar");
+        }
+        for ct in ["text/plain", "application/pdf", "text/calendarx", ""] {
+            assert!(!is_calendar_mime(ct), "{ct} should not be calendar");
+        }
+    }
+
+    #[test]
+    fn find_calendar_attachment_id_picks_application_ics() {
+        let listing = serde_json::json!({"value": [
+            {"id": "ATT_PDF", "contentType": "application/pdf"},
+            {"id": "ATT_ICS", "contentType": "application/ics"},
+        ]});
+        assert_eq!(
+            find_calendar_attachment_id(&listing).as_deref(),
+            Some("ATT_ICS")
+        );
+    }
+
+    #[test]
+    fn find_calendar_attachment_id_none_when_absent() {
+        let listing = serde_json::json!({"value": [
+            {"id": "ATT_PDF", "contentType": "application/pdf"},
+        ]});
+        assert_eq!(find_calendar_attachment_id(&listing), None);
     }
 
     #[test]

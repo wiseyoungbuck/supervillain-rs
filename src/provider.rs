@@ -527,15 +527,21 @@ pub async fn rsvp(
             // renders the response in the recipient's display TZ. See doc
             // comment on this fn (roborev 186 #5).
             let _ = reply_tz;
-            // Ensure the event exists in the calendar first
-            let event_parsed = calendar::parse_ics(ics_data)
-                .ok_or_else(|| Error::Internal("Failed to parse ICS for Outlook RSVP".into()))?;
-            let _ = outlook::add_to_calendar(s, ics_data, &event_parsed).await;
-
-            // Graph handles RSVP + email sending in one call
+            // No pre-add (kata wca3, verified live): when Exchange processed
+            // the invite the event is already on the calendar and accept /
+            // decline moves it — the add is a no-op. When Exchange did NOT
+            // process it, a copy we create is one Graph can't RSVP (400
+            // "you're the meeting organizer"), and creating it with attendees
+            // would email bogus duplicate invitations from this user to every
+            // attendee. Either way the pre-add can only hurt.
+            //
+            // Graph handles RSVP + calendar update + organizer email in one
+            // call; Ok(false) means no event with this UID exists to respond
+            // to (Err covers actual Graph failures).
             if !outlook::respond_to_event(s, &event.uid, status).await? {
-                return Err(Error::Internal(format!(
-                    "Outlook RSVP failed for event {}",
+                return Err(Error::NotFound(format!(
+                    "Outlook has no calendar entry for this invite (event {}). Exchange did not \
+                     process the invite as a meeting request, so Graph has nothing to RSVP to.",
                     event.uid
                 )));
             }
