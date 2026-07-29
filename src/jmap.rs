@@ -1278,11 +1278,14 @@ async fn send_itip_reply(
 ) -> Result<Option<String>, Error> {
     // rsvp() is the only producer of METHOD:REPLY submissions and sets none
     // of these. Fail loudly rather than let the minimal From/To/Subject
-    // builder silently drop a future caller's data (roborev 416 #1).
+    // builder silently drop a future caller's data (roborev 416 #1,
+    // 420 #1: every EmailSubmission field the builder ignores is checked).
     if !sub.cc.is_empty()
         || sub.bcc.as_ref().is_some_and(|b| !b.is_empty())
         || !sub.attachments.is_empty()
         || sub.in_reply_to.is_some()
+        || sub.references.is_some()
+        || sub.html_body.is_some()
     {
         return Err(Error::Internal(
             "send_itip_reply supports only to/subject/text_body/calendar_ics".into(),
@@ -1383,7 +1386,9 @@ fn build_draft_email(
     // appear at the top level.  We always set bodyStructure, so content is
     // defined entirely through bodyStructure + bodyValues with partId refs.
 
-    debug_assert!(
+    // Release-enforced (roborev 420 #2): a violated producer contract here
+    // means a wrong email to a third party — fail loudly, never send it.
+    assert!(
         sub.calendar_ics.is_none() || sub.html_body.is_none(),
         "calendar_ics and html_body are mutually exclusive"
     );
@@ -1399,7 +1404,9 @@ fn build_draft_email(
         // 2026-07-29, kata vt0m). The wire gets `text/calendar;
         // charset=utf-8` with no method parameter; recipients read
         // METHOD:REQUEST from the ICS body itself.
-        debug_assert!(
+        // Release-enforced (roborev 420 #2): a REPLY sent from here would go
+        // out mislabeled (no MIME method=REPLY) — the exact production bug.
+        assert!(
             !is_itip_reply_ics(calendar_ics),
             "iTIP REPLY goes through send_itip_reply, not build_draft_email"
         );
@@ -3896,22 +3903,15 @@ END:VCALENDAR";
     /// Loopback JMAP server + a session pointed at it. The canned response
     /// body satisfies both parsers that see it: `upload_blob` reads
     /// `blobId`/`size`, `jmap_call` reads `methodResponses`.
-    async fn spawn_jmap_loopback() -> (
+    /// Loopback recorder + a connected-looking session pointed at it, with
+    /// Drafts/Sent cached. The canned response body is returned for every
+    /// request (upload and JMAP alike).
+    async fn loopback_session(
+        canned: serde_json::Value,
+    ) -> (
         JmapSession,
         std::sync::Arc<std::sync::Mutex<Vec<caldav_recorder::RecordedRequest>>>,
     ) {
-        let canned = serde_json::json!({
-            "blobId": "blob-rfc822-1",
-            "size": 1,
-            "methodResponses": [
-                ["Email/import",
-                 {"created": {"e": {"id": "E-imported-1", "blobId": "blob-rfc822-1"}}},
-                 "0"],
-                ["EmailSubmission/set",
-                 {"created": {"send": {"id": "S1", "emailId": "E-imported-1"}}},
-                 "1"]
-            ]
-        });
         let (base, recorded) =
             caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
                 .await;
@@ -3937,6 +3937,25 @@ END:VCALENDAR";
             );
         }
         (s, recorded)
+    }
+
+    async fn spawn_jmap_loopback() -> (
+        JmapSession,
+        std::sync::Arc<std::sync::Mutex<Vec<caldav_recorder::RecordedRequest>>>,
+    ) {
+        loopback_session(serde_json::json!({
+            "blobId": "blob-rfc822-1",
+            "size": 1,
+            "methodResponses": [
+                ["Email/import",
+                 {"created": {"e": {"id": "E-imported-1", "blobId": "blob-rfc822-1"}}},
+                 "0"],
+                ["EmailSubmission/set",
+                 {"created": {"send": {"id": "S1", "emailId": "E-imported-1"}}},
+                 "1"]
+            ]
+        }))
+        .await
     }
 
     /// Walk a JSON value and assert it contains none of the two shapes
@@ -4359,36 +4378,13 @@ END:VCALENDAR";
         // would drop cc/attachments and mislabel the MIME method=REPLY);
         // they stay on Email/set with a bare `type: "text/calendar"` — the
         // only calendar shape Email/set accepts (verified live 2026-07-29).
-        let canned = serde_json::json!({
+        let (mut s, recorded) = loopback_session(serde_json::json!({
             "methodResponses": [
                 ["Email/set", {"created": {"draft": {"id": "E1"}}}, "0"],
                 ["EmailSubmission/set", {"created": {"send": {"emailId": "E1"}}}, "1"]
             ]
-        });
-        let (base, recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
-                .await;
-        let mut s = JmapSession::new("bob@example.com", "test-token", None);
-        s.api_url = Some(format!("{base}/jmap"));
-        s.upload_url = Some(format!("{base}/upload/{{accountId}}"));
-        s.account_id = Some("acc1".into());
-        s.identity_id = Some("ident1".into());
-        for (id, name, role) in [
-            ("mb-drafts", "Drafts", "drafts"),
-            ("mb-sent", "Sent", "sent"),
-        ] {
-            s.mailbox_cache.insert(
-                id.into(),
-                Mailbox {
-                    id: id.into(),
-                    name: name.into(),
-                    role: Some(role.into()),
-                    total_emails: 0,
-                    unread_emails: 0,
-                    parent_id: None,
-                },
-            );
-        }
+        }))
+        .await;
 
         let result = send_email(
             &mut s,
@@ -4430,6 +4426,49 @@ END:VCALENDAR";
             draft["bodyValues"]["calendar"]["value"],
             invite_submission().calendar_ics.unwrap()
         );
+        let rcpt = calls[1][1]["create"]["send"]["envelope"]["rcptTo"]
+            .as_array()
+            .expect("envelope rcptTo");
+        assert!(
+            rcpt.iter().any(|r| r["email"] == "observer@example.com"),
+            "envelope must include the cc recipient: {rcpt:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_without_attachments_sends_two_part_mixed() {
+        // roborev 420 #3: the attachment-free invite is the common shape —
+        // stage 2 is skipped and the calendar branch's two-part
+        // multipart/mixed goes out as-is. Pin it independently.
+        let (mut s, recorded) = loopback_session(serde_json::json!({
+            "methodResponses": [
+                ["Email/set", {"created": {"draft": {"id": "E1"}}}, "0"],
+                ["EmailSubmission/set", {"created": {"send": {"emailId": "E1"}}}, "1"]
+            ]
+        }))
+        .await;
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        let result = send_email(&mut s, &sub, "bob@example.com", Some("ident1")).await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_no_rejected_part_shapes(&body);
+        let draft = &body["methodCalls"][0][1]["create"]["draft"];
+        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
+        let parts = draft["bodyStructure"]["subParts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "text + calendar only: {parts:?}");
+        assert_eq!(parts[0]["type"], "text/plain");
+        assert_eq!(parts[1]["partId"], "calendar");
+        assert_eq!(parts[1]["type"], "text/calendar");
     }
 
     #[test]
@@ -4453,37 +4492,14 @@ END:VCALENDAR";
     async fn itip_reply_surfaces_method_level_jmap_error() {
         // roborev 416 #4: a method-level failure is ["error", {...}] — no
         // notCreated — and must surface the error object, not "no detail".
-        let canned = serde_json::json!({
+        let (mut s, _recorded) = loopback_session(serde_json::json!({
             "blobId": "blob-rfc822-1",
             "size": 1,
             "methodResponses": [
                 ["error", {"type": "serverFail", "description": "boom"}, "0"]
             ]
-        });
-        let (base, _recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
-                .await;
-        let mut s = JmapSession::new("bob@example.com", "test-token", None);
-        s.api_url = Some(format!("{base}/jmap"));
-        s.upload_url = Some(format!("{base}/upload/{{accountId}}"));
-        s.account_id = Some("acc1".into());
-        s.identity_id = Some("ident1".into());
-        for (id, name, role) in [
-            ("mb-drafts", "Drafts", "drafts"),
-            ("mb-sent", "Sent", "sent"),
-        ] {
-            s.mailbox_cache.insert(
-                id.into(),
-                Mailbox {
-                    id: id.into(),
-                    name: name.into(),
-                    role: Some(role.into()),
-                    total_emails: 0,
-                    unread_emails: 0,
-                    parent_id: None,
-                },
-            );
-        }
+        }))
+        .await;
         let err = send_email(
             &mut s,
             &itip_submission(),
