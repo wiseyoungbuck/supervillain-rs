@@ -3900,9 +3900,6 @@ END:VCALENDAR";
         }
     }
 
-    /// Loopback JMAP server + a session pointed at it. The canned response
-    /// body satisfies both parsers that see it: `upload_blob` reads
-    /// `blobId`/`size`, `jmap_call` reads `methodResponses`.
     /// Loopback recorder + a connected-looking session pointed at it, with
     /// Drafts/Sent cached. The canned response body is returned for every
     /// request (upload and JMAP alike).
@@ -3939,6 +3936,9 @@ END:VCALENDAR";
         (s, recorded)
     }
 
+    /// `loopback_session` canned for the happy-path import flow: the one
+    /// body satisfies both parsers that see it — `upload_blob` reads
+    /// `blobId`/`size`, `jmap_call` reads `methodResponses`.
     async fn spawn_jmap_loopback() -> (
         JmapSession,
         std::sync::Arc<std::sync::Mutex<Vec<caldav_recorder::RecordedRequest>>>,
