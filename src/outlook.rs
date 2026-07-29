@@ -2861,20 +2861,23 @@ async fn add_to_calendar_at(
     // Any tagged copies of ours that coexist with it are stale duplicates
     // (created for an unprocessed forward before Exchange processed a direct
     // delivery of the same UID) and always safe to delete (roborev 422 #1).
+    // The cleanup is best-effort (roborev 424 #1): the add is semantically
+    // satisfied — the meeting is on the calendar and Exchange keeps it
+    // current — so a transient delete failure must not report the whole
+    // operation as failed; the tagged copy stays findable and the next
+    // open retries.
     if processed.is_some() {
         tracing::debug!("Event {} already exists in Outlook calendar", event.uid);
-        for id in &self_created {
-            delete_event_at(session, graph_base, &token, id, &event.uid).await?;
-        }
+        cleanup_stale_copies(session, graph_base, &token, &self_created, &event.uid).await;
         return Ok(true);
     }
 
     if !self_created.is_empty() && !overwrite {
         tracing::debug!("Self-created copy of {} already exists", event.uid);
         // Keep one copy; clear any extras left by racing check-then-create.
-        for id in &self_created[1..] {
-            delete_event_at(session, graph_base, &token, id, &event.uid).await?;
-        }
+        // Best-effort for the same reason as above — the kept copy already
+        // satisfies the add.
+        cleanup_stale_copies(session, graph_base, &token, &self_created[1..], &event.uid).await;
         return Ok(true);
     }
     // Invite update: replace our copies so the calendar reflects the new
@@ -2901,6 +2904,26 @@ async fn add_to_calendar_at(
     } else {
         let text = resp.text().await.unwrap_or_default();
         Err(classify_outlook_error("events.create", status, &text))
+    }
+}
+
+/// Best-effort deletion of stale self-created copies: warn-and-continue on
+/// failure. Only for call sites where the calendar already holds a copy
+/// that satisfies the caller — the overwrite path must NOT use this, since
+/// there a failed delete followed by a create would duplicate the meeting.
+async fn cleanup_stale_copies(
+    session: &OutlookSession,
+    graph_base: &str,
+    token: &str,
+    event_ids: &[String],
+    uid: &str,
+) {
+    for id in event_ids {
+        if let Err(e) = delete_event_at(session, graph_base, token, id, uid).await {
+            tracing::warn!(
+                "Best-effort cleanup of stale copy of {uid} failed (will retry on next open): {e}"
+            );
+        }
     }
 }
 
@@ -4498,6 +4521,96 @@ mod tests {
         assert!(
             !reqs.iter().any(|(m, _, _)| m == "POST"),
             "a self-created copy must satisfy the dedupe check — no duplicate create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_dedupe_keeps_one_copy_and_deletes_only_extras() {
+        // roborev 424 #2: the non-overwrite dedupe path must delete exactly
+        // the extras left by racing check-then-create — not the copy it
+        // keeps, and not skip cleanup — and must not create anything.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}, {"id": "mine-2"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let deleted: Vec<&str> = reqs
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["/me/events/mine-2"],
+            "exactly the extra copy is deleted, the kept one survives: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "the kept copy satisfies the add — no create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_replaces_every_self_created_copy() {
+        // roborev 424 #2: an invite update over multiple racing copies must
+        // delete them all before the single create.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}, {"id": "mine-2"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else if method == "DELETE" {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            } else {
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-3"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let ops: Vec<(&str, &str)> = reqs
+            .iter()
+            .filter(|(m, _, _)| m != "GET")
+            .map(|(m, p, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("DELETE", "/me/events/mine-1"),
+                ("DELETE", "/me/events/mine-2"),
+                ("POST", "/me/events"),
+            ],
+            "both copies deleted before the single create: {reqs:?}"
         );
     }
 
