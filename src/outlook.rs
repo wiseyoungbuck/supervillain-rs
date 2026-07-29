@@ -4432,6 +4432,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_cleanup_failure_is_best_effort_when_add_is_satisfied() {
+        // roborev 424 #1 pinned (roborev 425): when the calendar already
+        // holds a copy that satisfies the add — the Exchange-processed
+        // event, or the one kept self-created copy — a failed cleanup
+        // DELETE must warn-and-continue, not fail the whole add: the
+        // meeting is present and current, and the tagged copy stays
+        // findable for the next open to retry.
+        for (processed, self_created) in [
+            // Coexistence branch: processed event + stale tagged copy.
+            (
+                serde_json::json!([{"id": "processed-1"}]),
+                serde_json::json!([{"id": "mine-1"}]),
+            ),
+            // Dedupe branch: kept copy + extra from a racing create.
+            (
+                serde_json::json!([]),
+                serde_json::json!([{"id": "mine-1"}, {"id": "mine-2"}]),
+            ),
+        ] {
+            let (base, requests) = spawn_graph_recorder(move |method, path| {
+                if method == "GET" && is_processed_lookup(path) {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": processed.clone()}),
+                    )
+                } else if method == "GET" {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": self_created.clone()}),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error": {"code": "ErrorInternalServerError", "message": "boom"}}),
+                    )
+                }
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let session = make_rsvp_session(dir.path().join("t.json"));
+
+            let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+                .await
+                .expect("best-effort cleanup failure must not fail the add");
+
+            assert!(added);
+            let reqs = requests.lock().unwrap();
+            assert!(
+                reqs.iter().any(|(m, _, _)| m == "DELETE"),
+                "cleanup must have been attempted: {reqs:?}"
+            );
+            assert!(
+                !reqs.iter().any(|(m, _, _)| m == "POST"),
+                "a satisfied add must not create anything: {reqs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn add_overwrite_delete_failure_aborts_before_create() {
         // roborev 422 #2: if deleting our old copy fails, the create must
         // not run — otherwise the calendar ends up with two copies of the
