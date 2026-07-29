@@ -379,37 +379,27 @@ pub async fn add_to_calendar(
             })?;
             if only_if_new {
                 // For auto-add on email open, just add if missing (add_to_calendar checks)
-                outlook::add_to_calendar(s, ics_data, &event).await
+                outlook::add_to_calendar(s, ics_data, &event, false).await
             } else {
-                // Explicit add — remove first then re-add to handle updates.
-                // Propagate remove failures (roborev 295 #3): if the delete
-                // failed, the event still exists, and the follow-up add hits
-                // the existence check and short-circuits to Ok(true), leaving
-                // the user thinking the update landed while the content is
-                // stale. `outlook::remove_from_calendar` is tolerant of "not
-                // found" (returns Ok(true) on a 404, same as a successful
-                // delete) — only Err and Ok(false) are real failures here.
-                match outlook::remove_from_calendar(s, uid).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(Error::Internal(format!(
-                            "Failed to remove existing Outlook calendar event {uid} before re-adding"
-                        )));
-                    }
-                    Err(e) => return Err(e),
-                }
-                // If the re-add fails right after a successful remove, the
-                // calendar would silently lack the meeting until the next
-                // email open — retry the add once immediately before giving
-                // up (roborev 292 #3).
-                let first = outlook::add_to_calendar(s, ics_data, &event).await;
+                // Explicit add / invite update. The overwrite semantics live
+                // inside `outlook::add_to_calendar` (kata wca3): an
+                // Exchange-processed invite event is never deleted — Exchange
+                // applies organizer updates to it itself, and it is the only
+                // copy Graph can RSVP, so the old remove+re-add here would
+                // have replaced it with an un-RSVP-able orphan. Only a
+                // supervillain-created copy is ours to replace, and a failed
+                // delete aborts before the create (no duplicate). If the
+                // create fails right after a successful delete, the calendar
+                // would silently lack the meeting until the next email open —
+                // retry once immediately before giving up (roborev 292 #3).
+                let first = outlook::add_to_calendar(s, ics_data, &event, true).await;
                 if matches!(first, Ok(true)) {
                     first
                 } else {
                     tracing::warn!(
-                        "Outlook add-after-remove did not succeed for {uid} ({first:?}); retrying once"
+                        "Outlook calendar update did not succeed for {uid} ({first:?}); retrying once"
                     );
-                    outlook::add_to_calendar(s, ics_data, &event).await
+                    outlook::add_to_calendar(s, ics_data, &event, true).await
                 }
             }
         }
@@ -766,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn add_to_calendar_retries_outlook_add_after_remove_failure() {
+    fn add_to_calendar_retries_outlook_overwrite_once() {
         let fn_src = add_to_calendar_fn_src();
         let outlook_block = fn_src
             .split("ProviderSession::Outlook(s) => {")
@@ -775,29 +765,30 @@ mod tests {
             .expect("Outlook arm of add_to_calendar dispatch must exist");
         assert!(
             outlook_block
-                .matches("outlook::add_to_calendar(s, ics_data, &event).await")
+                .matches("outlook::add_to_calendar(s, ics_data, &event, true).await")
                 .count()
                 >= 2,
-            "the only_if_new=false Outlook branch must retry add_to_calendar once after a failed attempt"
+            "the only_if_new=false Outlook branch must retry the overwrite add once after a failed attempt"
         );
         assert!(
-            outlook_block.contains("outlook::remove_from_calendar(s, uid).await"),
-            "the Outlook branch must still remove before re-adding"
+            outlook_block.contains("outlook::add_to_calendar(s, ics_data, &event, false).await"),
+            "the only_if_new=true Outlook branch must use the non-overwrite add"
         );
     }
 
-    // --- Outlook explicit-add remove-failure propagation (roborev 295 #3) ---
+    // --- Outlook update must not delete the Exchange-processed event ---
     //
-    // The only_if_new=false Outlook branch used to discard the remove result
-    // entirely (`let _ = outlook::remove_from_calendar(...).await;`), so a
-    // failed delete (network error, non-2xx/non-404 status) went unnoticed:
-    // the follow-up add's "already exists" check would short-circuit to
-    // Ok(true), reporting success while the stale event was never replaced.
-    // Same source-shape assertion pattern as the retry test above — no mock
-    // HTTP server is wired up in this codebase for real request injection.
+    // kata wca3: the only_if_new=false Outlook branch used to remove+re-add
+    // by UID. For an Exchange-processed invite that deleted the only
+    // RSVP-able copy (Graph 400s accept/decline on a self-created copy and
+    // ignores caller-supplied iCalUId, so the replacement was also
+    // unfindable). The processed/self-created split now lives inside
+    // `outlook::add_to_calendar(overwrite)`; this pins that the provider
+    // arm doesn't reintroduce a remove. Same source-shape assertion pattern
+    // as the retry test above.
 
     #[test]
-    fn add_to_calendar_propagates_outlook_remove_failure() {
+    fn add_to_calendar_outlook_never_removes_before_adding() {
         let fn_src = add_to_calendar_fn_src();
         let outlook_block = fn_src
             .split("ProviderSession::Outlook(s) => {")
@@ -805,16 +796,49 @@ mod tests {
             .and_then(|rest| rest.split("ProviderSession::Gmail(s) => {").next())
             .expect("Outlook arm of add_to_calendar dispatch must exist");
         assert!(
-            !outlook_block.contains("let _ = outlook::remove_from_calendar"),
-            "the Outlook branch must not silently discard remove failures"
+            !outlook_block.contains("outlook::remove_from_calendar"),
+            "the Outlook branch must not delete by UID before adding — that destroys the \
+             Exchange-processed (only RSVP-able) copy on invite updates"
+        );
+    }
+
+    // --- Outlook rsvp arm: honest failure semantics (kata wca3) ---
+    //
+    // `respond_to_event` returns Ok(false) for exactly one condition — no
+    // event with this UID on the calendar (Exchange never processed the
+    // invite) — which the arm must surface as NotFound, not a generic 500.
+    // Graph rejections arrive as Err and must propagate unmodified via `?`.
+    // The arm must also stay free of the old pre-add: it was a no-op for
+    // processed invites and emailed bogus invitations for unprocessed ones.
+
+    fn rsvp_outlook_arm_src() -> String {
+        let src = include_str!("provider.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        handler_src
+            .split("pub async fn rsvp(")
+            .nth(1)
+            .expect("rsvp fn must exist")
+            .split("ProviderSession::Outlook(s) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("ProviderSession::Gmail(s) => {").next())
+            .expect("Outlook arm of rsvp dispatch must exist")
+            .to_string()
+    }
+
+    #[test]
+    fn rsvp_outlook_arm_maps_not_found_and_propagates_errors() {
+        let arm = rsvp_outlook_arm_src();
+        assert!(
+            arm.contains("outlook::respond_to_event(s, &event.uid, status).await?"),
+            "respond_to_event errors must propagate via `?`, not be swallowed"
         );
         assert!(
-            outlook_block.contains("Err(e) => return Err(e)"),
-            "the Outlook branch must propagate a remove Err instead of continuing to add"
+            arm.contains("Error::NotFound"),
+            "Ok(false) (no event to respond to) must surface as NotFound, not a generic 500"
         );
         assert!(
-            outlook_block.contains("Ok(false) => {"),
-            "the Outlook branch must treat a failed (non-404) remove as an error, not silent success"
+            !arm.contains("add_to_calendar"),
+            "the rsvp arm must not pre-add: harmful for unprocessed invites, useless otherwise"
         );
     }
 

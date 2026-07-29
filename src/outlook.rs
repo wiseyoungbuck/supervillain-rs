@@ -2726,21 +2726,25 @@ fn build_event_action_url(graph_base: &str, event_id: &str, action: &str) -> Str
 
 /// Build the `DELETE /me/events/{id}` URL. Pure — no HTTP. See
 /// `build_event_action_url` for why `event_id` must be encoded.
-fn build_event_delete_url(event_id: &str) -> String {
+fn build_event_delete_url(graph_base: &str, event_id: &str) -> String {
     format!(
-        "{GRAPH_BASE}/me/events/{}",
+        "{graph_base}/me/events/{}",
         crate::provider_utils::encode_path_segment(event_id)
     )
 }
 
-/// Find a Graph event ID by iCalUId
-async fn find_event_by_uid(session: &OutlookSession, uid: &str) -> Result<Option<String>, Error> {
-    find_event_by_uid_at(session, GRAPH_BASE, uid).await
-}
+/// Open extended property tagging supervillain-created calendar events with
+/// the originating ICS UID. Graph ignores a caller-supplied `iCalUId` on
+/// `POST /me/events` (verified live, kata wca3), so without this tag a
+/// created copy could never be found again: the UID existence check would
+/// miss it (a fresh duplicate on every re-open of the email) and
+/// `remove_from_calendar` could never delete it. Open extended properties
+/// are settable on create and `$filter`-able (also verified live).
+const ICS_UID_PROP: &str = "String {8d8659b3-5b5c-45f2-b2f4-b1c9d2b298f8} Name supervillainIcsUid";
 
-/// Core of `find_event_by_uid`, parameterized on the Graph base URL so tests
-/// can point it at a local loopback server (same pattern as
-/// `ensure_token_at`).
+/// Find the Graph event ID of an *Exchange-processed* invite by ICS UID.
+/// Parameterized on the Graph base URL so tests can point it at a local
+/// loopback server (same pattern as `ensure_token_at`).
 ///
 /// For an invite Exchange processed, the stored `iCalUId` is an Exchange
 /// GlobalObjectID (a hex blob embedding the original ICS UID), yet the
@@ -2748,7 +2752,8 @@ async fn find_event_by_uid(session: &OutlookSession, uid: &str) -> Result<Option
 /// comparison (verified live against a Google Calendar invite, kata wca3).
 /// Events *created by us* via `POST /me/events` are never found here: Graph
 /// ignores a caller-supplied `iCalUId` and generates its own (also verified
-/// live), so there is no way to tag a created copy with the ICS UID.
+/// live). Created copies are found via [`find_self_created_by_uid_at`]'s
+/// extended-property filter instead.
 async fn find_event_by_uid_at(
     session: &OutlookSession,
     graph_base: &str,
@@ -2764,42 +2769,91 @@ async fn find_event_by_uid_at(
     )
     .await?;
 
-    Ok(resp["value"]
+    Ok(first_event_id(&resp))
+}
+
+/// Find the Graph event ID of a *supervillain-created* calendar copy by ICS
+/// UID, via the `ICS_UID_PROP` extended-property filter. The complement of
+/// `find_event_by_uid_at` — together they cover both ways an invite's event
+/// can exist on the user's calendar.
+async fn find_self_created_by_uid_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let safe_uid = uid.replace('\'', "''");
+    let url = format!(
+        "{graph_base}/me/events?$filter=singleValueExtendedProperties/Any(ep: ep/id eq '{ICS_UID_PROP}' and ep/value eq '{safe_uid}')&$select=id"
+    );
+    let resp = send_graph_json(
+        session.client.get(&url).bearer_auth(&token),
+        "events.filter.selfCreated",
+    )
+    .await?;
+
+    Ok(first_event_id(&resp))
+}
+
+/// First event ID out of a Graph `/me/events?$filter=...` response. Pure.
+fn first_event_id(resp: &serde_json::Value) -> Option<String> {
+    resp["value"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|ev| ev["id"].as_str())
-        .map(String::from))
+        .map(String::from)
 }
 
 /// Add an event to the Outlook calendar. Returns true on success.
 /// Builds a Graph event JSON from the parsed CalendarEvent fields.
+///
+/// `overwrite` controls what happens when a *supervillain-created* copy of
+/// this UID already exists: replace it (delete + recreate, the invite-update
+/// path) or keep it (the idempotent auto-add path). An *Exchange-processed*
+/// invite event is never touched in either mode: Exchange applies organizer
+/// updates and cancellations to it itself, and it is the only copy Graph can
+/// RSVP (kata wca3) — deleting it to "update" would destroy the RSVP-able
+/// event and orphan the meeting.
 pub async fn add_to_calendar(
     session: &OutlookSession,
     _ics_data: &str,
     event: &CalendarEvent,
+    overwrite: bool,
 ) -> Result<bool, Error> {
-    add_to_calendar_at(session, GRAPH_BASE, event).await
+    add_to_calendar_at(session, GRAPH_BASE, event, overwrite).await
 }
 
 /// Core of `add_to_calendar`, parameterized on the Graph base URL for
-/// loopback tests. The existence check runs first so a re-add of an
-/// Exchange-processed invite is a no-op; if that lookup fails (e.g. a
-/// transient 429/5xx), the error propagates instead of reading as "not
-/// found" — a mis-read that used to POST a duplicate event (kata 8qdw).
-/// A failed create is an `Err`, not a logged-and-swallowed `Ok(false)`:
-/// every caller treats this bool as "is the event on the calendar", and
-/// answering that question with a warn-log helps nobody (kata wca3).
+/// loopback tests. The existence checks run first so a re-add of a known
+/// event is a no-op; if a lookup fails (e.g. a transient 429/5xx), the
+/// error propagates instead of reading as "not found" — a mis-read that
+/// used to POST a duplicate event (kata 8qdw). A failed create or replace
+/// is an `Err`, not a logged-and-swallowed `Ok(false)`: every caller treats
+/// this bool as "is the event on the calendar", and answering that question
+/// with a warn-log helps nobody (kata wca3).
 async fn add_to_calendar_at(
     session: &OutlookSession,
     graph_base: &str,
     event: &CalendarEvent,
+    overwrite: bool,
 ) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
-    // Check if event already exists
+    // Exchange-processed copy: Exchange owns it — never delete or duplicate.
     if let Some(_existing_id) = find_event_by_uid_at(session, graph_base, &event.uid).await? {
         tracing::debug!("Event {} already exists in Outlook calendar", event.uid);
         return Ok(true);
+    }
+
+    if let Some(existing_id) = find_self_created_by_uid_at(session, graph_base, &event.uid).await? {
+        if !overwrite {
+            tracing::debug!("Self-created copy of {} already exists", event.uid);
+            return Ok(true);
+        }
+        // Invite update: replace our copy so the calendar reflects the new
+        // details. Delete failure must abort — proceeding to create would
+        // leave two copies of the meeting.
+        delete_event_at(session, graph_base, &token, &existing_id, &event.uid).await?;
     }
 
     let body = build_graph_event(event);
@@ -2819,6 +2873,32 @@ async fn add_to_calendar_at(
     } else {
         let text = resp.text().await.unwrap_or_default();
         Err(classify_outlook_error("events.create", status, &text))
+    }
+}
+
+/// DELETE a Graph event by its opaque ID. 404 counts as success (the event
+/// is gone either way); any other failure is a classified `Err`.
+async fn delete_event_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    token: &str,
+    event_id: &str,
+    uid: &str,
+) -> Result<(), Error> {
+    let resp = session
+        .client
+        .delete(build_event_delete_url(graph_base, event_id))
+        .bearer_auth(token)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        tracing::info!("Removed event {uid} from Outlook calendar");
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(classify_outlook_error("events.delete", status, &text))
     }
 }
 
@@ -3014,9 +3094,26 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
 
 /// Remove an event from the Outlook calendar by iCalUId
 pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result<bool, Error> {
+    remove_from_calendar_at(session, GRAPH_BASE, uid).await
+}
+
+/// Core of `remove_from_calendar`, parameterized on the Graph base URL for
+/// loopback tests. Checks both ways the event can exist — an
+/// Exchange-processed invite (iCalUId filter) and a supervillain-created
+/// copy (`ICS_UID_PROP` filter) — since a cancellation must remove
+/// whichever copy the calendar holds.
+async fn remove_from_calendar_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
-    let event_id = match find_event_by_uid(session, uid).await? {
+    let found = match find_event_by_uid_at(session, graph_base, uid).await? {
+        Some(id) => Some(id),
+        None => find_self_created_by_uid_at(session, graph_base, uid).await?,
+    };
+    let event_id = match found {
         Some(id) => id,
         None => {
             tracing::debug!("Event {uid} not found in Outlook calendar, nothing to remove");
@@ -3024,22 +3121,8 @@ pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result
         }
     };
 
-    let resp = session
-        .client
-        .delete(build_event_delete_url(&event_id))
-        .bearer_auth(&token)
-        .send()
-        .await?;
-
-    if resp.status().is_success() || resp.status().as_u16() == 404 {
-        tracing::info!("Removed event {uid} from Outlook calendar");
-        Ok(true)
-    } else {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph DELETE event failed ({status}): {text}");
-        Ok(false)
-    }
+    delete_event_at(session, graph_base, &token, &event_id, uid).await?;
+    Ok(true)
 }
 
 /// Build a Microsoft Graph event JSON from a CalendarEvent.
@@ -3053,8 +3136,9 @@ pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result
 ///   the user's own calendar — re-inviting the whole attendee list to a
 ///   bogus duplicate is actively harmful.
 /// - **No `iCalUId`.** Graph ignores a caller-supplied value and generates
-///   its own, so sending the ICS UID would be a placebo; created copies are
-///   inherently invisible to `find_event_by_uid`.
+///   its own, so sending the ICS UID would be a placebo. The `ICS_UID_PROP`
+///   extended property carries the UID instead — that's what makes created
+///   copies findable again (see `find_self_created_by_uid_at`).
 ///
 /// Times are sent as UTC instants with `timeZone: "UTC"`; Outlook renders
 /// them in the viewing client's display timezone, so the wall time the user
@@ -3069,7 +3153,10 @@ fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
         "body": {
             "contentType": "text",
             "content": event.description.as_deref().unwrap_or("")
-        }
+        },
+        "singleValueExtendedProperties": [
+            {"id": ICS_UID_PROP, "value": event.uid}
+        ]
     });
 
     if let Some(dtend) = event.dtend {
@@ -3625,7 +3712,7 @@ mod tests {
 
     #[test]
     fn build_event_delete_url_encodes_slash_in_event_id() {
-        let url = build_event_delete_url("some/nested/id");
+        let url = build_event_delete_url(GRAPH_BASE, "some/nested/id");
         assert!(!url.contains("some/nested/id"));
         assert!(url.contains("some%2Fnested%2Fid"));
         assert!(url.starts_with(&format!("{GRAPH_BASE}/me/events/")));
@@ -4143,6 +4230,17 @@ mod tests {
         crate::calendar::parse_ics(ics).expect("probe ICS parses")
     }
 
+    /// True for the iCalUId-filter lookup (Exchange-processed events).
+    fn is_processed_lookup(path: &str) -> bool {
+        path.contains("iCalUId")
+    }
+
+    /// True for the `ICS_UID_PROP` extended-property lookup (self-created
+    /// copies).
+    fn is_self_created_lookup(path: &str) -> bool {
+        path.contains("supervillainIcsUid")
+    }
+
     #[tokio::test]
     async fn rsvp_add_checks_uid_then_posts_utc_instant_without_attendees() {
         let (base, requests) = spawn_graph_recorder(|method, path| {
@@ -4161,19 +4259,31 @@ mod tests {
         let session = make_rsvp_session(dir.path().join("t.json"));
         let event = probe_calendar_event();
 
-        let added = add_to_calendar_at(&session, &base, &event).await.unwrap();
+        let added = add_to_calendar_at(&session, &base, &event, false)
+            .await
+            .unwrap();
 
         assert!(added);
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 2, "lookup then create: {reqs:?}");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "processed lookup, self-created lookup, create: {reqs:?}"
+        );
         assert_eq!(reqs[0].0, "GET");
         assert!(
-            reqs[0].1.starts_with("/me/events?") && reqs[0].1.contains("iCalUId"),
-            "existence check must filter by iCalUId: {}",
+            reqs[0].1.starts_with("/me/events?") && is_processed_lookup(&reqs[0].1),
+            "first existence check must filter by iCalUId: {}",
             reqs[0].1
         );
         assert!(reqs[0].1.contains("wca3-pin@example.test"));
-        let (method, path, body) = &reqs[1];
+        assert_eq!(reqs[1].0, "GET");
+        assert!(
+            is_self_created_lookup(&reqs[1].1),
+            "second existence check must filter by the ICS-UID extended property: {}",
+            reqs[1].1
+        );
+        let (method, path, body) = &reqs[2];
         assert_eq!(method, "POST");
         assert_eq!(path, "/me/events");
         // 15:00 America/Chicago (CDT, UTC-5) == 20:00 UTC — the instant must
@@ -4185,6 +4295,16 @@ mod tests {
         assert!(
             body.get("attendees").is_none(),
             "create body must not carry attendees — Exchange would email them"
+        );
+        // The tag that makes this copy findable (and thus removable /
+        // dedupe-able) later — Graph ignores iCalUId on create.
+        assert_eq!(
+            body["singleValueExtendedProperties"][0]["id"], ICS_UID_PROP,
+            "create body must tag the event with the ICS UID extended property"
+        );
+        assert_eq!(
+            body["singleValueExtendedProperties"][0]["value"],
+            "wca3-pin@example.test"
         );
     }
 
@@ -4200,7 +4320,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = make_rsvp_session(dir.path().join("t.json"));
 
-        let added = add_to_calendar_at(&session, &base, &probe_calendar_event())
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
             .await
             .unwrap();
 
@@ -4228,7 +4348,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = make_rsvp_session(dir.path().join("t.json"));
 
-        let result = add_to_calendar_at(&session, &base, &probe_calendar_event()).await;
+        let result = add_to_calendar_at(&session, &base, &probe_calendar_event(), false).await;
 
         assert!(result.is_err(), "transient lookup failure must be Err");
         let reqs = requests.lock().unwrap();
@@ -4237,6 +4357,140 @@ mod tests {
                 .iter()
                 .any(|(m, p, _)| m == "POST" && p == "/me/events"),
             "no create may fire after a failed lookup: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_skips_create_when_self_created_copy_exists() {
+        // Without the extended-property lookup, every open of an
+        // unprocessed-invite email re-created the event: the app's own
+        // copies were invisible to the iCalUId filter, so copies
+        // accumulated forever (roborev 419 #2).
+        let (base, requests) = spawn_graph_recorder(|_method, path| {
+            if is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "a self-created copy must satisfy the dedupe check — no duplicate create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_replaces_self_created_copy() {
+        // Invite update over a self-created copy: delete ours, then create
+        // the new version.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else if method == "DELETE" {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            } else {
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-2"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let ops: Vec<(&str, &str)> = reqs
+            .iter()
+            .map(|(m, p, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(ops[2], ("DELETE", "/me/events/mine-1"), "all: {ops:?}");
+        assert_eq!(ops[3], ("POST", "/me/events"));
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_never_deletes_exchange_processed_event() {
+        // roborev 419 #1: an invite update must not remove+re-add an
+        // Exchange-processed event — Exchange applies organizer updates to
+        // it itself, and it is the only copy Graph can RSVP. Deleting it
+        // would replace the meeting with an un-RSVP-able orphan.
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"value": [{"id": "processed-1"}]}),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "found via iCalUId ⇒ hands off, even in overwrite mode: {reqs:?}"
+        );
+        assert_eq!(reqs[0].0, "GET");
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_self_created_copy_found_by_extended_property() {
+        // A cancellation must be able to remove the app's own copy, which
+        // only the extended-property filter can find (roborev 419 #2).
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let removed = remove_from_calendar_at(&session, &base, "wca3-pin@example.test")
+            .await
+            .unwrap();
+
+        assert!(removed);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.last().map(|(m, p, _)| (m.as_str(), p.as_str())),
+            Some(("DELETE", "/me/events/mine-1")),
+            "all: {reqs:?}"
         );
     }
 
