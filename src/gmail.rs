@@ -37,6 +37,8 @@ use crate::types::{CalendarEvent, Email, EmailAddress, EmailSort, Identity, Mail
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+/// Default for `GmailSession::calendar_base`. `/calendars/primary` is baked in:
+/// every calendar operation targets the user's primary calendar.
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3/calendars/primary";
 // Google's OAuth server auto-allows http://127.0.0.1:<port>/* for Desktop app
 // clients (no URI registration needed). http://localhost:* is "supported but
@@ -90,6 +92,14 @@ pub struct GmailSession {
     /// should be routed through `limiter.execute(...)` so the throttling
     /// intent is expressed in one place (see [`build_gmail_limiter`]).
     pub limiter: Arc<RateLimiter>,
+    /// Google Calendar API base for the primary calendar. [`CALENDAR_BASE`] in
+    /// production; tests point it at a loopback recorder (same pattern as
+    /// `JmapSession::caldav_base`).
+    pub calendar_base: String,
+    /// Gmail API base. [`GMAIL_BASE`] in production; tests point it at a
+    /// loopback recorder. (`fetch_user_email` runs before a session exists
+    /// and keeps the const.)
+    pub gmail_base: String,
 }
 
 // UPLOAD_CACHE_CAP, MAX_BLOB_BYTES, MAX_UPLOAD_CACHE_BYTES → see
@@ -327,6 +337,8 @@ pub fn load_session(
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
         limiter: build_gmail_limiter(),
+        calendar_base: CALENDAR_BASE.to_string(),
+        gmail_base: GMAIL_BASE.to_string(),
     })
 }
 
@@ -379,6 +391,8 @@ pub async fn oauth_flow(
         upload_cache: tokio::sync::Mutex::new(HashMap::new()),
         parent_message_id_cache: tokio::sync::Mutex::new(Vec::new()),
         limiter: build_gmail_limiter(),
+        calendar_base: CALENDAR_BASE.to_string(),
+        gmail_base: GMAIL_BASE.to_string(),
     };
 
     let token = session.token.lock().await;
@@ -506,7 +520,7 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
             .execute("labels.list", || async {
                 session
                     .client
-                    .get(format!("{GMAIL_BASE}/labels"))
+                    .get(format!("{}/labels", session.gmail_base))
                     .bearer_auth(&token)
                     .send()
                     .await
@@ -534,8 +548,9 @@ pub async fn get_mailboxes(session: &GmailSession) -> Result<Vec<Mailbox>, Error
         let token = token.clone();
         let id = stub.id.clone();
         let limiter = session.limiter.clone();
+        let gmail_base = session.gmail_base.clone();
         join_set.spawn(async move {
-            let url = format!("{GMAIL_BASE}/labels/{id}");
+            let url = format!("{gmail_base}/labels/{id}");
             let resp = limiter
                 .execute("labels.get", || async {
                     client.get(&url).bearer_auth(&token).send().await
@@ -629,7 +644,7 @@ pub async fn get_identities(session: &GmailSession) -> Result<Vec<Identity>, Err
         .execute("sendAs.list", || async {
             session
                 .client
-                .get(format!("{GMAIL_BASE}/settings/sendAs"))
+                .get(format!("{}/settings/sendAs", session.gmail_base))
                 .bearer_auth(&token)
                 .send()
                 .await
@@ -739,7 +754,7 @@ async fn fetch_messages_page(
     q: &str,
     page_token: Option<&str>,
 ) -> Result<MessagesListResp, Error> {
-    let mut url = url::Url::parse(&format!("{GMAIL_BASE}/messages")).expect("valid base");
+    let mut url = url::Url::parse(&format!("{}/messages", session.gmail_base)).expect("valid base");
     {
         let mut qp = url.query_pairs_mut();
         qp.append_pair("maxResults", &MESSAGES_PAGE_SIZE.to_string());
@@ -1015,8 +1030,9 @@ pub async fn get_emails(
         let id = id.clone();
         let format = format.to_string();
         let limiter = session.limiter.clone();
+        let gmail_base = session.gmail_base.clone();
         join_set.spawn(async move {
-            let url = format!("{GMAIL_BASE}/messages/{id}?format={format}");
+            let url = format!("{gmail_base}/messages/{id}?format={format}");
             let resp = limiter
                 .execute_prioritized(priority, "messages.get", || async {
                     client.get(&url).bearer_auth(&token).send().await
@@ -1500,7 +1516,7 @@ async fn modify_labels(
     remove: &[&str],
 ) -> Result<bool, Error> {
     let token = access_token(session).await?;
-    let url = format!("{GMAIL_BASE}/messages/{msg_id}/modify");
+    let url = format!("{}/messages/{msg_id}/modify", session.gmail_base);
     let body = modify_body(add, remove);
     // Retry/backoff (including for the rapid archive + prefetch +
     // split-count fan-out bursts that used to need a bespoke 750ms
@@ -1653,7 +1669,7 @@ async fn message_has_label(
 ) -> Result<bool, Error> {
     let token = access_token(session).await?;
     // format=metadata returns labelIds without the payload bytes (cheaper).
-    let url = format!("{GMAIL_BASE}/messages/{msg_id}?format=metadata");
+    let url = format!("{}/messages/{msg_id}?format=metadata", session.gmail_base);
     let resp = session
         .limiter
         .execute("messages.get(metadata)", || async {
@@ -1675,7 +1691,7 @@ async fn message_has_label(
 
 pub async fn trash(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
     let token = access_token(session).await?;
-    let url = format!("{GMAIL_BASE}/messages/{msg_id}/trash");
+    let url = format!("{}/messages/{msg_id}/trash", session.gmail_base);
     // Priority lane: trashing is a direct user action, same as
     // `modify_labels` (mark-read/star/archive) — see that fn's comment.
     let resp = session
@@ -1708,7 +1724,7 @@ pub async fn archive_batch(session: &GmailSession, msg_ids: &[String]) -> Result
         return Ok(0);
     }
     let token = access_token(session).await?;
-    let url = format!("{GMAIL_BASE}/messages/batchModify");
+    let url = format!("{}/messages/batchModify", session.gmail_base);
     let body = batch_modify_body(msg_ids, &[], &["INBOX"]);
     // Non-priority lane: this is a bulk fan-out, not a single interactive
     // action — see `get_mailboxes`'s labels.get comment on keeping bulk
@@ -1768,8 +1784,23 @@ pub async fn download_blob(
         }
     };
 
+    let bytes = fetch_attachment_bytes(session, &msg_id, &att_id).await?;
+    Ok((mime_type_from_filename(filename).to_string(), bytes))
+}
+
+/// GET one attachment's bytes via `messages.attachments.get`. Shared by
+/// `download_blob` and `get_calendar_data` (Fastmail-organized invites store
+/// the text/calendar part as an attachment, not inline data).
+async fn fetch_attachment_bytes(
+    session: &GmailSession,
+    msg_id: &str,
+    att_id: &str,
+) -> Result<Vec<u8>, Error> {
     let token = access_token(session).await?;
-    let url = format!("{GMAIL_BASE}/messages/{msg_id}/attachments/{att_id}");
+    let url = format!(
+        "{}/messages/{msg_id}/attachments/{att_id}",
+        session.gmail_base
+    );
     let resp = session
         .limiter
         .execute("messages.attachments.get", || async {
@@ -1789,8 +1820,7 @@ pub async fn download_blob(
     let data = body
         .data
         .ok_or_else(|| Error::Internal("Gmail attachment response had no data field".into()))?;
-    let bytes = base64url_decode(&data)?;
-    Ok((mime_type_from_filename(filename).to_string(), bytes))
+    base64url_decode(&data)
 }
 
 // =============================================================================
@@ -1922,8 +1952,10 @@ async fn lookup_parent_message_id(
     // from frontend-provided `EmailSubmission.in_reply_to`; if a future
     // change widens that input's trust boundary, the URL won't corrupt.
     let encoded_id = encode_path_segment(gmail_msg_id);
-    let url =
-        format!("{GMAIL_BASE}/messages/{encoded_id}?format=metadata&metadataHeaders=Message-ID");
+    let url = format!(
+        "{}/messages/{encoded_id}?format=metadata&metadataHeaders=Message-ID",
+        session.gmail_base
+    );
     let resp = session
         .limiter
         .execute("messages.get(metadata,Message-ID)", || async {
@@ -2186,7 +2218,7 @@ pub async fn send_email(
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&rfc822);
 
     let token = access_token(session).await?;
-    let url = format!("{GMAIL_BASE}/messages/send");
+    let url = format!("{}/messages/send", session.gmail_base);
     let body = serde_json::json!({ "raw": raw });
     // Priority lane: the user is actively waiting on this send to complete —
     // same reasoning as `modify_labels`.
@@ -2248,7 +2280,7 @@ async fn find_event_id_by_ical_uid(
     // it's safe to reuse for query string values. If that set is ever
     // narrowed, audit these query-string callers.
     let encoded = encode_path_segment(uid);
-    let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
+    let url = format!("{}/events?iCalUID={encoded}", session.calendar_base);
     let resp = session
         .limiter
         .execute("calendar.events.list?iCalUID", || async {
@@ -2490,7 +2522,7 @@ pub async fn get_calendar_event(
     // See `find_event_id_by_ical_uid`: `encode_path_segment`'s escape set is a
     // superset of query-component requirements, so reusing it here is safe.
     let encoded = encode_path_segment(uid);
-    let url = format!("{CALENDAR_BASE}/events?iCalUID={encoded}");
+    let url = format!("{}/events?iCalUID={encoded}", session.calendar_base);
     let resp = session
         .limiter
         .execute("calendar.events.list?iCalUID", || async {
@@ -2528,7 +2560,7 @@ pub async fn add_to_calendar(
     }
     let token = access_token(session).await?;
     let body = calendar_event_to_google_json(event);
-    let url = format!("{CALENDAR_BASE}/events/import");
+    let url = format!("{}/events/import", session.calendar_base);
     let resp = session
         .limiter
         .execute("calendar.events.import", || async {
@@ -2568,7 +2600,7 @@ pub async fn remove_from_calendar(session: &GmailSession, uid: &str) -> Result<b
     };
     let token = access_token(session).await?;
     let encoded_id = encode_path_segment(&event_id);
-    let url = format!("{CALENDAR_BASE}/events/{encoded_id}");
+    let url = format!("{}/events/{encoded_id}", session.calendar_base);
     let resp = session
         .limiter
         .execute("calendar.events.delete", || async {
@@ -2611,7 +2643,7 @@ pub async fn respond_to_event(
     };
     let token = access_token(session).await?;
     let encoded_id = encode_path_segment(&event_id);
-    let event_url = format!("{CALENDAR_BASE}/events/{encoded_id}");
+    let event_url = format!("{}/events/{encoded_id}", session.calendar_base);
 
     // GET the current event so we have the full attendees array (Google's
     // PATCH semantics require the full array; partial PATCH silently wipes).
@@ -2729,7 +2761,7 @@ pub async fn get_calendar_data(
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     let encoded_id = encode_path_segment(email_id);
-    let url = format!("{GMAIL_BASE}/messages/{encoded_id}?format=full");
+    let url = format!("{}/messages/{encoded_id}?format=full", session.gmail_base);
     let resp = session
         .limiter
         .execute("messages.get(full)", || async {
@@ -2746,26 +2778,53 @@ pub async fn get_calendar_data(
         ));
     }
     let msg: GmailMessage = resp.json().await?;
-    Ok(find_calendar_ics(&msg.payload))
+    match find_calendar_ics(&msg.payload) {
+        None => Ok(None),
+        Some(IcsSource::Inline(s)) => Ok(Some(s)),
+        Some(IcsSource::Attachment(att_id)) => {
+            let bytes = fetch_attachment_bytes(session, email_id, &att_id).await?;
+            let s = String::from_utf8(bytes).map_err(|_| {
+                Error::Internal("text/calendar attachment was not valid UTF-8".into())
+            })?;
+            Ok(Some(s))
+        }
+    }
 }
 
-/// Walk the payload tree until a `text/calendar` part with inline data is
-/// found, then return its decoded UTF-8 string. Pure — testable with
+/// Where a message's ICS bytes live. Gmail inlines small `text/calendar`
+/// parts as base64url `body.data`, but parts carrying a filename (how
+/// Fastmail sends invites) are stored as attachments needing a second
+/// `messages.attachments.get` round-trip.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IcsSource {
+    /// Decoded ICS text, ready to use.
+    Inline(String),
+    /// `attachmentId` to fetch via `messages.attachments.get`.
+    Attachment(String),
+}
+
+/// Walk the payload tree until a `text/calendar` part with a usable body
+/// (inline data or an attachmentId) is found. Pure — testable with
 /// hand-rolled GmailPayload fixtures.
 ///
 /// Iterative DFS rather than recursion so a pathological or malicious
 /// payload can't blow the stack. Pre-order traversal preserves the original
 /// "outer parts first, then nested" order.
-pub(crate) fn find_calendar_ics(part: &GmailPayload) -> Option<String> {
+pub(crate) fn find_calendar_ics(part: &GmailPayload) -> Option<IcsSource> {
     let mut stack: Vec<&GmailPayload> = vec![part];
     while let Some(node) = stack.pop() {
         if node.mime_type.eq_ignore_ascii_case("text/calendar")
             && let Some(body) = &node.body
-            && let Some(data) = &body.data
-            && let Ok(bytes) = base64url_decode(data)
-            && let Ok(s) = String::from_utf8(bytes)
         {
-            return Some(s);
+            if let Some(data) = &body.data
+                && let Ok(bytes) = base64url_decode(data)
+                && let Ok(s) = String::from_utf8(bytes)
+            {
+                return Some(IcsSource::Inline(s));
+            }
+            if let Some(att_id) = &body.attachment_id {
+                return Some(IcsSource::Attachment(att_id.clone()));
+            }
         }
         if let Some(parts) = &node.parts {
             // Push in reverse so pop() yields siblings in original order.
@@ -4844,10 +4903,18 @@ mod tests {
         }
     }
 
+    /// Unwrap the Inline variant — these tests all model inline-data parts.
+    fn inline_ics(payload: &GmailPayload) -> String {
+        match find_calendar_ics(payload) {
+            Some(IcsSource::Inline(s)) => s,
+            other => panic!("expected IcsSource::Inline, got {other:?}"),
+        }
+    }
+
     #[test]
     fn find_calendar_ics_at_root() {
         let payload = calendar_part("BEGIN:VCALENDAR\r\nEND:VCALENDAR");
-        let ics = find_calendar_ics(&payload).unwrap();
+        let ics = inline_ics(&payload);
         assert!(ics.starts_with("BEGIN:VCALENDAR"));
     }
 
@@ -4873,7 +4940,7 @@ mod tests {
                 calendar_part("BEGIN:VCALENDAR\r\nUID:abc\r\nEND:VCALENDAR"),
             ]),
         };
-        let ics = find_calendar_ics(&payload).unwrap();
+        let ics = inline_ics(&payload);
         assert!(ics.contains("UID:abc"));
     }
 
@@ -4918,7 +4985,7 @@ mod tests {
                 parts: Some(vec![current]),
             };
         }
-        let ics = find_calendar_ics(&current).unwrap();
+        let ics = inline_ics(&current);
         assert!(ics.contains("UID:deep"));
     }
 
@@ -4936,7 +5003,7 @@ mod tests {
                 calendar_part("BEGIN:VCALENDAR\r\nUID:second\r\nEND:VCALENDAR"),
             ]),
         };
-        let ics = find_calendar_ics(&payload).unwrap();
+        let ics = inline_ics(&payload);
         assert!(ics.contains("UID:first"));
     }
 
@@ -4962,5 +5029,385 @@ mod tests {
         assert_eq!(session.limiter.name(), "gmail");
         assert_eq!(session.limiter.concurrency(), 5);
         assert_eq!(session.limiter.spacing(), Duration::from_millis(80));
+    }
+
+    // ---- Google Calendar RSVP round-trip pins (kata awxa) ----
+    //
+    // Behavioral loopback tests for the events.import / events.patch path.
+    // No mocking framework: a real tokio TcpListener + axum server records
+    // every request (same pattern as jmap.rs's caldav_recorder), and a test
+    // points `GmailSession::calendar_base` at it. These pin the on-the-wire
+    // contract the "coparties in sync" requirement hinges on: iCalUID
+    // preserved on import, PATCH carries the FULL attendees array with
+    // `?sendUpdates=all`, and an already-matching status makes zero PATCH
+    // calls (no duplicate organizer notification).
+
+    /// One request as seen by the loopback calendar recorder.
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        query: Option<String>,
+        body: Vec<u8>,
+    }
+
+    /// `((method, path), (status, body))` — one canned response rule.
+    type RecorderRoute = ((&'static str, &'static str), (u16, String));
+
+    /// Spawn a loopback server answering exact `(method, path)` pairs with
+    /// canned `(status, body)` responses; everything else gets 404. Returns
+    /// `(base_url, recorded_buffer)`.
+    async fn spawn_calendar_recorder(
+        routes: Vec<RecorderRoute>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let recorded: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_handler = recorded.clone();
+        let routes: Vec<((String, String), (u16, String))> = routes
+            .into_iter()
+            .map(|((m, p), r)| ((m.to_string(), p.to_string()), r))
+            .collect();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let recorded = recorded_for_handler.clone();
+            let routes = routes.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let query = req.uri().query().map(|q| q.to_string());
+                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default()
+                    .to_vec();
+                recorded.lock().unwrap().push(RecordedRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    query,
+                    body,
+                });
+                let (status, resp_body) = routes
+                    .iter()
+                    .find(|((m, p), _)| *m == method && *p == path)
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or((404, "{}".to_string()));
+                (axum::http::StatusCode::from_u16(status).unwrap(), resp_body)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), recorded)
+    }
+
+    fn probe_event() -> CalendarEvent {
+        CalendarEvent {
+            uid: "probe-uid-123@fastmail.example".into(),
+            summary: "Cross-provider probe".into(),
+            dtstart: chrono::DateTime::parse_from_rfc3339("2026-08-03T14:30:00+07:00")
+                .unwrap()
+                .with_timezone(&Utc),
+            dtend: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-03T15:30:00+07:00")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            location: None,
+            description: None,
+            organizer_email: "organizer@fastmail.example".into(),
+            organizer_name: None,
+            attendees: vec![
+                crate::types::Attendee {
+                    email: "organizer@fastmail.example".into(),
+                    name: None,
+                    status: "ACCEPTED".into(),
+                },
+                crate::types::Attendee {
+                    email: "u@g.com".into(),
+                    name: None,
+                    status: "NEEDS-ACTION".into(),
+                },
+            ],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: None,
+            is_update: false,
+        }
+    }
+
+    /// The JSON `respond_to_event`'s preliminary GET returns: the event as
+    /// Google stores it, with the responding attendee at `matt_status`.
+    fn google_event_body(matt_status: &str) -> String {
+        serde_json::json!({
+            "id": "evt-42",
+            "iCalUID": "probe-uid-123@fastmail.example",
+            "attendees": [
+                { "email": "organizer@fastmail.example", "responseStatus": "accepted",
+                  "organizer": true },
+                { "email": "u@g.com", "responseStatus": matt_status, "self": true },
+                { "email": "carol@example.com", "responseStatus": "declined" },
+            ],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn calendar_base_defaults_to_primary_calendar() {
+        // The loopback tests below override calendar_base; this pins what
+        // production actually targets.
+        let session = test_session();
+        assert_eq!(
+            session.calendar_base,
+            "https://www.googleapis.com/calendar/v3/calendars/primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_rsvp_import_preserves_icaluid_and_instant() {
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            // Existence pre-check: not in the calendar yet.
+            (("GET", "/events"), (200, r#"{"items":[]}"#.into())),
+            (("POST", "/events/import"), (200, "{}".into())),
+        ])
+        .await;
+        let mut session = test_session();
+        session.calendar_base = base;
+        let event = probe_event();
+
+        let added = add_to_calendar(&session, "", &event).await.unwrap();
+        assert!(added);
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "expected existence GET then import POST");
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/events");
+        assert_eq!(
+            reqs[0].query.as_deref(),
+            Some("iCalUID=probe-uid-123%40fastmail.example"),
+            "existence check must query by the invite's iCalUID"
+        );
+        assert_eq!(reqs[1].method, "POST");
+        assert_eq!(reqs[1].path, "/events/import");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[1].body).unwrap();
+        assert_eq!(
+            body["iCalUID"].as_str(),
+            Some("probe-uid-123@fastmail.example"),
+            "events.import must preserve the iCalUID for cross-account dedup"
+        );
+        // The instant must survive: 14:30+07:00 == 07:30Z. (The TZID itself is
+        // deliberately not preserved — Google re-renders in each viewer's TZ.)
+        let start =
+            chrono::DateTime::parse_from_rfc3339(body["start"]["dateTime"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&Utc);
+        assert_eq!(start, event.dtstart);
+        assert_eq!(body["start"]["timeZone"].as_str(), Some("UTC"));
+    }
+
+    #[tokio::test]
+    async fn gmail_rsvp_patch_sends_updates_all_with_full_attendees() {
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/events"),
+                (200, r#"{"items":[{"id":"evt-42"}]}"#.into()),
+            ),
+            (
+                ("GET", "/events/evt-42"),
+                (200, google_event_body("needsAction")),
+            ),
+            (("PATCH", "/events/evt-42"), (200, "{}".into())),
+        ])
+        .await;
+        let mut session = test_session();
+        session.calendar_base = base;
+
+        let ok = respond_to_event(
+            &session,
+            "probe-uid-123@fastmail.example",
+            "u@g.com",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+
+        let reqs = recorded.lock().unwrap().clone();
+        let patches: Vec<_> = reqs.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(patches.len(), 1, "exactly one PATCH");
+        let patch = patches[0];
+        assert_eq!(patch.path, "/events/evt-42");
+        assert_eq!(
+            patch.query.as_deref(),
+            Some("sendUpdates=all"),
+            "sendUpdates=all is what triggers the organizer-notification email"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&patch.body).unwrap();
+        let attendees = body["attendees"].as_array().unwrap();
+        // Google's PATCH is read-modify-write: a partial array silently wipes
+        // the other attendees, so the full array must go back on the wire.
+        assert_eq!(
+            attendees.len(),
+            3,
+            "PATCH must carry the FULL attendees array"
+        );
+        let by_email = |e: &str| {
+            attendees
+                .iter()
+                .find(|a| a["email"].as_str() == Some(e))
+                .unwrap_or_else(|| panic!("attendee {e} missing from PATCH body"))
+                .clone()
+        };
+        assert_eq!(
+            by_email("u@g.com")["responseStatus"].as_str(),
+            Some("accepted")
+        );
+        assert_eq!(
+            by_email("organizer@fastmail.example")["responseStatus"].as_str(),
+            Some("accepted"),
+            "other attendees' statuses must be untouched"
+        );
+        assert_eq!(
+            by_email("carol@example.com")["responseStatus"].as_str(),
+            Some("declined"),
+            "other attendees' statuses must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_rsvp_idempotent_skip_does_not_resend() {
+        // The GET already shows the target status: respond_to_event must make
+        // zero PATCH calls — each PATCH with sendUpdates=all would email the
+        // organizer a duplicate notification.
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/events"),
+                (200, r#"{"items":[{"id":"evt-42"}]}"#.into()),
+            ),
+            (
+                ("GET", "/events/evt-42"),
+                (200, google_event_body("accepted")),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.calendar_base = base;
+
+        let ok = respond_to_event(
+            &session,
+            "probe-uid-123@fastmail.example",
+            "u@g.com",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "already-matching status is success, not failure");
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "no PATCH may be sent when the status already matches: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_calendar_data_fetches_attachment_backed_ics() {
+        // The empirical probe (kata awxa) showed Fastmail-organized invites
+        // arrive in Gmail with the text/calendar part stored as an ATTACHMENT
+        // (body.attachmentId, no inline data). get_calendar_data must fetch
+        // it via messages.attachments.get — returning None here 404s the
+        // whole RSVP flow before any calendar call.
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:probe-uid-123@fastmail.example\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let ics_b64url = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE.encode(ics)
+        };
+        // Mirror of the real structure observed from a Fastmail invite:
+        // multipart/mixed > [multipart/alternative > [plain, html,
+        // text/calendar (attachment)], application/ics (attachment)].
+        let message = serde_json::json!({
+            "id": "msg-1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "multipart/alternative",
+                        "parts": [
+                            { "mimeType": "text/plain", "body": { "size": 10, "data": "aGVsbG8" } },
+                            { "mimeType": "text/html", "body": { "size": 20, "data": "PGI-aGk8L2I-" } },
+                            { "mimeType": "text/calendar", "filename": "invite.ics",
+                              "body": { "size": 912, "attachmentId": "att-ics-1" } },
+                        ],
+                    },
+                    { "mimeType": "application/ics", "filename": "invite.ics",
+                      "body": { "size": 910, "attachmentId": "att-ics-2" } },
+                ],
+            },
+        })
+        .to_string();
+        let attachment = serde_json::json!({ "size": 912, "data": ics_b64url }).to_string();
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (("GET", "/messages/msg-1"), (200, message)),
+            (
+                ("GET", "/messages/msg-1/attachments/att-ics-1"),
+                (200, attachment),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.gmail_base = base;
+
+        let got = get_calendar_data(&session, "msg-1").await.unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(ics),
+            "attachment-backed text/calendar must be fetched and decoded"
+        );
+        let reqs = recorded.lock().unwrap().clone();
+        assert!(
+            reqs.iter()
+                .any(|r| r.path == "/messages/msg-1/attachments/att-ics-1"),
+            "expected a messages.attachments.get call: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gmail_rsvp_returns_false_when_attendee_not_invited() {
+        // Ok(false) is the "honest failure" signal provider::rsvp converts to
+        // an Err the UI sees — pin that an unknown attendee produces it and
+        // never PATCHes (which would wipe/mutate someone else's response).
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/events"),
+                (200, r#"{"items":[{"id":"evt-42"}]}"#.into()),
+            ),
+            (
+                ("GET", "/events/evt-42"),
+                (200, google_event_body("needsAction")),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.calendar_base = base;
+
+        let ok = respond_to_event(
+            &session,
+            "probe-uid-123@fastmail.example",
+            "not-invited@elsewhere.example",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok,
+            "an uninvited attendee must yield Ok(false), not success"
+        );
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert!(
+            reqs.iter().all(|r| r.method == "GET"),
+            "no PATCH may be sent for an uninvited attendee: {reqs:?}"
+        );
     }
 }
