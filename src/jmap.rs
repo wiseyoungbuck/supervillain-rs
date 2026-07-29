@@ -1110,6 +1110,228 @@ pub async fn archive_batch(s: &JmapSession, email_ids: &[String]) -> Result<usiz
 // Send email
 // =============================================================================
 
+/// Header-injection guard for values interpolated into the client-built
+/// RFC 5322 message (`build_itip_reply_mime`): the subject embeds an event
+/// summary parsed from third-party ICS, so CR/LF must not reach a header
+/// line.
+fn strip_crlf(s: &str) -> String {
+    s.replace(['\r', '\n'], "")
+}
+
+/// base64 with CRLF line breaks every 76 chars (RFC 2045 §6.8 line limit).
+fn base64_mime_lines(data: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    b64.as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).expect("base64 output is ASCII"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// RFC 2047 B-encode a Subject that contains non-ASCII (event summaries are
+/// user text — "Réunion d'équipe"); ASCII subjects pass through bare.
+/// Chunking at ≤45 UTF-8 bytes (on char boundaries) keeps every
+/// encoded-word within RFC 2047's 75-char limit; continuation words fold
+/// onto their own header lines.
+fn encode_subject(raw: &str) -> String {
+    let s = strip_crlf(raw);
+    if s.is_ascii() {
+        return s;
+    }
+    fn encoded_word(chunk: &str) -> String {
+        use base64::Engine;
+        format!(
+            "=?UTF-8?B?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes())
+        )
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut chunk = String::new();
+    for ch in s.chars() {
+        if chunk.len() + ch.len_utf8() > 45 {
+            words.push(encoded_word(&chunk));
+            chunk.clear();
+        }
+        chunk.push(ch);
+    }
+    if !chunk.is_empty() {
+        words.push(encoded_word(&chunk));
+    }
+    words.join("\r\n ")
+}
+
+/// Multipart boundary for the client-built iTIP reply. A fixed value is
+/// safe: both parts are base64-encoded and no line of base64 output can
+/// start with `--`, so the delimiter cannot collide with content.
+const ITIP_REPLY_BOUNDARY: &str = "supervillain-itip-reply";
+
+/// Build the complete RFC 5322 message for an iTIP REPLY.
+///
+/// Client-built MIME, not Email/set bodyStructure, because Email/set has no
+/// channel for MIME Content-Type *parameters* (kata vt0m, verified against
+/// live Fastmail 2026-07-29): `type` must be a bare token, `charset` and
+/// `header:Content-Type` on a part are rejected as `invalidProperties`
+/// (the two production failures), and a blob's upload Content-Type is
+/// silently replaced by one generated from the part's properties. The
+/// `method=REPLY` parameter is what makes the message an iTIP REPLY the
+/// organizer's client will process (RFC 5546 §3.2), and charset=utf-8 is
+/// required for non-ASCII ICS (RFC 5545 §8.1) — so the whole message is
+/// built here and delivered via Email/import, which Fastmail preserves
+/// byte-for-byte. Date and Message-Id are omitted: Fastmail's MTA adds
+/// both at submission (verified live).
+fn build_itip_reply_mime(sub: &EmailSubmission, from_addr: &str) -> String {
+    let ics = sub
+        .calendar_ics
+        .as_deref()
+        .expect("build_itip_reply_mime requires calendar_ics");
+    let to = sub
+        .to
+        .iter()
+        .map(|a| strip_crlf(a))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let b = ITIP_REPLY_BOUNDARY;
+    format!(
+        "From: {from}\r\n\
+         To: {to}\r\n\
+         Subject: {subject}\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"{b}\"\r\n\
+         \r\n\
+         --{b}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {text}\r\n\
+         --{b}\r\n\
+         Content-Type: text/calendar; method=REPLY; charset=utf-8\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {cal}\r\n\
+         --{b}--\r\n",
+        from = strip_crlf(from_addr),
+        subject = encode_subject(&sub.subject),
+        text = base64_mime_lines(sub.text_body.as_bytes()),
+        cal = base64_mime_lines(ics.as_bytes()),
+    )
+}
+
+/// SMTP envelope recipients for a submission: to + cc + bcc.
+fn envelope_rcpt_to(sub: &EmailSubmission) -> Vec<serde_json::Value> {
+    let mut rcpt_to: Vec<serde_json::Value> = sub
+        .to
+        .iter()
+        .map(|e| serde_json::json!({"email": e}))
+        .collect();
+    rcpt_to.extend(sub.cc.iter().map(|e| serde_json::json!({"email": e})));
+    if let Some(ref bcc) = sub.bcc {
+        rcpt_to.extend(bcc.iter().map(|e| serde_json::json!({"email": e})));
+    }
+    rcpt_to
+}
+
+/// Send an iTIP REPLY: upload the client-built RFC822 message as
+/// `message/rfc822`, then one JMAP request — Email/import into Drafts
+/// (`$draft`) plus EmailSubmission/set referencing the import through the
+/// `#e` creation id, moving the message Drafts→Sent on success exactly like
+/// the plain send path. See `build_itip_reply_mime` for why this bypasses
+/// Email/set bodyStructure entirely.
+async fn send_itip_reply(
+    s: &JmapSession,
+    sub: &EmailSubmission,
+    from_addr: &str,
+    account_id: &str,
+    identity_id: &str,
+    drafts_id: &str,
+    sent_id: &str,
+) -> Result<Option<String>, Error> {
+    // rsvp() is the only producer of calendar_ics submissions and sets none
+    // of these; the minimal From/To/Subject builder would silently drop them.
+    debug_assert!(
+        sub.cc.is_empty()
+            && sub.bcc.is_none()
+            && sub.attachments.is_empty()
+            && sub.in_reply_to.is_none(),
+        "send_itip_reply builds a minimal From/To/Subject message"
+    );
+    let mime = build_itip_reply_mime(sub, from_addr);
+    let (blob_id, _) = upload_blob(s, "message/rfc822", mime.as_bytes()).await?;
+
+    let mut patch = serde_json::Map::new();
+    patch.insert(format!("mailboxIds/{drafts_id}"), serde_json::Value::Null);
+    patch.insert(format!("mailboxIds/{sent_id}"), serde_json::json!(true));
+    patch.insert("keywords/$draft".into(), serde_json::Value::Null);
+
+    let resp = jmap_call(
+        s,
+        vec![
+            serde_json::json!([
+                "Email/import",
+                {
+                    "accountId": account_id,
+                    "emails": {
+                        "e": {
+                            "blobId": blob_id,
+                            "mailboxIds": { drafts_id: true },
+                            "keywords": { "$draft": true }
+                        }
+                    }
+                },
+                "0"
+            ]),
+            serde_json::json!([
+                "EmailSubmission/set",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        "send": {
+                            "emailId": "#e",
+                            "identityId": identity_id,
+                            "envelope": {
+                                "mailFrom": { "email": from_addr },
+                                "rcptTo": envelope_rcpt_to(sub)
+                            }
+                        }
+                    },
+                    "onSuccessUpdateEmail": { "#send": patch }
+                },
+                "1"
+            ]),
+        ],
+    )
+    .await?;
+
+    let imported = &resp["methodResponses"][0][1]["created"]["e"];
+    if imported.is_null() {
+        let not_created = &resp["methodResponses"][0][1]["notCreated"];
+        let detail = if not_created.is_null() {
+            "no detail".into()
+        } else {
+            not_created.to_string()
+        };
+        return Err(Error::Internal(format!("Email import failed: {detail}")));
+    }
+
+    let submission = &resp["methodResponses"][1][1]["created"]["send"];
+    if submission.is_null() {
+        let not_created = &resp["methodResponses"][1][1]["notCreated"];
+        let detail = if not_created.is_null() {
+            "no detail".into()
+        } else {
+            not_created.to_string()
+        };
+        return Err(Error::Internal(format!(
+            "Email submission failed: {detail}"
+        )));
+    }
+
+    Ok(submission["emailId"]
+        .as_str()
+        .or_else(|| imported["id"].as_str())
+        .map(String::from))
+}
+
 fn build_draft_email(
     sub: &EmailSubmission,
     from_addr: &str,
@@ -1136,58 +1358,16 @@ fn build_draft_email(
     // appear at the top level.  We always set bodyStructure, so content is
     // defined entirely through bodyStructure + bodyValues with partId refs.
 
+    // calendar_ics never reaches this builder: an iTIP reply cannot be
+    // expressed as Email/set bodyStructure at all — no part property carries
+    // the MIME `method=REPLY` parameter (kata vt0m, verified against live
+    // Fastmail) — so `send_email` routes it through `send_itip_reply`
+    // (Email/import) before this is called.
     debug_assert!(
-        sub.calendar_ics.is_none() || sub.html_body.is_none(),
-        "calendar_ics and html_body are mutually exclusive"
+        sub.calendar_ics.is_none(),
+        "calendar_ics is sent via send_itip_reply (Email/import), not build_draft_email"
     );
-    if let Some(ref calendar_ics) = sub.calendar_ics {
-        // iTIP REPLY: multipart/mixed with text/plain + text/calendar.
-        //
-        // kata vt0m: RFC 8621 §4.1.4 — a part's `type` is the Content-Type
-        // media type with "parameters stripped" (a bare token), so
-        // `method=REPLY` cannot live there (Fastmail rejects
-        // `"text/calendar; method=REPLY"` as `invalidProperties` on
-        // `bodyStructure/subParts[1]/type`). It also cannot travel via a
-        // blob's upload Content-Type — a blob is raw octets (§4.1.4) and the
-        // part's Content-Type is generated from the part's own properties,
-        // not the blob. The RFC-sanctioned channel is `header:Content-Type`
-        // on the EmailBodyPart (§4.1.4: the client may send per-header
-        // properties). Per §4.6 ("there MUST NOT be two properties that
-        // represent the same header field"), setting `header:Content-Type`
-        // means the part MUST omit `type` (derived from that header) — so the
-        // calendar part carries only `partId` + `header:Content-Type`, and
-        // the ICS stays inline in `bodyValues` (the partId resolves there).
-        // charset=utf-8 is declared per RFC 5545 §8.1: iCalendar's default
-        // charset is UTF-8 (not the generic text/* us-ascii default), and the
-        // charset Content-Type parameter MUST be used in MIME transports to
-        // specify it — so the parameter is correctness-required for the
-        // calendar part, not belt-and-braces. The value's encoding still
-        // follows §4.6 (server-chosen for bodyValues); this asserts the
-        // server emits UTF-8 for the ICS (normal Fastmail/Cyrus behavior).
-        // The live verification gate should confirm with a non-ASCII invite
-        // (e.g. an accented event title), not only ASCII.
-        // The leading space in the header value is load-bearing: RFC 8621
-        // §4.1.1 Raw form is the octets following the terminating colon, so
-        // the space is what yields `Content-Type: text/calendar…` rather
-        // than the unconventional `Content-Type:text/calendar…` on the wire.
-        m.insert(
-            "bodyValues".into(),
-            serde_json::json!({
-                "body": { "value": sub.text_body },
-                "calendar": { "value": calendar_ics }
-            }),
-        );
-        m.insert(
-            "bodyStructure".into(),
-            serde_json::json!({
-                "type": "multipart/mixed",
-                "subParts": [
-                    { "partId": "body", "type": "text/plain" },
-                    { "partId": "calendar", "header:Content-Type": " text/calendar; method=REPLY; charset=utf-8" }
-                ]
-            }),
-        );
-    } else if let Some(ref html) = sub.html_body {
+    if let Some(ref html) = sub.html_body {
         m.insert(
             "bodyValues".into(),
             serde_json::json!({
@@ -1237,33 +1417,20 @@ fn build_draft_email(
             })
             .collect();
 
+        // Text or HTML body: wrap in multipart/mixed with the attachments.
+        // (The stage-1 structure is never already multipart/mixed — the
+        // calendar case that used to produce one goes through
+        // send_itip_reply, not this builder.)
         let body_structure = m.remove("bodyStructure").unwrap();
-        if body_structure["type"] == "multipart/mixed" {
-            // Calendar case: append attachment parts to existing subParts
-            let mut sub_parts = body_structure["subParts"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            sub_parts.extend(attachment_parts);
-            m.insert(
-                "bodyStructure".into(),
-                serde_json::json!({
-                    "type": "multipart/mixed",
-                    "subParts": sub_parts
-                }),
-            );
-        } else {
-            // Text or HTML: wrap in new multipart/mixed
-            let mut sub_parts = vec![body_structure];
-            sub_parts.extend(attachment_parts);
-            m.insert(
-                "bodyStructure".into(),
-                serde_json::json!({
-                    "type": "multipart/mixed",
-                    "subParts": sub_parts
-                }),
-            );
-        }
+        let mut sub_parts = vec![body_structure];
+        sub_parts.extend(attachment_parts);
+        m.insert(
+            "bodyStructure".into(),
+            serde_json::json!({
+                "type": "multipart/mixed",
+                "subParts": sub_parts
+            }),
+        );
     }
 
     if !sub.cc.is_empty() {
@@ -1356,18 +1523,24 @@ pub async fn send_email(
         .id
         .clone();
 
-    let email_create = build_draft_email(sub, from_addr, &drafts_id);
-
-    // Build envelope
-    let mut rcpt_to: Vec<serde_json::Value> = sub
-        .to
-        .iter()
-        .map(|e| serde_json::json!({"email": e}))
-        .collect();
-    rcpt_to.extend(sub.cc.iter().map(|e| serde_json::json!({"email": e})));
-    if let Some(ref bcc) = sub.bcc {
-        rcpt_to.extend(bcc.iter().map(|e| serde_json::json!({"email": e})));
+    // iTIP replies can't be expressed as Email/set bodyStructure — no part
+    // property carries the MIME `method=REPLY` parameter (kata vt0m) — so
+    // they go out as a client-built RFC822 message via Email/import.
+    if sub.calendar_ics.is_some() {
+        return send_itip_reply(
+            s,
+            sub,
+            from_addr,
+            &account_id,
+            &identity_id,
+            &drafts_id,
+            &sent_id,
+        )
+        .await;
     }
+
+    let email_create = build_draft_email(sub, from_addr, &drafts_id);
+    let rcpt_to = envelope_rcpt_to(sub);
 
     let resp = jmap_call(
         s,
@@ -2012,16 +2185,18 @@ fn uuid_v4() -> String {
 // Tests
 // =============================================================================
 
-/// A real loopback HTTP recorder for CalDAV behavioral tests.
+/// A real loopback HTTP recorder for CalDAV and JMAP behavioral tests.
 ///
 /// No mocking framework: `tokio::net::TcpListener` + `axum::serve` (the same
 /// real-HTTP pattern the codebase already uses in `outlook.rs` tests). Every
 /// incoming request is appended to the shared `recorded` buffer with its
-/// method, path, `Authorization` header, and body; the server responds to
-/// *every* method/path with the canned `status` + `body` so a test can drive
-/// PUT / GET / DELETE against one endpoint and then assert on the recorded
-/// headers. A test points `JmapSession::caldav_base` at the returned URL so
-/// the CalDAV functions hit the recorder instead of `caldav.fastmail.com`.
+/// method, path, `Authorization` / `Content-Type` headers, and body; the
+/// server responds to *every* method/path with the canned `status` + `body`
+/// so a test can drive PUT / GET / DELETE against one endpoint and then
+/// assert on the recorded headers. A test points
+/// `JmapSession::caldav_base` (CalDAV) or `api_url`/`upload_url` (JMAP) at
+/// the returned URL so the functions under test hit the recorder instead of
+/// Fastmail.
 #[cfg(test)]
 pub(crate) mod caldav_recorder {
     use std::sync::{Arc, Mutex};
@@ -2032,6 +2207,7 @@ pub(crate) mod caldav_recorder {
         pub method: String,
         pub path: String,
         pub authorization: Option<String>,
+        pub content_type: Option<String>,
         pub body: Vec<u8>,
     }
 
@@ -2054,6 +2230,11 @@ pub(crate) mod caldav_recorder {
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let content_type = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
                 let req_body = axum::body::to_bytes(req.into_body(), usize::MAX)
                     .await
                     .unwrap_or_default()
@@ -2062,6 +2243,7 @@ pub(crate) mod caldav_recorder {
                     method,
                     path,
                     authorization,
+                    content_type,
                     body: req_body,
                 });
                 (status, axum::body::Bytes::from(body))
@@ -3514,90 +3696,97 @@ END:VCALENDAR";
         assert_ne!(a, b, "Two UUIDs should not be identical");
     }
 
-    // --- build_draft_email calendar_ics tests ---
+    // --- build_itip_reply_mime tests (kata vt0m) ---
 
     #[test]
-    fn calendar_part_carries_method_reply_on_content_type_header() {
-        // kata vt0m: see build_draft_email's calendar branch for the full
-        // RFC 8621 rationale (why `type` can't carry parameters, why a blob
-        // upload doesn't work, and the §4.6 duplicate-header rule). This test
-        // pins the resulting invariant: the calendar part must set
-        // `header:Content-Type` carrying method=REPLY (and charset=utf-8) and
-        // must omit `type`. Fails today: no `header:Content-Type`; `type`
-        // carries the malformed `text/calendar; method=REPLY`.
-        let sub = EmailSubmission {
-            to: vec!["organizer@example.com".into()],
-            cc: vec![],
-            subject: "Re: Team Standup".into(),
-            text_body: "Bob has accepted the invitation: Team Standup".into(),
-            bcc: None,
-            html_body: None,
-            in_reply_to: None,
-            references: None,
-            attachments: vec![],
-            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
-        };
-        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
-        let sub_parts = draft["bodyStructure"]["subParts"]
-            .as_array()
-            .expect("calendar draft must have subParts");
-        let cal_part = sub_parts
-            .iter()
-            .find(|p| p.get("partId").and_then(|v| v.as_str()) == Some("calendar"))
-            .expect("calendar part must exist with partId 'calendar'");
-        let ct = cal_part
-            .get("header:Content-Type")
-            .and_then(|v| v.as_str())
-            .expect(
-                "calendar part must set header:Content-Type (RFC 8621 §4.1.4) to carry \
-                 method=REPLY on the wire — not the `type` field, not a blob upload (kata vt0m)",
-            );
+    fn itip_mime_ascii_subject_passes_through_and_non_ascii_is_rfc2047() {
+        let mut sub = itip_submission();
+        sub.subject = "Re: Team Standup".into();
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        assert!(mime.contains("Subject: Re: Team Standup\r\n"));
+
+        let mime = build_itip_reply_mime(&itip_submission(), "bob@example.com");
+        let subject_line = mime
+            .lines()
+            .find(|l| l.starts_with("Subject: "))
+            .expect("Subject header present");
         assert!(
-            ct.starts_with(" text/calendar;") && ct.contains("method=REPLY"),
-            "header:Content-Type {ct:?} must be ` text/calendar;` (leading space per RFC 8621 §4.1.1 \
-             Raw form; `;` pins the media-type token boundary) with method=REPLY (kata vt0m)"
+            subject_line.contains("=?UTF-8?B?"),
+            "non-ASCII subject must be RFC 2047 encoded: {subject_line}"
         );
         assert!(
-            ct.contains("charset=utf-8"),
-            "header:Content-Type {ct:?} must declare charset=utf-8 — text/* parts otherwise \
-             default to us-ascii and non-ASCII ICS is mislabeled (kata vt0m)"
-        );
-        assert!(
-            cal_part.get("type").is_none(),
-            "calendar part must NOT set `type` when header:Content-Type is set — RFC 8621 §4.6 \
-             forbids two properties for the same header field (kata vt0m)"
+            !subject_line.contains('é'),
+            "no raw non-ASCII may appear in a header: {subject_line}"
         );
     }
 
     #[test]
-    fn draft_with_calendar_ics_has_multipart_mixed() {
-        let sub = EmailSubmission {
-            to: vec!["organizer@example.com".into()],
-            cc: vec![],
-            subject: "Re: Team Standup".into(),
-            text_body: "Bob has accepted the invitation: Team Standup".into(),
-            bcc: None,
-            html_body: None,
-            in_reply_to: None,
-            references: None,
-            attachments: vec![],
-            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
-        };
-        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
-        assert_eq!(
-            draft["bodyStructure"]["type"], "multipart/mixed",
-            "Calendar draft should use multipart/mixed"
+    fn itip_mime_long_non_ascii_subject_folds_into_short_encoded_words() {
+        let mut sub = itip_submission();
+        sub.subject = "Re: Réunion très importante de l'équipe européenne à Genève".into();
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        let subject_start = mime.find("Subject: ").unwrap() + "Subject: ".len();
+        let subject_end = mime[subject_start..]
+            .find("\r\nMIME-Version")
+            .map(|i| subject_start + i)
+            .unwrap();
+        for word in mime[subject_start..subject_end].split("\r\n ") {
+            assert!(
+                word.len() <= 75,
+                "each RFC 2047 encoded-word must be ≤75 chars: {word:?} ({})",
+                word.len()
+            );
+            assert!(word.starts_with("=?UTF-8?B?") && word.ends_with("?="));
+        }
+    }
+
+    #[test]
+    fn itip_mime_strips_crlf_header_injection() {
+        let mut sub = itip_submission();
+        sub.subject = "Re: x\r\nBcc: evil@example.com".into();
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        assert!(
+            !mime.lines().any(|l| l.starts_with("Bcc:")),
+            "CRLF in a subject must not inject a header line:\n{mime}"
         );
-        let sub_parts = draft["bodyStructure"]["subParts"]
-            .as_array()
-            .expect("Should have subParts");
-        assert_eq!(sub_parts.len(), 2);
-        assert_eq!(sub_parts[0]["type"], "text/plain");
-        assert_eq!(sub_parts[1]["partId"], "calendar");
-        // The header:Content-Type invariants (method=REPLY, charset=utf-8,
-        // no `type`) are pinned by
-        // calendar_part_carries_method_reply_on_content_type_header; this
-        // test stays scoped to the multipart/mixed shape and part count.
+    }
+
+    #[test]
+    fn itip_mime_base64_lines_stay_within_rfc2045_limit() {
+        let mut sub = itip_submission();
+        sub.calendar_ics = Some(format!(
+            "BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nDESCRIPTION:{}\r\nEND:VCALENDAR\r\n",
+            "x".repeat(600)
+        ));
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        for line in mime.lines() {
+            assert!(
+                line.len() <= 78,
+                "MIME line exceeds RFC 2045 length limit ({}): {line:?}",
+                line.len()
+            );
+        }
+    }
+
+    #[test]
+    fn itip_mime_text_part_decodes_to_text_body() {
+        use base64::Engine;
+        let sub = itip_submission();
+        let mime = build_itip_reply_mime(&sub, "bob@example.com");
+        let text_start = mime.find("Content-Type: text/plain").unwrap();
+        let b64_start = mime[text_start..].find("\r\n\r\n").unwrap() + text_start + 4;
+        let b64_end = mime[b64_start..].find("\r\n--").unwrap() + b64_start;
+        let b64: String = mime[b64_start..b64_end]
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let text = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(text, sub.text_body);
     }
 
     #[test]
@@ -3610,45 +3799,464 @@ END:VCALENDAR";
         );
     }
 
-    #[test]
-    fn draft_calendar_body_value_contains_ics() {
-        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nEND:VCALENDAR";
-        let sub = EmailSubmission {
+    // --- iTIP reply via Email/import: loopback behavioral tests (kata vt0m) ---
+    //
+    // Empirically verified against live Fastmail (2026-07-29): Email/set
+    // bodyStructure CANNOT put `method=REPLY` on the wire — `type` with
+    // parameters and `header:Content-Type` are both rejected as
+    // invalidProperties (the two production failures), a blob's upload
+    // Content-Type is silently replaced by one generated from the part
+    // properties, and `charset` is not a settable part property. The only
+    // channel that preserves `Content-Type: text/calendar; method=REPLY` is
+    // building the RFC822 message client-side, uploading it as
+    // `message/rfc822`, and creating the email via Email/import. These tests
+    // drive the real `send_email` against a loopback recorder and assert on
+    // what actually goes over the wire.
+
+    fn itip_submission() -> EmailSubmission {
+        EmailSubmission {
             to: vec!["organizer@example.com".into()],
             cc: vec![],
-            subject: "Re: Meeting".into(),
-            text_body: "Accepted".into(),
+            subject: "Re: Réunion d'équipe".into(),
+            text_body: "bob@example.com has accepted the invitation: Réunion d'équipe".into(),
             bcc: None,
             html_body: None,
             in_reply_to: None,
             references: None,
             attachments: vec![],
-            calendar_ics: Some(ics.into()),
-        };
-        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
-        let body_values = draft["bodyValues"]
-            .as_object()
-            .expect("bodyValues should exist");
-        assert_eq!(body_values["calendar"]["value"], ics);
-        assert_eq!(body_values["body"]["value"], "Accepted");
+            calendar_ics: Some(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\n\
+                 SUMMARY:Réunion d'équipe\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                    .into(),
+            ),
+        }
     }
 
-    #[test]
-    #[should_panic(expected = "calendar_ics and html_body are mutually exclusive")]
-    fn draft_rejects_calendar_ics_with_html_body() {
+    /// Loopback JMAP server + a session pointed at it. The canned response
+    /// body satisfies both parsers that see it: `upload_blob` reads
+    /// `blobId`/`size`, `jmap_call` reads `methodResponses`.
+    async fn spawn_jmap_loopback() -> (
+        JmapSession,
+        std::sync::Arc<std::sync::Mutex<Vec<caldav_recorder::RecordedRequest>>>,
+    ) {
+        let canned = serde_json::json!({
+            "blobId": "blob-rfc822-1",
+            "size": 1,
+            "methodResponses": [
+                ["Email/import",
+                 {"created": {"e": {"id": "E-imported-1", "blobId": "blob-rfc822-1"}}},
+                 "0"],
+                ["EmailSubmission/set",
+                 {"created": {"send": {"id": "S1", "emailId": "E-imported-1"}}},
+                 "1"]
+            ]
+        });
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
+                .await;
+        let mut s = JmapSession::new("bob@example.com", "test-token", None);
+        s.api_url = Some(format!("{base}/jmap"));
+        s.upload_url = Some(format!("{base}/upload/{{accountId}}"));
+        s.account_id = Some("acc1".into());
+        s.identity_id = Some("ident1".into());
+        for (id, name, role) in [
+            ("mb-drafts", "Drafts", "drafts"),
+            ("mb-sent", "Sent", "sent"),
+        ] {
+            s.mailbox_cache.insert(
+                id.into(),
+                Mailbox {
+                    id: id.into(),
+                    name: name.into(),
+                    role: Some(role.into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            );
+        }
+        (s, recorded)
+    }
+
+    /// Walk a JSON value and assert it contains none of the two shapes
+    /// Fastmail rejected in production: an object key starting with
+    /// `header:` (rejected `bodyStructure/subParts[1]/header:Content-Type`)
+    /// or a `type` value carrying a `;`-parameter (rejected
+    /// `bodyStructure/subParts[1]/type`).
+    fn assert_no_rejected_part_shapes(v: &serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    assert!(
+                        !k.starts_with("header:"),
+                        "Email/set part-input schema has no header:* properties — \
+                         Fastmail rejects them as invalidProperties (kata vt0m): {k}"
+                    );
+                    if k == "type"
+                        && let Some(t) = val.as_str()
+                    {
+                        assert!(
+                            !t.contains(';'),
+                            "JMAP `type` is a bare MIME token; `{t}` carries a parameter \
+                             and is rejected as invalidProperties (kata vt0m)"
+                        );
+                    }
+                    assert_no_rejected_part_shapes(val);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    assert_no_rejected_part_shapes(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn itip_reply_sends_no_shape_fastmail_rejects() {
+        // Regression signatures from BOTH production failures: the original
+        // `"type": "text/calendar; method=REPLY"` and the first fix's
+        // `"header:Content-Type"` — every JSON body sent to the JMAP API
+        // endpoint must be free of both.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        let sub = itip_submission();
+        let result = send_email(&mut s, &sub, "bob@example.com", Some("ident1")).await;
+        assert!(result.is_ok(), "send should succeed: {result:?}");
+        let reqs = recorded.lock().unwrap().clone();
+        let jmap_bodies: Vec<serde_json::Value> = reqs
+            .iter()
+            .filter(|r| r.path.ends_with("/jmap"))
+            .map(|r| serde_json::from_slice(&r.body).expect("JMAP body is JSON"))
+            .collect();
+        assert!(!jmap_bodies.is_empty(), "expected at least one JMAP call");
+        for body in &jmap_bodies {
+            assert_no_rejected_part_shapes(body);
+        }
+    }
+
+    #[tokio::test]
+    async fn itip_reply_uploads_rfc822_whose_calendar_part_carries_method_reply() {
+        // The delivery channel: the calendar part's Content-Type — with
+        // method=REPLY and charset=utf-8 — must be inside a client-built
+        // RFC822 message uploaded as message/rfc822 (the only channel
+        // Fastmail preserves, verified live 2026-07-29).
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        let sub = itip_submission();
+        let result = send_email(&mut s, &sub, "bob@example.com", Some("ident1")).await;
+        assert!(result.is_ok(), "send should succeed: {result:?}");
+        let reqs = recorded.lock().unwrap().clone();
+        let uploads: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.path.starts_with("/upload/"))
+            .collect();
+        assert_eq!(
+            uploads.len(),
+            1,
+            "iTIP reply must upload exactly one message/rfc822 blob"
+        );
+        let up = uploads[0];
+        assert_eq!(up.path, "/upload/acc1", "upload must substitute accountId");
+        assert_eq!(
+            up.content_type.as_deref(),
+            Some("message/rfc822"),
+            "blob must be uploaded as message/rfc822 so Email/import accepts it"
+        );
+        let mime = String::from_utf8(up.body.clone()).expect("MIME is UTF-8");
+        assert!(
+            mime.contains("Content-Type: text/calendar; method=REPLY; charset=utf-8"),
+            "calendar part must carry method=REPLY (RFC 5546 §3.2) and charset=utf-8 \
+             (RFC 5545 §8.1) on its MIME Content-Type; got:\n{mime}"
+        );
+        // The ICS travels base64-encoded (8-bit safe, and no line of base64
+        // output can collide with a boundary delimiter). Decode the calendar
+        // part and confirm the actual ICS arrived intact, non-ASCII included.
+        let cal_start = mime
+            .find("Content-Type: text/calendar")
+            .expect("calendar part present");
+        let b64_start = mime[cal_start..]
+            .find("\r\n\r\n")
+            .map(|i| cal_start + i + 4)
+            .expect("calendar part has a header/body separator");
+        let b64_end = mime[b64_start..]
+            .find("\r\n--")
+            .map(|i| b64_start + i)
+            .expect("calendar part is terminated by a boundary");
+        let b64: String = mime[b64_start..b64_end]
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        use base64::Engine;
+        let ics = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("calendar part body is valid base64"),
+        )
+        .expect("decoded ICS is UTF-8");
+        assert_eq!(
+            ics,
+            sub.calendar_ics.as_deref().unwrap(),
+            "decoded calendar part must be the ICS byte-for-byte"
+        );
+        assert!(ics.contains("METHOD:REPLY"));
+        assert!(ics.contains("Réunion"), "non-ASCII must survive encoding");
+    }
+
+    #[tokio::test]
+    async fn itip_reply_imports_then_submits_with_creation_id_reference() {
+        // The verified JMAP chain: one request — Email/import into Drafts
+        // ($draft), then EmailSubmission/set referencing the import via the
+        // "#e" creation id, moving the message to Sent on success (the same
+        // Drafts→Sent patch the plain send path uses).
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        let sub = itip_submission();
+        let result = send_email(&mut s, &sub, "bob@example.com", Some("ident1")).await;
+        assert_eq!(
+            result.expect("send should succeed").as_deref(),
+            Some("E-imported-1"),
+            "send_email must return the sent email's id"
+        );
+        let reqs = recorded.lock().unwrap().clone();
+        let jmap_bodies: Vec<serde_json::Value> = reqs
+            .iter()
+            .filter(|r| r.path.ends_with("/jmap"))
+            .map(|r| serde_json::from_slice(&r.body).expect("JMAP body is JSON"))
+            .collect();
+        assert_eq!(jmap_bodies.len(), 1, "import + submit must be one request");
+        let calls = &jmap_bodies[0]["methodCalls"];
+        assert_eq!(calls[0][0], "Email/import");
+        let e = &calls[0][1]["emails"]["e"];
+        assert_eq!(e["blobId"], "blob-rfc822-1");
+        assert_eq!(e["mailboxIds"]["mb-drafts"], true);
+        assert_eq!(e["keywords"]["$draft"], true);
+        assert_eq!(calls[1][0], "EmailSubmission/set");
+        let send = &calls[1][1]["create"]["send"];
+        assert_eq!(
+            send["emailId"], "#e",
+            "submission must reference the import by creation id"
+        );
+        assert_eq!(send["identityId"], "ident1");
+        assert_eq!(send["envelope"]["mailFrom"]["email"], "bob@example.com");
+        assert_eq!(
+            send["envelope"]["rcptTo"][0]["email"],
+            "organizer@example.com"
+        );
+        let patch = &calls[1][1]["onSuccessUpdateEmail"]["#send"];
+        assert!(
+            patch["mailboxIds/mb-drafts"].is_null()
+                && patch
+                    .as_object()
+                    .unwrap()
+                    .contains_key("mailboxIds/mb-drafts"),
+            "success patch must remove the message from Drafts"
+        );
+        assert_eq!(patch["mailboxIds/mb-sent"], true);
+        assert!(
+            patch["keywords/$draft"].is_null()
+                && patch.as_object().unwrap().contains_key("keywords/$draft"),
+            "success patch must clear $draft"
+        );
+    }
+
+    /// Live acceptance gate (kata vt0m): run the REAL `send_email` iTIP path
+    /// against the REAL Fastmail server and verify the reply arrives with
+    /// `Content-Type: text/calendar; method=REPLY; charset=utf-8` on the
+    /// calendar part. This is the test the first vt0m fix lacked — its
+    /// loopback tests asserted the client's output shape, which went green
+    /// on a shape Fastmail rejects. A recorder can't catch a server
+    /// rejection it doesn't model; only the live server is authoritative.
+    ///
+    /// `#[ignore]` because it needs the local Fastmail config and sends a
+    /// real message (to the account itself; both copies are destroyed at
+    /// the end). Run with:
+    /// `cargo test --lib live_fastmail_itip_reply_roundtrip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_fastmail_itip_reply_roundtrip() {
+        use base64::Engine;
+
+        // Load the real Fastmail credentials the way main() does.
+        let config_path = crate::platform::config_dir().join("supervillain/config");
+        let (cfg, _) = crate::accounts::parse_config(&config_path);
+        let (username, api_token) = cfg
+            .accounts
+            .values()
+            .find_map(|a| match a {
+                crate::accounts::AccountConfig::Fastmail {
+                    username,
+                    api_token,
+                    ..
+                } => Some((username.clone(), api_token.clone())),
+                _ => None,
+            })
+            .expect("live test needs a Fastmail account in the local config");
+
+        let mut s = JmapSession::new(&username, &api_token, None);
+        connect(&mut s).await.expect("connect to Fastmail");
+        for mb in get_mailboxes(&s).await.expect("fetch mailboxes") {
+            s.mailbox_cache.insert(mb.id.clone(), mb);
+        }
+        let account_id = s.account_id.clone().unwrap();
+        let inbox_id = s
+            .mailbox_cache
+            .values()
+            .find(|mb| mb.role.as_deref() == Some("inbox"))
+            .expect("inbox")
+            .id
+            .clone();
+
+        // Unique marker so polling can't match an earlier run's message.
+        let marker = format!(
+            "vt0m-live-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        // The real generator, a non-ASCII summary (the roborev 385 charset
+        // concern), replying to self so no third party sees the probe.
+        let event = CalendarEvent {
+            uid: format!("{marker}@supervillain"),
+            summary: format!("Réunion d'équipe {marker}"),
+            dtstart: chrono::Utc::now() + chrono::Duration::days(1),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: username.clone(),
+            organizer_name: None,
+            attendees: vec![],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: String::new(),
+            user_rsvp_status: None,
+            is_update: false,
+        };
+        let rsvp_ics = crate::calendar::generate_rsvp_with_tz(
+            &event,
+            &username,
+            &crate::types::RsvpStatus::Accepted,
+            chrono_tz::America::Chicago,
+        );
         let sub = EmailSubmission {
-            to: vec!["organizer@example.com".into()],
+            to: vec![username.clone()],
             cc: vec![],
-            subject: "Re: Meeting".into(),
-            text_body: "Accepted".into(),
+            subject: format!("Re: {}", event.summary),
+            text_body: format!("{username} has accepted the invitation: {}", event.summary),
             bcc: None,
-            html_body: Some("<p>Should not coexist</p>".into()),
+            html_body: None,
             in_reply_to: None,
             references: None,
             attachments: vec![],
-            calendar_ics: Some("BEGIN:VCALENDAR\r\nEND:VCALENDAR".into()),
+            calendar_ics: Some(rsvp_ics.clone()),
         };
-        build_draft_email(&sub, "bob@example.com", "mb-drafts");
+
+        let sent_id = send_email(&mut s, &sub, &username, None)
+            .await
+            .expect("live send_email must be accepted by Fastmail")
+            .expect("send_email returns the email id");
+
+        // Poll the inbox for arrival.
+        let mut arrived_id = None;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let resp = jmap_call(
+                &s,
+                vec![serde_json::json!([
+                    "Email/query",
+                    {
+                        "accountId": &account_id,
+                        "filter": { "inMailbox": &inbox_id, "subject": &marker }
+                    },
+                    "0"
+                ])],
+            )
+            .await
+            .expect("Email/query");
+            if let Some(id) = resp["methodResponses"][0][1]["ids"][0].as_str() {
+                arrived_id = Some(id.to_string());
+                break;
+            }
+        }
+        let arrived_id = arrived_id.expect("iTIP reply never arrived in the inbox");
+
+        // Download the raw message and verify what's actually on the wire.
+        let resp = jmap_call(
+            &s,
+            vec![serde_json::json!([
+                "Email/get",
+                { "accountId": &account_id, "ids": [&arrived_id], "properties": ["blobId"] },
+                "0"
+            ])],
+        )
+        .await
+        .expect("Email/get");
+        let blob_id = resp["methodResponses"][0][1]["list"][0]["blobId"]
+            .as_str()
+            .expect("blobId")
+            .to_string();
+        let (_, raw) = download_blob(&s, &blob_id, "probe.eml")
+            .await
+            .expect("download raw");
+        let mime = String::from_utf8_lossy(&raw);
+
+        assert!(
+            mime.contains("Content-Type: text/calendar; method=REPLY; charset=utf-8"),
+            "arrived message must carry method=REPLY on the calendar part:\n{mime}"
+        );
+        assert!(
+            mime.lines().any(|l| l.starts_with("Date:")),
+            "Fastmail's MTA must have added a Date header"
+        );
+        assert!(
+            mime.to_lowercase().contains("message-id:"),
+            "Fastmail's MTA must have added a Message-Id header"
+        );
+        // Decode the calendar part; the generated ICS must arrive intact.
+        let cal_start = mime.find("Content-Type: text/calendar").unwrap();
+        let b64_start = mime[cal_start..].find("\r\n\r\n").unwrap() + cal_start + 4;
+        let b64_end = mime[b64_start..].find("\r\n--").unwrap() + b64_start;
+        let b64: String = mime[b64_start..b64_end]
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let ics = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("valid base64"),
+        )
+        .expect("UTF-8 ICS");
+        assert_eq!(ics, rsvp_ics, "ICS must arrive byte-for-byte");
+        assert!(ics.contains("METHOD:REPLY"));
+        assert!(ics.contains("PARTSTAT=ACCEPTED"));
+        assert!(ics.contains("Réunion"), "non-ASCII summary must survive");
+
+        // Cleanup: destroy both the received copy and the Sent copy.
+        let destroyed = jmap_call(
+            &s,
+            vec![serde_json::json!([
+                "Email/set",
+                { "accountId": &account_id, "destroy": [&arrived_id, &sent_id] },
+                "0"
+            ])],
+        )
+        .await
+        .expect("cleanup destroy");
+        println!(
+            "live round-trip OK; destroyed: {}",
+            destroyed["methodResponses"][0][1]["destroyed"]
+        );
+        println!(
+            "--- arrived calendar part Content-Type verified: text/calendar; method=REPLY; charset=utf-8 ---"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "calendar_ics is sent via send_itip_reply")]
+    fn build_draft_email_rejects_calendar_ics() {
+        // send_email routes calendar_ics through send_itip_reply before this
+        // builder runs; reaching it with calendar_ics set is a routing bug.
+        build_draft_email(&itip_submission(), "bob@example.com", "mb-drafts");
     }
 
     // --- build_draft_email attachment tests ---
@@ -3716,40 +4324,6 @@ END:VCALENDAR";
         // Second part is the attachment
         assert_eq!(parts[1]["type"], "application/pdf");
         assert_eq!(parts[1]["blobId"], "blob-pdf-123");
-    }
-
-    #[test]
-    fn draft_calendar_with_attachment_appends() {
-        let sub = EmailSubmission {
-            to: vec!["organizer@example.com".into()],
-            cc: vec![],
-            subject: "Re: Meeting".into(),
-            text_body: "Accepted".into(),
-            bcc: None,
-            html_body: None,
-            in_reply_to: None,
-            references: None,
-            attachments: vec![pdf_attachment()],
-            calendar_ics: Some("BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nEND:VCALENDAR".into()),
-        };
-        let draft = build_draft_email(&sub, "bob@example.com", "mb-drafts");
-        assert_eq!(draft["bodyStructure"]["type"], "multipart/mixed");
-        let parts = draft["bodyStructure"]["subParts"]
-            .as_array()
-            .expect("subParts");
-        // text/plain + text/calendar (header:Content-Type, no `type`) + attachment (appended, not double-wrapped)
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0]["type"], "text/plain");
-        // kata vt0m: calendar part uses header:Content-Type, not `type`.
-        assert_eq!(parts[1]["partId"], "calendar");
-        assert!(parts[1].get("type").is_none());
-        assert!(
-            parts[1]["header:Content-Type"]
-                .as_str()
-                .expect("header:Content-Type")
-                .contains("method=REPLY")
-        );
-        assert_eq!(parts[2]["type"], "application/pdf");
     }
 
     #[test]
