@@ -374,36 +374,64 @@ async fn mobile_sw() -> impl IntoResponse {
     )
 }
 
+/// `Cache-Control` + content-type for the binary, build-embedded display
+/// assets (fonts/icons/jpg). These are large (~750 KB total: 3 woff2 fonts
+/// ~282 KB + icons/jpg ~470 KB), stable — the vendored JetBrains Mono and app
+/// branding change only with a new binary — and, unlike the app shell, carry no
+/// deploy-freshness contract. With no `Cache-Control` and no
+/// `Last-Modified`/`ETag`, a spec-compliant browser treats them as NOT
+/// cacheable (RFC 7234 heuristic freshness needs a validator), so every page
+/// load re-transfers the full ~750 KB — a real cost on repeat phone-over-tailnet
+/// visits. An explicit `max-age` makes warm-load caching deterministic: within
+/// the window the browser serves from cache with no round-trip, and the bytes
+/// are in memory so a cold 200 is cheap anyway.
+///
+/// Trade-off, stated honestly (kata 7dmx: measure, don't assume): a deploy that
+/// ships new font/icon bytes (rare) is served stale by clients within `max-age`,
+/// but ONLY these display bytes lag — the app shell is `no-cache` (revalidates
+/// every load; pinned by app_shell_routes_force_revalidation_so_reload_picks_up_deploys
+/// and mobile_sw_serves_javascript_with_scope_header), so the code is always
+/// current and a hard reload refreshes the assets. `public` because the response
+/// has no auth coupling; the auth-gated, dynamic API is intentionally NOT
+/// cached by this. 30 days covers a month of daily phone use; bounded
+/// staleness is acceptable for display assets.
+fn binary_asset_headers(content_type: &'static str) -> [(&'static str, &'static str); 2] {
+    [
+        ("content-type", content_type),
+        ("cache-control", "public, max-age=2592000"),
+    ]
+}
+
 async fn font_jbm_regular() -> impl IntoResponse {
-    ([("content-type", "font/woff2")], FONT_JBM_REGULAR)
+    (binary_asset_headers("font/woff2"), FONT_JBM_REGULAR)
 }
 
 async fn font_jbm_semibold() -> impl IntoResponse {
-    ([("content-type", "font/woff2")], FONT_JBM_SEMIBOLD)
+    (binary_asset_headers("font/woff2"), FONT_JBM_SEMIBOLD)
 }
 
 async fn font_jbm_bold() -> impl IntoResponse {
-    ([("content-type", "font/woff2")], FONT_JBM_BOLD)
+    (binary_asset_headers("font/woff2"), FONT_JBM_BOLD)
 }
 
 async fn favicon_32() -> impl IntoResponse {
-    ([("content-type", "image/png")], FAVICON_32)
+    (binary_asset_headers("image/png"), FAVICON_32)
 }
 
 async fn icon_180() -> impl IntoResponse {
-    ([("content-type", "image/png")], ICON_180)
+    (binary_asset_headers("image/png"), ICON_180)
 }
 
 async fn icon_192() -> impl IntoResponse {
-    ([("content-type", "image/png")], ICON_192)
+    (binary_asset_headers("image/png"), ICON_192)
 }
 
 async fn icon_512() -> impl IntoResponse {
-    ([("content-type", "image/png")], ICON_512)
+    (binary_asset_headers("image/png"), ICON_512)
 }
 
 async fn supervillain_jpg() -> impl IntoResponse {
-    ([("content-type", "image/jpeg")], SUPERVILLAIN_JPG)
+    (binary_asset_headers("image/jpeg"), SUPERVILLAIN_JPG)
 }
 
 // =============================================================================
@@ -2444,6 +2472,46 @@ mod tests {
                 && INDEX_HTML.contains(r#"crossorigin"#),
             "index.html must preload the body font (Regular woff2) with as=font crossorigin"
         );
+    }
+
+    #[tokio::test]
+    async fn binary_assets_are_long_term_cacheable() {
+        // 7dmx: the binary display assets (fonts/icons/jpg, ~750 KB total) are
+        // stable and carry no deploy-freshness contract, so they should cache
+        // long-term. Without an explicit Cache-Control a spec-compliant browser
+        // treats them as NOT cacheable (no validator → no RFC 7234 heuristic
+        // freshness) and re-transfers the full ~750 KB on every page load — a
+        // real cost on repeat phone-over-tailnet visits. This pins the
+        // contract: each binary asset route returns a `public, max-age=N>0`
+        // that makes warm-load caching deterministic, plus its correct
+        // content-type. A future handler that drops the header — or anything
+        // that strips it — fails here.
+        for (resp, ct) in [
+            (font_jbm_regular().await.into_response(), "font/woff2"),
+            (font_jbm_semibold().await.into_response(), "font/woff2"),
+            (font_jbm_bold().await.into_response(), "font/woff2"),
+            (favicon_32().await.into_response(), "image/png"),
+            (icon_180().await.into_response(), "image/png"),
+            (icon_192().await.into_response(), "image/png"),
+            (icon_512().await.into_response(), "image/png"),
+            (supervillain_jpg().await.into_response(), "image/jpeg"),
+        ] {
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get("content-type").unwrap().to_str().unwrap(),
+                ct,
+                "binary asset content-type must be correct"
+            );
+            let cc = headers
+                .get("cache-control")
+                .expect("binary assets must carry a Cache-Control so they're cacheable")
+                .to_str()
+                .unwrap();
+            assert!(
+                cc.starts_with("public, max-age=") && cc != "public, max-age=0",
+                "binary assets must be long-term cacheable (public, max-age=N, N>0), got {cc}"
+            );
+        }
     }
 
     // --- kata qknk: branded splash during cold boot (contract tests) ---
