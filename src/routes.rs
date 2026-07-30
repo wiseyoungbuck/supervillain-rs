@@ -9689,8 +9689,38 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn palette_cancel_restores_insert_focus() {
+        let open = js_fn_body(APP_JS, "function openCommandPalette(");
+        assert!(
+            open.contains("document.activeElement") && open.contains("state.mode"),
+            "openCommandPalette must capture both the focused element and mode before focusing the palette (kata sqke)"
+        );
+
+        let close = js_fn_body(APP_JS, "function closeCommandPalette(");
+        let cancel_idx = close
+            .find("if (cancelled)")
+            .expect("closeCommandPalette must distinguish cancellation from action execution");
+        let focus_idx = close
+            .find("previousFocus.focus()")
+            .expect("the cancel path must restore the pre-palette focus");
+        assert!(
+            focus_idx > cancel_idx && close.contains("setMode(previousMode)"),
+            "closeCommandPalette must refocus and restore mode only on its cancel path (kata sqke)"
+        );
+    }
+
+    #[test]
+    fn palette_index_is_clamped_to_filtered_results() {
+        let body = js_fn_body(APP_JS, "function renderCommandPalette(");
+        assert!(
+            body.contains("Math.min(state.commandPaletteIndex, filtered.length - 1)"),
+            "renderCommandPalette must clamp ArrowDown navigation to the filtered result count (kata sqke)"
+        );
+    }
+
+    #[test]
     fn palette_render_escapes_command_markup() {
-        // sefy-final/roborev 393-394: command name/shortcut (rendered into
+        // kata fhtz / sefy-final roborev 393-394: command name/shortcut (rendered into
         // innerHTML) built from user/server-controlled strings (split.name in
         // `Delete Split: ...`, acct.email in `Remove Account: ...`) were
         // interpolated unescaped — a split name or account email containing
@@ -9711,6 +9741,12 @@ white   = '#fdf6e3'
         assert!(
             body.contains("escapeAttr(cmd.action)"),
             "renderCommandPalette must escapeAttr the data-action attribute — escapeHtml (div.textContent) does not encode quotes, so a quote in cmd.action breaks out of the attribute (sefy-final/roborev 394)"
+        );
+        assert!(
+            !body.contains("${cmd.name}")
+                && !body.contains("${cmd.shortcut}")
+                && !body.contains("${cmd.action}"),
+            "renderCommandPalette must not interpolate raw cmd.* values into innerHTML (kata fhtz)"
         );
     }
 
@@ -9780,6 +9816,10 @@ white   = '#fdf6e3'
         assert!(
             body.contains("bareKey && key === 'a'"),
             "handleSettingsNormalKey must bareKey-guard its bare-letter matches (a/d/D/j/k/Enter) so Ctrl/Cmd chords aren't swallowed as settings actions (sefy-final/roborev 401)"
+        );
+        assert!(
+            body.contains("if (bareKey && key === 'Enter')"),
+            "handleSettingsNormalKey must not treat Ctrl/Alt/Cmd+Enter as bare Enter and enter edit mode (kata sqke)"
         );
         // Count-based: `if (confirmOpen) {` appears twice in the handler —
         // once in the Escape branch, once as the modal early-return guard. Pin

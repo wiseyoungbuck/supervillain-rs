@@ -82,6 +82,12 @@ const emailCache = {};
 // Scroll position cache: email id -> scrollTop
 const scrollPositions = {};
 
+// Opening the palette blurs insert-mode fields. Keep the pre-palette focus and
+// mode outside the command state so Escape can restore the exact editing
+// context without an executed action being able to reuse stale focus.
+let commandPalettePreviousFocus = null;
+let commandPalettePreviousMode = 'normal';
+
 // Rolling email cache
 const CACHE_LIMIT = 150;
 
@@ -2292,14 +2298,28 @@ function renderCommandPalette() {
         c.name.toLowerCase().includes(query) ||
         c.desc.toLowerCase().includes(query)
     );
+    // ArrowDown can increment past the end before re-rendering. Clamp against
+    // the filtered set so one item always remains selected when results exist.
+    state.commandPaletteIndex = Math.max(
+        0,
+        Math.min(state.commandPaletteIndex, filtered.length - 1)
+    );
 
-    els.commandResults.innerHTML = filtered.map((cmd, idx) => `
+    // Commands can include user-controlled split names, account labels, and
+    // ids. Escape each value at the final innerHTML boundary so command data
+    // is always text/attribute content, never markup (kata fhtz).
+    els.commandResults.innerHTML = filtered.map((cmd, idx) => {
+        const action = escapeAttr(cmd.action);
+        const name = escapeHtml(cmd.name);
+        const shortcut = escapeHtml(cmd.shortcut);
+        return `
         <div class="command-item ${idx === state.commandPaletteIndex ? 'selected' : ''}"
-             data-action="${escapeAttr(cmd.action)}">
-            <span>${escapeHtml(cmd.name)}</span>
-            <span class="shortcut">${escapeHtml(cmd.shortcut)}</span>
+             data-action="${action}">
+            <span>${name}</span>
+            <span class="shortcut">${shortcut}</span>
         </div>
-    `).join('');
+    `;
+    }).join('');
 
     els.commandResults.querySelectorAll('.command-item').forEach(el => {
         el.addEventListener('click', () => {
@@ -3443,9 +3463,9 @@ function handleSettingsNormalKey(e) {
         }
         return;
     }
-    // Bare-letter matches only — Ctrl/Cmd/Alt chords (Ctrl+A select-all, Ctrl+D
-    // bookmark, Ctrl+J/K) must fall through to the browser, not fire settings
-    // actions (mirrors the wizard bareKey guard, sefy-final/roborev 401).
+    // Bare-key matches only — Ctrl/Cmd/Alt chords (Ctrl+A select-all, Ctrl+D
+    // bookmark, Ctrl+J/K, Ctrl+Enter) must fall through to the browser, not
+    // fire settings actions (mirrors the wizard bareKey guard).
     const bareKey = !e.ctrlKey && !e.metaKey && !e.altKey;
     if (bareKey && key === 'a') {
         beginAddAccount();
@@ -3650,7 +3670,7 @@ function handleNormalModeKey(e) {
 
 function handleCommandPaletteKey(e) {
     if (e.key === 'Escape') {
-        closeCommandPalette();
+        closeCommandPalette({ cancelled: true });
         e.preventDefault();
     } else if (e.key === 'Enter') {
         const selected = els.commandResults.querySelector('.command-item.selected');
@@ -4550,6 +4570,8 @@ function autoSelectFromAddress(email) {
 // Command palette
 
 function openCommandPalette() {
+    commandPalettePreviousFocus = document.activeElement;
+    commandPalettePreviousMode = state.mode;
     els.commandPalette.classList.remove('hidden');
     els.commandInput.value = '';
     state.commandPaletteIndex = 0;
@@ -4558,8 +4580,24 @@ function openCommandPalette() {
     setMode('command');
 }
 
-function closeCommandPalette() {
+function closeCommandPalette({ cancelled = false } = {}) {
     els.commandPalette.classList.add('hidden');
+
+    if (cancelled) {
+        const previousFocus = commandPalettePreviousFocus;
+        const previousMode = commandPalettePreviousMode;
+        commandPalettePreviousFocus = null;
+        commandPalettePreviousMode = 'normal';
+        if (previousFocus?.isConnected) previousFocus.focus();
+        // Native focus listeners restore compose/wizard insert mode. Dense
+        // settings fields have no focus listener, so use the captured mode as
+        // a fallback when focus itself left the palette mode unchanged.
+        if (state.mode === 'command') setMode(previousMode);
+        return;
+    }
+
+    commandPalettePreviousFocus = null;
+    commandPalettePreviousMode = 'normal';
     // Only fall back to normal if the executed command didn't set its own
     // mode — e.g. 'search' sets 'search', 'compose' ends in 'insert' via
     // the compose-field focus listener. Unconditionally resetting to

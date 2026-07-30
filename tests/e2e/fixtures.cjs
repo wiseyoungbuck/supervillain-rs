@@ -91,7 +91,12 @@ function inviteEmail({ method, summary = 'Sync', emailId = 'e-cal' }) {
 
 // Intercept the boot + list routes with the given mailboxes and email list.
 // `extra` lets a spec add per-route overrides (e.g. a specific email by id).
-async function mockApi(page, { mailboxes = MAILBOXES_WITH_XSS, emails = ONE_EMAIL_LIST, extra = {} } = {}) {
+async function mockApi(page, {
+  mailboxes = MAILBOXES_WITH_XSS,
+  emails = ONE_EMAIL_LIST,
+  splits = [],
+  extra = {},
+} = {}) {
   await page.route('**/api/accounts', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(ACCOUNTS) })
   );
@@ -116,7 +121,7 @@ async function mockApi(page, { mailboxes = MAILBOXES_WITH_XSS, emails = ONE_EMAI
   // mismatch, so every spec booted with the deploy banner showing — an
   // unintended UI state that killed the deploy poll and shifted layout.
   await page.route('**/api/identities**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
-  await page.route('**/api/splits**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
+  await page.route('**/api/splits**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(splits) }));
   await page.route('**/api/split-counts**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));
   await page.route('**/api/theme', (route) => route.fulfill({ status: 200, contentType: 'text/css', body: '' }));
   await page.route('**/api/timezone**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));

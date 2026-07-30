@@ -54,6 +54,88 @@ function loadGetCommands(state, visibleRows) {
     return new Function('state', 'visibleRows', code + '\nreturn getCommands;')(state, visibleRows);
 }
 
+// Extract one real column-0 function body from app.js. This follows the same
+// js_fn_body convention as the Rust contract tests and extractGetCommands.
+function extractFunction(src, declaration) {
+    const start = src.indexOf(declaration);
+    assert.notStrictEqual(start, -1, `${declaration} must exist in app.js`);
+    const close = src.indexOf('\n}', start);
+    assert.notStrictEqual(close, -1, `${declaration} must close with a column-0 brace`);
+    return src.slice(start, close + 2);
+}
+
+// escapeHtml relies on the browser's textContent -> innerHTML serialization.
+// Keep this shim exact: encode text metacharacters, but leave quotes for
+// escapeAttr to encode according to the surrounding attribute context.
+function makeEscapeDocument() {
+    return {
+        createElement() {
+            let text = '';
+            return {
+                set textContent(value) { text = String(value); },
+                get innerHTML() {
+                    return text
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+                },
+            };
+        },
+    };
+}
+
+// Evaluate the real renderCommandPalette together with the real escape
+// helpers. commandResults intentionally records the assigned markup before a
+// browser parses it, which lets the tests prove the single-quote escapeAttr
+// branch emitted &#39; as well as checking that tags are text.
+function renderCommands(state, getCommands, query = '') {
+    const code = [
+        extractFunction(APP_JS, 'function renderCommandPalette('),
+        extractFunction(APP_JS, 'function escapeHtml('),
+        extractFunction(APP_JS, 'function escapeAttr('),
+        'return renderCommandPalette;',
+    ].join('\n');
+    const commandResults = {
+        innerHTML: '',
+        querySelectorAll() { return []; },
+    };
+    const els = {
+        commandInput: { value: query },
+        commandResults,
+    };
+    // eslint-disable-next-line no-new-func
+    const render = new Function('state', 'els', 'document', 'getCommands', code)(
+        state,
+        els,
+        makeEscapeDocument(),
+        getCommands,
+    );
+    render();
+    return commandResults.innerHTML;
+}
+
+// Load the real open/close functions in one closure, just as they live in
+// app.js. The two `let`s mirror their module state; all behavior under test is
+// still the production function body extracted with the js_fn_body pattern.
+function loadPaletteLifecycle(state, els, document, renderCommandPalette, setMode) {
+    const code = [
+        'let commandPalettePreviousFocus = null;',
+        "let commandPalettePreviousMode = 'normal';",
+        extractFunction(APP_JS, 'function openCommandPalette('),
+        extractFunction(APP_JS, 'function closeCommandPalette('),
+        'return { openCommandPalette, closeCommandPalette };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    return new Function(
+        'state',
+        'els',
+        'document',
+        'renderCommandPalette',
+        'setMode',
+        code,
+    )(state, els, document, renderCommandPalette, setMode);
+}
+
 // Minimal stub state: every field commandsForView reads (view, selectedIndex,
 // currentEmail, accounts). visibleRows is injected separately because it is a
 // module-level function in app.js, not a state field.
@@ -189,4 +271,134 @@ test('sefy: unknown view falls back to the defensive global set (roborev 378 #6)
         'default branch must not offer RSVP — that is detail + calendar-gated',
     );
     assert.ok(!a.includes('archive'), 'default branch must not offer Archive — that is view-native');
+});
+
+test('fhtz: split command names render markup as text and escape quote-bearing ids', () => {
+    const state = makeState({
+        view: 'list',
+        commandPaletteIndex: 0,
+        splits: [{
+            id: `split\"double'single`,
+            name: '<img src=x onerror="window.__xss_palette=1">',
+        }],
+    });
+    const getCommands = loadGetCommands(state, () => []);
+    const markup = renderCommands(state, getCommands);
+
+    assert.ok(markup.includes('Delete Split: &lt;img src=x onerror="window.__xss_palette=1"&gt;'));
+    assert.ok(!markup.includes('<img'), 'the split-name payload must not survive as a live tag');
+    assert.ok(markup.includes('&quot;double'), 'escapeAttr must encode the double-quote branch');
+    assert.ok(markup.includes('&#39;single'), 'escapeAttr must encode the single-quote branch');
+});
+
+test('fhtz: account labels containing markup render as literal command text', () => {
+    const state = makeState({
+        view: 'settings',
+        commandPaletteIndex: 0,
+        accounts: [{
+            id: 'acct-1',
+            email: '<svg onload="window.__xss_account=1">',
+        }],
+    });
+    const getCommands = loadGetCommands(state, () => []);
+    const markup = renderCommands(state, getCommands);
+
+    assert.ok(markup.includes('Remove Account: &lt;svg onload="window.__xss_account=1"&gt;'));
+    assert.ok(!markup.includes('<svg'), 'the account-label payload must not survive as a live tag');
+});
+
+test('sqke: cancelling the palette restores the insert-mode field and focus', () => {
+    const state = { mode: 'insert', commandPaletteIndex: 0 };
+    let restored = 0;
+    const previousField = {
+        isConnected: true,
+        focus() {
+            restored++;
+            document.activeElement = previousField;
+            // Dense settings inputs do not have a focus listener. The captured
+            // mode must therefore provide the insert-mode fallback.
+        },
+    };
+    const document = { activeElement: previousField };
+    const classes = new Set(['hidden']);
+    const els = {
+        commandPalette: {
+            classList: {
+                add(value) { classes.add(value); },
+                remove(value) { classes.delete(value); },
+            },
+        },
+        commandInput: {
+            value: 'stale',
+            focus() {
+                document.activeElement = this;
+                state.mode = 'normal'; // model the previous field's blur
+            },
+        },
+    };
+    const setMode = (mode) => { state.mode = mode; };
+    const lifecycle = loadPaletteLifecycle(state, els, document, () => {}, setMode);
+
+    lifecycle.openCommandPalette();
+    assert.equal(state.mode, 'command');
+    assert.equal(document.activeElement, els.commandInput);
+    lifecycle.closeCommandPalette({ cancelled: true });
+    assert.equal(restored, 1, 'Escape/cancel must refocus the previous field');
+    assert.equal(document.activeElement, previousField);
+    assert.equal(state.mode, 'insert', 'cancel must restore the captured insert mode');
+
+    lifecycle.openCommandPalette();
+    lifecycle.closeCommandPalette();
+    assert.equal(restored, 1, 'an executed action close must not restore stale focus');
+    assert.equal(state.mode, 'normal', 'action close retains the normal fallback');
+});
+
+test('sqke: Ctrl+Enter in settings normal mode does not enter edit mode', () => {
+    const state = { selectedAccountId: 'acct-1', settingsMode: 'view' };
+    const els = {
+        acctConfirmDelete: {
+            classList: { contains(value) { return value === 'hidden'; } },
+        },
+    };
+    const code = extractFunction(APP_JS, 'function handleSettingsNormalKey(')
+        + '\nreturn handleSettingsNormalKey;';
+    // eslint-disable-next-line no-new-func
+    const handleSettingsNormalKey = new Function('state', 'els', code)(state, els);
+    let prevented = false;
+
+    handleSettingsNormalKey({
+        key: 'Enter',
+        ctrlKey: true,
+        metaKey: false,
+        altKey: false,
+        preventDefault() { prevented = true; },
+    });
+
+    assert.equal(state.settingsMode, 'view');
+    assert.equal(prevented, false, 'Ctrl+Enter must fall through in settings normal mode');
+});
+
+test('sqke: repeated ArrowDown stays on the final filtered command', () => {
+    const state = makeState({ view: 'compose', commandPaletteIndex: 0 });
+    const getCommands = loadGetCommands(state, () => []);
+    const commands = getCommands();
+    state.commandPaletteIndex = commands.length - 1;
+
+    const handlerCode = extractFunction(APP_JS, 'function handleCommandPaletteKey(')
+        + '\nreturn handleCommandPaletteKey;';
+    const rerender = () => { renderCommands(state, getCommands); };
+    // eslint-disable-next-line no-new-func
+    const handleCommandPaletteKey = new Function(
+        'state',
+        'renderCommandPalette',
+        handlerCode,
+    )(state, rerender);
+
+    let prevented = false;
+    handleCommandPaletteKey({
+        key: 'ArrowDown',
+        preventDefault() { prevented = true; },
+    });
+    assert.equal(state.commandPaletteIndex, commands.length - 1);
+    assert.equal(prevented, true);
 });
