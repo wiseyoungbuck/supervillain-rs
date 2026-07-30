@@ -161,6 +161,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/emails/{email_id}/mark-unread", post(mark_unread))
         .route("/api/emails/{email_id}/toggle-flag", post(toggle_flag))
         .route("/api/emails/{email_id}/move", post(move_email))
+        .route("/api/emails/{email_id}/remind", post(remind_email))
+        .route(
+            "/api/emails/{email_id}/cancel-reminder",
+            post(cancel_reminder),
+        )
+        .route("/api/reminders", get(list_reminders))
+        .route(
+            "/api/reminder-settings",
+            get(get_reminder_settings).put(put_reminder_settings),
+        )
         .route("/api/emails/{email_id}/rsvp", post(rsvp))
         .route(
             "/api/emails/{email_id}/add-to-calendar",
@@ -455,6 +465,31 @@ struct ListEmailsParams {
 #[derive(Deserialize)]
 struct MoveBody {
     mailbox_id: String,
+}
+
+fn default_reminder_mode() -> crate::reminders::ReminderMode {
+    crate::reminders::ReminderMode::IfNoReply
+}
+
+#[derive(Deserialize)]
+struct ReminderBody {
+    wake_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default = "default_reminder_mode")]
+    mode: crate::reminders::ReminderMode,
+}
+
+#[derive(Deserialize)]
+struct ReminderSettingsBody {
+    #[serde(default = "default_reminder_time")]
+    default_time: String,
+    #[serde(default)]
+    regardless_default: bool,
+    #[serde(default)]
+    skip_weekends: bool,
+}
+
+fn default_reminder_time() -> String {
+    "08:00".into()
 }
 
 #[derive(Deserialize)]
@@ -1442,6 +1477,143 @@ async fn move_email(
     drop(session);
     state.prefetch.invalidate(&id).await;
     Ok(Json(serde_json::json!({"success": success})))
+}
+
+async fn remind_email(
+    State(state): State<Arc<AppState>>,
+    Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
+    Json(body): Json<ReminderBody>,
+) -> Result<impl IntoResponse, Error> {
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&account_id)).await?;
+    let mut session = session_lock.write().await;
+    let inbox = provider::get_mailboxes(&session)
+        .await?
+        .into_iter()
+        .find(|mailbox| mailbox.role.as_deref() == Some("inbox"))
+        .ok_or_else(|| Error::Internal("No Inbox mailbox".into()))?;
+    let success = provider::remind(&mut session, &email_id).await?;
+    if !success {
+        return Ok(Json(serde_json::json!({"success": false})));
+    }
+    let record = crate::reminders::ReminderRecord {
+        account_id: account_id.clone(),
+        email_id: email_id.clone(),
+        original_inbox_id: inbox.id,
+        wake_at: body.wake_at,
+        mode: body.mode,
+        snoozed_at: chrono::Utc::now(),
+    };
+    state.reminders.insert(record.clone());
+    state.reminders.save()?;
+    drop(session);
+    state.prefetch.invalidate(&account_id).await;
+    Ok(Json(
+        serde_json::json!({"success": true, "reminder": record}),
+    ))
+}
+
+async fn cancel_reminder(
+    State(state): State<Arc<AppState>>,
+    Path(email_id): Path<String>,
+    Query(params): Query<AccountParam>,
+) -> Result<impl IntoResponse, Error> {
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&account_id)).await?;
+    let session = session_lock.read().await;
+    let success = provider::cancel_reminder(&session, &email_id).await?;
+    if success {
+        state.reminders.remove(&account_id, &email_id);
+        state.reminders.save()?;
+        drop(session);
+        state.prefetch.invalidate(&account_id).await;
+    }
+    Ok(Json(serde_json::json!({"success": success})))
+}
+
+async fn list_reminders(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+) -> Result<impl IntoResponse, Error> {
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&account_id)).await?;
+    let session = session_lock.read().await;
+    let emails = provider::list_reminders(&session).await?;
+    let records = state.reminders.records_for_account(&account_id);
+    let mut by_id: HashMap<String, crate::reminders::ReminderRecord> = records
+        .into_iter()
+        .map(|record| (record.email_id.clone(), record))
+        .collect();
+    let mut response = Vec::new();
+    for email in emails {
+        let record = by_id.remove(&email.id);
+        response.push(reminder_json(&account_id, record.as_ref(), Some(&email)));
+    }
+    // A durable row whose provider message is temporarily unavailable is
+    // still shown; a mailbox listing without a row is an orphan and gets a
+    // null wake_at below.
+    for record in by_id.values() {
+        response.push(reminder_json(&account_id, Some(record), None));
+    }
+    Ok(Json(response))
+}
+
+fn reminder_json(
+    account_id: &str,
+    record: Option<&crate::reminders::ReminderRecord>,
+    email: Option<&Email>,
+) -> serde_json::Value {
+    let email_json = email.map(|email| {
+        serde_json::json!({
+            "id": email.id,
+            "threadId": email.thread_id,
+            "subject": email.subject,
+            "from": email.from,
+            "to": email.to,
+            "cc": email.cc,
+            "preview": email.preview,
+            "receivedAt": email.received_at,
+            "isUnread": email.is_unread(),
+            "isFlagged": email.is_flagged(),
+            "hasAttachment": email.has_attachment,
+            "hasCalendar": email.has_calendar,
+            "account": account_id,
+        })
+    });
+    serde_json::json!({
+        "account_id": account_id,
+        "email_id": record.map(|record| record.email_id.as_str()).or_else(|| email.map(|email| email.id.as_str())),
+        "original_inbox_id": record.map(|record| record.original_inbox_id.as_str()),
+        "wake_at": record.map(|record| record.wake_at),
+        "mode": record.map(|record| record.mode),
+        "snoozed_at": record.map(|record| record.snoozed_at),
+        "email": email_json,
+    })
+}
+
+async fn get_reminder_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::reminders::load_settings(
+        &state.reminder_settings_path,
+    ))
+}
+
+async fn put_reminder_settings(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReminderSettingsBody>,
+) -> Result<impl IntoResponse, Error> {
+    if chrono::NaiveTime::parse_from_str(&body.default_time, "%H:%M").is_err()
+        && chrono::NaiveTime::parse_from_str(&body.default_time, "%H:%M:%S").is_err()
+    {
+        return Err(Error::BadRequest("default_time must be HH:MM".into()));
+    }
+    let settings = crate::reminders::ReminderSettings {
+        default_time: body.default_time,
+        regardless_default: body.regardless_default,
+        skip_weekends: body.skip_weekends,
+    };
+    crate::reminders::save_settings(&state.reminder_settings_path, &settings)?;
+    Ok(Json(settings))
 }
 
 // Defense in depth for outbound HTML: scrubs scripts, event handlers,
@@ -3318,7 +3490,7 @@ mod tests {
         );
         assert!(
             API_JS.contains(
-                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts)"
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders)"
             ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );
@@ -3640,6 +3812,11 @@ mod tests {
             config_error_baseline: std::sync::RwLock::new(Vec::new()),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
             prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
+            reminders: crate::reminders::ReminderStore::new(
+                std::env::temp_dir().join("supervillain-test-reminders.json"),
+            ),
+            reminder_settings_path: std::env::temp_dir()
+                .join("supervillain-test-reminder-settings.json"),
         }
     }
 
@@ -10530,11 +10707,40 @@ white   = '#fdf6e3'
     #[test]
     fn remind_routes_and_persistence_are_wired() {
         let src = include_str!("routes.rs");
-        assert!(src.contains("/api/emails/{email_id}/remind"));
-        assert!(src.contains("/api/emails/{email_id}/cancel-reminder"));
-        assert!(src.contains("/api/reminders"));
-        assert!(src.contains("/api/reminder-settings"));
-        assert!(src.contains("ReminderBody"));
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(production.contains("/api/emails/{email_id}/remind"));
+        assert!(production.contains("/api/emails/{email_id}/cancel-reminder"));
+        assert!(production.contains("/api/reminders"));
+        assert!(production.contains("/api/reminder-settings"));
+        assert!(production.contains("ReminderBody"));
+    }
+
+    #[test]
+    fn remind_route_payload() {
+        let if_no_reply: ReminderBody =
+            serde_json::from_str(r#"{"wake_at":"2030-01-02T15:00:00Z","mode":"if-no-reply"}"#)
+                .unwrap();
+        assert_eq!(if_no_reply.mode, crate::reminders::ReminderMode::IfNoReply);
+        let regardless: ReminderBody =
+            serde_json::from_str(r#"{"wake_at":"2030-01-02T15:00:00Z","mode":"regardless"}"#)
+                .unwrap();
+        assert_eq!(regardless.mode, crate::reminders::ReminderMode::Regardless);
+        let defaulted: ReminderBody =
+            serde_json::from_str(r#"{"wake_at":"2030-01-02T15:00:00Z"}"#).unwrap();
+        assert_eq!(defaulted.mode, crate::reminders::ReminderMode::IfNoReply);
+    }
+
+    #[test]
+    fn reminder_settings_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reminder-settings.json");
+        let settings = crate::reminders::ReminderSettings {
+            default_time: "10:00".into(),
+            regardless_default: true,
+            skip_weekends: true,
+        };
+        crate::reminders::save_settings(&path, &settings).unwrap();
+        assert_eq!(crate::reminders::load_settings(&path), settings);
     }
 }
 

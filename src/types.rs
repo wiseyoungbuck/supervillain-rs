@@ -472,6 +472,10 @@ pub struct AppState {
     /// Loaded at startup so a restart paints the last-known mailbox state
     /// instantly instead of cold-starting; saved after each warm pass.
     pub prefetch_cache_path: PathBuf,
+    /// Durable Remind Me wake table, shared by all provider sessions.
+    pub reminders: crate::reminders::ReminderStore,
+    /// Global sidecar containing Reminder Settings defaults.
+    pub reminder_settings_path: PathBuf,
 }
 
 impl AppState {

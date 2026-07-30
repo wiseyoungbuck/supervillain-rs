@@ -727,6 +727,54 @@ fn quote_if_needed(s: &str) -> String {
 }
 
 // =============================================================================
+// Reminders label
+// =============================================================================
+
+/// Find or create the provider-native Gmail label used as Reminders.
+pub async fn ensure_mailbox_by_name(session: &GmailSession, name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::BadRequest("Mailbox name must not be empty".into()));
+    }
+    if let Some(mailbox) = get_mailboxes(session)
+        .await?
+        .into_iter()
+        .find(|m| m.name == name)
+    {
+        return Ok(mailbox.id);
+    }
+    let token = access_token(session).await?;
+    let body = serde_json::json!({
+        "name": name,
+        "labelListVisibility": "labelShow",
+        "messageListVisibility": "show"
+    });
+    let resp = session
+        .limiter
+        .execute("labels.create", || async {
+            session
+                .client
+                .post(format!("{}/labels", session.gmail_base))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error("labels.create", status, &text));
+    }
+    let created: serde_json::Value = resp.json().await?;
+    let id = created["id"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("Gmail labels.create response missing id".into()))?
+        .to_string();
+    invalidate_label_cache(session).await;
+    Ok(id)
+}
+
+// =============================================================================
 // query_emails — messages.list with cursor pagination
 // =============================================================================
 
@@ -1576,6 +1624,24 @@ pub async fn archive(session: &GmailSession, msg_id: &str) -> Result<bool, Error
 /// Cross-user-label moves (e.g. `Work` → `Personal`) remain additive — Gmail
 /// has no way to know the source label without the caller telling us. If
 /// that becomes a real complaint, extend the signature with `from_mailbox_id`.
+/// Return a reminder to Inbox and remove the custom Reminders label. Gmail's
+/// flat label model makes this source cleanup explicit.
+pub async fn move_reminder_to_inbox(session: &GmailSession, msg_id: &str) -> Result<bool, Error> {
+    let reminders_id = get_mailboxes(session)
+        .await?
+        .into_iter()
+        .find(|mailbox| mailbox.name == "Reminders")
+        .map(|mailbox| mailbox.id);
+    let moved = move_to_mailbox(session, msg_id, "INBOX").await?;
+    if !moved {
+        return Ok(false);
+    }
+    if let Some(reminders_id) = reminders_id {
+        modify_labels(session, msg_id, &[], &[reminders_id.as_str()]).await?;
+    }
+    Ok(true)
+}
+
 pub async fn move_to_mailbox(
     session: &GmailSession,
     msg_id: &str,

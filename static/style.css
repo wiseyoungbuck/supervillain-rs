@@ -1211,7 +1211,9 @@ body:not(.light-theme) .compose-quote a * {
 }
 
 /* Split modal */
-#split-modal {
+#split-modal,
+#remind-modal,
+#reminder-settings-modal {
     position: fixed;
     inset: 0;
     background: var(--overlay);
@@ -1221,8 +1223,53 @@ body:not(.light-theme) .compose-quote a * {
     z-index: 2000;
 }
 
-#split-modal.hidden {
+#split-modal.hidden,
+#remind-modal.hidden,
+#reminder-settings-modal.hidden {
     display: none;
+}
+
+.remind-quick-options {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+
+.remind-quick-options button {
+    padding: 8px;
+    background: var(--bg-secondary);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    cursor: pointer;
+}
+
+.remind-quick-options button:hover,
+.wake-now-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+#remind-mode {
+    margin: 12px 0 4px;
+    color: var(--accent);
+    font-size: 12px;
+}
+
+.reminder-meta {
+    color: var(--fg-dim);
+    font-size: 11px;
+}
+
+.wake-now-btn {
+    margin-left: auto;
+    padding: 5px 8px;
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    cursor: pointer;
 }
 
 .modal-content {

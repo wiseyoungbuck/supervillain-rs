@@ -356,6 +356,62 @@ pub async fn get_mailboxes(s: &JmapSession) -> Result<Vec<Mailbox>, Error> {
     extract_list::<Mailbox>(&resp, 0, "Mailbox/get")
 }
 
+/// Find a named mailbox or create it with the JMAP `Mailbox/set` primitive.
+///
+/// Mailbox names are provider-neutral in the rest of the application.  The
+/// returned id is cached on the session so subsequent Remind Me actions can
+/// move directly without creating duplicate folders.
+pub async fn ensure_mailbox_by_name(s: &mut JmapSession, name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::BadRequest("Mailbox name must not be empty".into()));
+    }
+    if let Some(mailbox) = s
+        .mailbox_cache
+        .values()
+        .find(|mailbox| mailbox.name == name)
+    {
+        return Ok(mailbox.id.clone());
+    }
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?.clone();
+    let mailboxes = get_mailboxes(s).await?;
+    for mailbox in mailboxes {
+        let id = mailbox.id.clone();
+        s.mailbox_cache.insert(id.clone(), mailbox.clone());
+        if mailbox.name == name {
+            return Ok(id);
+        }
+    }
+
+    let resp = jmap_call(
+        s,
+        vec![serde_json::json!([
+            "Mailbox/set",
+            {
+                "accountId": account_id,
+                "create": { "reminders": { "name": name } }
+            },
+            "0"
+        ])],
+    )
+    .await?;
+    let id = resp["methodResponses"][0][1]["created"]["reminders"]["id"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("Mailbox/set response missing created mailbox id".into()))?
+        .to_string();
+    s.mailbox_cache.insert(
+        id.clone(),
+        Mailbox {
+            id: id.clone(),
+            name: name.to_string(),
+            role: None,
+            total_emails: 0,
+            unread_emails: 0,
+            parent_id: None,
+        },
+    );
+    Ok(id)
+}
+
 pub async fn get_identities(s: &mut JmapSession) -> Result<Vec<Identity>, Error> {
     if let Some(ref ids) = s.identities {
         return Ok(ids.clone());
@@ -1046,6 +1102,41 @@ async fn move_to_role(s: &JmapSession, email_id: &str, role: &str) -> Result<boo
         .is_some_and(|obj| obj.contains_key(email_id));
 
     Ok(updated)
+}
+
+/// Return a reminder to Inbox while removing the provider-native Reminders
+/// mailbox membership as well as the usual source hint.
+pub async fn move_reminder_to_inbox(s: &JmapSession, email_id: &str) -> Result<bool, Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let mailboxes = get_mailboxes(s).await?;
+    let inbox_id = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.role.as_deref() == Some("inbox"))
+        .map(|mailbox| mailbox.id.clone())
+        .ok_or_else(|| Error::Internal("No Inbox mailbox".into()))?;
+    let reminders_id = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.name == "Reminders")
+        .map(|mailbox| mailbox.id.clone());
+    let mut patch = build_mailbox_move_patch(&inbox_id, None);
+    if let Some(reminders_id) = reminders_id {
+        patch.insert(
+            format!("mailboxIds/{reminders_id}"),
+            serde_json::Value::Null,
+        );
+    }
+    let resp = jmap_call(
+        s,
+        vec![serde_json::json!([
+            "Email/set",
+            { "accountId": account_id, "update": { email_id: patch } },
+            "0"
+        ])],
+    )
+    .await?;
+    Ok(resp["methodResponses"][0][1]["updated"]
+        .as_object()
+        .is_some_and(|updated| updated.contains_key(email_id)))
 }
 
 pub async fn move_to_mailbox(

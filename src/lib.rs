@@ -12,6 +12,7 @@ pub mod prefetch;
 pub mod provider;
 pub mod provider_utils;
 pub mod rate_limit;
+pub mod reminders;
 pub mod routes;
 pub mod search;
 pub mod splits;
