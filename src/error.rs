@@ -27,6 +27,20 @@ pub enum Error {
     /// return this *before* issuing any HTTP request, and the caller surfaces
     /// it to the UI instead of `warn!`-ing past an `Ok(false)`.
     CalendarAuthUnconfigured,
+    /// CalDAV calendar-home discovery failed (kata wybm).
+    ///
+    /// The four CalDAV functions no longer hardcode `/Default/` (which
+    /// 301→404's on real Fastmail accounts); they discover the user's default
+    /// writable calendar collection via PROPFIND and cache it. If that
+    /// discovery can't resolve a writable calendar — the PROPFIND chain
+    /// returns non-207, the server exposes no `current-user-principal`, or no
+    /// writable calendar collection exists — this is surfaced instead of
+    /// silently writing to a wrong/missing collection. The `String` is an
+    /// operator-facing detail (which step failed) logged at WARN and used in
+    /// the account-error banner rationale; it is *not* sent to the HTTP
+    /// client (`IntoResponse` substitutes `CALENDAR_DISCOVERY_FAILED_MSG` so
+    /// no URL/username leaks).
+    CalendarDiscoveryFailed(String),
 }
 
 impl fmt::Display for Error {
@@ -42,6 +56,9 @@ impl fmt::Display for Error {
                 f,
                 "calendar auth unconfigured: Fastmail app password not set"
             ),
+            Error::CalendarDiscoveryFailed(msg) => {
+                write!(f, "calendar discovery failed: {msg}")
+            }
             Error::Internal(msg) => write!(f, "internal error: {msg}"),
             Error::RateLimited { retry_after } => match retry_after {
                 Some(d) => write!(f, "rate limited — retry after {}s", d.as_secs()),
@@ -59,6 +76,16 @@ impl fmt::Display for Error {
 /// body can't drift.
 pub const CALENDAR_AUTH_UNCONFIGURED_MSG: &str =
     "Fastmail calendar sync needs an app password — add one in Settings";
+
+/// The actionable client-facing message for `Error::CalendarDiscoveryFailed`.
+/// Used by `IntoResponse` (the 503 body) and by the fire-and-forget spawned
+/// calendar writers in `get_email` (which push it to the account-error
+/// banner). One constant so the banner and the 503 body can't drift, and so
+/// the discovery-specific detail inside the error (URL/username) never
+/// reaches the client — only this generic, actionable message does. Paired
+/// with `CALENDAR_AUTH_UNCONFIGURED_MSG` (the m5yp credential case); this is
+/// the wybm discovery case.
+pub const CALENDAR_DISCOVERY_FAILED_MSG: &str = "Couldn't find your Fastmail calendar to sync the event — check your calendars in Fastmail Settings";
 
 impl std::error::Error for Error {}
 
@@ -96,6 +123,20 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST,
                 CALENDAR_AUTH_UNCONFIGURED_MSG.to_string(),
             ),
+            // Discovery couldn't resolve a writable calendar — either the
+            // PROPFIND chain broke (transient server/transport) or no
+            // writable calendar collection exists (config). 503 surfaces it
+            // as "try again / check setup" rather than a silent Ok. The
+            // operator-facing detail (which step failed, which URL) is logged
+            // at WARN for debugging; only the generic, actionable message is
+            // sent to the client so no URL/username leaks.
+            Error::CalendarDiscoveryFailed(msg) => {
+                tracing::warn!("Calendar discovery failed: {msg}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    CALENDAR_DISCOVERY_FAILED_MSG.to_string(),
+                )
+            }
             Error::NotConnected => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "not connected to email server".into(),
@@ -220,6 +261,35 @@ mod tests {
         assert!(
             body.contains("Settings"),
             "body must point at Settings: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn calendar_discovery_failed_returns_503_and_does_not_leak_detail() {
+        // The operator detail (which PROPFIND step failed, the URL/username)
+        // stays in the WARN log; the HTTP client gets a generic, actionable
+        // message so no account path leaks. 503 surfaces "try again / check
+        // setup" rather than the silent Ok the old /Default/ 301→404 produced.
+        let (status, body) = response_status_and_body(Error::CalendarDiscoveryFailed(
+            "PROPFIND https://caldav.fastmail.com/dav/calendars/user/u_name@fastmail.com/ returned 404".into()
+        ))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.contains("calendar"),
+            "body must reference the calendar problem: {body}"
+        );
+        assert!(
+            body.contains("Settings"),
+            "body must point at Settings: {body}"
+        );
+        assert!(
+            !body.contains("u_name@fastmail.com"),
+            "operator detail (account path) must not leak: {body}"
+        );
+        assert!(
+            !body.contains("PROPFIND"),
+            "operator detail (which step) must not leak: {body}"
         );
     }
 

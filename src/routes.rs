@@ -1478,12 +1478,14 @@ fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str
 /// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
 /// (the auto-add / update / auto-remove tasks in `get_email`). These tasks
 /// have no HTTP response to attach to, so a config-state failure
-/// (`CalendarAuthUnconfigured`) is pushed to the account-error banner —
-/// deduped via `push_error_if_absent` so every email open against a
-/// misconfigured account doesn't stack another identical banner — while
-/// genuinely transient errors (network, 5xx) stay as a `warn!` log line.
-/// This is the auto-add-on-open half of the kata m5yp swallow fix; the
-/// RSVP / explicit-add half propagates through the route's `?`.
+/// (`CalendarAuthUnconfigured` — no app password, kata m5yp) or a discovery
+/// failure (`CalendarDiscoveryFailed` — couldn't resolve a writable calendar,
+/// kata wybm) is pushed to the account-error banner — deduped via
+/// `push_error_if_absent` so every email open against a misconfigured account
+/// doesn't stack another identical banner — while genuinely transient errors
+/// (network, 5xx) stay as a `warn!` log line. This is the auto-add-on-open
+/// half of the swallow fix; the RSVP / explicit-add half propagates through
+/// the route's `?`.
 async fn surface_caldav_spawn_failure(
     state: &AppState,
     account: &str,
@@ -1498,6 +1500,16 @@ async fn surface_caldav_spawn_failure(
                 account: account.to_string(),
                 provider: "fastmail".into(),
                 error: crate::error::CALENDAR_AUTH_UNCONFIGURED_MSG.into(),
+            },
+        )
+        .await;
+    } else if matches!(err, Error::CalendarDiscoveryFailed(_)) {
+        accounts::push_error_if_absent(
+            state,
+            crate::types::AccountError {
+                account: account.to_string(),
+                provider: "fastmail".into(),
+                error: crate::error::CALENDAR_DISCOVERY_FAILED_MSG.into(),
             },
         )
         .await;

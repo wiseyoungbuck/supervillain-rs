@@ -3,8 +3,10 @@ use crate::error::Error;
 use crate::rate_limit::RateLimiter;
 use crate::types::ParsedQuery;
 use crate::types::*;
+use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 // =============================================================================
 // JMAP deserialization types (internal to this module)
@@ -135,6 +137,16 @@ pub struct JmapSession {
     /// the constant lives in one place (not four inline string literals) and
     /// tests can point it at a loopback recorder.
     pub caldav_base: String,
+    /// Resolved default calendar collection URL (absolute, no trailing slash),
+    /// discovered once via CalDAV PROPFIND and cached for the session
+    /// lifetime (kata wybm). Replaces the hardcoded `/Default/` that
+    /// 301→404'd on real Fastmail accounts. Populated lazily on first CalDAV
+    /// use by `resolve_calendar_collection`; the four CalDAV functions append
+    /// `/{uid}.ics` to it. `None` means "not yet discovered / discovery
+    /// failed (retry next call)". Held in a `std::sync::Mutex`
+    /// (set-once-read-many, no await while held) so the four `&self` CalDAV
+    /// functions can populate it without `&mut`.
+    pub caldav_collection_url: std::sync::Mutex<Option<String>>,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
     pub upload_url: Option<String>,
@@ -169,6 +181,7 @@ impl JmapSession {
             auth_header: format!("Bearer {api_token}"),
             caldav_auth_header: basic_auth_header(username, app_password),
             caldav_base: "https://caldav.fastmail.com".into(),
+            caldav_collection_url: std::sync::Mutex::new(None),
             api_url: None,
             account_id: None,
             upload_url: None,
@@ -2041,6 +2054,342 @@ fn caldav_failure(method: &str, url: &str, status: reqwest::StatusCode, body: &s
     }
 }
 
+// =============================================================================
+// CalDAV calendar-home discovery (kata wybm)
+// -----------------------------------------------------------------------------
+// Replaces the hardcoded `/Default/` collection name that 301→404'd on real
+// Fastmail accounts (every CalDAV write silently missed the calendar). The
+// four CalDAV functions below now resolve the user's default *writable*
+// calendar collection once via PROPFIND, cache it on the session, and address
+// that cached URL — never a string-concatenated `/Default/`.
+//
+// THE CHAIN WAS VERIFIED EMPIRICALLY AGAINST THE LIVE Fastmail/CyrUS SERVER,
+// not reasoned from the RFC — the vt0m lesson. The RFC 4791 §6.2.1 chain
+// (PROPFIND principal → `calendar-home-set`) is DEAD on Fastmail: that
+// property 404's on the principal, on `/dav/calendars`, and on the home
+// itself (confirmed by `PROPFIND ...allprop` — Cyrus exposes only
+// `displayname` + `principal` resourcetype there). What Fastmail/Cyrus DOES
+// expose is `current-user-principal`, and — critically — its href encodes the
+// Cyrus *underscore-munged* user segment (`matt_coburn@…`, NOT the dotted
+// session username `matt.coburn@…`). The calendar home is the principal path
+// with `principals`→`calendars` substituted. Cyrus also tags the `calendar`
+// resourcetype under the OLDER `urn:ietf:params:xml:ns:caldav` namespace, not
+// RFC 4791's `urn:ietf:params:calDav:` — the parser matches both. End-to-end
+// verified: PUT/GET/DELETE through the resolved URL succeed (201/200/204/404).
+// =============================================================================
+
+/// PROPFIND body for step 1: ask the calendars root for
+/// `current-user-principal` (the one property Fastmail/Cyrus exposes here).
+const PROPFIND_PRINCIPAL_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-principal/></D:prop></D:propfind>"#;
+
+/// PROPFIND body for step 3: ask the calendar home (Depth:1) for the
+/// properties the parser needs to enumerate and pick a default writable
+/// calendar collection — `resourcetype`, `displayname`, and
+/// `current-user-privilege-set`.
+const PROPFIND_HOME_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:calDav:"><D:prop><D:resourcetype/><D:displayname/><D:current-user-privilege-set/></D:prop></D:propfind>"#;
+
+// --- XML parsing helpers ---
+//
+// Cyrus emits well-structured but namespace-prefix-variable XML (D:, C:,
+// X27CD:, CY:, CS:, …) with CDATA-wrapped displaynames. These helpers match
+// on *local* element names (the part after `:`, or the whole tag when
+// un-prefixed) so the parser is immune to the server's prefix choices, and
+// handle `<![CDATA[…]]>` text. Regexes are `LazyLock`-static to match the
+// codebase style (`calendar.rs`) and avoid recompiling per call; discovery
+// runs once per session anyway (cached).
+
+static CUP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<(?:[A-Za-z0-9_.-]+:)?current-user-principal\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?current-user-principal\s*>")
+        .expect("static regex")
+});
+static HREF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<(?:[A-Za-z0-9_.-]+:)?href\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?href\s*>")
+        .expect("static regex")
+});
+static RESPONSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<(?:[A-Za-z0-9_.-]+:)?response\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?response\s*>",
+    )
+    .expect("static regex")
+});
+static RESOURCETYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<(?:[A-Za-z0-9_.-]+:)?resourcetype\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?resourcetype\s*>")
+        .expect("static regex")
+});
+static CALENDAR_ELEM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // `<…:calendar/>` or `<…:calendar>` — the `\s*/?>` after `calendar` stops
+    // this matching `calendar-home-set` / `calendar-color` /
+    // `supported-calendar-component-set` (those have `-` after `calendar`).
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?calendar\s*/?>").expect("static regex")
+});
+static SCHEDULE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?schedule-(?:inbox|outbox)\b").expect("static regex")
+});
+static DISPLAYNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<(?:[A-Za-z0-9_.-]+:)?displayname\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?displayname\s*>",
+    )
+    .expect("static regex")
+});
+static PRIVILEGE_SET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<(?:[A-Za-z0-9_.-]+:)?current-user-privilege-set\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?current-user-privilege-set\s*>")
+        .expect("static regex")
+});
+static WRITE_PRIV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // `<…:write/>` / `<…:write>` — does NOT match `write-properties` /
+    // `write-content` (those have `-` after `write`).
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?write\s*/?>").expect("static regex")
+});
+static ALL_PRIV_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?all\s*/?>").expect("static regex"));
+static CDATA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<!\[CDATA\[(.*?)\]\]>").expect("static regex"));
+
+/// Strip a leading `<![CDATA[…]]>` wrapper if present, else trim whitespace.
+/// Cyrus wraps `displayname` in CDATA; `href`/principal text is plain.
+fn element_text(inner: &str) -> String {
+    if let Some(c) = CDATA_RE.captures(inner) {
+        return c[1].to_string();
+    }
+    inner.trim().to_string()
+}
+
+/// Step 1 parse: extract the `current-user-principal` href from the calendars
+/// root PROPFIND response. Returns the server-absolute path (e.g.
+/// `/dav/principals/user/matt_coburn@aristoi.ai/`), or `None` if the server
+/// exposed no principal (a discovery failure the caller surfaces).
+fn parse_current_user_principal(xml: &str) -> Option<String> {
+    let cup = CUP_RE.captures(xml)?;
+    let href_inner = HREF_RE.captures(&cup[1])?;
+    let text = element_text(&href_inner[1]);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Step 2: derive the calendar home path from the principal href by
+/// substituting the `principals` segment for `calendars` (the Fastmail/Cyrus
+/// convention — both live under `/dav/<collection-class>/user/{USER}/` with
+/// the same user segment). `None` if the principal href has no `/principals/`
+/// segment (a shape we don't recognize — surface rather than guess).
+fn derive_calendar_home(principal_href: &str) -> Option<String> {
+    if principal_href.contains("/principals/") {
+        Some(principal_href.replace("/principals/", "/calendars/"))
+    } else {
+        None
+    }
+}
+
+/// One calendar-home child as parsed from the Depth:1 PROPFIND — the fields
+/// `pick_default_calendar` decides on. `href` is server-absolute with a
+/// trailing slash.
+#[derive(Clone, Debug)]
+struct CalCollectionInfo {
+    href: String,
+    displayname: Option<String>,
+    is_calendar: bool,
+    is_schedule: bool,
+    writable: bool,
+}
+
+/// Step 3 parse: enumerate the `<D:response>` blocks in the home PROPFIND and
+/// distill each to a `CalCollectionInfo`. Non-calendar children (the home
+/// itself, `schedule-inbox`/`schedule-outbox`) are included with their flags
+/// set so `pick_default_calendar` can exclude them — matching the real Cyrus
+/// home listing, which interleaves the home, calendars, and the scheduling
+/// collections.
+fn parse_calendar_collections(xml: &str) -> Vec<CalCollectionInfo> {
+    RESPONSE_RE
+        .find_iter(xml)
+        .filter_map(|m| {
+            let block = m.as_str();
+            let href = element_text(&HREF_RE.captures(block)?[1]);
+            let rt = RESOURCETYPE_RE
+                .captures(block)
+                .map(|c| c[1].to_string())
+                .unwrap_or_default();
+            let is_calendar = CALENDAR_ELEM_RE.is_match(&rt);
+            let is_schedule = SCHEDULE_RE.is_match(&rt);
+            let displayname = DISPLAYNAME_RE
+                .captures(block)
+                .map(|c| element_text(&c[1]))
+                .filter(|s| !s.is_empty());
+            let privs = PRIVILEGE_SET_RE
+                .captures(block)
+                .map(|c| c[1].to_string())
+                .unwrap_or_default();
+            let writable = WRITE_PRIV_RE.is_match(&privs) || ALL_PRIV_RE.is_match(&privs);
+            Some(CalCollectionInfo {
+                href,
+                displayname,
+                is_calendar,
+                is_schedule,
+                writable,
+            })
+        })
+        .collect()
+}
+
+/// The last non-empty path segment of a collection href, with any trailing
+/// slash trimmed — e.g. `/dav/calendars/user/u/u.Default/` → `u.Default`.
+/// Used to recognize the Fastmail `username.Default` convention.
+fn href_last_segment(href: &str) -> &str {
+    href.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+}
+
+/// Step 4: pick the default writable calendar collection from the parsed home
+/// listing. Priority (most-specific to least), returning the first match —
+/// honest failure (`None`) when nothing matches so the caller surfaces
+/// `CalendarDiscoveryFailed` instead of guessing among multiple:
+///   a. `displayname == "Default"` — a legacy/default-named calendar.
+///   b. href segment `Default` or ending `.Default` — the Fastmail
+///      `username.Default` convention (the old `/Default/` 301 target shape).
+///   c. `displayname` contains `(FastMail)` (and not `task`) — Fastmail's
+///      system-default events calendar marker (empirically `General (FastMail)`;
+///      the tasks calendar is `DEFAULT_TASK_CALENDAR_NAME`, no marker).
+///   d. exactly one writable calendar collection — single-calendar accounts.
+/// Schedule-inbox/outbox and non-writable collections are excluded throughout.
+fn pick_default_calendar(colls: &[CalCollectionInfo]) -> Option<&CalCollectionInfo> {
+    let writable: Vec<&CalCollectionInfo> = colls
+        .iter()
+        .filter(|c| c.is_calendar && c.writable && !c.is_schedule)
+        .collect();
+    if let Some(c) = writable
+        .iter()
+        .find(|c| c.displayname.as_deref() == Some("Default"))
+    {
+        return Some(c);
+    }
+    if let Some(c) = writable.iter().find(|c| {
+        let seg = href_last_segment(&c.href);
+        seg == "Default" || seg.ends_with(".Default")
+    }) {
+        return Some(c);
+    }
+    if let Some(c) = writable.iter().find(|c| {
+        c.displayname
+            .as_deref()
+            .is_some_and(|d| d.contains("(FastMail)") && !d.to_lowercase().contains("task"))
+    }) {
+        return Some(c);
+    }
+    if writable.len() == 1 {
+        return Some(writable[0]);
+    }
+    None
+}
+
+/// Resolve a server-returned href (server-absolute path, or a full URL) to an
+/// absolute URL against the CalDAV base. Cyrus returns paths; this keeps the
+/// parser honest if a full URL ever appears.
+fn absolute_url(base: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else {
+        format!("{base}{href}")
+    }
+}
+
+/// Issue one CalDAV PROPFIND. Returns the response body on 207 Multi-Status;
+/// any other status (301/404/5xx — or a silently-followed redirect that landed
+/// on a non-207) is a discovery failure, surfaced as
+/// `CalendarDiscoveryFailed` rather than followed or swallowed. The 207 check
+/// is the gate: reqwest follows redirects by default, but a PROPFIND that
+/// 301's to a GET would return 200 (not 207) and surface here.
+async fn caldav_propfind(
+    s: &JmapSession,
+    auth: &str,
+    url: &str,
+    depth: &str,
+    body: &str,
+) -> Result<String, Error> {
+    let resp = s
+        .client
+        .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
+        .header("Authorization", auth)
+        .header("Depth", depth)
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.as_u16() != 207 {
+        let text = resp.text().await.unwrap_or_default();
+        // Trim the body — it can be an HTML error page (Cyrus's 404 is ~460B);
+        // the first line is usually the useful part. This detail is logged at
+        // WARN by `CalendarDiscoveryFailed`'s `IntoResponse`, never sent to
+        // the HTTP client, so a verbose body here is fine for operators.
+        let detail = text.lines().next().unwrap_or("").trim();
+        return Err(Error::CalendarDiscoveryFailed(format!(
+            "PROPFIND {url} returned {status} — {detail}"
+        )));
+    }
+    Ok(resp.text().await?)
+}
+
+/// Run the three-step discovery chain (no caching — the caller
+/// `resolve_calendar_collection` caches the result) and return the absolute
+/// default calendar collection URL (no trailing slash — the four callers
+/// append `/{uid}.ics`). Each step's failure surfaces a specific
+/// `CalendarDiscoveryFailed` message so the operator log names the broken
+/// step.
+async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
+    // Step 1: PROPFIND the calendars root for current-user-principal. We hit
+    // `{caldav_base}/dav/calendars` directly rather than RFC 6764's
+    // `/.well-known/caldav` because the well-known 301-redirects to exactly
+    // this path, and reqwest (like browsers) drops the PROPFIND method/body
+    // across a 301 — so PROPFINDing the well-known would arrive as a GET.
+    // `/dav/calendars` is the redirect target and exposes
+    // `current-user-principal` directly (verified live).
+    let root = format!("{}/dav/calendars", s.caldav_base);
+    let principal_xml = caldav_propfind(s, auth, &root, "0", PROPFIND_PRINCIPAL_BODY).await?;
+    let principal_href = parse_current_user_principal(&principal_xml).ok_or_else(|| {
+        Error::CalendarDiscoveryFailed(
+            "PROPFIND of calendars root returned no current-user-principal".into(),
+        )
+    })?;
+
+    // Step 2: derive the calendar home (principals → calendars).
+    let home_path = derive_calendar_home(&principal_href).ok_or_else(|| {
+        Error::CalendarDiscoveryFailed(format!(
+            "cannot derive calendar home from principal href {principal_href}"
+        ))
+    })?;
+    let home_url = absolute_url(&s.caldav_base, &home_path);
+
+    // Step 3: PROPFIND the home Depth:1 and enumerate calendar collections.
+    let home_xml = caldav_propfind(s, auth, &home_url, "1", PROPFIND_HOME_BODY).await?;
+    let collections = parse_calendar_collections(&home_xml);
+    let default = pick_default_calendar(&collections).ok_or_else(|| {
+        Error::CalendarDiscoveryFailed(format!(
+            "no writable default calendar collection found in {home_path} \
+             ({} calendar collection(s) listed)",
+            collections.iter().filter(|c| c.is_calendar).count()
+        ))
+    })?;
+    // Strip the trailing slash so the four CalDAV functions can append
+    // `/{uid}.ics` with a single slash — Cyrus lists collection hrefs with a
+    // trailing `/`; keeping it would yield `…/COLLID//uid.ics`.
+    let href = default.href.trim_end_matches('/');
+    Ok(absolute_url(&s.caldav_base, href))
+}
+
+/// Resolve the session's default calendar collection URL, discovering it once
+/// via PROPFIND and caching the result in `caldav_collection_url` for the
+/// session lifetime (one discovery per session, not per CalDAV call). On a
+/// cache hit no HTTP is issued. Discovery failure is NOT cached — the field
+/// stays `None` so a transient failure retries on the next call while a
+/// permanent one (no writable calendar) keeps surfacing honestly each time.
+/// `auth` is the `require_caldav_auth` header; discovery is only reached when
+/// the app password is configured (the m5yp guard runs first in each caller).
+async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
+    if let Some(url) = s.caldav_collection_url.lock().unwrap().clone() {
+        return Ok(url);
+    }
+    let url = discover_calendar_collection(s, auth).await?;
+    *s.caldav_collection_url.lock().unwrap() = Some(url.clone());
+    Ok(url)
+}
+
 /// Fetch the current calendar event from CalDAV by UID.
 /// Returns a parsed CalendarEvent, or None if the event doesn't exist.
 pub async fn get_calendar_event(
@@ -2048,12 +2397,10 @@ pub async fn get_calendar_event(
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
     let auth = require_caldav_auth(s)?;
-    let caldav_url = format!(
-        "{}/dav/calendars/user/{}/Default/{}.ics",
-        s.caldav_base,
-        s.username,
-        percent_encode_path(uid)
-    );
+    // Resolve the default writable calendar collection via PROPFIND (cached on
+    // the session) — never the hardcoded /Default/ that 301→404'd (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    let caldav_url = format!("{}/{}.ics", collection, percent_encode_path(uid));
 
     let resp = s
         .client
@@ -2089,13 +2436,11 @@ pub async fn add_to_calendar(
     // contain METHOD (it's an iTIP transport property, not a storage property)
     let ics_data = calendar::strip_method(ics_data);
 
-    // CalDAV PUT to Fastmail calendar, using event UID as filename for idempotency
-    let caldav_url = format!(
-        "{}/dav/calendars/user/{}/Default/{}.ics",
-        s.caldav_base,
-        s.username,
-        percent_encode_path(uid)
-    );
+    // Resolve the default writable calendar collection via PROPFIND (cached
+    // on the session) — never the hardcoded /Default/ that 301→404'd (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    // CalDAV PUT to the resolved calendar, using event UID as filename for idempotency
+    let caldav_url = format!("{}/{}.ics", collection, percent_encode_path(uid));
 
     let mut req = s
         .client
@@ -2131,12 +2476,9 @@ pub async fn add_to_calendar(
 pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Error> {
     // Missing app password → named error, no HTTP (kata m5yp).
     let auth = require_caldav_auth(s)?;
-    let caldav_url = format!(
-        "{}/dav/calendars/user/{}/Default/{}.ics",
-        s.caldav_base,
-        s.username,
-        percent_encode_path(uid)
-    );
+    // Resolved collection URL (cached) — never /Default/ (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    let caldav_url = format!("{}/{}.ics", collection, percent_encode_path(uid));
 
     let resp = s
         .client
@@ -2172,12 +2514,9 @@ pub async fn get_rsvp_status(
 ) -> Result<Option<String>, Error> {
     // Missing app password → named error, no HTTP (kata m5yp).
     let auth = require_caldav_auth(s)?;
-    let caldav_url = format!(
-        "{}/dav/calendars/user/{}/Default/{}.ics",
-        s.caldav_base,
-        s.username,
-        percent_encode_path(uid)
-    );
+    // Resolved collection URL (cached) — never /Default/ (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    let caldav_url = format!("{}/{}.ics", collection, percent_encode_path(uid));
 
     let resp = s
         .client
@@ -2332,6 +2671,146 @@ pub(crate) mod caldav_recorder {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{app_password}"))
         )
+    }
+
+    /// Spawn a *scripted* loopback recorder (kata wybm): the caller supplies a
+    /// closure mapping `(method, path)` → `(status, body)`, so one server can
+    /// answer the multi-step CalDAV discovery chain differently — PROPFIND on
+    /// the calendars root returns the `current-user-principal` multistatus,
+    /// PROPFIND on the derived home returns the collection list, and
+    /// PUT/GET/DELETE on a collection member return the write/read/delete
+    /// status. Every request is recorded (method/path/auth/content-type/body)
+    /// so a test can assert the client followed the chain and addressed the
+    /// *resolved* URL, never `/Default/`. No mocking framework — just a
+    /// loopback `TcpListener` + axum, matching `spawn` above.
+    pub async fn spawn_scripted<F>(responder: F) -> (String, Arc<Mutex<Vec<RecordedRequest>>>)
+    where
+        F: Fn(&str, &str) -> (axum::http::StatusCode, Vec<u8>) + Send + Sync + Clone + 'static,
+    {
+        let recorded: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_handler = recorded.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let recorded = recorded_for_handler.clone();
+            let responder = responder.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let authorization = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let content_type = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let req_body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default()
+                    .to_vec();
+                recorded.lock().unwrap().push(RecordedRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    authorization,
+                    content_type,
+                    body: req_body,
+                });
+                let (status, body) = responder(&method, &path);
+                (status, axum::body::Bytes::from(body))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), recorded)
+    }
+
+    /// What kind of DAV resource a `CalCollection` is — drives the
+    /// `resourcetype` the builder emits, so a test can mix real calendars with
+    /// the schedule-inbox/outbox and the non-calendar home that Cyrus lists.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CalKind {
+        Calendar,
+        ScheduleInbox,
+        ScheduleOutbox,
+        /// The home itself, or any plain `collection` (no `calendar`).
+        PlainCollection,
+    }
+
+    /// One `<D:response>` the `home_multistatus` builder will emit — the fields
+    /// the discovery parser reads (href / resourcetype / displayname /
+    /// write-privilege). `displayname` is wrapped in CDATA like Cyrus.
+    #[derive(Clone, Debug)]
+    pub struct CalCollection {
+        pub href: String,
+        pub displayname: String,
+        pub kind: CalKind,
+        pub writable: bool,
+    }
+
+    /// Build the PROPFIND Depth:0 response for the calendars root
+    /// (`{caldav_base}/dav/calendars`), carrying `current-user-principal`.
+    /// `principal_href` is the server-absolute path Cyrus returns — the
+    /// underscore-munged user segment (e.g. `/dav/principals/user/u_name@…/`),
+    /// NOT the session username. This is step 1 of the verified chain.
+    pub fn principal_multistatus(principal_href: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<D:multistatus xmlns:D=\"DAV:\">\n  <D:response>\n    <D:href>/dav/calendars</D:href>\n    <D:propstat>\n      <D:prop>\n        <D:current-user-principal>\n          <D:href>{principal_href}</D:href>\n        </D:current-user-principal>\n      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n    </D:propstat>\n  </D:response>\n</D:multistatus>\n"
+        )
+    }
+
+    /// Build the PROPFIND Depth:1 response for the calendar home, listing the
+    /// given collections. Mimics the *real* Cyrus shape captured live so the
+    /// parser is pinned against what the server actually emits: the `calendar`
+    /// resourcetype is tagged under the older `urn:ietf:params:xml:ns:caldav`
+    /// namespace (Cyrus uses `C:` there, NOT the RFC 4791 `urn:ietf:params:
+    /// calDav:`), displaynames are CDATA-wrapped, and `current-user-privilege-
+    /// set` carries `<D:write/>` (alongside `<D:write-properties/>` etc., to
+    /// exercise the write-vs-`write-properties` distinction the parser must
+    /// get right) when `writable` is true.
+    pub fn home_multistatus(collections: &[CalCollection]) -> String {
+        let mut out = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CY=\"http://cyrusimap.org/ns/\">\n",
+        );
+        for c in collections {
+            out.push_str("  <D:response>\n");
+            out.push_str(&format!("    <D:href>{}</D:href>\n", c.href));
+            out.push_str("    <D:propstat>\n      <D:prop>\n");
+            // resourcetype — Cyrus tags calendar/schedule-* under the older
+            // caldav namespace (C:), collection under D:.
+            out.push_str("        <D:resourcetype>\n          <D:collection/>\n");
+            match c.kind {
+                CalKind::Calendar => out.push_str("          <C:calendar/>\n"),
+                CalKind::ScheduleInbox => out.push_str("          <C:schedule-inbox/>\n"),
+                CalKind::ScheduleOutbox => out.push_str("          <C:schedule-outbox/>\n"),
+                CalKind::PlainCollection => {}
+            }
+            out.push_str("        </D:resourcetype>\n");
+            out.push_str(&format!(
+                "        <D:displayname><![CDATA[{}]]></D:displayname>\n",
+                c.displayname
+            ));
+            // privileges — include the near-collision elements
+            // (`write-properties`, `write-content`, `read`, `all`) so the
+            // parser's `write`-vs-`write-properties` matching is exercised.
+            out.push_str("        <D:current-user-privilege-set>\n");
+            out.push_str("          <D:privilege><D:read/></D:privilege>\n");
+            if c.writable {
+                out.push_str("          <D:privilege><D:all/></D:privilege>\n");
+                out.push_str("          <D:privilege><D:write/></D:privilege>\n");
+                out.push_str("          <D:privilege><D:write-properties/></D:privilege>\n");
+                out.push_str("          <D:privilege><D:write-content/></D:privilege>\n");
+                out.push_str("          <D:privilege><CY:make-collection/></D:privilege>\n");
+            }
+            out.push_str("        </D:current-user-privilege-set>\n");
+            out.push_str("      </D:prop>\n      <D:status>HTTP/1.1 200 OK</D:status>\n");
+            out.push_str("    </D:propstat>\n  </D:response>\n");
+        }
+        out.push_str("</D:multistatus>\n");
+        out
     }
 }
 
@@ -4899,14 +5378,122 @@ END:VCALENDAR";
     const TEST_ICS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-m5yp\r\nSUMMARY:Test\r\n\
          DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
+    /// The collection-id segment the discovery recorders serve as the default
+    /// writable calendar — so tests can assert the resolved PUT/GET/DELETE
+    /// address it (never `/Default/`).
+    const DEFAULT_COLL_SEGMENT: &str = "collid-default";
+
+    /// Find the recorded requests with a given method (e.g. `"PUT"`),
+    /// ignoring the discovery PROPFINDs that precede them — so a test can
+    /// assert on the actual calendar op after discovery runs.
+    fn recorded_by_method<'a>(
+        rec: &'a [caldav_recorder::RecordedRequest],
+        method: &str,
+    ) -> Vec<&'a caldav_recorder::RecordedRequest> {
+        rec.iter().filter(|r| r.method == method).collect()
+    }
+
+    /// Count the recorded PROPFINDs — used to assert discovery ran (and ran
+    /// once, when cached across ops on the same session).
+    fn propfind_count(rec: &[caldav_recorder::RecordedRequest]) -> usize {
+        rec.iter().filter(|r| r.method == "PROPFIND").count()
+    }
+
+    /// Spawn a scripted recorder serving the empirically-verified CalDAV
+    /// discovery chain (kata wybm): PROPFIND `/dav/calendars` →
+    /// `current-user-principal` at `principal_href`; PROPFIND the derived home
+    /// → a realistic Cyrus home listing (the home itself, the default writable
+    /// calendar "General (FastMail)" at `default_href`, a tasks calendar
+    /// "DEFAULT_TASK_CALENDAR_NAME", and schedule-inbox/outbox — so the parser
+    /// must exclude the non-event collections to pick the default); and any
+    /// PUT/GET/DELETE → `write_status` / `write_body`. `principal_href` is the
+    /// server-absolute path (the Cyrus underscore-munged user segment), NOT the
+    /// session username — that's the whole point of the fix.
+    async fn spawn_discovery(
+        principal_href: &str,
+        default_href: &str,
+        write_status: axum::http::StatusCode,
+        write_body: Vec<u8>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<caldav_recorder::RecordedRequest>>>,
+    ) {
+        use caldav_recorder::{CalCollection, CalKind};
+        let home = principal_href.replace("/principals/", "/calendars/");
+        let collections = vec![
+            CalCollection {
+                href: home.clone(),
+                displayname: "Home".into(),
+                kind: CalKind::PlainCollection,
+                writable: true,
+            },
+            CalCollection {
+                href: default_href.into(),
+                displayname: "General (FastMail)".into(),
+                kind: CalKind::Calendar,
+                writable: true,
+            },
+            CalCollection {
+                href: format!("{home}TASKS/"),
+                displayname: "DEFAULT_TASK_CALENDAR_NAME".into(),
+                kind: CalKind::Calendar,
+                writable: true,
+            },
+            CalCollection {
+                href: format!("{home}Inbox/"),
+                displayname: "Inbox".into(),
+                kind: CalKind::ScheduleInbox,
+                writable: true,
+            },
+            CalCollection {
+                href: format!("{home}Outbox/"),
+                displayname: "Outbox".into(),
+                kind: CalKind::ScheduleOutbox,
+                writable: true,
+            },
+        ];
+        let principal_xml =
+            std::sync::Arc::new(caldav_recorder::principal_multistatus(principal_href));
+        let home_xml = std::sync::Arc::new(caldav_recorder::home_multistatus(&collections));
+        let write_body = std::sync::Arc::new(write_body);
+        let home_path = home.clone();
+        caldav_recorder::spawn_scripted(move |method, path| {
+            if method == "PROPFIND" && path == "/dav/calendars" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    principal_xml.as_bytes().to_vec(),
+                )
+            } else if method == "PROPFIND" && path == home_path {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    home_xml.as_bytes().to_vec(),
+                )
+            } else {
+                (write_status, write_body.as_ref().clone())
+            }
+        })
+        .await
+    }
+
+    /// The expected discovered collection path for a munged-user scenario:
+    /// `/dav/calendars/user/{munged_user}/collid-default/`.
+    fn default_coll_path(munged_user: &str) -> String {
+        format!("/dav/calendars/user/{munged_user}/{DEFAULT_COLL_SEGMENT}/")
+    }
+
     #[tokio::test]
     async fn caldav_put_uses_basic_auth_with_app_password() {
-        // RED today: add_to_calendar sends `Bearer <api-token>` (the JMAP
-        // header) to caldav.fastmail.com, so the loopback records either
-        // nothing (request goes to the real host) or a Bearer header — never
-        // `Basic <base64(username:app_password)>`.
-        let (base, recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::CREATED, Vec::new()).await;
+        // With an app password, add_to_calendar must (a) discover the default
+        // calendar collection via PROPFIND (kata wybm), then (b) PUT the
+        // METHOD-stripped ICS to the *resolved* URL using Basic auth with the
+        // app password — never the Bearer api-token, never `/Default/`.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/user@fastmail.com/",
+            &default_coll_path("user@fastmail.com"),
+            axum::http::StatusCode::CREATED,
+            Vec::new(),
+        )
+        .await;
         let mut sess = JmapSession::new(
             "user@fastmail.com",
             "fmu1-test-token",
@@ -4921,17 +5508,33 @@ END:VCALENDAR";
         );
 
         let rec = recorded.lock().unwrap();
-        assert_eq!(rec.len(), 1, "exactly one CalDAV PUT expected, got {rec:?}");
-        assert_eq!(rec[0].method, "PUT");
-        // URL built from caldav_base + username + uid, not a hardcoded host.
-        assert!(
-            rec[0]
-                .path
-                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
-            "CalDAV PUT path must be built from the session's username + uid: {}",
-            rec[0].path
+        // Discovery ran: PROPFIND the calendars root, then the derived home.
+        assert_eq!(
+            propfind_count(&rec),
+            2,
+            "discovery must issue two PROPFINDs (root + home), got {rec:?}"
         );
-        let auth = rec[0]
+        let puts = recorded_by_method(&rec, "PUT");
+        assert_eq!(
+            puts.len(),
+            1,
+            "exactly one CalDAV PUT expected, got {rec:?}"
+        );
+        let put = puts[0];
+        // The PUT addresses the DISCOVERED collection — not the /Default/
+        // literal (the wybm bug) and not a session-username-concatenated path.
+        assert!(
+            put.path
+                .ends_with("/dav/calendars/user/user@fastmail.com/collid-default/uid-m5yp.ics"),
+            "CalDAV PUT must address the discovered collection, not /Default/: {}",
+            put.path
+        );
+        assert!(
+            !put.path.contains("/Default/"),
+            "the /Default/ literal must be gone: {}",
+            put.path
+        );
+        let auth = put
             .authorization
             .as_deref()
             .expect("CalDAV PUT must send an Authorization header");
@@ -4946,7 +5549,7 @@ END:VCALENDAR";
         );
         // METHOD:PUMPED — strip_method must remove the iTIP transport property
         // before storage (RFC 4791). Body is the stored ICS, so no METHOD line.
-        let body = std::str::from_utf8(&rec[0].body).unwrap_or("");
+        let body = std::str::from_utf8(&put.body).unwrap_or("");
         assert!(
             !body.contains("METHOD:"),
             "stored ICS must have METHOD stripped"
@@ -4983,10 +5586,15 @@ END:VCALENDAR";
 
     #[tokio::test]
     async fn caldav_get_and_delete_use_same_basic_auth() {
-        // Sibling calls can't regress to the Bearer api-token. RED today:
-        // both send `Bearer <api-token>`.
-        let (base, recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        // Sibling calls can't regress to the Bearer api-token, and must both
+        // address the discovered (cached) collection — never /Default/.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/user@fastmail.com/",
+            &default_coll_path("user@fastmail.com"),
+            axum::http::StatusCode::OK,
+            TEST_ICS.as_bytes().to_vec(),
+        )
+        .await;
         let mut sess = JmapSession::new(
             "user@fastmail.com",
             "fmu1-test-token",
@@ -4999,51 +5607,58 @@ END:VCALENDAR";
         let _ = remove_from_calendar(&sess, "uid-m5yp").await;
 
         let rec = recorded.lock().unwrap();
-        assert_eq!(rec.len(), 2, "expected one GET and one DELETE, got {rec:?}");
-        assert_eq!(rec[0].method, "GET");
-        assert!(
-            rec[0]
-                .path
-                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
-            "get_calendar_event path must be built from username + uid: {}",
-            rec[0].path
-        );
+        // Discovery ran once (cached across the two ops on the same session):
+        // two PROPFINDs total, not four.
         assert_eq!(
-            rec[0].authorization.as_deref(),
-            Some(expected.as_str()),
-            "get_calendar_event must use Basic auth with the app password"
+            propfind_count(&rec),
+            2,
+            "discovery must be cached across ops (two PROPFINDs total), got {rec:?}"
         );
-        assert!(
-            !rec[0]
-                .authorization
-                .as_deref()
-                .unwrap_or("")
-                .contains("Bearer"),
-            "get_calendar_event must not send the Bearer api-token"
-        );
-        assert_eq!(rec[1].method, "DELETE");
-        assert!(
-            rec[1]
-                .path
-                .ends_with("/dav/calendars/user/user@fastmail.com/Default/uid-m5yp.ics"),
-            "remove_from_calendar path must be built from username + uid: {}",
-            rec[1].path
-        );
-        assert_eq!(
-            rec[1].authorization.as_deref(),
-            Some(expected.as_str()),
-            "remove_from_calendar must use Basic auth with the app password"
-        );
+        let gets = recorded_by_method(&rec, "GET");
+        let deletes = recorded_by_method(&rec, "DELETE");
+        assert_eq!(gets.len(), 1, "one GET expected, got {rec:?}");
+        assert_eq!(deletes.len(), 1, "one DELETE expected, got {rec:?}");
+        for r in [gets[0], deletes[0]] {
+            assert!(
+                r.path
+                    .ends_with("/dav/calendars/user/user@fastmail.com/collid-default/uid-m5yp.ics"),
+                "{} must address the discovered collection, not /Default/: {}",
+                r.method,
+                r.path
+            );
+            assert!(
+                !r.path.contains("/Default/"),
+                "the /Default/ literal must be gone: {}",
+                r.path
+            );
+            assert_eq!(
+                r.authorization.as_deref(),
+                Some(expected.as_str()),
+                "{} must use Basic auth with the app password",
+                r.method
+            );
+            assert!(
+                !r.authorization.as_deref().unwrap_or("").contains("Bearer"),
+                "{} must not send the Bearer api-token",
+                r.method
+            );
+        }
     }
 
     #[tokio::test]
     async fn caldav_get_rsvp_status_uses_basic_auth_and_refuses_without_app_password() {
         // `get_rsvp_status` is the fourth CalDAV call (kata m5yp "done when":
-        // all four must use Basic + surface CalendarAuthUnconfigured). With an
-        // app password it sends Basic; without, it returns
-        // Err(CalendarAuthUnconfigured) and issues no request.
-        let (base, recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        // all four must use Basic + surface CalendarAuthUnconfigured, and now
+        // also address the discovered collection — kata wybm). With an app
+        // password it discovers then GETs the resolved URL with Basic; without,
+        // it returns Err(CalendarAuthUnconfigured) and issues no request.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/user@fastmail.com/",
+            &default_coll_path("user@fastmail.com"),
+            axum::http::StatusCode::OK,
+            TEST_ICS.as_bytes().to_vec(),
+        )
+        .await;
         let mut sess = JmapSession::new(
             "user@fastmail.com",
             "fmu1-test-token",
@@ -5055,10 +5670,17 @@ END:VCALENDAR";
         let _ = get_rsvp_status(&sess, "uid-m5yp", "user@fastmail.com").await;
         {
             let rec = recorded.lock().unwrap();
-            assert_eq!(rec.len(), 1, "one CalDAV GET expected, got {rec:?}");
-            assert_eq!(rec[0].method, "GET");
+            let gets = recorded_by_method(&rec, "GET");
+            assert_eq!(gets.len(), 1, "one CalDAV GET expected, got {rec:?}");
+            assert!(
+                gets[0]
+                    .path
+                    .ends_with("/dav/calendars/user/user@fastmail.com/collid-default/uid-m5yp.ics"),
+                "get_rsvp_status must address the discovered collection, not /Default/: {}",
+                gets[0].path
+            );
             assert_eq!(
-                rec[0].authorization.as_deref(),
+                gets[0].authorization.as_deref(),
                 Some(expected.as_str()),
                 "get_rsvp_status must use Basic auth with the app password"
             );
@@ -5088,9 +5710,15 @@ END:VCALENDAR";
         // '/', '@' — legal in iCalendar) was stored by PUT under the encoded
         // name but looked up by GET under the raw one → perpetual 404 → the
         // first-time auto-add re-ran on every email open. All four must encode
-        // identically so PUT and GET address the same resource.
-        let (base, recorded) =
-            caldav_recorder::spawn(axum::http::StatusCode::OK, TEST_ICS.as_bytes().to_vec()).await;
+        // identically so PUT and GET address the same resource — now under the
+        // discovered collection (kata wybm), not /Default/.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/user@fastmail.com/",
+            &default_coll_path("user@fastmail.com"),
+            axum::http::StatusCode::OK,
+            TEST_ICS.as_bytes().to_vec(),
+        )
+        .await;
         let mut sess = JmapSession::new(
             "user@fastmail.com",
             "fmu1-test-token",
@@ -5107,11 +5735,15 @@ END:VCALENDAR";
         let _ = remove_from_calendar(&sess, uid).await;
 
         let rec = recorded.lock().unwrap();
-        assert_eq!(rec.len(), 3, "PUT + GET + DELETE expected, got {rec:?}");
-        for r in rec.iter() {
+        let ops: Vec<&caldav_recorder::RecordedRequest> = rec
+            .iter()
+            .filter(|r| matches!(r.method.as_str(), "PUT" | "GET" | "DELETE"))
+            .collect();
+        assert_eq!(ops.len(), 3, "PUT + GET + DELETE expected, got {rec:?}");
+        for r in ops.iter() {
             assert!(
-                r.path.ends_with(&format!("/Default/{encoded}.ics")),
-                "{} {:?} must address the encoded UID, not the raw one: {}",
+                r.path.ends_with(&format!("/collid-default/{encoded}.ics")),
+                "{} {:?} must address the encoded UID under the discovered collection, not the raw one: {}",
                 r.method,
                 r.path,
                 uid
@@ -5120,6 +5752,494 @@ END:VCALENDAR";
                 !r.path.contains(' '),
                 "raw space must not appear in the path"
             );
+            assert!(
+                !r.path.contains("/Default/"),
+                "the /Default/ literal must be gone: {}",
+                r.path
+            );
         }
+    }
+
+    // =========================================================================
+    // kata wybm — CalDAV calendar-home discovery (replace hardcoded /Default/)
+    //
+    // The four tests below pin the empirically-verified Fastmail/Cyrus chain
+    // (PROPFIND calendars root → current-user-principal → derive home →
+    // PROPFIND home → pick default writable calendar) against loopback
+    // recorders, plus the caching and honest-failure contracts. The parser
+    // unit tests above them pin the XML parsing and the default-selection
+    // heuristic in isolation, including the Cyrus older-namespace quirk that
+    // an RFC-only parser would miss (the vt0m lesson).
+    // =========================================================================
+
+    // --- parser unit tests ---
+
+    #[test]
+    fn element_text_strips_cdata_and_trims() {
+        assert_eq!(
+            element_text("<![CDATA[General (FastMail)]]>"),
+            "General (FastMail)"
+        );
+        assert_eq!(
+            element_text("  /dav/principals/user/u/  "),
+            "/dav/principals/user/u/"
+        );
+        assert_eq!(element_text("plain"), "plain");
+    }
+
+    #[test]
+    fn href_last_segment_trims_trailing_slash() {
+        assert_eq!(href_last_segment("/dav/calendars/user/u/COLLID/"), "COLLID");
+        assert_eq!(
+            href_last_segment("/dav/calendars/user/u.name@x.Default/"),
+            "u.name@x.Default"
+        );
+        assert_eq!(href_last_segment("/dav/calendars/user/u/"), "u");
+    }
+
+    #[test]
+    fn parse_current_user_principal_extracts_href() {
+        // The href Cyrus returns carries the underscore-munged user segment —
+        // the parser must surface it verbatim (the client never munges).
+        let xml =
+            caldav_recorder::principal_multistatus("/dav/principals/user/u_name@fastmail.com/");
+        assert_eq!(
+            parse_current_user_principal(&xml).as_deref(),
+            Some("/dav/principals/user/u_name@fastmail.com/")
+        );
+    }
+
+    #[test]
+    fn parse_current_user_principal_none_when_absent() {
+        let xml = "<?xml version=\"1.0\"?><D:multistatus xmlns:D=\"DAV:\"><D:response>\
+<D:href>/dav/calendars</D:href></D:response></D:multistatus>";
+        assert!(parse_current_user_principal(xml).is_none());
+    }
+
+    #[test]
+    fn derive_calendar_home_substitutes_principals_for_calendars() {
+        assert_eq!(
+            derive_calendar_home("/dav/principals/user/u_name@fastmail.com/").as_deref(),
+            Some("/dav/calendars/user/u_name@fastmail.com/")
+        );
+    }
+
+    #[test]
+    fn derive_calendar_home_none_when_not_a_principal_href() {
+        assert!(derive_calendar_home("/dav/calendars/user/u/").is_none());
+        assert!(derive_calendar_home("").is_none());
+    }
+
+    #[test]
+    fn parse_calendar_collections_handles_cyrus_older_namespace_and_flags() {
+        // The builder emits `calendar` under Cyrus's older
+        // `urn:ietf:params:xml:ns:caldav` namespace (C:), CDATA displaynames,
+        // and `write`/`write-properties`/`all` privileges — the real shape.
+        use caldav_recorder::{CalCollection, CalKind};
+        let collections = vec![
+            CalCollection {
+                href: "/dav/calendars/user/u/".into(),
+                displayname: "Home".into(),
+                kind: CalKind::PlainCollection,
+                writable: true,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u/COLLID/".into(),
+                displayname: "General (FastMail)".into(),
+                kind: CalKind::Calendar,
+                writable: true,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u/TASKS/".into(),
+                displayname: "DEFAULT_TASK_CALENDAR_NAME".into(),
+                kind: CalKind::Calendar,
+                writable: true,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u/Inbox/".into(),
+                displayname: "Inbox".into(),
+                kind: CalKind::ScheduleInbox,
+                writable: true,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u/RO/".into(),
+                displayname: "Read Only".into(),
+                kind: CalKind::Calendar,
+                writable: false,
+            },
+        ];
+        let xml = caldav_recorder::home_multistatus(&collections);
+        let parsed = parse_calendar_collections(&xml);
+        let by_href = |h: &str| parsed.iter().find(|c| c.href == h);
+        let home = by_href("/dav/calendars/user/u/").expect("home parsed");
+        assert!(!home.is_calendar, "home is a plain collection");
+        assert!(home.writable);
+        let general = by_href("/dav/calendars/user/u/COLLID/").expect("general parsed");
+        assert!(
+            general.is_calendar,
+            "General is a calendar (older namespace matched)"
+        );
+        assert!(general.writable);
+        assert_eq!(general.displayname.as_deref(), Some("General (FastMail)"));
+        let inbox = by_href("/dav/calendars/user/u/Inbox/").expect("inbox parsed");
+        assert!(inbox.is_schedule, "inbox flagged as schedule");
+        assert!(!inbox.is_calendar, "inbox is not a calendar");
+        let ro = by_href("/dav/calendars/user/u/RO/").expect("read-only parsed");
+        assert!(ro.is_calendar, "read-only is still a calendar");
+        assert!(!ro.writable, "read-only is not writable");
+    }
+
+    #[test]
+    fn parse_calendar_collections_accepts_rfc4791_namespace_too() {
+        // Robustness: the parser matches `calendar` by local name, so the RFC
+        // 4791 namespace (`urn:ietf:params:calDav:`) is also recognized — not
+        // just Cyrus's older `urn:ietf:params:xml:ns:caldav`. A server that
+        // switches to (or uses) the RFC namespace still discovers.
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:calDav:\">\
+<D:response><D:href>/dav/calendars/user/u/C/</D:href><D:propstat><D:prop>\
+<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\
+<D:displayname><![CDATA[General (FastMail)]]></D:displayname>\
+<D:current-user-privilege-set><D:privilege><D:write/></D:privilege></D:current-user-privilege-set>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+</D:multistatus>";
+        let parsed = parse_calendar_collections(xml);
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].is_calendar,
+            "RFC-4791-namespace calendar must be recognized"
+        );
+        assert!(parsed[0].writable);
+    }
+
+    // --- default-selection heuristic unit tests ---
+
+    fn cal(href: &str, displayname: &str, is_calendar: bool, writable: bool) -> CalCollectionInfo {
+        CalCollectionInfo {
+            href: href.into(),
+            displayname: Some(displayname.into()),
+            is_calendar,
+            is_schedule: false,
+            writable,
+        }
+    }
+
+    #[test]
+    fn pick_default_prefers_general_fastmail_marker_over_tasks() {
+        let colls = [
+            cal("/h/COLLID/", "General (FastMail)", true, true),
+            cal("/h/TASKS/", "DEFAULT_TASK_CALENDAR_NAME", true, true),
+            cal("/h/C2/", "Events", true, true),
+        ];
+        let picked = pick_default_calendar(&colls).expect("a default exists");
+        assert_eq!(
+            picked.href, "/h/COLLID/",
+            "(FastMail) marker wins, not the tasks calendar"
+        );
+    }
+
+    #[test]
+    fn pick_default_prefers_displayname_default_literal() {
+        let colls = [
+            cal("/h/Default/", "Default", true, true),
+            cal("/h/COLLID/", "General (FastMail)", true, true),
+        ];
+        let picked = pick_default_calendar(&colls).expect("a default exists");
+        assert_eq!(
+            picked.href, "/h/Default/",
+            "displayname Default wins over the FastMail marker"
+        );
+    }
+
+    #[test]
+    fn pick_default_prefers_href_username_dot_default() {
+        // The Fastmail `username.Default` convention (the 301 target shape) —
+        // recognized by href segment, even with a non-`Default` displayname.
+        let colls = [
+            cal("/h/u.name@x.Default/", "My Cal", true, true),
+            cal("/h/C2/", "Events", true, true),
+        ];
+        let picked = pick_default_calendar(&colls).expect("a default exists");
+        assert_eq!(
+            picked.href, "/h/u.name@x.Default/",
+            ".Default href segment wins"
+        );
+    }
+
+    #[test]
+    fn pick_default_single_writable_when_unmarked() {
+        let colls = [cal("/h/only/", "Only", true, true)];
+        let picked = pick_default_calendar(&colls).expect("single writable is the default");
+        assert_eq!(picked.href, "/h/only/");
+    }
+
+    #[test]
+    fn pick_default_none_when_multiple_unmarked() {
+        // Honest failure: two writable calendars, no Default/FastMail marker —
+        // don't guess.
+        let colls = [
+            cal("/h/a/", "Work", true, true),
+            cal("/h/b/", "Personal", true, true),
+        ];
+        assert!(
+            pick_default_calendar(&colls).is_none(),
+            "multiple unmarked writable calendars must surface, not guess"
+        );
+    }
+
+    #[test]
+    fn pick_default_none_when_only_read_only() {
+        let colls = [cal("/h/ro/", "Read Only", true, false)];
+        assert!(
+            pick_default_calendar(&colls).is_none(),
+            "a read-only calendar must not be picked for writes"
+        );
+    }
+
+    #[test]
+    fn pick_default_none_when_only_schedule_collections() {
+        let colls = [
+            CalCollectionInfo {
+                href: "/h/Inbox/".into(),
+                displayname: Some("Inbox".into()),
+                is_calendar: false,
+                is_schedule: true,
+                writable: true,
+            },
+            CalCollectionInfo {
+                href: "/h/Outbox/".into(),
+                displayname: Some("Outbox".into()),
+                is_calendar: false,
+                is_schedule: true,
+                writable: true,
+            },
+        ];
+        assert!(
+            pick_default_calendar(&colls).is_none(),
+            "schedule-inbox/outbox must not be picked as the default calendar"
+        );
+    }
+
+    // --- behavioral discovery tests (loopback recorders) ---
+
+    #[tokio::test]
+    async fn caldav_discovery_resolves_default_collection_not_default_literal() {
+        // The core wybm fix: the session username has a DOT (`u.name@…`) but
+        // the server's principal href uses the Cyrus UNDERSCORE-munged form
+        // (`u_name@…`). The client must read `current-user-principal` and
+        // address the resolved collection — never concatenate the session
+        // username, never use `/Default/`. Fails on the old hardcoded code.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/u_name@fastmail.com/",
+            &default_coll_path("u_name@fastmail.com"),
+            axum::http::StatusCode::CREATED,
+            Vec::new(),
+        )
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let result = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        assert!(result.is_ok(), "add_to_calendar should succeed: {result:?}");
+
+        let rec = recorded.lock().unwrap();
+        let puts = recorded_by_method(&rec, "PUT");
+        assert_eq!(puts.len(), 1, "one PUT expected, got {rec:?}");
+        let put = puts[0];
+        // The PUT addresses the munged-user discovered collection — not the
+        // session username (`u.name@`) and not `/Default/`.
+        assert!(
+            put.path.contains("u_name@fastmail.com"),
+            "PUT must use the server-given (underscore-munged) user segment: {}",
+            put.path
+        );
+        assert!(
+            !put.path.contains("u.name@"),
+            "PUT must NOT use the dotted session username: {}",
+            put.path
+        );
+        assert!(
+            put.path
+                .ends_with("/dav/calendars/user/u_name@fastmail.com/collid-default/uid-wybm.ics"),
+            "PUT must address the discovered default collection: {}",
+            put.path
+        );
+        assert!(
+            !put.path.contains("/Default/"),
+            "the /Default/ literal must be gone: {}",
+            put.path
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_discovery_caches_resolved_url_across_calls() {
+        // One discovery per session, not per call: across add + get + remove on
+        // the same session, the two PROPFINDs (root + home) are issued exactly
+        // once, and all three ops address the same resolved collection URL.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/u_name@fastmail.com/",
+            &default_coll_path("u_name@fastmail.com"),
+            axum::http::StatusCode::OK,
+            TEST_ICS.as_bytes().to_vec(),
+        )
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let _ = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        let _ = get_calendar_event(&sess, "uid-wybm").await;
+        let _ = remove_from_calendar(&sess, "uid-wybm").await;
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            propfind_count(&rec),
+            2,
+            "discovery PROPFINDs must be issued once (cached), not per call: {rec:?}"
+        );
+        let ops: Vec<&caldav_recorder::RecordedRequest> = rec
+            .iter()
+            .filter(|r| matches!(r.method.as_str(), "PUT" | "GET" | "DELETE"))
+            .collect();
+        assert_eq!(ops.len(), 3, "PUT + GET + DELETE expected, got {rec:?}");
+        for r in ops.iter() {
+            assert!(
+                r.path.ends_with(
+                    "/dav/calendars/user/u_name@fastmail.com/collid-default/uid-wybm.ics"
+                ),
+                "{} must address the same cached resolved URL: {}",
+                r.method,
+                r.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caldav_discovery_failure_surfaces_not_swallowed() {
+        // The home PROPFIND returns 404 — discovery must surface
+        // CalendarDiscoveryFailed and issue NO PUT. Fails on the old code,
+        // which PUT to /Default/, followed the 301, 404'd, and returned
+        // Ok(false) + warn (swallowed).
+        let principal_xml = std::sync::Arc::new(caldav_recorder::principal_multistatus(
+            "/dav/principals/user/u_name@fastmail.com/",
+        ));
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, path| {
+            if method == "PROPFIND" && path == "/dav/calendars" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    principal_xml.as_bytes().to_vec(),
+                )
+            } else {
+                // The derived home PROPFIND 404s ("Mailbox does not exist" —
+                // the real Cyrus 404 shape).
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    b"Mailbox does not exist".to_vec(),
+                )
+            }
+        })
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let result = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        let err = result.expect_err("home-PROPFIND 404 must surface, not Ok(true)");
+        assert!(
+            matches!(err, Error::CalendarDiscoveryFailed(_)),
+            "expected CalendarDiscoveryFailed, got {err:?}"
+        );
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            propfind_count(&rec),
+            2,
+            "both discovery PROPFINDs were attempted: {rec:?}"
+        );
+        assert!(
+            recorded_by_method(&rec, "PUT").is_empty(),
+            "no PUT may be issued when discovery fails: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_no_writable_collection_surfaces() {
+        // The home lists only a read-only calendar and schedule collections —
+        // no writable default calendar collection. Discovery must surface
+        // CalendarDiscoveryFailed and issue no PUT (not guess /Default/).
+        use caldav_recorder::{CalCollection, CalKind};
+        let principal_xml = std::sync::Arc::new(caldav_recorder::principal_multistatus(
+            "/dav/principals/user/u_name@fastmail.com/",
+        ));
+        let collections = vec![
+            CalCollection {
+                href: "/dav/calendars/user/u_name@fastmail.com/".into(),
+                displayname: "Home".into(),
+                kind: CalKind::PlainCollection,
+                writable: true,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u_name@fastmail.com/RO/".into(),
+                displayname: "Read Only".into(),
+                kind: CalKind::Calendar,
+                writable: false,
+            },
+            CalCollection {
+                href: "/dav/calendars/user/u_name@fastmail.com/Inbox/".into(),
+                displayname: "Inbox".into(),
+                kind: CalKind::ScheduleInbox,
+                writable: true,
+            },
+        ];
+        let home_xml = std::sync::Arc::new(caldav_recorder::home_multistatus(&collections));
+        let home_path = "/dav/calendars/user/u_name@fastmail.com/".to_string();
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, path| {
+            if method == "PROPFIND" && path == "/dav/calendars" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    principal_xml.as_bytes().to_vec(),
+                )
+            } else if method == "PROPFIND" && path == home_path {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    home_xml.as_bytes().to_vec(),
+                )
+            } else {
+                (axum::http::StatusCode::CREATED, Vec::new())
+            }
+        })
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let result = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        let err = result.expect_err("no writable calendar must surface, not Ok(true)");
+        assert!(
+            matches!(err, Error::CalendarDiscoveryFailed(_)),
+            "expected CalendarDiscoveryFailed, got {err:?}"
+        );
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            propfind_count(&rec),
+            2,
+            "discovery ran (both PROPFINDs) before giving up: {rec:?}"
+        );
+        assert!(
+            recorded_by_method(&rec, "PUT").is_empty(),
+            "no PUT may be issued when no writable calendar exists: {rec:?}"
+        );
     }
 }
