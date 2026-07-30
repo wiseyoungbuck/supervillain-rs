@@ -590,6 +590,20 @@ fn escape_search_string(s: &str) -> String {
     s.replace('\\', r"\\").replace('"', r#"\""#)
 }
 
+/// True when an attachment content type is an iCalendar payload. Pure.
+///
+/// Exchange exposes the ICS of a processed meeting request (an
+/// `eventMessageRequest`) as a `fileAttachment` with contentType
+/// `application/ics` — NOT `text/calendar` (verified live against Exchange
+/// Online with a native Google Calendar invite, kata wca3). Unprocessed
+/// forwards can also carry `text/calendar; method=REQUEST` with parameters.
+/// An exact `text/calendar` match therefore missed every real invite, which
+/// made the whole Outlook RSVP flow unreachable from the UI.
+fn is_calendar_mime(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or("").trim();
+    essence.eq_ignore_ascii_case("text/calendar") || essence.eq_ignore_ascii_case("application/ics")
+}
+
 /// Parse a Graph `Message` resource JSON into our canonical `Email`. Pure —
 /// `fetch_body=false` means we got the metadata-only Graph response (skip
 /// body extraction) which matches our `get_emails(fetch_body: bool)` API.
@@ -637,9 +651,7 @@ pub(crate) fn parse_graph_message(
     let attachments = parse_graph_attachments(&id, &json["attachments"]);
     let has_attachment =
         json["hasAttachments"].as_bool().unwrap_or(false) || !attachments.is_empty();
-    let has_calendar = attachments
-        .iter()
-        .any(|a| a.mime_type.eq_ignore_ascii_case("text/calendar"));
+    let has_calendar = attachments.iter().any(|a| is_calendar_mime(&a.mime_type));
 
     // Graph's message size field is "size" — not Gmail's "sizeEstimate".
     let size = json["size"].as_i64().unwrap_or(0);
@@ -1527,15 +1539,31 @@ pub async fn get_emails(
     Ok(indexed.into_iter().map(|(_, e)| e).collect())
 }
 
-/// Extract the ICS bytes from a message's `text/calendar` attachment, if
-/// any. Bridges the inbox view to the existing calendar RSVP flow.
+/// Pick the calendar attachment's ID out of a Graph attachments-list
+/// response. Pure — separated from `get_calendar_data` for testability.
+fn find_calendar_attachment_id(attachments_json: &serde_json::Value) -> Option<String> {
+    attachments_json["value"].as_array().and_then(|arr| {
+        arr.iter().find_map(|a| {
+            let ct = a["contentType"].as_str()?;
+            if is_calendar_mime(ct) {
+                a["id"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Extract the ICS bytes from a message's calendar attachment
+/// (`text/calendar` or Exchange's `application/ics`), if any. Bridges the
+/// inbox view to the existing calendar RSVP flow.
 pub async fn get_calendar_data(
     session: &OutlookSession,
     email_id: &str,
 ) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     let encoded = crate::provider_utils::encode_path_segment(email_id);
-    // List attachments first to find the text/calendar one.
+    // List attachments first to find the calendar one.
     let list_url = format!("{GRAPH_BASE}/me/messages/{encoded}/attachments?$select=id,contentType");
     let resp = session
         .client
@@ -1553,17 +1581,7 @@ pub async fn get_calendar_data(
         ));
     }
     let parsed: serde_json::Value = resp.json().await?;
-    let calendar_att_id = parsed["value"].as_array().and_then(|arr| {
-        arr.iter().find_map(|a| {
-            let ct = a["contentType"].as_str()?;
-            if ct.eq_ignore_ascii_case("text/calendar") {
-                a["id"].as_str().map(String::from)
-            } else {
-                None
-            }
-        })
-    });
-    let Some(att_id) = calendar_att_id else {
+    let Some(att_id) = find_calendar_attachment_id(&parsed) else {
         return Ok(None);
     };
 
@@ -2699,87 +2717,276 @@ async fn send_graph_json(
 /// other ID-in-path interpolation in this file; an unencoded `/` inside the
 /// ID would otherwise split the path and hit the wrong (or a nonexistent)
 /// Graph route.
-fn build_event_action_url(event_id: &str, action: &str) -> String {
+fn build_event_action_url(graph_base: &str, event_id: &str, action: &str) -> String {
     format!(
-        "{GRAPH_BASE}/me/events/{}/{action}",
+        "{graph_base}/me/events/{}/{action}",
         crate::provider_utils::encode_path_segment(event_id)
     )
 }
 
 /// Build the `DELETE /me/events/{id}` URL. Pure — no HTTP. See
 /// `build_event_action_url` for why `event_id` must be encoded.
-fn build_event_delete_url(event_id: &str) -> String {
+fn build_event_delete_url(graph_base: &str, event_id: &str) -> String {
     format!(
-        "{GRAPH_BASE}/me/events/{}",
+        "{graph_base}/me/events/{}",
         crate::provider_utils::encode_path_segment(event_id)
     )
 }
 
-/// Find a Graph event ID by iCalUId
-async fn find_event_by_uid(session: &OutlookSession, uid: &str) -> Result<Option<String>, Error> {
+/// Open extended property tagging supervillain-created calendar events with
+/// the originating ICS UID. Graph ignores a caller-supplied `iCalUId` on
+/// `POST /me/events` (verified live, kata wca3), so without this tag a
+/// created copy could never be found again: the UID existence check would
+/// miss it (a fresh duplicate on every re-open of the email) and
+/// `remove_from_calendar` could never delete it. Open extended properties
+/// are settable on create and `$filter`-able (also verified live).
+const ICS_UID_PROP: &str = "String {8d8659b3-5b5c-45f2-b2f4-b1c9d2b298f8} Name supervillainIcsUid";
+
+/// Find the Graph event ID of an *Exchange-processed* invite by ICS UID.
+/// Parameterized on the Graph base URL so tests can point it at a local
+/// loopback server (same pattern as `ensure_token_at`).
+///
+/// For an invite Exchange processed, the stored `iCalUId` is an Exchange
+/// GlobalObjectID (a hex blob embedding the original ICS UID), yet the
+/// `$filter=iCalUId eq '<ics-uid>'` still matches — Graph normalizes the
+/// comparison (verified live against a Google Calendar invite, kata wca3).
+/// Events *created by us* via `POST /me/events` are never found here: Graph
+/// ignores a caller-supplied `iCalUId` and generates its own (also verified
+/// live). Created copies are found via [`find_self_created_by_uid_at`]'s
+/// extended-property filter instead.
+async fn find_event_by_uid_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<Option<String>, Error> {
     let token = access_token(session).await?;
     // Escape single quotes in UID to prevent OData filter injection
     let safe_uid = uid.replace('\'', "''");
-    let url = format!("{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id",);
+    let url = format!("{graph_base}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id",);
     let resp = send_graph_json(
         session.client.get(&url).bearer_auth(&token),
         "events.filter",
     )
     .await?;
 
-    Ok(resp["value"]
+    Ok(first_event_id(&resp))
+}
+
+/// Find the Graph event IDs of *supervillain-created* calendar copies of an
+/// ICS UID, via the `ICS_UID_PROP` extended-property filter. The complement
+/// of `find_event_by_uid_at` — together they cover both ways an invite's
+/// event can exist on the user's calendar. Returns every match: the
+/// lookup/create pair is not atomic, so racing sessions can leave more than
+/// one tagged copy, and callers delete all of them (our own copies are
+/// always safe to delete) rather than orphaning the extras (roborev 422 #3).
+async fn find_self_created_by_uid_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<Vec<String>, Error> {
+    let token = access_token(session).await?;
+    let safe_uid = uid.replace('\'', "''");
+    let url = format!(
+        "{graph_base}/me/events?$filter=singleValueExtendedProperties/Any(ep: ep/id eq '{ICS_UID_PROP}' and ep/value eq '{safe_uid}')&$select=id"
+    );
+    let resp = send_graph_json(
+        session.client.get(&url).bearer_auth(&token),
+        "events.filter.selfCreated",
+    )
+    .await?;
+
+    Ok(all_event_ids(&resp))
+}
+
+/// First event ID out of a Graph `/me/events?$filter=...` response. Pure.
+fn first_event_id(resp: &serde_json::Value) -> Option<String> {
+    resp["value"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|ev| ev["id"].as_str())
-        .map(String::from))
+        .map(String::from)
+}
+
+/// Every event ID out of a Graph `/me/events?$filter=...` response. Pure.
+fn all_event_ids(resp: &serde_json::Value) -> Vec<String> {
+    resp["value"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|ev| ev["id"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Add an event to the Outlook calendar. Returns true on success.
 /// Builds a Graph event JSON from the parsed CalendarEvent fields.
+///
+/// `overwrite` controls what happens when a *supervillain-created* copy of
+/// this UID already exists: replace it (delete + recreate, the invite-update
+/// path) or keep it (the idempotent auto-add path). An *Exchange-processed*
+/// invite event is never touched in either mode: Exchange applies organizer
+/// updates and cancellations to it itself, and it is the only copy Graph can
+/// RSVP (kata wca3) — deleting it to "update" would destroy the RSVP-able
+/// event and orphan the meeting.
 pub async fn add_to_calendar(
     session: &OutlookSession,
     _ics_data: &str,
     event: &CalendarEvent,
+    overwrite: bool,
+) -> Result<bool, Error> {
+    add_to_calendar_at(session, GRAPH_BASE, event, overwrite).await
+}
+
+/// Core of `add_to_calendar`, parameterized on the Graph base URL for
+/// loopback tests. The existence checks run first so a re-add of a known
+/// event is a no-op; if a lookup fails (e.g. a transient 429/5xx), the
+/// error propagates instead of reading as "not found" — a mis-read that
+/// used to POST a duplicate event (kata 8qdw). A failed create or replace
+/// is an `Err`, not a logged-and-swallowed `Ok(false)`: every caller treats
+/// this bool as "is the event on the calendar", and answering that question
+/// with a warn-log helps nobody (kata wca3).
+async fn add_to_calendar_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    event: &CalendarEvent,
+    overwrite: bool,
 ) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
-    // Check if event already exists
-    if let Some(_existing_id) = find_event_by_uid(session, &event.uid).await? {
+    let processed = find_event_by_uid_at(session, graph_base, &event.uid).await?;
+    let self_created = find_self_created_by_uid_at(session, graph_base, &event.uid).await?;
+
+    // Exchange-processed copy: Exchange owns it — never delete or duplicate.
+    // Any tagged copies of ours that coexist with it are stale duplicates
+    // (created for an unprocessed forward before Exchange processed a direct
+    // delivery of the same UID) and always safe to delete (roborev 422 #1).
+    // The cleanup is best-effort (roborev 424 #1): the add is semantically
+    // satisfied — the meeting is on the calendar and Exchange keeps it
+    // current — so a transient delete failure must not report the whole
+    // operation as failed; the tagged copy stays findable and the next
+    // open retries.
+    if processed.is_some() {
         tracing::debug!("Event {} already exists in Outlook calendar", event.uid);
+        cleanup_stale_copies(session, graph_base, &token, &self_created, &event.uid).await;
         return Ok(true);
+    }
+
+    if !self_created.is_empty() && !overwrite {
+        tracing::debug!("Self-created copy of {} already exists", event.uid);
+        // Keep one copy; clear any extras left by racing check-then-create.
+        // Best-effort for the same reason as above — the kept copy already
+        // satisfies the add.
+        cleanup_stale_copies(session, graph_base, &token, &self_created[1..], &event.uid).await;
+        return Ok(true);
+    }
+    // Invite update: replace our copies so the calendar reflects the new
+    // details. Delete failure must abort — proceeding to create would
+    // leave two copies of the meeting.
+    for id in &self_created {
+        delete_event_at(session, graph_base, &token, id, &event.uid).await?;
     }
 
     let body = build_graph_event(event);
 
     let resp = session
         .client
-        .post(format!("{GRAPH_BASE}/me/events"))
+        .post(format!("{graph_base}/me/events"))
         .bearer_auth(&token)
         .json(&body)
         .send()
         .await?;
 
-    if resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
         tracing::info!("Added event {} to Outlook calendar", event.uid);
         Ok(true)
     } else {
-        let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph POST /me/events failed ({status}): {text}");
-        Ok(false)
+        Err(classify_outlook_error("events.create", status, &text))
+    }
+}
+
+/// Best-effort deletion of stale self-created copies: warn-and-continue on
+/// failure. Only for call sites where the calendar already holds a copy
+/// that satisfies the caller — the overwrite path must NOT use this, since
+/// there a failed delete followed by a create would duplicate the meeting.
+async fn cleanup_stale_copies(
+    session: &OutlookSession,
+    graph_base: &str,
+    token: &str,
+    event_ids: &[String],
+    uid: &str,
+) {
+    for id in event_ids {
+        if let Err(e) = delete_event_at(session, graph_base, token, id, uid).await {
+            tracing::warn!(
+                "Best-effort cleanup of stale copy of {uid} failed (will retry on next open): {e}"
+            );
+        }
+    }
+}
+
+/// DELETE a Graph event by its opaque ID. 404 counts as success (the event
+/// is gone either way); any other failure is a classified `Err`.
+async fn delete_event_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    token: &str,
+    event_id: &str,
+    uid: &str,
+) -> Result<(), Error> {
+    let resp = session
+        .client
+        .delete(build_event_delete_url(graph_base, event_id))
+        .bearer_auth(token)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 404 {
+        tracing::info!("Removed event {uid} from Outlook calendar");
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(classify_outlook_error("events.delete", status, &text))
     }
 }
 
 /// Respond to a calendar event (accept/decline/tentative).
 /// Graph sends the RSVP email automatically when sendResponse=true.
+///
+/// Verified end-to-end against a cross-provider (Google Calendar) organizer,
+/// kata wca3: Exchange emails a genuine iTIP `METHOD:REPLY` — original UID,
+/// `PARTSTAT` matching the action, `DTSTART;TZID=...` with a full VTIMEZONE —
+/// which the organizer's calendar auto-processes, and the user's own copy
+/// flips to the responded status. No supplementary iTIP send is needed.
+///
+/// `Ok(false)` means exactly one thing: no event with this UID is on the
+/// calendar (Exchange never processed the invite), so Graph has nothing to
+/// respond to. A Graph rejection of the action itself (e.g. 400 "you're the
+/// meeting organizer" for a self-created copy) is an `Err`, not `Ok(false)` —
+/// the caller must be able to tell "nothing to respond to" from "the
+/// response failed" (kata wca3).
 pub async fn respond_to_event(
     session: &OutlookSession,
     uid: &str,
     status: &crate::types::RsvpStatus,
 ) -> Result<bool, Error> {
+    respond_to_event_at(session, GRAPH_BASE, uid, status).await
+}
+
+/// Core of `respond_to_event`, parameterized on the Graph base URL for
+/// loopback tests.
+async fn respond_to_event_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+    status: &crate::types::RsvpStatus,
+) -> Result<bool, Error> {
     let token = access_token(session).await?;
 
-    let event_id = match find_event_by_uid(session, uid).await? {
+    let event_id = match find_event_by_uid_at(session, graph_base, uid).await? {
         Some(id) => id,
         None => {
             tracing::warn!("Cannot RSVP: event {uid} not found in Outlook calendar");
@@ -2795,20 +3002,23 @@ pub async fn respond_to_event(
 
     let resp = session
         .client
-        .post(build_event_action_url(&event_id, action))
+        .post(build_event_action_url(graph_base, &event_id, action))
         .bearer_auth(&token)
         .json(&serde_json::json!({"sendResponse": true}))
         .send()
         .await?;
 
-    if resp.status().is_success() {
+    let status_code = resp.status();
+    if status_code.is_success() {
         tracing::info!("RSVP {action} for event {uid} via Graph");
         Ok(true)
     } else {
-        let status_code = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph RSVP {action} failed ({status_code}): {text}");
-        Ok(false)
+        Err(classify_outlook_error(
+            &format!("events.{action}"),
+            status_code,
+            &text,
+        ))
     }
 }
 
@@ -2935,35 +3145,56 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
 
 /// Remove an event from the Outlook calendar by iCalUId
 pub async fn remove_from_calendar(session: &OutlookSession, uid: &str) -> Result<bool, Error> {
-    let token = access_token(session).await?;
-
-    let event_id = match find_event_by_uid(session, uid).await? {
-        Some(id) => id,
-        None => {
-            tracing::debug!("Event {uid} not found in Outlook calendar, nothing to remove");
-            return Ok(true);
-        }
-    };
-
-    let resp = session
-        .client
-        .delete(build_event_delete_url(&event_id))
-        .bearer_auth(&token)
-        .send()
-        .await?;
-
-    if resp.status().is_success() || resp.status().as_u16() == 404 {
-        tracing::info!("Removed event {uid} from Outlook calendar");
-        Ok(true)
-    } else {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::warn!("Graph DELETE event failed ({status}): {text}");
-        Ok(false)
-    }
+    remove_from_calendar_at(session, GRAPH_BASE, uid).await
 }
 
-/// Build a Microsoft Graph event JSON from a CalendarEvent
+/// Core of `remove_from_calendar`, parameterized on the Graph base URL for
+/// loopback tests. Checks both ways the event can exist — an
+/// Exchange-processed invite (iCalUId filter) and supervillain-created
+/// copies (`ICS_UID_PROP` filter) — and deletes every hit: a cancellation
+/// is processed once, so short-circuiting on the first copy would orphan
+/// the rest forever (roborev 422 #1).
+async fn remove_from_calendar_at(
+    session: &OutlookSession,
+    graph_base: &str,
+    uid: &str,
+) -> Result<bool, Error> {
+    let token = access_token(session).await?;
+
+    let mut event_ids: Vec<String> = find_event_by_uid_at(session, graph_base, uid)
+        .await?
+        .into_iter()
+        .collect();
+    event_ids.extend(find_self_created_by_uid_at(session, graph_base, uid).await?);
+    if event_ids.is_empty() {
+        tracing::debug!("Event {uid} not found in Outlook calendar, nothing to remove");
+        return Ok(true);
+    }
+
+    for event_id in &event_ids {
+        delete_event_at(session, graph_base, &token, event_id, uid).await?;
+    }
+    Ok(true)
+}
+
+/// Build a Microsoft Graph event JSON from a CalendarEvent.
+///
+/// Two deliberate omissions, both verified live against Exchange Online
+/// (kata wca3):
+///
+/// - **No `attendees`.** `POST /me/events` with attendees makes Exchange
+///   email real meeting invitations to every listed address, from this user,
+///   as organizer. This copy exists purely to put someone else's meeting on
+///   the user's own calendar — re-inviting the whole attendee list to a
+///   bogus duplicate is actively harmful.
+/// - **No `iCalUId`.** Graph ignores a caller-supplied value and generates
+///   its own, so sending the ICS UID would be a placebo. The `ICS_UID_PROP`
+///   extended property carries the UID instead — that's what makes created
+///   copies findable again (see `find_self_created_by_uid_at`).
+///
+/// Times are sent as UTC instants with `timeZone: "UTC"`; Outlook renders
+/// them in the viewing client's display timezone, so the wall time the user
+/// sees is correct without preserving the original TZID.
 fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
     let mut body = serde_json::json!({
         "subject": event.summary,
@@ -2974,7 +3205,10 @@ fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
         "body": {
             "contentType": "text",
             "content": event.description.as_deref().unwrap_or("")
-        }
+        },
+        "singleValueExtendedProperties": [
+            {"id": ICS_UID_PROP, "value": event.uid}
+        ]
     });
 
     if let Some(dtend) = event.dtend {
@@ -2993,23 +3227,6 @@ fn build_graph_event(event: &CalendarEvent) -> serde_json::Value {
 
     if let Some(ref location) = event.location {
         body["location"] = serde_json::json!({"displayName": location});
-    }
-
-    if !event.attendees.is_empty() {
-        let attendees: Vec<serde_json::Value> = event
-            .attendees
-            .iter()
-            .map(|a| {
-                serde_json::json!({
-                    "emailAddress": {
-                        "address": a.email,
-                        "name": a.name.as_deref().unwrap_or("")
-                    },
-                    "type": "required"
-                })
-            })
-            .collect();
-        body["attendees"] = serde_json::json!(attendees);
     }
 
     body
@@ -3196,7 +3413,11 @@ mod tests {
     }
 
     #[test]
-    fn build_graph_event_with_attendees() {
+    fn build_graph_event_omits_attendees() {
+        // kata wca3 (verified live): POST /me/events with attendees makes
+        // Exchange email real invitations from this user to every listed
+        // address. The created copy is for the user's own calendar only, so
+        // the ICS attendee list must never reach the create body.
         let event = CalendarEvent {
             uid: "test".into(),
             summary: "Standup".into(),
@@ -3225,11 +3446,13 @@ mod tests {
             is_update: false,
         };
         let json = build_graph_event(&event);
-        let attendees = json["attendees"].as_array().unwrap();
-        assert_eq!(attendees.len(), 2);
-        assert_eq!(attendees[0]["emailAddress"]["address"], "alice@co.com");
-        assert_eq!(attendees[0]["emailAddress"]["name"], "Alice");
-        assert_eq!(attendees[1]["emailAddress"]["name"], "");
+        assert!(
+            json.get("attendees").is_none(),
+            "attendees must not be sent — Exchange emails invitations to them"
+        );
+        // Graph ignores caller-supplied iCalUId (verified live) — sending it
+        // would be a placebo, so we deliberately don't.
+        assert!(json.get("iCalUId").is_none());
     }
 
     #[test]
@@ -3527,7 +3750,7 @@ mod tests {
 
     #[test]
     fn build_event_action_url_encodes_slash_in_event_id() {
-        let url = build_event_action_url("AAMkAG/weird+id", "accept");
+        let url = build_event_action_url(GRAPH_BASE, "AAMkAG/weird+id", "accept");
         assert!(
             !url.contains("AAMkAG/weird"),
             "unencoded slash must not survive into the path: {url}"
@@ -3541,7 +3764,7 @@ mod tests {
 
     #[test]
     fn build_event_delete_url_encodes_slash_in_event_id() {
-        let url = build_event_delete_url("some/nested/id");
+        let url = build_event_delete_url(GRAPH_BASE, "some/nested/id");
         assert!(!url.contains("some/nested/id"));
         assert!(url.contains("some%2Fnested%2Fid"));
         assert!(url.starts_with(&format!("{GRAPH_BASE}/me/events/")));
@@ -3549,7 +3772,7 @@ mod tests {
 
     #[test]
     fn build_event_action_url_passthrough_for_normal_id() {
-        let url = build_event_action_url("AAMkAGI1AAA", "decline");
+        let url = build_event_action_url(GRAPH_BASE, "AAMkAGI1AAA", "decline");
         assert_eq!(url, format!("{GRAPH_BASE}/me/events/AAMkAGI1AAA/decline"));
     }
 
@@ -3971,6 +4194,738 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["value"][0]["id"].as_str(), Some("evt-1"));
+    }
+
+    // ---- Outlook RSVP round-trip pinning (kata wca3) ----
+    //
+    // Loopback recorder for the Graph calendar calls: every request's
+    // (method, path+query, JSON body) is captured, and the `respond`
+    // closure scripts the reply per request. Same no-mock-framework style
+    // as `spawn_test_server`; the `_at` URL-injection variants mirror
+    // `ensure_token_at`.
+    //
+    // The RSVP semantics these tests pin were verified live against
+    // Exchange Online + a Google Calendar organizer (evidence in kata
+    // wca3): an Exchange-processed invite is found by `$filter=iCalUId eq
+    // '<ics-uid>'`, `POST .../{accept|tentativelyAccept|decline}` with
+    // `{"sendResponse": true}` makes Exchange email the organizer a real
+    // iTIP METHOD:REPLY (TZ-correct, auto-processed by Google Calendar),
+    // and the user's own calendar copy flips to the responded status.
+
+    type RecordedRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+    async fn spawn_graph_recorder<F>(respond: F) -> (String, RecordedRequests)
+    where
+        F: Fn(&str, &str) -> (axum::http::StatusCode, serde_json::Value)
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let requests: RecordedRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = requests.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let reqs = reqs.clone();
+            let respond = respond.clone();
+            async move {
+                let method = req.method().to_string();
+                let path_and_query = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.to_string())
+                    .unwrap_or_default();
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                let (status, json) = respond(&method, &path_and_query);
+                reqs.lock().unwrap().push((method, path_and_query, body));
+                (status, axum::Json(json))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// Session whose access token is fresh, so `access_token()` skips the
+    /// refresh flow (which would hit the real TOKEN_URL) and the calendar
+    /// calls go straight to the loopback recorder.
+    fn make_rsvp_session(token_path: PathBuf) -> OutlookSession {
+        let mut session = make_outlook_session_with_token_file(token_path);
+        session.token.get_mut().token_expiry = Utc::now() + chrono::Duration::hours(1);
+        session
+    }
+
+    /// A cross-provider invite as it reaches the RSVP path: parsed from ICS
+    /// with a TZID wall time, so the tests pin the wall-time→UTC-instant
+    /// conversion end to end (15:00 America/Chicago in July == 20:00Z).
+    fn probe_calendar_event() -> CalendarEvent {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "METHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:wca3-pin@example.test\r\n",
+            "DTSTART;TZID=America/Chicago:20260730T150000\r\n",
+            "DTEND;TZID=America/Chicago:20260730T153000\r\n",
+            "SUMMARY:wca3 pin\r\n",
+            "ORGANIZER:mailto:organizer@gmail.example\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@outlook.example\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        crate::calendar::parse_ics(ics).expect("probe ICS parses")
+    }
+
+    /// True for the iCalUId-filter lookup (Exchange-processed events).
+    fn is_processed_lookup(path: &str) -> bool {
+        path.contains("iCalUId")
+    }
+
+    /// True for the `ICS_UID_PROP` extended-property lookup (self-created
+    /// copies).
+    fn is_self_created_lookup(path: &str) -> bool {
+        path.contains("supervillainIcsUid")
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_checks_uid_then_posts_utc_instant_without_attendees() {
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                assert_eq!(path, "/me/events");
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-1"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+        let event = probe_calendar_event();
+
+        let added = add_to_calendar_at(&session, &base, &event, false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "processed lookup, self-created lookup, create: {reqs:?}"
+        );
+        assert_eq!(reqs[0].0, "GET");
+        assert!(
+            reqs[0].1.starts_with("/me/events?") && is_processed_lookup(&reqs[0].1),
+            "first existence check must filter by iCalUId: {}",
+            reqs[0].1
+        );
+        assert!(reqs[0].1.contains("wca3-pin@example.test"));
+        assert_eq!(reqs[1].0, "GET");
+        assert!(
+            is_self_created_lookup(&reqs[1].1),
+            "second existence check must filter by the ICS-UID extended property: {}",
+            reqs[1].1
+        );
+        let (method, path, body) = &reqs[2];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/me/events");
+        // 15:00 America/Chicago (CDT, UTC-5) == 20:00 UTC — the instant must
+        // survive the ICS→Graph conversion.
+        assert_eq!(body["start"]["dateTime"], "2026-07-30T20:00:00");
+        assert_eq!(body["start"]["timeZone"], "UTC");
+        assert_eq!(body["end"]["dateTime"], "2026-07-30T20:30:00");
+        assert_eq!(body["subject"], "wca3 pin");
+        assert!(
+            body.get("attendees").is_none(),
+            "create body must not carry attendees — Exchange would email them"
+        );
+        // The tag that makes this copy findable (and thus removable /
+        // dedupe-able) later — Graph ignores iCalUId on create.
+        assert_eq!(
+            body["singleValueExtendedProperties"][0]["id"], ICS_UID_PROP,
+            "create body must tag the event with the ICS UID extended property"
+        );
+        assert_eq!(
+            body["singleValueExtendedProperties"][0]["value"],
+            "wca3-pin@example.test"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_skips_create_when_event_exists() {
+        let (base, requests) = spawn_graph_recorder(|_method, path| {
+            if is_processed_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "existing-1"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added, "already-present is success (idempotent add)");
+        let reqs = requests.lock().unwrap();
+        assert!(
+            reqs.iter().all(|(m, _, _)| m == "GET"),
+            "an Exchange-processed invite must not be re-created or deleted: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_cleans_up_self_created_copy_when_processed_event_coexists() {
+        // roborev 422 #1: a tagged copy (created for an unprocessed forward)
+        // and an Exchange-processed event of the same UID can coexist —
+        // e.g. Exchange later processes a directly-delivered update. The
+        // stale copy is ours and must be cleaned up, not left as a visible
+        // duplicate meeting.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_processed_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "processed-1"}]}),
+                )
+            } else if method == "GET" {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert!(
+            reqs.iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/me/events/mine-1"),
+            "the stale self-created copy must be deleted: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "the processed event satisfies the add — no create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_cleanup_failure_is_best_effort_when_add_is_satisfied() {
+        // roborev 424 #1 pinned (roborev 425): when the calendar already
+        // holds a copy that satisfies the add — the Exchange-processed
+        // event, or the one kept self-created copy — a failed cleanup
+        // DELETE must warn-and-continue, not fail the whole add: the
+        // meeting is present and current, and the tagged copy stays
+        // findable for the next open to retry.
+        for (processed, self_created) in [
+            // Coexistence branch: processed event + stale tagged copy.
+            (
+                serde_json::json!([{"id": "processed-1"}]),
+                serde_json::json!([{"id": "mine-1"}]),
+            ),
+            // Dedupe branch: kept copy + extra from a racing create.
+            (
+                serde_json::json!([]),
+                serde_json::json!([{"id": "mine-1"}, {"id": "mine-2"}]),
+            ),
+        ] {
+            let (base, requests) = spawn_graph_recorder(move |method, path| {
+                if method == "GET" && is_processed_lookup(path) {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": processed.clone()}),
+                    )
+                } else if method == "GET" {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": self_created.clone()}),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({"error": {"code": "ErrorInternalServerError", "message": "boom"}}),
+                    )
+                }
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let session = make_rsvp_session(dir.path().join("t.json"));
+
+            let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+                .await
+                .expect("best-effort cleanup failure must not fail the add");
+
+            assert!(added);
+            let reqs = requests.lock().unwrap();
+            assert!(
+                reqs.iter().any(|(m, _, _)| m == "DELETE"),
+                "cleanup must have been attempted: {reqs:?}"
+            );
+            assert!(
+                !reqs.iter().any(|(m, _, _)| m == "POST"),
+                "a satisfied add must not create anything: {reqs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_delete_failure_aborts_before_create() {
+        // roborev 422 #2: if deleting our old copy fails, the create must
+        // not run — otherwise the calendar ends up with two copies of the
+        // meeting and the caller is told the update succeeded.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({"error": {"code": "ErrorInternalServerError", "message": "boom"}}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let result = add_to_calendar_at(&session, &base, &probe_calendar_event(), true).await;
+
+        assert!(result.is_err(), "failed delete must surface as Err");
+        let reqs = requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "no create may follow a failed delete: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_transient_lookup_error_yields_err_and_no_duplicate_post() {
+        // kata 8qdw pinned under the RSVP path: a 429/5xx on the iCalUId
+        // lookup must surface as Err — not read as "event not found" and
+        // POST a duplicate.
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"error": {"code": "ServiceUnavailable", "message": "try later"}}),
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let result = add_to_calendar_at(&session, &base, &probe_calendar_event(), false).await;
+
+        assert!(result.is_err(), "transient lookup failure must be Err");
+        let reqs = requests.lock().unwrap();
+        assert!(
+            !reqs
+                .iter()
+                .any(|(m, p, _)| m == "POST" && p == "/me/events"),
+            "no create may fire after a failed lookup: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_add_skips_create_when_self_created_copy_exists() {
+        // Without the extended-property lookup, every open of an
+        // unprocessed-invite email re-created the event: the app's own
+        // copies were invisible to the iCalUId filter, so copies
+        // accumulated forever (roborev 419 #2).
+        let (base, requests) = spawn_graph_recorder(|_method, path| {
+            if is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "a self-created copy must satisfy the dedupe check — no duplicate create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_dedupe_keeps_one_copy_and_deletes_only_extras() {
+        // roborev 424 #2: the non-overwrite dedupe path must delete exactly
+        // the extras left by racing check-then-create — not the copy it
+        // keeps, and not skip cleanup — and must not create anything.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}, {"id": "mine-2"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), false)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let deleted: Vec<&str> = reqs
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["/me/events/mine-2"],
+            "exactly the extra copy is deleted, the kept one survives: {reqs:?}"
+        );
+        assert!(
+            !reqs.iter().any(|(m, _, _)| m == "POST"),
+            "the kept copy satisfies the add — no create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_replaces_every_self_created_copy() {
+        // roborev 424 #2: an invite update over multiple racing copies must
+        // delete them all before the single create.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}, {"id": "mine-2"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else if method == "DELETE" {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            } else {
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-3"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let ops: Vec<(&str, &str)> = reqs
+            .iter()
+            .filter(|(m, _, _)| m != "GET")
+            .map(|(m, p, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("DELETE", "/me/events/mine-1"),
+                ("DELETE", "/me/events/mine-2"),
+                ("POST", "/me/events"),
+            ],
+            "both copies deleted before the single create: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_replaces_self_created_copy() {
+        // Invite update over a self-created copy: delete ours, then create
+        // the new version.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else if method == "DELETE" {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            } else {
+                (
+                    axum::http::StatusCode::CREATED,
+                    serde_json::json!({"id": "created-2"}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        let ops: Vec<(&str, &str)> = reqs
+            .iter()
+            .map(|(m, p, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(ops[2], ("DELETE", "/me/events/mine-1"), "all: {ops:?}");
+        assert_eq!(ops[3], ("POST", "/me/events"));
+    }
+
+    #[tokio::test]
+    async fn add_overwrite_never_deletes_exchange_processed_event() {
+        // roborev 419 #1: an invite update must not remove+re-add an
+        // Exchange-processed event — Exchange applies organizer updates to
+        // it itself, and it is the only copy Graph can RSVP. Deleting it
+        // would replace the meeting with an un-RSVP-able orphan.
+        let (base, requests) = spawn_graph_recorder(|_method, path| {
+            if is_processed_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "processed-1"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let added = add_to_calendar_at(&session, &base, &probe_calendar_event(), true)
+            .await
+            .unwrap();
+
+        assert!(added);
+        let reqs = requests.lock().unwrap();
+        assert!(
+            reqs.iter().all(|(m, _, _)| m == "GET"),
+            "found via iCalUId ⇒ hands off, even in overwrite mode: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_self_created_copy_found_by_extended_property() {
+        // A cancellation must be able to remove the app's own copy, which
+        // only the extended-property filter can find (roborev 419 #2).
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_self_created_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}]}),
+                )
+            } else if method == "GET" {
+                (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let removed = remove_from_calendar_at(&session, &base, "wca3-pin@example.test")
+            .await
+            .unwrap();
+
+        assert!(removed);
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.last().map(|(m, p, _)| (m.as_str(), p.as_str())),
+            Some(("DELETE", "/me/events/mine-1")),
+            "all: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_every_copy_processed_and_self_created() {
+        // roborev 422 #1/#3: a cancellation is processed once, so removal
+        // must delete every copy in one pass — the Exchange-processed event
+        // AND all tagged copies (racing check-then-create can leave several)
+        // — not short-circuit on the first hit.
+        let (base, requests) = spawn_graph_recorder(|method, path| {
+            if method == "GET" && is_processed_lookup(path) {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "processed-1"}]}),
+                )
+            } else if method == "GET" {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "mine-1"}, {"id": "mine-2"}]}),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, serde_json::json!({}))
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let removed = remove_from_calendar_at(&session, &base, "wca3-pin@example.test")
+            .await
+            .unwrap();
+
+        assert!(removed);
+        let reqs = requests.lock().unwrap();
+        let deleted: Vec<&str> = reqs
+            .iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![
+                "/me/events/processed-1",
+                "/me/events/mine-1",
+                "/me/events/mine-2"
+            ],
+            "all: {reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_posts_action_with_send_response_true() {
+        for (status, action) in [
+            (crate::types::RsvpStatus::Accepted, "accept"),
+            (crate::types::RsvpStatus::Tentative, "tentativelyAccept"),
+            (crate::types::RsvpStatus::Declined, "decline"),
+        ] {
+            let (base, requests) = spawn_graph_recorder(|method, _path| {
+                if method == "GET" {
+                    (
+                        axum::http::StatusCode::OK,
+                        serde_json::json!({"value": [{"id": "evt-42"}]}),
+                    )
+                } else {
+                    (axum::http::StatusCode::ACCEPTED, serde_json::json!({}))
+                }
+            })
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let session = make_rsvp_session(dir.path().join("t.json"));
+
+            let responded = respond_to_event_at(&session, &base, "wca3-pin@example.test", &status)
+                .await
+                .unwrap();
+
+            assert!(responded);
+            let reqs = requests.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "lookup then respond: {reqs:?}");
+            let (method, path, body) = &reqs[1];
+            assert_eq!(method, "POST");
+            assert_eq!(
+                path,
+                &format!("/me/events/evt-42/{action}"),
+                "RSVP action path for {status:?}"
+            );
+            // sendResponse:true is what makes Exchange email the organizer
+            // the iTIP REPLY — the entire cross-provider notification hangs
+            // on this field.
+            assert_eq!(body, &serde_json::json!({"sendResponse": true}));
+        }
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_returns_false_when_event_not_found() {
+        let (base, requests) = spawn_graph_recorder(|_method, _path| {
+            (axum::http::StatusCode::OK, serde_json::json!({"value": []}))
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let responded = respond_to_event_at(
+            &session,
+            &base,
+            "missing@example.test",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !responded,
+            "no event ⇒ Ok(false), the caller's cue that Exchange never processed the invite"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1, "no action POST may fire");
+    }
+
+    #[tokio::test]
+    async fn rsvp_respond_graph_rejection_is_err_not_false() {
+        // Graph 400s an accept on a self-created copy ("you're the meeting
+        // organizer" — reproduced live, kata wca3). That's a failed response,
+        // which must be distinguishable from "nothing to respond to".
+        let (base, _requests) = spawn_graph_recorder(|method, _path| {
+            if method == "GET" {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"value": [{"id": "evt-42"}]}),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": {"code": "ErrorInvalidRequest",
+                        "message": "You can't respond to this meeting because you're the meeting organizer."}}),
+                )
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let session = make_rsvp_session(dir.path().join("t.json"));
+
+        let result = respond_to_event_at(
+            &session,
+            &base,
+            "wca3-pin@example.test",
+            &crate::types::RsvpStatus::Accepted,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a rejected RSVP must be Err, not Ok(false)"
+        );
     }
 
     // ---- ensure_token_at (kata 0ch3) ----
@@ -4478,6 +5433,62 @@ mod tests {
         }]);
         let m = parse_graph_message(&j, true);
         assert!(m.has_calendar);
+    }
+
+    #[test]
+    fn parse_graph_message_application_ics_attachment_sets_has_calendar() {
+        // kata wca3 (verified live): Exchange exposes the ICS of a processed
+        // meeting request as contentType "application/ics", not
+        // "text/calendar". Matching only the latter made every real invite
+        // invisible — no RSVP UI, and /rsvp 404'd on "No calendar data".
+        let mut j = graph_message_minimal();
+        j["hasAttachments"] = serde_json::json!(true);
+        j["attachments"] = serde_json::json!([{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "id": "ATT_ICS",
+            "name": "invite.ics",
+            "contentType": "application/ics",
+            "size": 1585
+        }]);
+        let m = parse_graph_message(&j, true);
+        assert!(m.has_calendar);
+    }
+
+    #[test]
+    fn is_calendar_mime_matches_ics_variants_only() {
+        for ct in [
+            "text/calendar",
+            "TEXT/CALENDAR",
+            "application/ics",
+            "Application/ICS",
+            "text/calendar; charset=\"UTF-8\"; method=REQUEST",
+            "application/ics; name=invite.ics",
+        ] {
+            assert!(is_calendar_mime(ct), "{ct} should be calendar");
+        }
+        for ct in ["text/plain", "application/pdf", "text/calendarx", ""] {
+            assert!(!is_calendar_mime(ct), "{ct} should not be calendar");
+        }
+    }
+
+    #[test]
+    fn find_calendar_attachment_id_picks_application_ics() {
+        let listing = serde_json::json!({"value": [
+            {"id": "ATT_PDF", "contentType": "application/pdf"},
+            {"id": "ATT_ICS", "contentType": "application/ics"},
+        ]});
+        assert_eq!(
+            find_calendar_attachment_id(&listing).as_deref(),
+            Some("ATT_ICS")
+        );
+    }
+
+    #[test]
+    fn find_calendar_attachment_id_none_when_absent() {
+        let listing = serde_json::json!({"value": [
+            {"id": "ATT_PDF", "contentType": "application/pdf"},
+        ]});
+        assert_eq!(find_calendar_attachment_id(&listing), None);
     }
 
     #[test]
