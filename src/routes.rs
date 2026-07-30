@@ -10436,6 +10436,106 @@ white   = '#fdf6e3'
             "no CalDAV HTTP request may be issued when the app password is unconfigured"
         );
     }
+
+    // --- kata dd0d: Remind Me red contracts ---
+
+    #[test]
+    fn remind_h_key_opens_picker() {
+        let body = js_fn_body(APP_JS, "function handleNormalModeKey(");
+        assert!(
+            body.contains("case 'h':"),
+            "H must open the Remind Me picker"
+        );
+        let h = body.split("case 'h':").nth(1).unwrap_or_default();
+        assert!(
+            h.contains("openRemindPicker"),
+            "H must call openRemindPicker"
+        );
+    }
+
+    #[test]
+    fn remind_tab_toggles_regardless() {
+        let body = js_fn_body(APP_JS, "function openRemindPicker(");
+        assert!(body.contains("Tab"), "the picker must handle Tab");
+        assert!(
+            body.contains("regardless") || body.contains("remindMode"),
+            "Tab must toggle reminder mode"
+        );
+    }
+
+    #[test]
+    fn remind_picker_renders_quick_options() {
+        let body = js_fn_body(APP_JS, "function openRemindPicker(");
+        for label in ["Tomorrow", "Next week", "Pick a date"] {
+            assert!(
+                body.contains(label),
+                "picker must render quick option {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn remind_is_optimistic_with_undo() {
+        let body = js_fn_body(APP_JS, "async function remindEmail(");
+        assert!(
+            body.contains("pushUndo("),
+            "remindEmail must push an undo entry"
+        );
+        assert!(
+            body.contains("removeEmailFromList("),
+            "remindEmail must remove optimistically"
+        );
+    }
+
+    #[test]
+    fn remind_toast_conveys_mode() {
+        let body = js_fn_body(APP_JS, "async function remindEmail(");
+        assert!(
+            body.contains("if no reply") && body.contains("regardless"),
+            "reminder feedback must distinguish modes"
+        );
+    }
+
+    #[test]
+    fn remind_sidebar_entry_exists() {
+        let body = js_fn_body(APP_JS, "function renderMailboxes(");
+        assert!(
+            body.contains("Reminders"),
+            "sidebar must include Reminders outside role ordering"
+        );
+        assert!(
+            body.contains("state.reminders"),
+            "sidebar count must come from reminder state"
+        );
+    }
+
+    #[test]
+    fn remind_reverts_on_api_failure() {
+        let body = js_fn_body(APP_JS, "async function remindEmail(");
+        assert!(
+            body.contains("catch") && body.contains("state.undoStack.pop()"),
+            "remindEmail must revert its optimistic update"
+        );
+    }
+
+    #[test]
+    fn remind_settings_command_in_palette() {
+        let body = js_fn_body(APP_JS, "function commandsForView(");
+        assert!(
+            body.contains("Reminder Settings"),
+            "settings palette must expose Reminder Settings"
+        );
+    }
+
+    #[test]
+    fn remind_routes_and_persistence_are_wired() {
+        let src = include_str!("routes.rs");
+        assert!(src.contains("/api/emails/{email_id}/remind"));
+        assert!(src.contains("/api/emails/{email_id}/cancel-reminder"));
+        assert!(src.contains("/api/reminders"));
+        assert!(src.contains("/api/reminder-settings"));
+        assert!(src.contains("ReminderBody"));
+    }
 }
 
 // External dep for theme path
