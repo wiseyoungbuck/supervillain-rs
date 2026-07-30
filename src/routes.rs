@@ -5978,9 +5978,10 @@ mod tests {
             "desktop and mobile providerIcon must remain byte-identical"
         );
         assert!(
-            desktop.contains(r#"alt="${icon.label}""#)
-                && desktop.contains(r#"title="${icon.label}""#),
-            "known provider icons need an accessible name and hover label"
+            desktop.contains("escapeAttr(icon.label)")
+                && desktop.contains(r#"alt="${escapedLabel}""#)
+                && desktop.contains(r#"title="${escapedLabel}""#),
+            "known provider icons need attribute-escaped accessible and hover labels"
         );
         assert!(
             desktop.contains("provider-icon-fallback") && desktop.contains("escapeHtml(label)"),
@@ -6029,8 +6030,8 @@ mod tests {
     fn mobile_account_labels_render_provider_icons() {
         assert!(
             js_fn_body(MOBILE_APP_JS, "function renderAccountPicker(")
-                .contains("providerIcon(a.provider)"),
-            "mobile account selector must render the provider mark"
+                .contains("a.provider ? providerIcon(a.provider) : ''"),
+            "mobile account selector must render a provider mark only when provider data exists"
         );
         for path in [
             "/provider-icons/gmail.svg",

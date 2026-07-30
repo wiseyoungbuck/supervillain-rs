@@ -5215,7 +5215,8 @@ function providerIcon(provider) {
     const label = typeof provider === 'string' && provider ? provider : 'Unknown provider';
     const icon = PROVIDER_ICONS.get(label.toLowerCase());
     if (!icon) return `<span class="provider-icon-fallback">${escapeHtml(label)}</span>`;
-    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${icon.label}" title="${icon.label}">`;
+    const escapedLabel = escapeAttr(icon.label);
+    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${escapedLabel}" title="${escapedLabel}">`;
 }
 
 // escapeHtml is safe for text content but textContent's serializer doesn't
