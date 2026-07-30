@@ -335,22 +335,22 @@ pub async fn thread_has_new_reply(
     session: &provider::ProviderSession,
     email_id: &str,
     since: DateTime<Utc>,
-) -> bool {
+) -> Result<bool, Error> {
     let original =
         match provider::get_emails(session, &[email_id.to_string()], false, None, false).await {
             Ok(emails) => match emails.into_iter().next() {
                 Some(email) => email,
-                None => return false,
+                None => return Ok(false),
             },
             Err(error) => {
                 tracing::warn!("reply gate could not fetch reminder email: {error}");
-                return false;
+                return Ok(false);
             }
         };
     let thread_id = original.thread_id.trim();
     let subject = normalize_subject(&original.subject);
     if thread_id.is_empty() && subject.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let query = ParsedQuery {
@@ -363,17 +363,17 @@ pub async fn thread_has_new_reply(
         Ok(ids) => ids,
         Err(error) => {
             tracing::warn!("reply gate query failed: {error}");
-            return false;
+            return Ok(false);
         }
     };
     let emails = match provider::get_emails(session, &ids, false, None, false).await {
         Ok(emails) => emails,
         Err(error) => {
             tracing::warn!("reply gate fetch failed: {error}");
-            return false;
+            return Ok(false);
         }
     };
-    emails.into_iter().any(|email| {
+    Ok(emails.into_iter().any(|email| {
         email.id != original.id
             && email.received_at > since
             && (if !thread_id.is_empty() {
@@ -385,7 +385,7 @@ pub async fn thread_has_new_reply(
                 .from
                 .iter()
                 .any(|from| from.email.eq_ignore_ascii_case(session.username()))
-    })
+    }))
 }
 
 fn normalize_subject(subject: &str) -> String {
@@ -445,7 +445,9 @@ pub async fn tick_reminder_daemon(
         };
         let session = session_lock.read().await;
         let has_reply = if record.mode == ReminderMode::IfNoReply {
-            thread_has_new_reply(&session, &record.email_id, record.snoozed_at).await
+            thread_has_new_reply(&session, &record.email_id, record.snoozed_at)
+                .await
+                .unwrap_or(false)
         } else {
             false
         };
