@@ -1191,6 +1191,40 @@ pub async fn get_mailboxes(session: &OutlookSession) -> Result<Vec<Mailbox>, Err
     Ok(folders)
 }
 
+/// Find or create the provider-native Outlook folder used as Reminders.
+pub async fn ensure_mailbox_by_name(session: &OutlookSession, name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::BadRequest("Mailbox name must not be empty".into()));
+    }
+    if let Some(folder) = get_mailboxes(session)
+        .await?
+        .into_iter()
+        .find(|m| m.name == name)
+    {
+        return Ok(folder.id);
+    }
+    let token = access_token(session).await?;
+    let resp = session
+        .client
+        .post(format!("{GRAPH_BASE}/me/mailFolders"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "displayName": name }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error("mailFolders.create", status, &text));
+    }
+    let created: serde_json::Value = resp.json().await?;
+    let id = created["id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Error::Internal("Graph folder create response missing id".into()))?;
+    invalidate_folder_cache(session).await;
+    Ok(id)
+}
+
 /// Resolve each well-known alias (`/me/mailFolders/inbox` etc.) to its
 /// opaque folder id. Lookups run concurrently; a failed lookup drops that
 /// alias rather than failing the whole mailboxes fetch, so Graph

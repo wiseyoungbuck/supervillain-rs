@@ -513,6 +513,20 @@
             </div>
         </div>
 
+        <!-- Remind Me picker (H) -->
+        <div id="remind-modal" class="hidden" role="dialog" aria-label="Remind Me"></div>
+
+        <!-- Reminder Settings -->
+        <div id="reminder-settings-modal" class="hidden" role="dialog" aria-label="Reminder Settings">
+            <div class="modal-content">
+                <h3>Reminder Settings</h3>
+                <div class="modal-field"><label for="reminder-default-time">Default time for date-only reminders</label><input id="reminder-default-time" type="time" value="08:00"></div>
+                <div class="modal-field"><label><input id="reminder-regardless-default" type="checkbox"> Remind regardless by default</label></div>
+                <div class="modal-field"><label><input id="reminder-skip-weekends" type="checkbox"> Skip weekends</label></div>
+                <div class="modal-buttons"><button id="reminder-settings-cancel" type="button">Cancel</button><button id="reminder-settings-save" type="button">Save</button></div>
+            </div>
+        </div>
+
         <!-- Command palette -->
         <div id="command-palette" class="hidden">
             <input type="text" id="command-input" placeholder="Type a command...">
@@ -543,6 +557,7 @@
                 <div class="help-section">
                     <h3>Actions</h3>
                     <div class="shortcut"><kbd>e</kbd> Archive</div>
+                    <div class="shortcut"><kbd>h</kbd> Remind Me (<kbd>Tab</kbd> toggles Regardless)</div>
                     <div class="shortcut"><kbd>#</kbd> Trash</div>
                     <div class="shortcut"><kbd>r</kbd> Reply</div>
                     <div class="shortcut"><kbd>a</kbd> Reply all</div>

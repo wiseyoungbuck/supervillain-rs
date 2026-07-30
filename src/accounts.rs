@@ -2675,6 +2675,11 @@ api-token = tok
             }]),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
             prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
+            reminders: crate::reminders::ReminderStore::new(
+                std::env::temp_dir().join("supervillain-test-reminders.json"),
+            ),
+            reminder_settings_path: std::env::temp_dir()
+                .join("supervillain-test-reminder-settings.json"),
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -2843,6 +2848,11 @@ api-token = tok
             config_error_baseline: std::sync::RwLock::new(Vec::new()),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
             prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
+            reminders: crate::reminders::ReminderStore::new(
+                std::env::temp_dir().join("supervillain-test-reminders.json"),
+            ),
+            reminder_settings_path: std::env::temp_dir()
+                .join("supervillain-test-reminder-settings.json"),
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -3155,6 +3165,11 @@ api-token = tok
                 "supervillain-test-prefetch-{}.json",
                 uuid::Uuid::new_v4()
             )),
+            reminders: crate::reminders::ReminderStore::new(
+                std::env::temp_dir().join("supervillain-test-reminders.json"),
+            ),
+            reminder_settings_path: std::env::temp_dir()
+                .join("supervillain-test-reminder-settings.json"),
         })
     }
 

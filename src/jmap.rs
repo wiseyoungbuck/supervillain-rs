@@ -356,6 +356,62 @@ pub async fn get_mailboxes(s: &JmapSession) -> Result<Vec<Mailbox>, Error> {
     extract_list::<Mailbox>(&resp, 0, "Mailbox/get")
 }
 
+/// Find a named mailbox or create it with the JMAP `Mailbox/set` primitive.
+///
+/// Mailbox names are provider-neutral in the rest of the application.  The
+/// returned id is cached on the session so subsequent Remind Me actions can
+/// move directly without creating duplicate folders.
+pub async fn ensure_mailbox_by_name(s: &mut JmapSession, name: &str) -> Result<String, Error> {
+    if name.is_empty() {
+        return Err(Error::BadRequest("Mailbox name must not be empty".into()));
+    }
+    if let Some(mailbox) = s
+        .mailbox_cache
+        .values()
+        .find(|mailbox| mailbox.name == name)
+    {
+        return Ok(mailbox.id.clone());
+    }
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?.clone();
+    let mailboxes = get_mailboxes(s).await?;
+    for mailbox in mailboxes {
+        let id = mailbox.id.clone();
+        s.mailbox_cache.insert(id.clone(), mailbox.clone());
+        if mailbox.name == name {
+            return Ok(id);
+        }
+    }
+
+    let resp = jmap_call(
+        s,
+        vec![serde_json::json!([
+            "Mailbox/set",
+            {
+                "accountId": account_id,
+                "create": { "reminders": { "name": name } }
+            },
+            "0"
+        ])],
+    )
+    .await?;
+    let id = resp["methodResponses"][0][1]["created"]["reminders"]["id"]
+        .as_str()
+        .ok_or_else(|| Error::Internal("Mailbox/set response missing created mailbox id".into()))?
+        .to_string();
+    s.mailbox_cache.insert(
+        id.clone(),
+        Mailbox {
+            id: id.clone(),
+            name: name.to_string(),
+            role: None,
+            total_emails: 0,
+            unread_emails: 0,
+            parent_id: None,
+        },
+    );
+    Ok(id)
+}
+
 pub async fn get_identities(s: &mut JmapSession) -> Result<Vec<Identity>, Error> {
     if let Some(ref ids) = s.identities {
         return Ok(ids.clone());
@@ -1085,6 +1141,41 @@ async fn move_to_role(s: &JmapSession, email_id: &str, role: &str) -> Result<boo
         .is_some_and(|obj| obj.contains_key(email_id));
 
     Ok(updated)
+}
+
+/// Return a reminder to Inbox while removing the provider-native Reminders
+/// mailbox membership as well as the usual source hint.
+pub async fn move_reminder_to_inbox(s: &JmapSession, email_id: &str) -> Result<bool, Error> {
+    let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
+    let mailboxes = get_mailboxes(s).await?;
+    let inbox_id = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.role.as_deref() == Some("inbox"))
+        .map(|mailbox| mailbox.id.clone())
+        .ok_or_else(|| Error::Internal("No Inbox mailbox".into()))?;
+    let reminders_id = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.name == "Reminders")
+        .map(|mailbox| mailbox.id.clone());
+    let mut patch = build_mailbox_move_patch(&inbox_id, None);
+    if let Some(reminders_id) = reminders_id {
+        patch.insert(
+            format!("mailboxIds/{reminders_id}"),
+            serde_json::Value::Null,
+        );
+    }
+    let resp = jmap_call(
+        s,
+        vec![serde_json::json!([
+            "Email/set",
+            { "accountId": account_id, "update": { email_id: patch } },
+            "0"
+        ])],
+    )
+    .await?;
+    Ok(resp["methodResponses"][0][1]["updated"]
+        .as_object()
+        .is_some_and(|updated| updated.contains_key(email_id)))
 }
 
 pub async fn move_to_mailbox(
@@ -7121,6 +7212,70 @@ END:VCALENDAR";
             recorded_by_method(&rec, "PUT").len(),
             1,
             "only the retried (successful) attempt may PUT: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_mailbox_by_name_creates_on_loopback_and_reuses_cache() {
+        use std::sync::{Arc, Mutex};
+
+        let calls: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_handler = calls.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let calls = calls_for_handler.clone();
+            async move {
+                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                calls.lock().unwrap().push(payload);
+                let method = calls.lock().unwrap().last().unwrap()["methodCalls"][0][0]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let response = if method == "Mailbox/get" {
+                    serde_json::json!({
+                        "methodResponses": [["Mailbox/get", {"list": [{"id":"inbox","name":"Inbox","role":"inbox","totalEmails":0,"unreadEmails":0} ]}, "0"]]
+                    })
+                } else {
+                    serde_json::json!({
+                        "methodResponses": [["Mailbox/set", {"created": {"reminders": {"id":"reminders-id"}}}, "0"]]
+                    })
+                };
+                (axum::http::StatusCode::OK, axum::Json(response))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut session = JmapSession::new("user@fastmail.com", "token", None);
+        session.api_url = Some(format!("http://{address}"));
+        session.account_id = Some("account".into());
+        assert_eq!(
+            ensure_mailbox_by_name(&mut session, "Reminders")
+                .await
+                .unwrap(),
+            "reminders-id"
+        );
+        let calls_snapshot = calls.lock().unwrap().clone();
+        assert_eq!(calls_snapshot.len(), 2);
+        assert_eq!(calls_snapshot[1]["methodCalls"][0][0], "Mailbox/set");
+        assert_eq!(
+            calls_snapshot[1]["methodCalls"][0][1]["create"]["reminders"]["name"],
+            "Reminders"
+        );
+
+        calls.lock().unwrap().clear();
+        assert_eq!(
+            ensure_mailbox_by_name(&mut session, "Reminders")
+                .await
+                .unwrap(),
+            "reminders-id"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cached mailbox must avoid a second create/fetch"
         );
     }
 }

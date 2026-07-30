@@ -58,6 +58,62 @@ pub async fn get_mailboxes(s: &ProviderSession) -> Result<Vec<Mailbox>, Error> {
     }
 }
 
+/// Ensure the shared Reminders mailbox/label exists using the provider's
+/// native folder primitive.
+pub async fn ensure_reminders_mailbox(s: &mut ProviderSession) -> Result<String, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::ensure_mailbox_by_name(s, "Reminders").await,
+        ProviderSession::Outlook(s) => outlook::ensure_mailbox_by_name(s, "Reminders").await,
+        ProviderSession::Gmail(s) => gmail::ensure_mailbox_by_name(s, "Reminders").await,
+    }
+}
+
+/// Move one message into the provider-native Reminders mailbox. All folder
+/// creation and move mechanics stay behind this dispatch boundary.
+pub async fn remind(s: &mut ProviderSession, email_id: &str) -> Result<bool, Error> {
+    let reminders_id = ensure_reminders_mailbox(s).await?;
+    move_to_mailbox(s, email_id, &reminders_id).await
+}
+
+/// Move a reminder back to the Inbox and let the caller delete its durable
+/// schedule row.
+pub async fn cancel_reminder(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
+    move_to_inbox(s, email_id).await
+}
+
+/// Move a reminder back to the Inbox. The Inbox is deliberately resolved by
+/// role/name rather than using the recorded source: Superhuman always wakes
+/// into Inbox, even when the message was originally filed elsewhere.
+pub async fn move_to_inbox(s: &ProviderSession, email_id: &str) -> Result<bool, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::move_reminder_to_inbox(s, email_id).await,
+        ProviderSession::Gmail(s) => gmail::move_reminder_to_inbox(s, email_id).await,
+        ProviderSession::Outlook(s) => {
+            let inbox = outlook::get_mailboxes(s)
+                .await?
+                .into_iter()
+                .find(|mailbox| mailbox.role.as_deref() == Some("inbox"))
+                .ok_or_else(|| Error::Internal("No Inbox mailbox".into()))?;
+            outlook::move_to_mailbox(s, email_id, &inbox.id).await
+        }
+    }
+}
+
+/// Fetch the messages currently resting in the provider-native Reminders
+/// mailbox. Missing mailbox is an empty list, not an error: no reminder has
+/// been created yet for this account.
+pub async fn list_reminders(s: &ProviderSession) -> Result<Vec<Email>, Error> {
+    let mailbox = get_mailboxes(s)
+        .await?
+        .into_iter()
+        .find(|mailbox| mailbox.name == "Reminders");
+    let Some(mailbox) = mailbox else {
+        return Ok(Vec::new());
+    };
+    let ids = query_emails(s, Some(&mailbox.id), 500, 0, None, EmailSort::DateDesc).await?;
+    get_emails(s, &ids, false, None, false).await
+}
+
 pub async fn get_identities(s: &mut ProviderSession) -> Result<Vec<Identity>, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::get_identities(s).await,

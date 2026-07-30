@@ -24,6 +24,11 @@ const state = {
     contactAcField: null,     // 'to' | 'cc' | null — which compose field's dropdown is open
     contactAcIndex: 0,        // highlighted row in the open contact dropdown
     undoStack: [],
+    reminders: [],
+    remindPickerOpen: false,
+    remindMode: 'if-no-reply',
+    remindEmailId: null,
+    reminderSettings: { default_time: '08:00', regardless_default: false, skip_weekends: false },
     // Threading / conversation grouping in the desktop list view (kata 64z6,
     // task B7) — client-side v1, no server Thread/get. threadGroups is built
     // incrementally at APPEND time (see extendThreadGroups / rebuildThreadGroups)
@@ -192,6 +197,8 @@ function init() {
     els.splitSave = document.getElementById('split-save');
     els.splitPatternField = document.getElementById('split-pattern-field');
     els.splitHint = document.getElementById('split-hint');
+    els.remindModal = document.getElementById('remind-modal');
+    els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
     els.calendarEvent = document.getElementById('calendar-event');
     els.calTitle = document.getElementById('cal-title');
     els.calDatetime = document.getElementById('cal-datetime');
@@ -317,6 +324,10 @@ function init() {
     els.clearAllFilters.addEventListener('click', clearAllFilters);
     els.undoButton.addEventListener('click', performUndo);
     els.splitCancel.addEventListener('click', closeSplitModal);
+    document.getElementById('remind-cancel')?.addEventListener('click', closeRemindPicker);
+    document.getElementById('remind-confirm')?.addEventListener('click', confirmRemindPicker);
+    document.getElementById('reminder-settings-cancel')?.addEventListener('click', closeReminderSettings);
+    document.getElementById('reminder-settings-save')?.addEventListener('click', saveReminderSettings);
     els.splitSave.addEventListener('click', saveSplit);
     els.splitFilterType.addEventListener('change', updateSplitModalFields);
     els.rsvpAccept.addEventListener('click', () => rsvpToEvent('ACCEPTED'));
@@ -331,6 +342,27 @@ function init() {
     els.emailList.addEventListener('click', (e) => {
         // Threading (kata 64z6): a click on a collapsed thread's count badge
         // toggles inline expansion instead of opening the newest message.
+        const wakeButton = e.target.closest('.wake-now-btn');
+        if (wakeButton) {
+            e.preventDefault();
+            e.stopPropagation();
+            wakeReminder(wakeButton.dataset.id);
+            return;
+        }
+        const remindAgainButton = e.target.closest('.remind-again-btn');
+        if (remindAgainButton) {
+            e.preventDefault();
+            e.stopPropagation();
+            openRemindPicker(remindAgainButton.dataset.id);
+            return;
+        }
+        const archiveReminderButton = e.target.closest('.archive-reminder-btn');
+        if (archiveReminderButton) {
+            e.preventDefault();
+            e.stopPropagation();
+            archiveReminder(archiveReminderButton.dataset.id);
+            return;
+        }
         const countBadge = e.target.closest('.email-thread-count');
         if (countBadge) {
             toggleThreadExpand(countBadge.dataset.thread);
@@ -512,6 +544,9 @@ function init() {
     // Load data
     loadTheme();
     loadAccounts();
+    // Wake notifications are server-side; poll the shared reminder table so
+    // a browser open on any device notices a daemon wake without a websocket.
+    setInterval(() => { if (state.currentAccount) loadReminders(); }, 30_000);
     loadTimezone();
     loadTzZones();
     // Start the deploy-detection poll so a banner appears when a new version
@@ -1099,10 +1134,289 @@ function selectSplitByIndex(index) {
     }
 }
 
+function localReminderDate(days, hour = 8) {
+    const date = new Date();
+    date.setDate(date.getDate() + days);
+    date.setHours(hour, 0, 0, 0);
+    while (state.reminderSettings.skip_weekends && (date.getDay() === 0 || date.getDay() === 6)) {
+        date.setDate(date.getDate() + 1);
+    }
+    return date;
+}
+
+function reminderQuickDate(kind) {
+    if (kind === 'hour') return new Date(Date.now() + 60 * 60 * 1000);
+    if (kind === 'later') return new Date(Date.now() + 4 * 60 * 60 * 1000);
+    if (kind === 'tomorrow') return localReminderDate(1, 8);
+    return localReminderDate(7, 8);
+}
+
+function renderRemindMode() {
+    const mode = document.getElementById('remind-mode');
+    if (mode) {
+        mode.textContent = state.remindMode === 'regardless'
+            ? 'Regardless — returns even if someone replies'
+            : 'If no reply — returns only when nobody replies';
+    }
+}
+
+function openRemindPicker(emailId = getSelectedEmailId()) {
+    if (!emailId) return;
+    state.remindEmailId = emailId;
+    state.remindPickerOpen = true;
+    state.remindMode = state.reminderSettings.regardless_default ? 'regardless' : 'if-no-reply';
+    // Keep the quick options in the picker itself so the keyboard flow and the
+    // visible affordance cannot drift: H, then Tab toggles Regardless.
+    els.remindModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Remind Me</h3>
+            <div class="remind-quick-options">
+                <button type="button" data-remind-quick="hour">In 1 hour</button>
+                <button type="button" data-remind-quick="later">Later today</button>
+                <button type="button" data-remind-quick="tomorrow">Tomorrow 8am</button>
+                <button type="button" data-remind-quick="week">Next week 8am</button>
+                <button type="button" data-remind-quick="custom">Pick a date &amp; time</button>
+            </div>
+            <label>Type a time (tomorrow 3pm, next week, 3H/3D/1MO)</label>
+            <input id="remind-natural" type="text" placeholder="tomorrow 3pm" autocomplete="off">
+            <label>Or choose a date &amp; time</label>
+            <input id="remind-datetime" type="datetime-local">
+            <div id="remind-mode"></div>
+            <div class="modal-hint">Tab toggles Regardless · Enter confirms · Esc cancels</div>
+            <div class="modal-buttons"><button id="remind-cancel" type="button">Cancel</button><button id="remind-confirm" type="button">Remind</button></div>
+        </div>`;
+    els.remindModal.classList.remove('hidden');
+    els.remindModal.querySelectorAll('[data-remind-quick]').forEach(button => {
+        button.addEventListener('click', () => {
+            const kind = button.dataset.remindQuick;
+            if (kind === 'custom') {
+                document.getElementById('remind-datetime')?.focus();
+            } else {
+                confirmRemindAt(reminderQuickDate(kind));
+            }
+        });
+    });
+    document.getElementById('remind-cancel').addEventListener('click', closeRemindPicker);
+    document.getElementById('remind-confirm').addEventListener('click', confirmRemindPicker);
+    renderRemindMode();
+    els.remindModal.querySelector('#remind-natural').focus();
+}
+
+function handleRemindPickerKey(e) {
+    if (e.key === 'Escape') {
+        closeRemindPicker();
+        e.preventDefault();
+    } else if (e.key === 'Tab') {
+        state.remindMode = state.remindMode === 'regardless' ? 'if-no-reply' : 'regardless';
+        renderRemindMode();
+        e.preventDefault();
+    } else if (e.key === 'Enter') {
+        confirmRemindPicker();
+        e.preventDefault();
+    }
+}
+
+function closeRemindPicker() {
+    state.remindPickerOpen = false;
+    state.remindEmailId = null;
+    els.remindModal.classList.add('hidden');
+    setMode('normal');
+}
+
+function resolveReminderInput() {
+    const natural = document.getElementById('remind-natural')?.value.trim();
+    const typed = document.getElementById('remind-datetime')?.value;
+    if (typed) return new Date(typed);
+    if (!natural) return null;
+    const upper = natural.toUpperCase();
+    const shorthand = upper.match(/^(\d+)(MO|H|D)$/);
+    if (shorthand) {
+        const amount = Number(shorthand[1]);
+        const unit = shorthand[2] === 'H' ? 3600000 : shorthand[2] === 'D' ? 86400000 : 2592000000;
+        return new Date(Date.now() + amount * unit);
+    }
+    const match = natural.toLowerCase().match(/^(tomorrow|next week)(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$/);
+    if (match) {
+        const date = localReminderDate(match[1] === 'tomorrow' ? 1 : 7, 8);
+        if (match[2]) {
+            let hour = Number(match[2]);
+            if (match[4] === 'pm' && hour < 12) hour += 12;
+            if (match[4] === 'am' && hour === 12) hour = 0;
+            date.setHours(hour, Number(match[3] || 0), 0, 0);
+        }
+        return date;
+    }
+    const relative = natural.toLowerCase().match(/^in\s+(\d+)\s+(hours?|days?)$/);
+    if (relative) return new Date(Date.now() + Number(relative[1]) * (relative[2].startsWith('hour') ? 3600000 : 86400000));
+    return null;
+}
+
+function confirmRemindAt(date) {
+    if (!date || Number.isNaN(date.getTime())) {
+        showStatus('Choose a valid reminder time', 'error');
+        return;
+    }
+    const id = state.remindEmailId;
+    closeRemindPicker();
+    remindEmail(id, date.toISOString(), state.remindMode);
+}
+
+function confirmRemindPicker() {
+    confirmRemindAt(resolveReminderInput());
+}
+
+async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
+    if (!emailId) return;
+    const removedEmail = state.emails.find(email => email.id === emailId);
+    const removedIndex = state.emails.indexOf(removedEmail);
+    const label = mode === 'regardless' ? 'regardless' : 'if no reply';
+    pushUndo('reminded', emailId, removedEmail, removedIndex, { mode, wakeAt });
+    removeEmailFromList(emailId);
+    if (state.view === 'detail') showView('list');
+    showStatus(`Reminded ${label} until ${new Date(wakeAt).toLocaleString()}`, 'success');
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+    }
+    try {
+        await api('POST', `/emails/${emailId}/remind`, { wake_at: wakeAt, mode });
+        loadReminders();
+        loadSplitCounts();
+    } catch (err) {
+        state.undoStack.pop();
+        if (removedEmail) {
+            state.emails.splice(removedIndex, 0, removedEmail);
+            extendThreadGroups([removedEmail]);
+            invalidateSplitListCache();
+            renderEmailList();
+        }
+        adjustSplitCounts(+1);
+        showStatus('Reminder failed: ' + err.message, 'error');
+    }
+}
+
+async function loadReminders() {
+    try {
+        const reminders = await api('GET', '/reminders');
+        const previous = new Map(state.reminders.map(item => [item.email_id, item]));
+        state.reminders = reminders || [];
+        const currentIds = new Set(state.reminders.map(item => item.email_id));
+        for (const [emailId, oldReminder] of previous) {
+            if (!currentIds.has(emailId) && oldReminder.wake_at
+                && typeof Notification !== 'undefined'
+                && Notification.permission === 'granted') {
+                new Notification('Reminder ready', {
+                    body: oldReminder.email?.subject || 'An email reminder is ready',
+                });
+            }
+        }
+        if (state.currentMailbox?.role === 'reminders') {
+            state.emails = state.reminders.map(item => item.email).filter(Boolean);
+            state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.emails.length - 1));
+            renderReminderList();
+        }
+        renderMailboxes();
+    } catch (err) {
+        console.warn('Failed to load reminders:', err);
+    }
+}
+
+function selectReminders() {
+    state.currentMailbox = { id: '__reminders__', name: 'Reminders', role: 'reminders' };
+    state.currentSplit = null;
+    state.searchTokens = [];
+    state.selectedIndex = 0;
+    updateMailboxNameDisplay();
+    renderMailboxes();
+    loadReminders();
+}
+
+function renderReminderList() {
+    const rows = state.reminders.filter(item => item.email);
+    if (!rows.length) {
+        els.emailList.innerHTML = '<div class="empty-state">No pending reminders</div>';
+        return;
+    }
+    els.emailList.innerHTML = rows.map((item, index) => {
+        const email = item.email;
+        const wake = item.wake_at ? new Date(item.wake_at).toLocaleString() : 'No wake time — orphaned';
+        const mode = item.mode === 'regardless' ? 'regardless' : 'if no reply';
+        const orphanActions = item.wake_at ? '' : `<button class="remind-again-btn" type="button" data-id="${escapeAttr(email.id)}">Re-remind</button><button class="archive-reminder-btn" type="button" data-id="${escapeAttr(email.id)}">Archive</button>`;
+        return `<div class="email-row reminder-row${index === state.selectedIndex ? ' selected' : ''}" data-id="${escapeAttr(email.id)}" data-index="${index}">
+            <span class="email-from">${escapeHtml(email.from?.[0]?.name || email.from?.[0]?.email || 'Unknown')}</span>
+            <span class="email-subject">${escapeHtml(email.subject)} <span class="reminder-meta">${escapeHtml(wake)} · ${mode}</span></span>
+            <button class="wake-now-btn" type="button" data-id="${escapeAttr(email.id)}">Wake now</button>${orphanActions}
+        </div>`;
+    }).join('');
+}
+
+async function archiveReminder(emailId) {
+    try {
+        // Clear the custom Reminders membership first; then the existing
+        // archive action can file the orphan cleanly in every provider.
+        await api('POST', `/emails/${emailId}/cancel-reminder`);
+        await api('POST', `/emails/${emailId}/archive`);
+        showStatus('Reminder archived', 'success');
+        await loadReminders();
+    } catch (err) {
+        showStatus('Archive failed: ' + err.message, 'error');
+    }
+}
+
+async function wakeReminder(emailId) {
+    try {
+        await api('POST', `/emails/${emailId}/cancel-reminder`);
+        showStatus('Reminder woken', 'success');
+        await loadReminders();
+        if (state.currentMailbox?.role === 'reminders') renderReminderList();
+    } catch (err) {
+        showStatus('Wake failed: ' + err.message, 'error');
+    }
+}
+
+async function loadReminderSettings() {
+    try {
+        state.reminderSettings = await api('GET', '/reminder-settings');
+    } catch (err) {
+        console.warn('Failed to load reminder settings:', err);
+    }
+}
+
+async function openReminderSettings() {
+    await loadReminderSettings();
+    document.getElementById('reminder-default-time').value = state.reminderSettings.default_time || '08:00';
+    document.getElementById('reminder-regardless-default').checked = !!state.reminderSettings.regardless_default;
+    document.getElementById('reminder-skip-weekends').checked = !!state.reminderSettings.skip_weekends;
+    els.reminderSettingsModal.classList.remove('hidden');
+    document.getElementById('reminder-default-time').focus();
+    setMode('insert');
+}
+
+function closeReminderSettings() {
+    els.reminderSettingsModal.classList.add('hidden');
+    setMode('normal');
+}
+
+async function saveReminderSettings() {
+    const settings = {
+        default_time: document.getElementById('reminder-default-time').value || '08:00',
+        regardless_default: document.getElementById('reminder-regardless-default').checked,
+        skip_weekends: document.getElementById('reminder-skip-weekends').checked,
+    };
+    try {
+        state.reminderSettings = await api('PUT', '/reminder-settings', settings);
+        closeReminderSettings();
+        showStatus('Reminder Settings saved', 'success');
+    } catch (err) {
+        showStatus('Reminder Settings failed: ' + err.message, 'error');
+    }
+}
+
 async function loadMailboxes() {
     try {
         state.mailboxes = await api('GET', '/mailboxes');
+        await loadReminderSettings();
         renderMailboxes();
+        loadReminders();
 
         // Select inbox by default
         const inbox = state.mailboxes.find(m => m.role === 'inbox');
@@ -1183,6 +1497,11 @@ let lastRenderedContext = null;
 
 async function loadEmails() {
     if (!state.currentMailbox) return;
+    if (state.currentMailbox.role === 'reminders') {
+        await loadReminders();
+        renderReminderList();
+        return;
+    }
 
     // Cancel any in-flight email fetch
     if (loadEmailsController) loadEmailsController.abort();
@@ -1958,21 +2277,26 @@ async function doSendEmail() {
 // Rendering
 
 function renderMailboxes() {
-    els.mailboxList.innerHTML = state.mailboxes
-        .filter(m => m.role || m.parentId === null)
+    const mailboxes = state.mailboxes
+        .filter(m => (m.role || m.parentId === null) && m.name !== 'Reminders')
         .sort((a, b) => {
             const order = ['inbox', 'drafts', 'sent', 'archive', 'trash', 'spam'];
             const ai = order.indexOf(a.role) >= 0 ? order.indexOf(a.role) : 99;
             const bi = order.indexOf(b.role) >= 0 ? order.indexOf(b.role) : 99;
             return ai - bi;
-        })
-        .map(m => `
+        });
+    const reminderActive = state.currentMailbox?.role === 'reminders';
+    els.mailboxList.innerHTML = mailboxes.map(m => `
             <div class="mailbox-item ${state.currentMailbox?.id === m.id ? 'active' : ''}"
                  data-id="${escapeAttr(m.id)}">
                 <span>${escapeHtml(m.name)}</span>
                 ${m.unreadEmails > 0 ? `<span class="unread-count">${m.unreadEmails}</span>` : ''}
             </div>
-        `).join('');
+        `).join('') + `
+        <div class="mailbox-item reminders-item ${reminderActive ? 'active' : ''}" data-reminders="true">
+            <span>Reminders</span>
+            ${state.reminders.length ? `<span class="unread-count">${state.reminders.length}</span>` : ''}
+        </div>`;
     // 1p0d: m.name / m.id are attacker-controlled (IMAP / shared / delegated
     // mailbox names). escapeHtml the text content; escapeAttr the data-id
     // attribute — escapeHtml alone doesn't encode quotes, so a crafted id
@@ -1980,6 +2304,10 @@ function renderMailboxes() {
 
     els.mailboxList.querySelectorAll('.mailbox-item').forEach(el => {
         el.addEventListener('click', () => {
+            if (el.dataset.reminders) {
+                selectReminders();
+                return;
+            }
             const mb = state.mailboxes.find(m => m.id === el.dataset.id);
             if (mb) selectMailbox(mb);
         });
@@ -2207,6 +2535,10 @@ function renderInviteChip(email) {
 }
 
 function renderEmailList() {
+    if (state.currentMailbox?.role === 'reminders') {
+        renderReminderList();
+        return;
+    }
     // Every render draws the CURRENT context's state.emails, so the pane
     // now shows that context — including the empty state below.
     lastRenderedContext = splitCacheKey();
@@ -3302,6 +3634,21 @@ function handleKeyDown(e) {
         return; // Let search input handle it
     }
 
+    // Remind Me picker owns Tab (H then Tab toggles Regardless).
+    if (!els.remindModal.classList.contains('hidden')) {
+        handleRemindPickerKey(e);
+        return;
+    }
+
+    // Reminder Settings modal owns its form fields and Escape.
+    if (!els.reminderSettingsModal.classList.contains('hidden')) {
+        if (e.key === 'Escape') {
+            closeReminderSettings();
+            e.preventDefault();
+        }
+        return;
+    }
+
     // Handle split modal
     if (!els.splitModal.classList.contains('hidden')) {
         if (e.key === 'Escape') {
@@ -3591,6 +3938,10 @@ function handleNormalModeKey(e) {
             break;
 
         // Actions
+        case 'h':
+            openRemindPicker();
+            e.preventDefault();
+            break;
         case 'e':
             actionSelected('archive');
             break;
@@ -4659,6 +5010,7 @@ function commandsForView(view) {
                 { name: 'Reply All', desc: 'Reply to all', shortcut: 'a', action: 'reply-all' },
                 { name: 'Forward', desc: 'Forward email', shortcut: 'f', action: 'forward' },
                 { name: 'Archive', desc: 'Archive email', shortcut: 'e', action: 'archive' },
+                { name: 'Remind Me', desc: 'Return this email later if no reply', shortcut: 'h', action: 'remind-me' },
                 { name: 'Trash', desc: 'Move to trash', shortcut: '#', action: 'trash' },
                 { name: 'Star', desc: 'Toggle star', shortcut: 's', action: 'toggle-flag' },
                 { name: 'Mark Unread', desc: 'Toggle unread', shortcut: 'u', action: 'toggle-unread' },
@@ -4706,6 +5058,7 @@ function commandsForView(view) {
             if (visibleRows()[state.selectedIndex]) {
                 cmds.push(
                     { name: 'Archive', desc: 'Archive email', shortcut: 'e', action: 'archive' },
+                    { name: 'Remind Me', desc: 'Return this email later if no reply', shortcut: 'h', action: 'remind-me' },
                     { name: 'Trash', desc: 'Move to trash', shortcut: '#', action: 'trash' },
                     { name: 'Star', desc: 'Toggle star', shortcut: 's', action: 'toggle-flag' },
                     { name: 'Mark Unread', desc: 'Toggle unread', shortcut: 'u', action: 'toggle-unread' },
@@ -4743,6 +5096,7 @@ function commandsForView(view) {
         case 'settings': {
             // Settings is a low-action surface: account management + Help only.
             const cmds = [
+                { name: 'Reminder Settings', desc: 'Default time, regardless mode, skip weekends', shortcut: '', action: 'reminder-settings' },
                 { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
             ];
             state.accounts.forEach(acct => {
@@ -4780,6 +5134,7 @@ function getCommands() {
 function executeCommand(action) {
     switch (action) {
         case 'archive': actionSelected('archive'); break;
+        case 'remind-me': openRemindPicker(); break;
         case 'trash': actionSelected('trash'); break;
         case 'reply': startReply(false); break;
         case 'reply-all': startReply(true); break;
@@ -4825,6 +5180,9 @@ function executeCommand(action) {
         case 'add-account':
             openSettings();
             openWizard();
+            break;
+        case 'reminder-settings':
+            openReminderSettings();
             break;
         default:
             // Handle dynamic delete-split commands
@@ -5099,11 +5457,14 @@ async function deleteSplit(splitId) {
 
 // Undo
 
-function pushUndo(action, emailId, emailData, insertIndex) {
-    state.undoStack.push({ action, emailId, emailData, insertIndex, timestamp: Date.now() });
+function pushUndo(action, emailId, emailData, insertIndex, reminder = null) {
+    state.undoStack.push({ action, emailId, emailData, insertIndex, reminder, timestamp: Date.now() });
 
     // Show toast
-    els.undoMessage.textContent = action === 'archived' ? 'Email archived' : 'Email trashed';
+    els.undoMessage.textContent = action === 'archived' ? 'Email archived'
+        : action === 'reminded'
+            ? `Reminded ${reminder?.mode === 'regardless' ? 'regardless' : 'if no reply'} until ${new Date(reminder?.wakeAt).toLocaleString()}`
+            : 'Email trashed';
     els.undoToast.classList.remove('hidden');
 
     // Auto-hide after 5 seconds
@@ -5137,9 +5498,13 @@ async function performUndo() {
     adjustSplitCounts(+1);
 
     try {
-        const inbox = state.mailboxes.find(m => m.role === 'inbox');
-        if (inbox) {
-            await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
+        if (item.action === 'reminded') {
+            await api('POST', `/emails/${item.emailId}/cancel-reminder`);
+        } else {
+            const inbox = state.mailboxes.find(m => m.role === 'inbox');
+            if (inbox) {
+                await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
+            }
         }
         loadSplitCounts(); // resync with server truth
     } catch (err) {

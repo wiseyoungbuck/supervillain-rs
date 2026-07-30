@@ -7,7 +7,7 @@ use supervillain::{
     platform::{FsTokenStore, TokenStore},
     prefetch, provider,
     provider::ProviderSession,
-    routes, splits, timezone,
+    reminders, routes, splits, timezone,
     types::{AccountError, AccountRegistry, AppState, SessionLock},
 };
 
@@ -27,6 +27,8 @@ async fn main() {
     let splits_config_path = config_dir.join("supervillain/splits.json");
     let timezone_config_path = config_dir.join("supervillain/timezone.json");
     let prefetch_cache_path = config_dir.join("supervillain/prefetch-cache.json");
+    let reminders_path = config_dir.join("supervillain/reminders.json");
+    let reminder_settings_path = config_dir.join("supervillain/reminder-settings.json");
 
     platform::init_tracing();
 
@@ -124,6 +126,8 @@ async fn main() {
             &cfg.accounts.keys().cloned().collect::<Vec<_>>(),
         )),
         prefetch_cache_path,
+        reminders: reminders::ReminderStore::load(&reminders_path),
+        reminder_settings_path,
     });
 
     // Kick off the background prefetch warmer. The first pass starts
@@ -133,6 +137,7 @@ async fn main() {
     // switches return from cache instead of waiting on ~24 s of Gmail
     // split-count requests.
     prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
+    reminders::spawn_daemon(state.clone());
 
     let app = routes::router(state).layer(routes::compression_layer());
 
