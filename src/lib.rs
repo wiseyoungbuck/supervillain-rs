@@ -3,6 +3,7 @@ pub mod calendar;
 pub mod error;
 pub mod glob;
 pub mod gmail;
+pub mod imip;
 pub mod jmap;
 pub mod oauth;
 pub mod outlook;

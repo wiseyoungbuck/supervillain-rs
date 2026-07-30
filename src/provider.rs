@@ -601,6 +601,7 @@ mod tests {
             identity_cache: tokio::sync::Mutex::new(None),
             folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: crate::outlook::build_outlook_limiter(),
+            graph_base: crate::outlook::GRAPH_BASE.to_string(),
         }))
     }
 

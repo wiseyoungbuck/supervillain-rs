@@ -2183,6 +2183,74 @@ async fn build_rfc822(
     Ok(out)
 }
 
+/// Resolve an EmailSubmission's attachments to `(name, mime_type, bytes)`
+/// triples for the iMIP invite builder. Mirrors `build_rfc822`'s per-attachment
+/// resolution (prefer the submission's declared mime_type; fall back to the
+/// resolved blob's) so the two send paths can't drift on content-types.
+/// Used only by the calendar_ics invite path (kata zs8n).
+async fn resolve_invite_attachments(
+    session: &GmailSession,
+    sub: &crate::types::EmailSubmission,
+) -> Result<Vec<crate::imip::ImipAttachment>, Error> {
+    let mut out = Vec::with_capacity(sub.attachments.len());
+    for att in &sub.attachments {
+        let (resolved_mime, bytes) = peek_blob_bytes(session, &att.blob_id, &att.name).await?;
+        let mime = if !att.mime_type.is_empty() {
+            att.mime_type.clone()
+        } else {
+            resolved_mime
+        };
+        out.push((att.name.clone(), mime, bytes));
+    }
+    Ok(out)
+}
+
+/// POST a base64url raw RFC822 to `messages/send`, then on success drain the
+/// consumed synthetic blobs and invalidate the label/page caches. Shared by
+/// the plain send path and the iMIP invite path (kata zs8n) so the
+/// post-send bookkeeping can't drift between them. Returns the new Gmail
+/// message id.
+async fn post_raw_and_finalize(
+    session: &GmailSession,
+    raw: &str,
+    attachments: &[crate::types::Attachment],
+) -> Result<Option<String>, Error> {
+    let token = access_token(session).await?;
+    let url = format!("{}/messages/send", session.gmail_base);
+    let body = serde_json::json!({ "raw": raw });
+    // Priority lane: the user is actively waiting on this send to complete —
+    // same reasoning as `modify_labels`.
+    let resp = session
+        .limiter
+        .execute_prioritized(true, "messages.send", || async {
+            session
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+        })
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_gmail_error("messages.send", status, &text));
+    }
+    let parsed: SendResponse = resp.json().await?;
+    // Consume the synthetic-blob entries now that we know the bytes made
+    // it onto the wire. Order matters: if the send fails (4xx/5xx earlier),
+    // the cache is preserved so the user can retry without re-uploading.
+    drain_consumed_synthetic_blobs(session, attachments).await;
+    // A successful send adds a message to the SENT label and changes
+    // counts. Invalidate label_cache for the count; clear page_cache so a
+    // subsequent scroll of Sent doesn't show stale cursors that miss the
+    // new message.
+    invalidate_label_cache(session).await;
+    session.page_cache.lock().await.clear();
+    Ok(Some(parsed.id))
+}
+
 pub async fn send_email(
     session: &mut GmailSession,
     sub: &crate::types::EmailSubmission,
@@ -2190,6 +2258,35 @@ pub async fn send_email(
     identity_id_override: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let display_name = pick_identity_display_name(session, from_addr, identity_id_override).await;
+
+    // iMIP invite path (kata zs8n): `calendar_ics` needs a
+    // `text/calendar; method=<METHOD>` MIME part with base64 CTE that
+    // `build_rfc822` (mail_builder) can't express precisely — mail_builder
+    // auto-encodes text/* parts as 7bit/quoted-printable, not base64, and
+    // has no clean channel for the `method` Content-Type parameter. Build
+    // the iMIP envelope directly (multipart/alternative > text/plain +
+    // text/calendar; method=REQUEST, wrapped in multipart/mixed when there
+    // are attachments) and send it as the raw RFC822. Mirrors Google
+    // Calendar's own invite shape. Invites are new messages
+    // (`send_invite_handler` sets in_reply_to=None), so threading headers
+    // don't apply on this branch.
+    if let Some(ics) = sub.calendar_ics.as_ref() {
+        let resolved_atts = resolve_invite_attachments(session, sub).await?;
+        let mime = crate::imip::build_imip_mime(
+            from_addr,
+            display_name.as_deref(),
+            &sub.to,
+            &sub.cc,
+            sub.bcc.as_deref(),
+            &sub.subject,
+            &sub.text_body,
+            ics,
+            &resolved_atts,
+        );
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&mime);
+        return post_raw_and_finalize(session, &raw, &sub.attachments).await;
+    }
 
     // Resolve in_reply_to. If the frontend already passed a `<…@…>` form,
     // use it verbatim; otherwise treat it as a Gmail msg ID and look up.
@@ -2222,40 +2319,7 @@ pub async fn send_email(
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&rfc822);
 
-    let token = access_token(session).await?;
-    let url = format!("{}/messages/send", session.gmail_base);
-    let body = serde_json::json!({ "raw": raw });
-    // Priority lane: the user is actively waiting on this send to complete —
-    // same reasoning as `modify_labels`.
-    let resp = session
-        .limiter
-        .execute_prioritized(true, "messages.send", || async {
-            session
-                .client
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await
-        })
-        .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(classify_gmail_error("messages.send", status, &text));
-    }
-    let parsed: SendResponse = resp.json().await?;
-    // Consume the synthetic-blob entries now that we know the bytes made
-    // it onto the wire. Order matters: if the send fails (4xx/5xx earlier),
-    // the cache is preserved so the user can retry without re-uploading.
-    drain_consumed_synthetic_blobs(session, &sub.attachments).await;
-    // A successful send adds a message to the SENT label and changes
-    // counts. Invalidate label_cache for the count; clear page_cache so a
-    // subsequent scroll of Sent doesn't show stale cursors that miss the
-    // new message.
-    invalidate_label_cache(session).await;
-    session.page_cache.lock().await.clear();
-    Ok(Some(parsed.id))
+    post_raw_and_finalize(session, &raw, &sub.attachments).await
 }
 
 // =============================================================================
@@ -4488,6 +4552,183 @@ mod tests {
         assert!(s.contains("b@example.com"));
         assert!(s.contains("c@example.com"));
         assert!(s.contains("Cc:"));
+    }
+
+    // ---- kata zs8n: calendar_ics invite send path ----
+    //
+    // Before zs8n, send_email silently dropped EmailSubmission.calendar_ics,
+    // so /api/calendar/invite?account=gmail produced a bare text/plain
+    // message with no text/calendar part (verified live: recipient raw MIME
+    // had no text/calendar, no METHOD:REQUEST). These pin that an invite now
+    // reaches messages.send as a raw RFC822 carrying
+    // text/calendar; method=REQUEST — the iMIP shape Google's own invites use.
+
+    fn invite_ics() -> String {
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+         BEGIN:VEVENT\r\nUID:zs8n@example.test\r\nSUMMARY:Team Standup\r\n\
+         DTSTART:20260801T100000Z\r\nDTEND:20260801T103000Z\r\n\
+         ORGANIZER:mailto:boss@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            .into()
+    }
+
+    fn invite_submission(subject: &str) -> crate::types::EmailSubmission {
+        crate::types::EmailSubmission {
+            to: vec!["guest@example.com".into()],
+            cc: vec!["observer@example.com".into()],
+            subject: subject.into(),
+            text_body: "You're invited".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: Some(invite_ics()),
+        }
+    }
+
+    /// Decode the `raw` field of a recorded `messages.send` POST back to MIME.
+    fn decode_send_raw(req: &RecordedRequest) -> String {
+        use base64::Engine;
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let raw = body["raw"].as_str().expect("messages.send raw field");
+        let mime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .expect("raw decodes as base64url");
+        String::from_utf8_lossy(&mime).to_string()
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_emits_text_calendar_part() {
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/settings/sendAs"),
+                (200, r#"{"sendAs":[]}"#.into()),
+            ),
+            (
+                ("POST", "/messages/send"),
+                (200, r#"{"id":"msg-1"}"#.into()),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.gmail_base = base;
+        let result = send_email(
+            &mut session,
+            &invite_submission("Team Standup"),
+            "boss@example.com",
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+        let reqs = recorded.lock().unwrap();
+        let send_req = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/messages/send")
+            .expect("messages.send POST recorded");
+        let s = decode_send_raw(send_req);
+        assert!(
+            s.contains("text/calendar; method=REQUEST"),
+            "calendar part missing: {s}"
+        );
+        assert!(
+            s.contains("multipart/alternative"),
+            "alternative wrapper missing: {s}"
+        );
+        // The ICS is base64-encoded in the calendar part, so assert its
+        // base64 form is present (first 76-char line == first 57 ICS bytes).
+        use base64::Engine;
+        let ics_b64 = base64::engine::general_purpose::STANDARD.encode(invite_ics().as_bytes());
+        let first_chunk = &ics_b64[..ics_b64.len().min(76)];
+        assert!(
+            s.contains(first_chunk),
+            "ICS base64 body missing from calendar part: {s}"
+        );
+        assert!(
+            s.contains("Content-Transfer-Encoding: base64"),
+            "calendar part must use base64 CTE: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_and_attachment_wraps_mixed() {
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/settings/sendAs"),
+                (200, r#"{"sendAs":[]}"#.into()),
+            ),
+            (
+                ("POST", "/messages/send"),
+                (200, r#"{"id":"msg-2"}"#.into()),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.gmail_base = base;
+        let (blob_id, _) = upload_blob(&session, "application/pdf", b"%PDF-fake")
+            .await
+            .unwrap();
+        let mut sub = invite_submission("With attachment");
+        sub.attachments = vec![crate::types::Attachment {
+            blob_id,
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 9,
+        }];
+        let result = send_email(&mut session, &sub, "boss@example.com", None).await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+        let reqs = recorded.lock().unwrap();
+        let send_req = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/messages/send")
+            .expect("messages.send POST recorded");
+        let s = decode_send_raw(send_req);
+        assert!(s.contains("multipart/mixed"), "mixed wrapper missing: {s}");
+        assert!(
+            s.contains("multipart/alternative"),
+            "alternative nested inside mixed missing: {s}"
+        );
+        assert!(
+            s.contains("text/calendar; method=REQUEST"),
+            "calendar part missing: {s}"
+        );
+        assert!(s.contains("report.pdf"), "attachment missing: {s}");
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_carries_cc_in_mime() {
+        // send_invite_handler threads cc (observers) into the invite; those
+        // must reach the MIME Cc header, not get dropped.
+        let (base, recorded) = spawn_calendar_recorder(vec![
+            (
+                ("GET", "/settings/sendAs"),
+                (200, r#"{"sendAs":[]}"#.into()),
+            ),
+            (
+                ("POST", "/messages/send"),
+                (200, r#"{"id":"msg-3"}"#.into()),
+            ),
+        ])
+        .await;
+        let mut session = test_session();
+        session.gmail_base = base;
+        let result = send_email(
+            &mut session,
+            &invite_submission("Cc check"),
+            "boss@example.com",
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+        let reqs = recorded.lock().unwrap();
+        let send_req = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/messages/send")
+            .expect("messages.send POST recorded");
+        let s = decode_send_raw(send_req);
+        assert!(
+            s.contains("Cc: observer@example.com"),
+            "cc missing from invite MIME: {s}"
+        );
     }
 
     // ---- Roborev 176 #8: looks_like_message_id heuristic ----
