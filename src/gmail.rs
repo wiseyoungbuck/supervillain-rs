@@ -1021,7 +1021,12 @@ pub async fn get_emails(
         return Ok(Vec::new());
     }
     let token = access_token(session).await?;
-    let format = if fetch_body { "full" } else { "metadata" };
+    // Gmail's metadata format omits the MIME tree entirely. Use `full` for
+    // list rows too so calendar semantics come from a real text/calendar
+    // part rather than a `.ics` filename guess. This replaces the existing
+    // messages.get request; it does not add one request per email. Only an
+    // attachment-backed calendar part needs the invite-only follow-up below.
+    let format = "full";
 
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
@@ -1048,7 +1053,46 @@ pub async fn get_emails(
                 ));
             }
             let msg: GmailMessage = resp.json().await?;
-            Ok::<_, Error>((idx, parse_message_to_email(msg, fetch_body)))
+            let calendar_ics = match find_calendar_ics(&msg.payload) {
+                Some(IcsSource::Inline(ics)) => Some(ics),
+                Some(IcsSource::Attachment(att_id)) => {
+                    match fetch_attachment_bytes_at(
+                        &client,
+                        &limiter,
+                        &gmail_base,
+                        &token,
+                        &id,
+                        &att_id,
+                        priority,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(ics) => Some(ics),
+                            Err(_) => {
+                                tracing::warn!(
+                                    msg_id = %id,
+                                    "Gmail text/calendar part was not UTF-8; omitting invite chip"
+                                );
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            // Invite enrichment is not load-bearing for the
+                            // mailbox. Keep the row and degrade to no chip.
+                            tracing::warn!(
+                                msg_id = %id,
+                                "Gmail calendar attachment fetch failed; omitting invite chip: {e}"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let mut email = parse_message_to_email(msg, fetch_body);
+            email.calendar_ics = calendar_ics;
+            Ok::<_, Error>((idx, email))
         });
     }
 
@@ -1164,6 +1208,7 @@ pub fn parse_message_to_email(msg: GmailMessage, fetch_body: bool) -> Email {
         text_body,
         html_body,
         has_calendar,
+        calendar_ics: None,
         attachments,
         // Drafts (the only consumer) are Fastmail-only in v1 — not parsed
         // out of Gmail's In-Reply-To header yet.
@@ -1797,19 +1842,40 @@ async fn fetch_attachment_bytes(
     att_id: &str,
 ) -> Result<Vec<u8>, Error> {
     let token = access_token(session).await?;
+    fetch_attachment_bytes_at(
+        &session.client,
+        &session.limiter,
+        &session.gmail_base,
+        &token,
+        msg_id,
+        att_id,
+        false,
+    )
+    .await
+}
+
+/// Core attachment fetch over owned/clonable session pieces. `get_emails`
+/// uses this inside its per-message task when a real text/calendar MIME part
+/// is attachment-backed, keeping those rare follow-ups concurrent and on the
+/// same limiter lane as the parent request.
+async fn fetch_attachment_bytes_at(
+    client: &reqwest::Client,
+    limiter: &RateLimiter,
+    gmail_base: &str,
+    token: &str,
+    msg_id: &str,
+    att_id: &str,
+    priority: bool,
+) -> Result<Vec<u8>, Error> {
     // Both ids are provider-issued today, but encode here so every caller
     // gets the guard for free if a future change widens an input's trust
     // boundary (same invariant as `lookup_parent_message_id`).
     let msg_id = encode_path_segment(msg_id);
     let att_id = encode_path_segment(att_id);
-    let url = format!(
-        "{}/messages/{msg_id}/attachments/{att_id}",
-        session.gmail_base
-    );
-    let resp = session
-        .limiter
-        .execute("messages.attachments.get", || async {
-            session.client.get(&url).bearer_auth(&token).send().await
+    let url = format!("{gmail_base}/messages/{msg_id}/attachments/{att_id}");
+    let resp = limiter
+        .execute_prioritized(priority, "messages.attachments.get", || async {
+            client.get(&url).bearer_auth(token).send().await
         })
         .await?;
     let status = resp.status();

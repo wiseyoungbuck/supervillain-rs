@@ -508,6 +508,13 @@ pub async fn get_emails(
 
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
+    // Normal Email fetches (lists and bodies) include enough MIME data to
+    // identify a genuine iTIP part without a per-row blob download. Split
+    // counting uses properties_override and deliberately stays metadata-only.
+    // `fetchAllBodyValues` is bounded per part: unusually huge ICS payloads
+    // truncate and safely produce no list chip rather than bloating the hot
+    // path without limit.
+    let include_invite_data = properties_override.is_none();
     let mut properties = if let Some(overrides) = properties_override {
         overrides.to_vec()
     } else {
@@ -526,10 +533,12 @@ pub async fn get_emails(
             "hasAttachment",
             "size",
             "inReplyTo",
+            "bodyValues",
+            "bodyStructure",
         ]
     };
     if fetch_body {
-        properties.extend_from_slice(&["textBody", "htmlBody", "bodyValues", "bodyStructure"]);
+        properties.extend_from_slice(&["textBody", "htmlBody"]);
     }
 
     let mut extra_args = serde_json::Map::new();
@@ -538,8 +547,15 @@ pub async fn get_emails(
     extra_args.insert("properties".into(), serde_json::json!(properties));
     extra_args.insert("fetchHTMLBodyValues".into(), serde_json::json!(fetch_body));
     extra_args.insert("fetchTextBodyValues".into(), serde_json::json!(fetch_body));
-    extra_args.insert("maxBodyValueBytes".into(), serde_json::json!(1_000_000));
-    if fetch_body {
+    extra_args.insert(
+        "fetchAllBodyValues".into(),
+        serde_json::json!(include_invite_data),
+    );
+    extra_args.insert(
+        "maxBodyValueBytes".into(),
+        serde_json::json!(if fetch_body { 1_000_000 } else { 131_072 }),
+    );
+    if include_invite_data {
         extra_args.insert(
             "bodyProperties".into(),
             serde_json::json!([
@@ -580,10 +596,14 @@ fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
 
     let mut text_body = None;
     let mut html_body = None;
-    let mut has_calendar = false;
 
     let default_bs = BodyStructurePart::default();
     let body_structure = raw.body_structure.as_ref().unwrap_or(&default_bs);
+    let has_calendar = find_calendar_blob_id(body_structure).is_some();
+    // Unlike has_calendar's backwards-compatible `.ics` filename fallback,
+    // invite_ics_from_body_values requires a real calendar MIME part. The
+    // route adds the second guard: an explicit METHOD in the ICS itself.
+    let calendar_ics = invite_ics_from_body_values(body_structure, &raw.body_values);
 
     if fetch_body {
         // Extract text body from body values
@@ -614,9 +634,6 @@ fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
             collect_inline_cids(body_structure, &mut cids);
             *html = resolve_inline_cids(html, &raw.id, &cids);
         }
-
-        // Check for calendar in body structure
-        has_calendar = find_calendar_blob_id(body_structure).is_some();
     }
 
     let attachments = if fetch_body {
@@ -642,11 +659,33 @@ fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
         text_body,
         html_body,
         has_calendar,
+        calendar_ics,
         attachments,
         // JMAP inReplyTo is a list; a single parent is the only case this app
         // produces (build_draft_email) and all the restore path needs.
         in_reply_to: raw.in_reply_to.and_then(|v| v.into_iter().next()),
     }
+}
+
+/// Return raw ICS only from an actual `text/calendar` MIME leaf whose value
+/// JMAP returned in the batched Email/get. A filename ending in `.ics` is not
+/// evidence of iTIP semantics; ordinary calendar exports must not become inbox
+/// invite chips (kata trbx). METHOD validation happens centrally in routes.rs.
+fn invite_ics_from_body_values(
+    part: &BodyStructurePart,
+    body_values: &HashMap<String, BodyValue>,
+) -> Option<String> {
+    let essence = part.mime_type.split(';').next().unwrap_or("").trim();
+    if essence.eq_ignore_ascii_case("text/calendar")
+        && let Some(part_id) = part.part_id.as_deref()
+        && let Some(value) = body_values.get(part_id)
+        && !value.value.is_empty()
+    {
+        return Some(value.value.clone());
+    }
+    part.sub_parts
+        .iter()
+        .find_map(|child| invite_ics_from_body_values(child, body_values))
 }
 
 /// Test-only wrapper: deserializes JSON then delegates to typed parsing.
@@ -2875,6 +2914,42 @@ mod tests {
             "blobId": "blob-cal-1"
         }));
         assert_eq!(find_calendar_blob_id(&body), Some("blob-cal-1".into()));
+    }
+
+    #[test]
+    fn list_invite_ics_requires_real_calendar_mime_part() {
+        let body = deser_bs(serde_json::json!({
+            "type": "multipart/mixed",
+            "subParts": [
+                { "type": "text/plain", "partId": "text" },
+                { "type": "text/calendar; method=REQUEST", "partId": "invite" }
+            ]
+        }));
+        let values = HashMap::from([
+            (
+                "text".into(),
+                BodyValue {
+                    value: "hello".into(),
+                },
+            ),
+            (
+                "invite".into(),
+                BodyValue {
+                    value: "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            invite_ics_from_body_values(&body, &values).as_deref(),
+            Some("BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR")
+        );
+
+        let named_only = deser_bs(serde_json::json!({
+            "type": "application/octet-stream",
+            "name": "invite.ics",
+            "partId": "invite"
+        }));
+        assert!(invite_ics_from_body_values(&named_only, &values).is_none());
     }
 
     #[test]

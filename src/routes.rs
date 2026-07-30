@@ -34,6 +34,13 @@ pub(crate) const DEFAULT_INBOX_LIMIT: usize = 150;
 pub(crate) const MAX_LIST_LIMIT: usize = 1000;
 pub(crate) const MAX_LIST_OFFSET: usize = 1_000_000;
 
+/// Maximum current-calendar reads performed for one list response. Reads are
+/// only for rows already proven to be actionable REQUESTs to this user, and
+/// they run concurrently; ordinary mail, REPLY/CANCEL, organizer copies, and
+/// `.ics` exports cost zero calendar calls. The cap keeps an adversarial page
+/// of invite-shaped messages from turning into unbounded provider fan-out.
+const MAX_LIST_INVITE_STATUS_LOOKUPS: usize = 8;
+
 /// Clamp a client-supplied list `limit` to `MAX_LIST_LIMIT`. Pulled out as a
 /// pure function so the clamp is unit-testable without spinning up a full
 /// handler (kata f7mm #2).
@@ -684,6 +691,181 @@ fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) 
         && sort == EmailSort::default()
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InviteListFields {
+    method: Option<String>,
+    is_invite_to_me: bool,
+    status: Option<String>,
+    is_updated: bool,
+}
+
+fn attendee_email_for_event(
+    email: &Email,
+    event: &CalendarEvent,
+    fallback: &str,
+) -> Option<String> {
+    email
+        .to
+        .iter()
+        .chain(email.cc.iter())
+        .find(|addr| {
+            event
+                .attendees
+                .iter()
+                .any(|a| a.email.eq_ignore_ascii_case(&addr.email))
+        })
+        .map(|addr| addr.email.clone())
+        .or_else(|| {
+            event
+                .attendees
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(fallback))
+                .map(|a| a.email.clone())
+        })
+}
+
+fn canonical_invite_status(status: &str) -> String {
+    match status.to_ascii_uppercase().as_str() {
+        "ACCEPTED" => "ACCEPTED",
+        "TENTATIVE" => "TENTATIVE",
+        "DECLINED" => "DECLINED",
+        _ => "NEEDS-ACTION",
+    }
+    .to_string()
+}
+
+/// Derive the four list-payload fields from parsed email iTIP plus an optional
+/// current calendar copy. The incoming event supplies safe fallback status;
+/// the stored copy wins when present so an RSVP made in detail is reflected.
+fn invite_list_fields(
+    email: &Email,
+    event: Option<&CalendarEvent>,
+    username: &str,
+    stored: Option<&CalendarEvent>,
+) -> InviteListFields {
+    let Some(event) = event else {
+        return InviteListFields::default();
+    };
+    let method = event.method.to_ascii_uppercase();
+    let mut fields = InviteListFields {
+        method: Some(method.clone()),
+        ..InviteListFields::default()
+    };
+    if method != "REQUEST" || event.organizer_email.eq_ignore_ascii_case(username) {
+        return fields;
+    }
+
+    let Some(attendee_email) = attendee_email_for_event(email, event, username) else {
+        return fields;
+    };
+    let Some(incoming_attendee) = event
+        .attendees
+        .iter()
+        .find(|a| a.email.eq_ignore_ascii_case(&attendee_email))
+    else {
+        return fields;
+    };
+
+    fields.is_invite_to_me = true;
+    fields.status = Some(canonical_invite_status(&incoming_attendee.status));
+
+    if let Some(stored) = stored {
+        let decision = calendar::invite_update_decision(
+            Some(stored.sequence),
+            event.sequence,
+            Some(&stored.organizer_email),
+            email.from.first().map(|a| a.email.as_str()),
+        );
+        fields.is_updated = decision == calendar::InviteAction::Update
+            && !(stored.sequence == 0 && calendar::events_content_match(stored, event));
+        if fields.is_updated {
+            fields.status = Some("NEEDS-ACTION".into());
+        } else if let Some(attendee) = stored
+            .attendees
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(&attendee_email))
+        {
+            fields.status = Some(canonical_invite_status(&attendee.status));
+        }
+    }
+    fields
+}
+
+/// Parse real calendar MIME payloads and enrich actionable invite rows from
+/// the current stored calendar state. The provider reads are invite-only,
+/// concurrent, and strictly capped; this avoids the old design's feared
+/// one-calendar-round-trip-per-email hot path while keeping RSVP status real.
+async fn invite_fields_for_list(
+    state: &Arc<AppState>,
+    account_id: &str,
+    emails: &[Email],
+    lookup_stored: bool,
+) -> Result<Vec<InviteListFields>, Error> {
+    let session_lock = resolve_session(state, Some(account_id)).await?;
+    let username = {
+        let session = session_lock.read().await;
+        session.username().to_string()
+    };
+    let primary_tz = configured_primary_tz(state);
+    let events: Vec<Option<CalendarEvent>> = emails
+        .iter()
+        .map(|email| {
+            email
+                .calendar_ics
+                .as_deref()
+                .and_then(|ics| calendar::parse_email_itip(ics, primary_tz))
+        })
+        .collect();
+    let mut fields: Vec<InviteListFields> = emails
+        .iter()
+        .zip(events.iter())
+        .map(|(email, event)| invite_list_fields(email, event.as_ref(), &username, None))
+        .collect();
+
+    // A disk-restored stale snapshot exists specifically for instant first
+    // paint. Never put calendar network I/O in front of that response; the
+    // client's bounded stale re-poll gets stored status from the fresh pass.
+    if !lookup_stored {
+        return Ok(fields);
+    }
+
+    let mut lookups = tokio::task::JoinSet::new();
+    for (idx, event) in events.iter().enumerate() {
+        if !fields[idx].is_invite_to_me || lookups.len() >= MAX_LIST_INVITE_STATUS_LOOKUPS {
+            continue;
+        }
+        let Some(event) = event else { continue };
+        let session_lock = session_lock.clone();
+        let uid = event.uid.clone();
+        lookups.spawn(async move {
+            let session = session_lock.read().await;
+            (
+                idx,
+                provider::get_calendar_event(&session, &uid, primary_tz).await,
+            )
+        });
+    }
+
+    while let Some(joined) = lookups.join_next().await {
+        match joined {
+            Ok((idx, Ok(stored))) => {
+                fields[idx] = invite_list_fields(
+                    &emails[idx],
+                    events[idx].as_ref(),
+                    &username,
+                    stored.as_ref(),
+                );
+            }
+            Ok((idx, Err(e))) => tracing::debug!(
+                email_id = %emails[idx].id,
+                "invite list status lookup failed; using incoming PARTSTAT: {e}"
+            ),
+            Err(e) => tracing::warn!("invite list status task panicked: {e}"),
+        }
+    }
+    Ok(fields)
+}
+
 async fn list_emails(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListEmailsParams>,
@@ -858,10 +1040,13 @@ async fn list_emails(
         emails.truncate(limit);
     }
 
+    let invite_fields = invite_fields_for_list(&state, &account_id, &emails, !stale).await?;
+
     // Serialize emails for frontend
     let response: Vec<serde_json::Value> = emails
         .iter()
-        .map(|e| {
+        .zip(invite_fields.iter())
+        .map(|(e, invite)| {
             serde_json::json!({
                 "id": e.id,
                 "threadId": e.thread_id,
@@ -875,6 +1060,10 @@ async fn list_emails(
                 "isFlagged": e.is_flagged(),
                 "hasAttachment": e.has_attachment,
                 "hasCalendar": e.has_calendar,
+                "inviteMethod": invite.method,
+                "isInviteToMe": invite.is_invite_to_me,
+                "inviteStatus": invite.status,
+                "inviteIsUpdated": invite.is_updated,
                 // Which account this row belongs to — rows must stay
                 // self-describing so per-email URLs (attachment hrefs)
                 // can't resolve against the wrong provider (kata kph2).
@@ -1618,16 +1807,7 @@ async fn upload_blob(
 }
 
 fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str) -> String {
-    for addr in email.to.iter().chain(email.cc.iter()) {
-        if event
-            .attendees
-            .iter()
-            .any(|a| a.email.eq_ignore_ascii_case(&addr.email))
-        {
-            return addr.email.clone();
-        }
-    }
-    fallback.to_string()
+    attendee_email_for_event(email, event, fallback).unwrap_or_else(|| fallback.to_string())
 }
 
 /// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
@@ -5844,6 +6024,49 @@ mod tests {
     }
 
     #[test]
+    fn list_email_payload_and_invite_chip_wiring_contract() {
+        // Backend contract: every row carries explicit invite semantics. The
+        // frontend must never infer an actionable invite from hasCalendar,
+        // which also covers REPLY/CANCEL and ordinary calendar attachments.
+        let src = include_str!("routes.rs");
+        let src = src.split("mod tests").next().unwrap_or(src);
+        let list = js_fn_body(src, "async fn list_emails(");
+        for field in [
+            r#""inviteMethod""#,
+            r#""isInviteToMe""#,
+            r#""inviteStatus""#,
+            r#""inviteIsUpdated""#,
+        ] {
+            assert!(list.contains(field), "list_emails must serialize {field}");
+        }
+
+        // Renderer contract: both surfaces use the dedicated helper from the
+        // actual row function. A helper that exists but is never interpolated
+        // would leave the Node units green while rendering no chip in-app.
+        for (name, src, row_decl) in [
+            ("desktop", APP_JS, "function renderEmailList("),
+            ("mobile", MOBILE_APP_JS, "function renderEmailRows("),
+        ] {
+            let chip = js_fn_body(src, "function renderInviteChip(");
+            assert!(
+                chip.contains("email.isInviteToMe")
+                    && chip.contains("email.inviteMethod !== 'REQUEST'"),
+                "{name} chip must gate on server-authoritative invite semantics"
+            );
+            assert!(
+                js_fn_body(src, row_decl).contains("renderInviteChip(email)"),
+                "{name} row renderer must interpolate renderInviteChip(email)"
+            );
+            let rsvp = js_fn_body(src, "async function rsvpToEvent(");
+            assert!(
+                rsvp.contains("listItem.inviteStatus = status")
+                    && rsvp.contains("listItem.inviteIsUpdated = false"),
+                "{name} RSVP must update the list chip before returning to the inbox"
+            );
+        }
+    }
+
+    #[test]
     fn desktop_attachment_hrefs_carry_account_param() {
         // Contract (kata kph2): download_attachment resolves the session
         // from the ?account= query param and silently falls back to the
@@ -7564,6 +7787,7 @@ white   = '#fdf6e3'
             text_body: None,
             html_body: None,
             has_calendar: false,
+            calendar_ics: None,
             attachments: vec![],
             in_reply_to: None,
         }
@@ -7593,6 +7817,68 @@ white   = '#fdf6e3'
             user_rsvp_status: None,
             is_update: false,
         }
+    }
+
+    #[test]
+    fn invite_list_fields_require_request_to_matching_attendee() {
+        let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        assert_eq!(
+            fields,
+            InviteListFields {
+                method: Some("REQUEST".into()),
+                is_invite_to_me: true,
+                status: Some("NEEDS-ACTION".into()),
+                is_updated: false,
+            }
+        );
+
+        let mut reply = event.clone();
+        reply.method = "REPLY".into();
+        assert!(!invite_list_fields(&email, Some(&reply), "bob@example.com", None).is_invite_to_me);
+
+        let not_to_me = test_calendar_event(vec!["carol@example.com"]);
+        assert!(
+            !invite_list_fields(&email, Some(&not_to_me), "bob@example.com", None).is_invite_to_me
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_hide_organizers_own_request() {
+        let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
+        let mut event = test_calendar_event(vec!["bob@example.com"]);
+        event.organizer_email = "bob@example.com".into();
+        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        assert_eq!(fields.method.as_deref(), Some("REQUEST"));
+        assert!(!fields.is_invite_to_me);
+        assert!(fields.status.is_none());
+    }
+
+    #[test]
+    fn invite_list_fields_prefer_stored_partstat() {
+        let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
+        let incoming = test_calendar_event(vec!["bob@example.com"]);
+        let mut stored = incoming.clone();
+        stored.attendees[0].status = "ACCEPTED".into();
+        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        assert_eq!(fields.status.as_deref(), Some("ACCEPTED"));
+        assert!(!fields.is_updated);
+    }
+
+    #[test]
+    fn invite_list_fields_mark_verified_reschedule_updated() {
+        let mut email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
+        email.from[0].email = "org@example.com".into();
+        let mut stored = test_calendar_event(vec!["bob@example.com"]);
+        stored.attendees[0].status = "ACCEPTED".into();
+        let mut incoming = stored.clone();
+        incoming.sequence = 1;
+        incoming.summary = "Rescheduled".into();
+
+        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        assert!(fields.is_updated);
+        assert_eq!(fields.status.as_deref(), Some("NEEDS-ACTION"));
     }
 
     #[test]
@@ -8176,9 +8462,8 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_optimistic_update_reverts_on_error() {
-        // rsvpToEvent should deep-clone prevEvent and revert on catch
-        let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
-        let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
+        // rsvpToEvent should deep-clone prevEvent and revert on catch.
+        let rsvp_fn = js_fn_body(APP_JS, "async function rsvpToEvent(");
         assert!(
             rsvp_fn.contains("JSON.parse(JSON.stringify(event))"),
             "should deep-clone event for revert"
@@ -8191,9 +8476,8 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_updates_cache_after_rsvp() {
-        // After successful RSVP, the email cache should be updated
-        let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
-        let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
+        // After successful RSVP, the email cache should be updated.
+        let rsvp_fn = js_fn_body(APP_JS, "async function rsvpToEvent(");
         assert!(
             rsvp_fn.contains("emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail"),
             "should update emailCache after RSVP (account-scoped key via cacheKey)"
@@ -8989,10 +9273,7 @@ white   = '#fdf6e3'
 
     #[test]
     fn mobile_app_js_has_rsvp_route_call() {
-        let start = MOBILE_APP_JS
-            .find("async function rsvpToEvent(")
-            .expect("rsvpToEvent must exist");
-        let rsvp_fn = &MOBILE_APP_JS[start..start + 1000];
+        let rsvp_fn = js_fn_body(MOBILE_APP_JS, "async function rsvpToEvent(");
         assert!(
             rsvp_fn.contains("state.api('POST',"),
             "rsvpToEvent should post through state.api"
@@ -9009,10 +9290,7 @@ white   = '#fdf6e3'
 
     #[test]
     fn mobile_app_js_rsvp_optimistic_flip_reverts_on_failure() {
-        let start = MOBILE_APP_JS
-            .find("async function rsvpToEvent(")
-            .expect("rsvpToEvent must exist");
-        let rsvp_fn = &MOBILE_APP_JS[start..start + 1000];
+        let rsvp_fn = js_fn_body(MOBILE_APP_JS, "async function rsvpToEvent(");
         assert!(
             rsvp_fn.contains("event.user_rsvp_status = status"),
             "should optimistically set user_rsvp_status before the request"

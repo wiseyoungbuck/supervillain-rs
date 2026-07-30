@@ -1299,6 +1299,7 @@ mod tests {
             text_body: None,
             html_body: None,
             has_calendar: false,
+            calendar_ics: None,
             attachments: vec![],
             in_reply_to: None,
         }

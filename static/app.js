@@ -2186,6 +2186,26 @@ function toggleThreadExpand(threadId) {
     renderEmailList();
 }
 
+function renderInviteChip(email) {
+    if (!email.isInviteToMe || email.inviteMethod !== 'REQUEST') return '';
+
+    const status = email.inviteIsUpdated
+        ? 'UPDATED'
+        : String(email.inviteStatus || 'NEEDS-ACTION').toUpperCase();
+    const presentations = {
+        'UPDATED':      { label: 'Updated',        cls: 'updated' },
+        'ACCEPTED':     { label: 'Accepted',       cls: 'accepted' },
+        'TENTATIVE':    { label: 'Tentative',      cls: 'tentative' },
+        'DECLINED':     { label: 'Declined',       cls: 'declined' },
+        'NEEDS-ACTION': { label: 'Needs response', cls: 'needs-action' },
+    };
+    const presentation = presentations[status] || presentations['NEEDS-ACTION'];
+    const accessibleLabel = 'Calendar invite: ' + presentation.label;
+    return `<span class="email-invite email-invite--${presentation.cls}" title="${accessibleLabel}" aria-label="${accessibleLabel}">`
+        + '<span class="email-invite-icon" aria-hidden="true">📅</span>'
+        + `<span class="email-invite-label">${presentation.label}</span></span>`;
+}
+
 function renderEmailList() {
     // Every render draws the CURRENT context's state.emails, so the pane
     // now shows that context — including the empty state below.
@@ -2240,6 +2260,7 @@ function renderEmailList() {
                     <span class="email-preview">— ${escapeHtml(email.preview)}</span>
                 </span>
                 ${email.hasAttachment ? '<span class="email-attachment">📎</span>' : ''}
+                ${renderInviteChip(email)}
                 <span class="email-date">${date}</span>
             </div>
         `;
@@ -5929,8 +5950,17 @@ async function rsvpToEvent(status) {
 
     const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     let prevEvent = null;
+    const listItem = state.emails.find(e => e.id === state.currentEmail.id);
+    const prevInviteStatus = listItem?.inviteStatus;
+    const prevInviteIsUpdated = listItem?.inviteIsUpdated;
 
-    // Optimistic: update RSVP buttons immediately if we have event data
+    // Optimistic: update RSVP buttons and the hidden list row immediately,
+    // so returning to the inbox shows the new chip without a list reload.
+    if (listItem?.isInviteToMe) {
+        listItem.inviteStatus = status;
+        listItem.inviteIsUpdated = false;
+        renderEmailList();
+    }
     if (event) {
         prevEvent = JSON.parse(JSON.stringify(event));
         event.user_rsvp_status = status;
@@ -5960,6 +5990,11 @@ async function rsvpToEvent(status) {
             state.currentEmail.calendarEvent = prevEvent;
             emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
             renderCalendarCard(prevEvent);
+        }
+        if (listItem?.isInviteToMe) {
+            listItem.inviteStatus = prevInviteStatus;
+            listItem.inviteIsUpdated = prevInviteIsUpdated;
+            renderEmailList();
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
     }

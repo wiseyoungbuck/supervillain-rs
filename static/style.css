@@ -699,6 +699,32 @@ body {
     margin-left: 8px;
 }
 
+.email-invite {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    border: 1px solid currentColor;
+    border-radius: 9px;
+    padding: 1px 6px;
+    background: var(--bg-tertiary);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.25;
+    white-space: nowrap;
+}
+
+.email-invite--needs-action,
+.email-invite--tentative { color: var(--warning); }
+.email-invite--accepted { color: var(--success); }
+.email-invite--declined { color: var(--danger); }
+.email-invite--updated { color: var(--accent); }
+
+.email-invite-icon {
+    font-size: 11px;
+    line-height: 1;
+}
+
 /* Threading / conversation grouping (kata 64z6, task B7) */
 .email-thread-count {
     background: var(--accent);
