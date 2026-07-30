@@ -4279,7 +4279,7 @@ mod tests {
             "END:VEVENT\r\n",
             "END:VCALENDAR\r\n",
         );
-        crate::calendar::parse_ics(ics).expect("probe ICS parses")
+        crate::calendar::parse_ics(ics, chrono_tz::Tz::UTC).expect("probe ICS parses")
     }
 
     /// True for the iCalUId-filter lookup (Exchange-processed events).

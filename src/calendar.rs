@@ -1,7 +1,5 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
-use chrono::{
-    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
-};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -89,7 +87,10 @@ static TAG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^</?([a-zA-Z
 // ICS Parsing (hand-rolled)
 // =============================================================================
 
-pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
+/// Parse an iCalendar event, interpreting floating DATE-TIME values in the
+/// configured primary timezone. Explicit `TZID` parameters and UTC `Z`
+/// suffixes take precedence over `primary_tz`.
+pub fn parse_ics(data: &str, primary_tz: Tz) -> Option<CalendarEvent> {
     let data = data.trim();
     if !data.contains("BEGIN:VCALENDAR") {
         return None;
@@ -123,8 +124,8 @@ pub fn parse_ics(data: &str) -> Option<CalendarEvent> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", &tz_offsets)?;
-    let dtend = parse_ics_datetime_property(&unfolded, "DTEND", &tz_offsets);
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", &tz_offsets, primary_tz)?;
+    let dtend = parse_ics_datetime_property(&unfolded, "DTEND", &tz_offsets, primary_tz);
 
     let status = extract_property(&unfolded, "STATUS");
 
@@ -557,6 +558,7 @@ fn parse_ics_datetime_property(
     text: &str,
     name: &str,
     tz_offsets: &HashMap<String, FixedOffset>,
+    primary_tz: Tz,
 ) -> Option<DateTime<Utc>> {
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
@@ -611,20 +613,11 @@ fn parse_ics_datetime_property(
             }
         }
 
-        // Case 3: Floating time (no Z, no TZID) — interpret as system local tz.
-        // Use from_local_datetime on the event's date to get the correct DST offset.
-        //
-        // NOTE (kata 6t75): per RFC 5545 this should really be the app's
-        // configured *primary* timezone (see timezone::resolve/primary_tz),
-        // not the process's system tz — chrono::Local can silently disagree
-        // with what the user picked in settings. Deliberately not changed
-        // here: that config lives behind `AppState.timezone_config_path` and
-        // is only reachable from routes.rs, while every caller of
-        // `parse_ics`/`parse_ics_datetime_property` (provider.rs, jmap.rs,
-        // routes.rs) is out of scope for this fix — threading it through
-        // would require a signature change that forces edits in those other
-        // files. See the report for what a follow-up would need to do.
-        let local = resolve_local_datetime_lenient(&Local, dt)?;
+        // Case 3: Floating time (no Z, no TZID). RFC 5545 leaves this as a
+        // wall-clock value; in the app, interpret it in the user's configured
+        // primary timezone rather than the process's system timezone. Resolve
+        // against the event date so the correct historical DST offset applies.
+        let local = resolve_local_datetime_lenient(&primary_tz, dt)?;
         return Some(local.with_timezone(&Utc));
     }
     None
@@ -1234,7 +1227,7 @@ END:VCALENDAR";
 
     #[test]
     fn parse_basic_event() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.uid, "test-uid-123@example.com");
         assert_eq!(event.summary, "Team Standup");
         assert_eq!(event.location, Some("Conference Room B".into()));
@@ -1245,19 +1238,19 @@ END:VCALENDAR";
 
     #[test]
     fn parse_organizer_email() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.organizer_email, "alice@example.com");
     }
 
     #[test]
     fn parse_organizer_name() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.organizer_name, Some("Alice".into()));
     }
 
     #[test]
     fn parse_attendees() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.attendees.len(), 2);
         assert_eq!(event.attendees[0].email, "bob@example.com");
         assert_eq!(event.attendees[0].name, Some("Bob".into()));
@@ -1269,40 +1262,40 @@ END:VCALENDAR";
 
     #[test]
     fn parse_missing_location() {
-        let event = parse_ics(SAMPLE_ICS_NO_LOCATION).unwrap();
+        let event = parse_ics(SAMPLE_ICS_NO_LOCATION, Tz::UTC).unwrap();
         assert!(event.location.is_none());
         assert_eq!(event.summary, "Quick Sync");
     }
 
     #[test]
     fn parse_missing_dtend() {
-        let event = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
+        let event = parse_ics(SAMPLE_ICS_NO_DTEND, Tz::UTC).unwrap();
         assert!(event.dtend.is_none());
     }
 
     #[test]
     fn parse_all_day_event() {
-        let event = parse_ics(SAMPLE_ICS_ALL_DAY).unwrap();
+        let event = parse_ics(SAMPLE_ICS_ALL_DAY, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.hour(), 0);
         assert_eq!(event.dtstart.minute(), 0);
     }
 
     #[test]
     fn parse_preserves_raw_ics() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert!(event.raw_ics.contains("VEVENT"));
         assert!(event.raw_ics.contains("Team Standup"));
     }
 
     #[test]
     fn parse_invalid_ics_returns_none() {
-        assert!(parse_ics("this is not valid ICS data").is_none());
+        assert!(parse_ics("this is not valid ICS data", Tz::UTC).is_none());
     }
 
     #[test]
     fn parse_no_vevent_returns_none() {
         let data = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR";
-        assert!(parse_ics(data).is_none());
+        assert!(parse_ics(data, Tz::UTC).is_none());
     }
 
     #[test]
@@ -1315,7 +1308,7 @@ SUMMARY:No UID\r\n\
 DTSTART:20260215T100000Z\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        assert!(parse_ics(data).is_none());
+        assert!(parse_ics(data, Tz::UTC).is_none());
     }
 
     /// kata 4ycd: a decoy "END:VEVENT" appearing in a property value BEFORE
@@ -1339,15 +1332,15 @@ ORGANIZER:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event =
-            parse_ics(data).expect("should parse the real VEVENT despite decoy text earlier");
+        let event = parse_ics(data, Tz::UTC)
+            .expect("should parse the real VEVENT despite decoy text earlier");
         assert_eq!(event.uid, "end-before-begin@example.com");
         assert_eq!(event.summary, "Real event");
     }
 
     #[test]
     fn parse_attendee_without_cn() {
-        let event = parse_ics(SAMPLE_ICS_ATTENDEE_NO_CN).unwrap();
+        let event = parse_ics(SAMPLE_ICS_ATTENDEE_NO_CN, Tz::UTC).unwrap();
         assert_eq!(event.attendees.len(), 1);
         assert!(event.attendees[0].name.is_none());
         assert_eq!(event.attendees[0].email, "dave@example.com");
@@ -1407,7 +1400,7 @@ END:VCALENDAR";
 
     #[test]
     fn parse_user_rsvp_status_is_none() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert!(
             event.user_rsvp_status.is_none(),
             "parse_ics should not populate user_rsvp_status"
@@ -1416,13 +1409,13 @@ END:VCALENDAR";
 
     #[test]
     fn parse_method() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.method, "REQUEST");
     }
 
     #[test]
     fn parse_dtstart_value() {
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.year(), 2026);
         assert_eq!(event.dtstart.month(), 2);
         assert_eq!(event.dtstart.day(), 15);
@@ -1449,7 +1442,7 @@ ORGANIZER:mailto:alice@example.com\r\n\
 ATTENDEE:mailto:bob@example.com\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR\r\n";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.hour(), 17, "PDT → 17:00 UTC, not 18:00");
         assert_eq!(event.dtstart.day(), 15);
     }
@@ -1471,19 +1464,16 @@ ORGANIZER:mailto:alice@example.com\r\n\
 ATTENDEE:mailto:bob@example.com\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR\r\n";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.hour(), 18);
     }
 
     /// kata 6t75: DST spring-forward gap. Clocks in America/New_York jump
-    /// from 02:00 to 03:00 on 2026-03-08, so 02:30 local never occurs.
-    /// `from_local_datetime` reports no mapping at all for that wall-clock
-    /// time (`.earliest()` and `.latest()` both `None`), which used to make
-    /// `parse_ics_datetime_property` return `None` and `parse_ics` drop the
-    /// whole event. It must instead resolve to a valid instant (shifted
-    /// forward past the gap) rather than silently discarding the invite.
+    /// from 02:00 to 03:00 on 2026-03-08, so the floating 02:30 DTSTART below
+    /// has no mapping in the configured primary timezone. It must resolve to
+    /// a valid instant after the gap rather than dropping the whole event.
     #[test]
-    fn parse_ics_dst_gap_dtstart_does_not_drop_event() {
+    fn parse_floating_dst_gap_shifts_forward_in_configured_primary_tz() {
         let ics = "\
 BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
@@ -1492,11 +1482,12 @@ METHOD:REQUEST\r\n\
 BEGIN:VEVENT\r\n\
 UID:dst-gap@example.com\r\n\
 SUMMARY:Spring forward\r\n\
-DTSTART;TZID=America/New_York:20260308T023000\r\n\
+DTSTART:20260308T023000\r\n\
 ORGANIZER:mailto:alice@example.com\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR\r\n";
-        let event = parse_ics(ics)
+        let primary_tz = "America/New_York".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz)
             .expect("a DTSTART landing in a DST spring-forward gap must not drop the event");
         // The gap runs [02:00, 03:00) EST/EDT; the first valid instant at or
         // after the requested 02:30 is 03:00 EDT (UTC-4) = 07:00 UTC.
@@ -1507,7 +1498,7 @@ END:VCALENDAR\r\n";
     // --- generate_rsvp tests ---
 
     fn sample_event() -> CalendarEvent {
-        parse_ics(SAMPLE_ICS).unwrap()
+        parse_ics(SAMPLE_ICS, Tz::UTC).unwrap()
     }
 
     #[test]
@@ -1569,14 +1560,14 @@ END:VCALENDAR\r\n";
     fn rsvp_is_parseable() {
         let rsvp = generate_rsvp(&sample_event(), "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.starts_with("BEGIN:VCALENDAR"));
-        let parsed = parse_ics(&rsvp).unwrap();
+        let parsed = parse_ics(&rsvp, Tz::UTC).unwrap();
         assert_eq!(parsed.uid, "test-uid-123@example.com");
         assert_eq!(parsed.method, "REPLY");
     }
 
     #[test]
     fn rsvp_no_dtend() {
-        let event = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
+        let event = parse_ics(SAMPLE_ICS_NO_DTEND, Tz::UTC).unwrap();
         let rsvp = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Accepted);
         assert!(rsvp.contains("METHOD:REPLY"));
         assert!(!rsvp.contains("DTEND"));
@@ -1600,7 +1591,7 @@ ORGANIZER:mailto:org@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.uid, "correct-uid@example.com");
     }
 
@@ -1620,7 +1611,7 @@ ORGANIZER:mailto:org@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.year(), 2026);
         assert_eq!(event.dtstart.month(), 3);
     }
@@ -1633,27 +1624,27 @@ END:VCALENDAR";
 
     #[test]
     fn uid_stable_through_full_rsvp_lifecycle() {
-        let original = parse_ics(SAMPLE_ICS).unwrap();
+        let original = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         let uid = &original.uid;
 
         // Accept → parse back
         let accept_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Accepted);
-        let accepted = parse_ics(&accept_ics).unwrap();
+        let accepted = parse_ics(&accept_ics, Tz::UTC).unwrap();
         assert_eq!(&accepted.uid, uid);
 
         // Decline → parse back
         let decline_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Declined);
-        let declined = parse_ics(&decline_ics).unwrap();
+        let declined = parse_ics(&decline_ics, Tz::UTC).unwrap();
         assert_eq!(&declined.uid, uid);
 
         // Re-accept after decline → parse back (the mis-click recovery path)
         let reaccept_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Accepted);
-        let reaccepted = parse_ics(&reaccept_ics).unwrap();
+        let reaccepted = parse_ics(&reaccept_ics, Tz::UTC).unwrap();
         assert_eq!(&reaccepted.uid, uid);
 
         // Tentative → parse back
         let maybe_ics = generate_rsvp(&original, "bob@example.com", &RsvpStatus::Tentative);
-        let maybe = parse_ics(&maybe_ics).unwrap();
+        let maybe = parse_ics(&maybe_ics, Tz::UTC).unwrap();
         assert_eq!(&maybe.uid, uid);
     }
 
@@ -1670,7 +1661,7 @@ END:VCALENDAR";
             RsvpStatus::Declined,
         ] {
             let ics = generate_rsvp(&event, "bob@example.com", status);
-            let parsed = parse_ics(&ics).unwrap();
+            let parsed = parse_ics(&ics, Tz::UTC).unwrap();
             assert_eq!(
                 parsed.method,
                 "REPLY",
@@ -1697,7 +1688,7 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:1\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.method, "CANCEL");
         assert_ne!(event.method, "REQUEST");
     }
@@ -1719,7 +1710,7 @@ ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.method, "REPLY");
         assert_ne!(event.method, "REQUEST");
     }
@@ -1739,7 +1730,7 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_ne!(event.method, "REQUEST");
     }
 
@@ -1761,11 +1752,11 @@ ATTENDEE;CN=Bob;PARTSTAT=NEEDS-ACTION:mailto:bob@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         let original_uid = event.uid.clone();
 
         let rsvp = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Accepted);
-        let parsed = parse_ics(&rsvp).unwrap();
+        let parsed = parse_ics(&rsvp, Tz::UTC).unwrap();
         assert_eq!(parsed.uid, original_uid);
     }
 
@@ -1777,7 +1768,7 @@ END:VCALENDAR";
         // enough data to parse fully (summary, organizer, etc).
         let event = sample_event();
         let ics = generate_rsvp(&event, "bob@example.com", &RsvpStatus::Declined);
-        let parsed = parse_ics(&ics).unwrap();
+        let parsed = parse_ics(&ics, Tz::UTC).unwrap();
 
         assert_eq!(parsed.uid, event.uid);
         assert_eq!(parsed.summary, event.summary);
@@ -1846,7 +1837,7 @@ END:VCALENDAR";
         assert!(result.contains("SUMMARY:Team Standup"));
         assert!(result.contains("UID:test-uid-123@example.com"));
         // Should still be parseable
-        let event = parse_ics(&result).unwrap();
+        let event = parse_ics(&result, Tz::UTC).unwrap();
         assert_eq!(event.uid, "test-uid-123@example.com");
         assert_eq!(event.attendees.len(), 2);
     }
@@ -1899,7 +1890,7 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:1\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.method, "CANCEL");
     }
 
@@ -1918,14 +1909,14 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.method, "REQUEST");
     }
 
     #[test]
     fn no_status_preserves_method() {
         // Most normal invitations have no STATUS field
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+        let event = parse_ics(SAMPLE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.method, "REQUEST");
     }
 
@@ -2074,7 +2065,7 @@ END:VCALENDAR";
     // to Unchanged so the destructive remove+re-add doesn't fire for nothing.
 
     fn base_event() -> CalendarEvent {
-        parse_ics(SAMPLE_ICS).unwrap()
+        parse_ics(SAMPLE_ICS, Tz::UTC).unwrap()
     }
 
     #[test]
@@ -2120,8 +2111,8 @@ END:VCALENDAR";
     fn content_match_true_when_both_missing_optional_fields() {
         // Neither side has LOCATION/DTEND — the None/None case must count as
         // a match, not a mismatch.
-        let stored = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
-        let incoming = parse_ics(SAMPLE_ICS_NO_DTEND).unwrap();
+        let stored = parse_ics(SAMPLE_ICS_NO_DTEND, Tz::UTC).unwrap();
+        let incoming = parse_ics(SAMPLE_ICS_NO_DTEND, Tz::UTC).unwrap();
         assert!(events_content_match(&stored, &incoming));
     }
 
@@ -2612,17 +2603,19 @@ END:VCALENDAR";
     // --- timezone handling tests ---
 
     #[test]
-    fn parse_utc_z_suffix_unchanged() {
-        // Z suffix = already UTC, should parse as-is
-        let event = parse_ics(SAMPLE_ICS).unwrap();
+    fn parse_utc_z_suffix_ignores_configured_primary_tz() {
+        // Z suffix = already UTC; a deliberately different primary timezone
+        // must not alter it.
+        let primary_tz = "Pacific/Honolulu".parse::<Tz>().unwrap();
+        let event = parse_ics(SAMPLE_ICS, primary_tz).unwrap();
         assert_eq!(event.dtstart.hour(), 10);
         assert_eq!(event.dtstart.minute(), 0);
     }
 
     #[test]
-    fn parse_tzid_converts_to_utc() {
-        // DTSTART with TZID=America/New_York and a VTIMEZONE block.
-        // 10:00 EST (UTC-5) should become 15:00 UTC.
+    fn parse_explicit_tzid_ignores_configured_primary_tz() {
+        // DTSTART has TZID=America/New_York while the configured primary is
+        // deliberately Tokyo. The explicit TZID wins: 10:00 EST = 15:00 UTC.
         let ics = "\
 BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
@@ -2649,11 +2642,10 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
-        // 10:00 EST = 15:00 UTC
+        let primary_tz = "Asia/Tokyo".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz).unwrap();
         assert_eq!(event.dtstart.hour(), 15);
         assert_eq!(event.dtstart.minute(), 0);
-        // 11:00 EST = 16:00 UTC
         let dtend = event.dtend.unwrap();
         assert_eq!(dtend.hour(), 16);
     }
@@ -2681,16 +2673,16 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
+        let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_eq!(event.dtstart.hour(), 4);
         assert_eq!(event.dtstart.minute(), 30);
     }
 
     #[test]
-    fn parse_floating_time_uses_local_tz() {
-        // No Z, no TZID — floating time. Should be interpreted as system local.
-        // We can't assert the exact UTC hour (depends on where tests run),
-        // but we can verify it parses and the offset is applied.
+    fn parse_floating_time_uses_configured_primary_tz() {
+        // No Z and no TZID means floating time. The configured primary is
+        // Kolkata (UTC+05:30), so 10:00 local must become 04:30 UTC regardless
+        // of the machine timezone running this test.
         let ics = "\
 BEGIN:VCALENDAR\r\n\
 VERSION:2.0\r\n\
@@ -2703,23 +2695,10 @@ ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
 SEQUENCE:0\r\n\
 END:VEVENT\r\n\
 END:VCALENDAR";
-        let event = parse_ics(ics).unwrap();
-        // Verify the local offset was applied: 10:00 local != 10:00 UTC
-        // unless we're in UTC. Compute expected value from system tz.
-        // Use the offset at the event's date (Feb 15), not the current date,
-        // so this test is correct across DST boundaries.
-        let event_date = NaiveDateTime::new(
-            NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
-            NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
-        );
-        let local_offset = Local
-            .from_local_datetime(&event_date)
-            .earliest()
-            .unwrap()
-            .offset()
-            .local_minus_utc();
-        let expected_utc_hour = (10 - local_offset / 3600 + 24) % 24;
-        assert_eq!(event.dtstart.hour() as i32, expected_utc_hour);
+        let primary_tz = "Asia/Kolkata".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz).unwrap();
+        assert_eq!(event.dtstart.hour(), 4);
+        assert_eq!(event.dtstart.minute(), 30);
     }
 
     #[test]
@@ -2795,14 +2774,14 @@ END:VCALENDAR";
     /// Verify: accept RSVP → persist to CalDAV → re-read → status is ACCEPTED
     #[test]
     fn lifecycle_accept_persists_and_reads_back() {
-        let event = parse_ics(INVITE_ICS).unwrap();
+        let event = parse_ics(INVITE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.user_rsvp_status, None);
 
         // Simulate backend rsvp(): update_partstat writes to CalDAV
         let updated_ics = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
 
         // Simulate get_email(): re-parse the stored ICS (what CalDAV returns)
-        let re_read = parse_ics(&updated_ics).unwrap();
+        let re_read = parse_ics(&updated_ics, Tz::UTC).unwrap();
         let bob = re_read
             .attendees
             .iter()
@@ -2824,7 +2803,7 @@ END:VCALENDAR";
     fn lifecycle_change_accept_to_decline() {
         // First: accept
         let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
-        let event = parse_ics(&after_accept).unwrap();
+        let event = parse_ics(&after_accept, Tz::UTC).unwrap();
         assert_eq!(
             event
                 .attendees
@@ -2840,7 +2819,7 @@ END:VCALENDAR";
         // works on already-updated ICS)
         let after_decline =
             update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
-        let event2 = parse_ics(&after_decline).unwrap();
+        let event2 = parse_ics(&after_decline, Tz::UTC).unwrap();
         assert_eq!(
             event2
                 .attendees
@@ -2860,7 +2839,7 @@ END:VCALENDAR";
         // Re-accept: the original ICS is used for the upsert (not the declined one,
         // since decline removes from calendar). This tests accept from the original invite.
         let after_reaccept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
-        let event = parse_ics(&after_reaccept).unwrap();
+        let event = parse_ics(&after_reaccept, Tz::UTC).unwrap();
         assert_eq!(
             event
                 .attendees
@@ -2874,7 +2853,7 @@ END:VCALENDAR";
         // Also verify that updating the declined version works too
         let after_reaccept2 =
             update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
-        let event2 = parse_ics(&after_reaccept2).unwrap();
+        let event2 = parse_ics(&after_reaccept2, Tz::UTC).unwrap();
         assert_eq!(
             event2
                 .attendees
@@ -2899,7 +2878,7 @@ END:VCALENDAR";
 
             // What CalDAV would store and get_rsvp_status() would return
             let updated_ics = update_partstat(INVITE_ICS, "bob@example.com", status);
-            let re_read = parse_ics(&updated_ics).unwrap();
+            let re_read = parse_ics(&updated_ics, Tz::UTC).unwrap();
             let persisted_status = re_read
                 .attendees
                 .iter()
@@ -2920,7 +2899,7 @@ END:VCALENDAR";
     /// (prevents auto-add loop when viewing sent RSVP emails)
     #[test]
     fn lifecycle_rsvp_reply_never_triggers_auto_add() {
-        let event = parse_ics(INVITE_ICS).unwrap();
+        let event = parse_ics(INVITE_ICS, Tz::UTC).unwrap();
         assert_eq!(event.method, "REQUEST", "original invite should be REQUEST");
 
         for status in &[
@@ -2929,7 +2908,7 @@ END:VCALENDAR";
             RsvpStatus::Declined,
         ] {
             let reply_ics = generate_rsvp(&event, "bob@example.com", status);
-            let reply = parse_ics(&reply_ics).unwrap();
+            let reply = parse_ics(&reply_ics, Tz::UTC).unwrap();
             assert_eq!(reply.method, "REPLY");
             assert_ne!(reply.method, "REQUEST");
         }
@@ -2939,7 +2918,7 @@ END:VCALENDAR";
     #[test]
     fn lifecycle_cancel_method_not_request() {
         let cancel_ics = INVITE_ICS.replace("METHOD:REQUEST", "METHOD:CANCEL");
-        let event = parse_ics(&cancel_ics).unwrap();
+        let event = parse_ics(&cancel_ics, Tz::UTC).unwrap();
         assert_eq!(event.method, "CANCEL");
         assert_ne!(event.method, "REQUEST");
     }
@@ -2949,26 +2928,26 @@ END:VCALENDAR";
     fn lifecycle_parse_never_sets_user_rsvp_status() {
         // Even after updating PARTSTAT, parse_ics never sets user_rsvp_status
         let updated = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
-        let event = parse_ics(&updated).unwrap();
+        let event = parse_ics(&updated, Tz::UTC).unwrap();
         assert_eq!(event.user_rsvp_status, None);
     }
 
     /// Verify: UID survives the full accept→decline→re-accept cycle
     #[test]
     fn lifecycle_uid_stable_through_rsvp_changes() {
-        let original = parse_ics(INVITE_ICS).unwrap();
+        let original = parse_ics(INVITE_ICS, Tz::UTC).unwrap();
         let uid = &original.uid;
 
         let after_accept = update_partstat(INVITE_ICS, "bob@example.com", &RsvpStatus::Accepted);
-        assert_eq!(parse_ics(&after_accept).unwrap().uid, *uid);
+        assert_eq!(parse_ics(&after_accept, Tz::UTC).unwrap().uid, *uid);
 
         let after_decline =
             update_partstat(&after_accept, "bob@example.com", &RsvpStatus::Declined);
-        assert_eq!(parse_ics(&after_decline).unwrap().uid, *uid);
+        assert_eq!(parse_ics(&after_decline, Tz::UTC).unwrap().uid, *uid);
 
         let after_reaccept =
             update_partstat(&after_decline, "bob@example.com", &RsvpStatus::Accepted);
-        assert_eq!(parse_ics(&after_reaccept).unwrap().uid, *uid);
+        assert_eq!(parse_ics(&after_reaccept, Tz::UTC).unwrap().uid, *uid);
     }
 
     /// Verify: update_partstat on CalDAV-stored ICS preserves other attendees
@@ -2979,7 +2958,7 @@ END:VCALENDAR";
         // Carol declines
         let after_both = update_partstat(&after_bob, "carol@example.com", &RsvpStatus::Declined);
 
-        let event = parse_ics(&after_both).unwrap();
+        let event = parse_ics(&after_both, Tz::UTC).unwrap();
         let bob = event
             .attendees
             .iter()
@@ -3046,7 +3025,7 @@ END:VCALENDAR";
             }],
             None,
         );
-        let parsed = parse_ics(&ics).unwrap();
+        let parsed = parse_ics(&ics, Tz::UTC).unwrap();
         // 14:30 London in July is BST (UTC+1) → 13:30 UTC.
         assert_eq!(parsed.dtstart.hour(), 13);
         assert_eq!(parsed.dtstart.minute(), 30);
@@ -3096,7 +3075,7 @@ END:VCALENDAR";
         let tz: Tz = "America/New_York".parse().unwrap();
         let original = sample_event();
         let rsvp = generate_rsvp_with_tz(&original, "bob@example.com", &RsvpStatus::Accepted, tz);
-        let parsed = parse_ics(&rsvp).unwrap();
+        let parsed = parse_ics(&rsvp, Tz::UTC).unwrap();
         // The UTC instant must round-trip even though wall-clock is now NYC.
         assert_eq!(parsed.dtstart, original.dtstart);
         assert_eq!(parsed.method, "REPLY");
@@ -3143,7 +3122,7 @@ END:VCALENDAR";
             attendee_lines, 1,
             "must not inject a second ATTENDEE line via CN= CRLF injection"
         );
-        let parsed = parse_ics(&ics).expect("must round-trip through parser");
+        let parsed = parse_ics(&ics, Tz::UTC).expect("must round-trip through parser");
         assert_eq!(
             parsed.attendees.len(),
             1,

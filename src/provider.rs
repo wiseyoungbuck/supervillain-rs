@@ -323,9 +323,10 @@ pub async fn get_calendar_data(
 pub async fn get_calendar_event(
     s: &ProviderSession,
     uid: &str,
+    primary_tz: chrono_tz::Tz,
 ) -> Result<Option<CalendarEvent>, Error> {
     match s {
-        ProviderSession::Fastmail(s) => jmap::get_calendar_event(s, uid).await,
+        ProviderSession::Fastmail(s) => jmap::get_calendar_event(s, uid, primary_tz).await,
         ProviderSession::Outlook(s) => outlook::get_calendar_event(s, uid).await,
         ProviderSession::Gmail(s) => gmail::get_calendar_event(s, uid).await,
     }
@@ -370,11 +371,12 @@ pub async fn add_to_calendar(
     ics_data: &str,
     uid: &str,
     only_if_new: bool,
+    primary_tz: chrono_tz::Tz,
 ) -> Result<bool, Error> {
     match s {
         ProviderSession::Fastmail(s) => jmap::add_to_calendar(s, ics_data, uid, only_if_new).await,
         ProviderSession::Outlook(s) => {
-            let event = calendar::parse_ics(ics_data).ok_or_else(|| {
+            let event = calendar::parse_ics(ics_data, primary_tz).ok_or_else(|| {
                 Error::Internal("Failed to parse ICS for Outlook calendar".into())
             })?;
             if only_if_new {
@@ -404,7 +406,7 @@ pub async fn add_to_calendar(
             }
         }
         ProviderSession::Gmail(s) => {
-            let event = calendar::parse_ics(ics_data)
+            let event = calendar::parse_ics(ics_data, primary_tz)
                 .ok_or_else(|| Error::Internal("Failed to parse ICS for Gmail calendar".into()))?;
             if only_if_new {
                 gmail::add_to_calendar(s, ics_data, &event).await

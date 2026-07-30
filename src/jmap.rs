@@ -2421,6 +2421,7 @@ async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<Stri
 pub async fn get_calendar_event(
     s: &JmapSession,
     uid: &str,
+    primary_tz: chrono_tz::Tz,
 ) -> Result<Option<CalendarEvent>, Error> {
     let auth = require_caldav_auth(s)?;
     // Resolve the default writable calendar collection via PROPFIND (cached on
@@ -2447,7 +2448,7 @@ pub async fn get_calendar_event(
     }
 
     let ics_data = resp.text().await?;
-    Ok(calendar::parse_ics(&ics_data))
+    Ok(calendar::parse_ics(&ics_data, primary_tz))
 }
 
 pub async fn add_to_calendar(
@@ -2537,6 +2538,7 @@ pub async fn get_rsvp_status(
     s: &JmapSession,
     uid: &str,
     attendee_email: &str,
+    primary_tz: chrono_tz::Tz,
 ) -> Result<Option<String>, Error> {
     // Missing app password → named error, no HTTP (kata m5yp).
     let auth = require_caldav_auth(s)?;
@@ -2561,12 +2563,20 @@ pub async fn get_rsvp_status(
     }
 
     let ics_data = resp.text().await?;
-    Ok(attendee_status_from_ics(&ics_data, attendee_email))
+    Ok(attendee_status_from_ics(
+        &ics_data,
+        attendee_email,
+        primary_tz,
+    ))
 }
 
 /// Parse ICS data and extract a specific attendee's PARTSTAT.
-fn attendee_status_from_ics(ics_data: &str, attendee_email: &str) -> Option<String> {
-    let event = crate::calendar::parse_ics(ics_data)?;
+fn attendee_status_from_ics(
+    ics_data: &str,
+    attendee_email: &str,
+    primary_tz: chrono_tz::Tz,
+) -> Option<String> {
+    let event = crate::calendar::parse_ics(ics_data, primary_tz)?;
     let email_lower = attendee_email.to_lowercase();
     event
         .attendees
@@ -3206,7 +3216,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_finds_accepted() {
         assert_eq!(
-            attendee_status_from_ics(RSVP_TEST_ICS, "bob@example.com"),
+            attendee_status_from_ics(RSVP_TEST_ICS, "bob@example.com", chrono_tz::Tz::UTC),
             Some("ACCEPTED".into())
         );
     }
@@ -3214,7 +3224,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_finds_tentative() {
         assert_eq!(
-            attendee_status_from_ics(RSVP_TEST_ICS, "carol@example.com"),
+            attendee_status_from_ics(RSVP_TEST_ICS, "carol@example.com", chrono_tz::Tz::UTC),
             Some("TENTATIVE".into())
         );
     }
@@ -3222,7 +3232,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_finds_needs_action() {
         assert_eq!(
-            attendee_status_from_ics(RSVP_TEST_ICS, "dave@example.com"),
+            attendee_status_from_ics(RSVP_TEST_ICS, "dave@example.com", chrono_tz::Tz::UTC),
             Some("NEEDS-ACTION".into())
         );
     }
@@ -3230,7 +3240,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_case_insensitive_email() {
         assert_eq!(
-            attendee_status_from_ics(RSVP_TEST_ICS, "Bob@Example.COM"),
+            attendee_status_from_ics(RSVP_TEST_ICS, "Bob@Example.COM", chrono_tz::Tz::UTC),
             Some("ACCEPTED".into())
         );
     }
@@ -3238,7 +3248,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_unknown_email_returns_none() {
         assert_eq!(
-            attendee_status_from_ics(RSVP_TEST_ICS, "nobody@example.com"),
+            attendee_status_from_ics(RSVP_TEST_ICS, "nobody@example.com", chrono_tz::Tz::UTC,),
             None
         );
     }
@@ -3246,7 +3256,7 @@ END:VCALENDAR";
     #[test]
     fn attendee_status_invalid_ics_returns_none() {
         assert_eq!(
-            attendee_status_from_ics("not valid ics", "bob@example.com"),
+            attendee_status_from_ics("not valid ics", "bob@example.com", chrono_tz::Tz::UTC),
             None
         );
     }
@@ -5629,7 +5639,7 @@ END:VCALENDAR";
         sess.caldav_base = base;
         let expected = caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass");
 
-        let _ = get_calendar_event(&sess, "uid-m5yp").await;
+        let _ = get_calendar_event(&sess, "uid-m5yp", chrono_tz::Tz::UTC).await;
         let _ = remove_from_calendar(&sess, "uid-m5yp").await;
 
         let rec = recorded.lock().unwrap();
@@ -5693,7 +5703,7 @@ END:VCALENDAR";
         sess.caldav_base = base.clone();
         let expected = caldav_recorder::expected_basic_header("user@fastmail.com", "test-app-pass");
 
-        let _ = get_rsvp_status(&sess, "uid-m5yp", "user@fastmail.com").await;
+        let _ = get_rsvp_status(&sess, "uid-m5yp", "user@fastmail.com", chrono_tz::Tz::UTC).await;
         {
             let rec = recorded.lock().unwrap();
             let gets = recorded_by_method(&rec, "GET");
@@ -5717,7 +5727,8 @@ END:VCALENDAR";
             caldav_recorder::spawn(axum::http::StatusCode::OK, Vec::new()).await;
         let mut sess2 = JmapSession::new("user@fastmail.com", "fmu1-test-token", None);
         sess2.caldav_base = base2;
-        let result = get_rsvp_status(&sess2, "uid-m5yp", "user@fastmail.com").await;
+        let result =
+            get_rsvp_status(&sess2, "uid-m5yp", "user@fastmail.com", chrono_tz::Tz::UTC).await;
         let err = result.expect_err("missing app password must surface, not Ok(None)");
         assert!(
             matches!(err, Error::CalendarAuthUnconfigured),
@@ -5757,7 +5768,7 @@ END:VCALENDAR";
         assert!(encoded.contains("%20") && encoded.contains("%40"));
 
         let _ = add_to_calendar(&sess, TEST_ICS, uid, false).await;
-        let _ = get_calendar_event(&sess, uid).await;
+        let _ = get_calendar_event(&sess, uid, chrono_tz::Tz::UTC).await;
         let _ = remove_from_calendar(&sess, uid).await;
 
         let rec = recorded.lock().unwrap();
@@ -6133,7 +6144,7 @@ END:VCALENDAR";
         sess.caldav_base = base;
 
         let _ = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
-        let _ = get_calendar_event(&sess, "uid-wybm").await;
+        let _ = get_calendar_event(&sess, "uid-wybm", chrono_tz::Tz::UTC).await;
         let _ = remove_from_calendar(&sess, "uid-wybm").await;
 
         let rec = recorded.lock().unwrap();
@@ -6306,7 +6317,7 @@ END:VCALENDAR";
         // resolve_calendar_collection before the cache is populated.
         let (put, get) = tokio::join!(
             add_to_calendar(&sess, TEST_ICS, "uid-wybm", false),
-            get_calendar_event(&sess, "uid-wybm"),
+            get_calendar_event(&sess, "uid-wybm", chrono_tz::Tz::UTC),
         );
         assert!(put.is_ok(), "concurrent add should succeed: {put:?}");
         assert!(get.is_ok(), "concurrent get should succeed: {get:?}");
