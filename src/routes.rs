@@ -1429,6 +1429,16 @@ fn sanitize_outgoing_html(html: &str) -> String {
     ammonia::clean(html)
 }
 
+/// Build a successful send response whether or not the provider returns the
+/// sent message's ID. Microsoft Graph's sendMail endpoints return 202 with no
+/// response body, so `None` means accepted rather than failed.
+fn send_success_response(email_id: Option<String>) -> Json<serde_json::Value> {
+    match email_id {
+        Some(id) => Json(serde_json::json!({"success": true, "emailId": id})),
+        None => Json(serde_json::json!({"success": true})),
+    }
+}
+
 async fn send_email_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AccountParam>,
@@ -1460,11 +1470,7 @@ async fn send_email_handler(
     };
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
-
-    match result {
-        Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
-        None => Err(Error::Internal("Failed to send email".into())),
-    }
+    Ok(send_success_response(result))
 }
 
 // --- Persistent drafts (kata wm57) -----------------------------------------
@@ -2335,10 +2341,7 @@ async fn send_invite_handler(
     };
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
-    match result {
-        Some(id) => Ok(Json(serde_json::json!({"success": true, "emailId": id}))),
-        None => Err(Error::Internal("Failed to send invite".into())),
-    }
+    Ok(send_success_response(result))
 }
 
 #[cfg(test)]
@@ -8272,6 +8275,25 @@ white   = '#fdf6e3'
         assert!(
             STYLE_CSS.contains(".error-banner-dismiss"),
             "style.css should have dismiss button styles"
+        );
+    }
+
+    // =========================================================================
+    // Send responses (kata qdba)
+    // =========================================================================
+
+    #[test]
+    fn send_success_response_accepts_missing_message_id() {
+        let Json(body) = send_success_response(None);
+        assert_eq!(body, serde_json::json!({"success": true}));
+    }
+
+    #[test]
+    fn send_success_response_includes_message_id_when_available() {
+        let Json(body) = send_success_response(Some("message-1".to_string()));
+        assert_eq!(
+            body,
+            serde_json::json!({"success": true, "emailId": "message-1"})
         );
     }
 
