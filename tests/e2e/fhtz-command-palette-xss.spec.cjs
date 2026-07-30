@@ -36,3 +36,9 @@ test('fhtz: a markup-named split is literal command text, not a live element', a
   expect(await page.evaluate(() => typeof window.__xss_palette !== 'undefined')).toBe(false);
   expect(await command.evaluate((el) => el.hasAttribute('onerror'))).toBe(false);
 });
+
+test('fhtz: quote-bearing split ids round-trip through the rendered tab attribute', async ({ page }) => {
+  const splitTab = page.locator('#split-tabs .split-tab').nth(1);
+  await expect(splitTab).toHaveAttribute('data-split', XSS_SPLIT.id);
+  expect(await splitTab.evaluate((el) => el.attributes.length)).toBe(3);
+});

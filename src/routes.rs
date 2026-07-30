@@ -10371,8 +10371,17 @@ white   = '#fdf6e3'
             .find("previousFocus.focus()")
             .expect("the cancel path must restore the pre-palette focus");
         assert!(
-            focus_idx > cancel_idx && close.contains("setMode(previousMode)"),
-            "closeCommandPalette must refocus and restore mode only on its cancel path (kata sqke)"
+            focus_idx > cancel_idx && close.contains("focusRestored ? previousMode : 'normal'"),
+            "closeCommandPalette must restore the captured mode only after focus was restored (kata sqke)"
+        );
+    }
+
+    #[test]
+    fn split_tab_ids_are_attribute_escaped() {
+        let body = js_fn_body(APP_JS, "function renderSplitTabs(");
+        assert!(
+            body.contains("data-split=\"${escapeAttr(split.id)}\""),
+            "renderSplitTabs must escape quote-bearing split ids at the data-split attribute boundary"
         );
     }
 
