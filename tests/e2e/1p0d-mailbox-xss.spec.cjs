@@ -16,7 +16,9 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/');
   // Wait for the mailbox list to render (loadAccounts → selectAccount →
   // loadMailboxes → renderMailboxes). The inbox item is always present.
-  await expect(page.locator('#mailbox-list .mailbox-item')).toHaveCount(3, { timeout: 10_000 });
+  // Excludes the synthetic Reminders item (kata dd0d) — it is app-generated,
+  // not attacker-controlled, and would make the provider-mailbox count 4.
+  await expect(page.locator('#mailbox-list .mailbox-item:not(.reminders-item)')).toHaveCount(3, { timeout: 10_000 });
 });
 
 test('1p0d: a mailbox name containing an <img onerror> payload renders as text, not a live element', async ({ page }) => {

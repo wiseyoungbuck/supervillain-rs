@@ -576,6 +576,7 @@ mod tests {
             has_calendar: false,
             attachments: Vec::new(),
             in_reply_to: None,
+            calendar_ics: None,
         };
         assert_eq!(store.orphan_ids("account", [&email]), vec!["orphan"]);
     }
@@ -629,7 +630,8 @@ mod tests {
     fn tick_if_no_reply_wakes_when_no_reply() {
         let now = Utc::now();
         let due = record("due", now - Duration::seconds(1), ReminderMode::IfNoReply);
-        let (wake, suppress) = evaluate_due_records(&[due.clone()], now, &HashMap::new());
+        let (wake, suppress) =
+            evaluate_due_records(std::slice::from_ref(&due), now, &HashMap::new());
         assert_eq!(wake, vec![due]);
         assert!(suppress.is_empty());
     }
@@ -639,7 +641,7 @@ mod tests {
         let now = Utc::now();
         let due = record("due", now - Duration::seconds(1), ReminderMode::IfNoReply);
         let replies = HashMap::from([(String::from("due"), true)]);
-        let (wake, suppress) = evaluate_due_records(&[due.clone()], now, &replies);
+        let (wake, suppress) = evaluate_due_records(std::slice::from_ref(&due), now, &replies);
         assert!(wake.is_empty());
         assert_eq!(suppress, vec![due]);
     }
@@ -649,7 +651,7 @@ mod tests {
         let now = Utc::now();
         let due = record("due", now - Duration::seconds(1), ReminderMode::Regardless);
         let replies = HashMap::from([(String::from("due"), true)]);
-        let (wake, suppress) = evaluate_due_records(&[due.clone()], now, &replies);
+        let (wake, suppress) = evaluate_due_records(std::slice::from_ref(&due), now, &replies);
         assert_eq!(wake, vec![due]);
         assert!(suppress.is_empty());
     }
@@ -666,7 +668,7 @@ mod tests {
     fn tick_idempotent_on_repeat() {
         let now = Utc::now();
         let due = record("due", now - Duration::seconds(1), ReminderMode::IfNoReply);
-        let (wake, _) = evaluate_due_records(&[due.clone()], now, &HashMap::new());
+        let (wake, _) = evaluate_due_records(std::slice::from_ref(&due), now, &HashMap::new());
         assert_eq!(wake, vec![due]);
         let (wake, _) = evaluate_due_records(&[], now, &HashMap::new());
         assert!(wake.is_empty());
@@ -676,6 +678,6 @@ mod tests {
     fn thread_identity_failure_fails_open() {
         let mut replies: HashMap<String, bool> = HashMap::new();
         replies.insert("unresolvable".into(), false);
-        assert_eq!(replies["unresolvable"], false);
+        assert!(!replies["unresolvable"]);
     }
 }
