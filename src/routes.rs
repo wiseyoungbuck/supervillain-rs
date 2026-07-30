@@ -1432,9 +1432,43 @@ fn valid_percent_triplets(value: &str) -> bool {
     true
 }
 
-/// Decode the coordinated browser/server upload contract.  New clients send
-/// an RFC 5987 UTF-8 extended value (`UTF-8''...`); plain ASCII and raw UTF-8
-/// remain accepted for old clients and command-line API users.
+/// Recognize RFC 5987's `charset'language'value` shape. The charset is a MIME
+/// token; language is intentionally left uninterpreted because filenames do
+/// not use it, but locating the second apostrophe lets valid `UTF-8'en'...`
+/// values take the same path as the app's usual `UTF-8''...` form.
+fn split_upload_ext_value(raw: &str) -> Option<(&str, &str, &str)> {
+    let (charset, rest) = raw.split_once('\'')?;
+    if charset.is_empty()
+        || !charset.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+    {
+        return None;
+    }
+    let (language, encoded) = rest.split_once('\'')?;
+    Some((charset, language, encoded))
+}
+
+/// Decode the coordinated browser/server upload contract. New clients send
+/// an RFC 5987 UTF-8 extended value (`UTF-8''...`); valid language tags are
+/// accepted too. Plain ASCII and raw UTF-8 remain accepted for old clients
+/// and command-line API users, while any advertised non-UTF-8 charset fails
+/// closed instead of leaking percent-escaped wire text into the filename.
 fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
     let Some(value) = value else {
         return "attachment".to_string();
@@ -1451,12 +1485,8 @@ fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
         },
     };
 
-    let decoded = if raw
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UTF-8''"))
-    {
-        let encoded = &raw[7..];
-        if !valid_percent_triplets(encoded) {
+    let decoded = if let Some((charset, _language, encoded)) = split_upload_ext_value(&raw) {
+        if !charset.eq_ignore_ascii_case("UTF-8") || !valid_percent_triplets(encoded) {
             None
         } else {
             percent_encoding::percent_decode_str(encoded)
@@ -1464,13 +1494,6 @@ fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
                 .ok()
                 .map(|value| value.into_owned())
         }
-    } else if raw
-        .get(..11)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ISO-8859-1'"))
-    {
-        // The app's contract is UTF-8 only.  Treat another advertised charset
-        // as malformed instead of displaying percent escapes as a filename.
-        None
     } else {
         Some(raw)
     };
@@ -2822,6 +2845,7 @@ mod tests {
             ),
             ("UTF-8''launch-%F0%9F%9A%80.zip", "launch-🚀.zip"),
             ("UTF-8''r%C3%A9sum%C3%A9.pdf", "résumé.pdf"),
+            ("UTF-8'en'r%C3%A9sum%C3%A9.pdf", "résumé.pdf"),
         ] {
             let value = HeaderValue::from_str(wire).expect("RFC 5987 value is ASCII");
             assert_eq!(decode_upload_filename(Some(&value)), expected);
@@ -2842,6 +2866,8 @@ mod tests {
             "UTF-8''bad%ZZname.pdf",
             "UTF-8''%F0%28%8C%28.txt",
             "ISO-8859-1''r%E9sum%E9.pdf",
+            "utf-16''%FF%FEr%00e%00p%00o%00r%00t%00.pdf",
+            "us-ascii''report.pdf",
         ] {
             let value = HeaderValue::from_str(malformed).unwrap();
             assert_eq!(
@@ -2850,6 +2876,23 @@ mod tests {
                 "invalid or unsupported extended value must fail closed: {malformed}"
             );
         }
+    }
+
+    #[test]
+    fn upload_filename_parser_supports_legacy_obs_text_bytes() {
+        let raw_utf8 = HeaderValue::from_bytes("résumé.pdf".as_bytes()).unwrap();
+        assert_eq!(
+            decode_upload_filename(Some(&raw_utf8)),
+            "résumé.pdf",
+            "raw UTF-8 obs-text from legacy clients must stay compatible"
+        );
+
+        let latin1 = HeaderValue::from_bytes(b"r\xE9sum\xE9.pdf").unwrap();
+        assert_eq!(
+            decode_upload_filename(Some(&latin1)),
+            "résumé.pdf",
+            "invalid UTF-8 obs-text falls back to ISO-8859-1 byte mapping"
+        );
     }
 
     #[test]
