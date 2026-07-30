@@ -7020,4 +7020,68 @@ END:VCALENDAR";
             "only the retried (successful) attempt may PUT: {rec:?}"
         );
     }
+
+    #[tokio::test]
+    async fn ensure_mailbox_by_name_creates_on_loopback_and_reuses_cache() {
+        use std::sync::{Arc, Mutex};
+
+        let calls: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_handler = calls.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let calls = calls_for_handler.clone();
+            async move {
+                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                calls.lock().unwrap().push(payload);
+                let method = calls.lock().unwrap().last().unwrap()["methodCalls"][0][0]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let response = if method == "Mailbox/get" {
+                    serde_json::json!({
+                        "methodResponses": [["Mailbox/get", {"list": [{"id":"inbox","name":"Inbox","role":"inbox","totalEmails":0,"unreadEmails":0} ]}, "0"]]
+                    })
+                } else {
+                    serde_json::json!({
+                        "methodResponses": [["Mailbox/set", {"created": {"reminders": {"id":"reminders-id"}}}, "0"]]
+                    })
+                };
+                (axum::http::StatusCode::OK, axum::Json(response))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut session = JmapSession::new("user@fastmail.com", "token", None);
+        session.api_url = Some(format!("http://{address}"));
+        session.account_id = Some("account".into());
+        assert_eq!(
+            ensure_mailbox_by_name(&mut session, "Reminders")
+                .await
+                .unwrap(),
+            "reminders-id"
+        );
+        let calls_snapshot = calls.lock().unwrap().clone();
+        assert_eq!(calls_snapshot.len(), 2);
+        assert_eq!(calls_snapshot[1]["methodCalls"][0][0], "Mailbox/set");
+        assert_eq!(
+            calls_snapshot[1]["methodCalls"][0][1]["create"]["reminders"]["name"],
+            "Reminders"
+        );
+
+        calls.lock().unwrap().clear();
+        assert_eq!(
+            ensure_mailbox_by_name(&mut session, "Reminders")
+                .await
+                .unwrap(),
+            "reminders-id"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cached mailbox must avoid a second create/fetch"
+        );
+    }
 }

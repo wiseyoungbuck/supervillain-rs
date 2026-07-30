@@ -349,6 +349,20 @@ function init() {
             wakeReminder(wakeButton.dataset.id);
             return;
         }
+        const remindAgainButton = e.target.closest('.remind-again-btn');
+        if (remindAgainButton) {
+            e.preventDefault();
+            e.stopPropagation();
+            openRemindPicker(remindAgainButton.dataset.id);
+            return;
+        }
+        const archiveReminderButton = e.target.closest('.archive-reminder-btn');
+        if (archiveReminderButton) {
+            e.preventDefault();
+            e.stopPropagation();
+            archiveReminder(archiveReminderButton.dataset.id);
+            return;
+        }
         const countBadge = e.target.closest('.email-thread-count');
         if (countBadge) {
             toggleThreadExpand(countBadge.dataset.thread);
@@ -1326,12 +1340,26 @@ function renderReminderList() {
         const email = item.email;
         const wake = item.wake_at ? new Date(item.wake_at).toLocaleString() : 'No wake time — orphaned';
         const mode = item.mode === 'regardless' ? 'regardless' : 'if no reply';
+        const orphanActions = item.wake_at ? '' : `<button class="remind-again-btn" type="button" data-id="${escapeAttr(email.id)}">Re-remind</button><button class="archive-reminder-btn" type="button" data-id="${escapeAttr(email.id)}">Archive</button>`;
         return `<div class="email-row reminder-row${index === state.selectedIndex ? ' selected' : ''}" data-id="${escapeAttr(email.id)}" data-index="${index}">
             <span class="email-from">${escapeHtml(email.from?.[0]?.name || email.from?.[0]?.email || 'Unknown')}</span>
             <span class="email-subject">${escapeHtml(email.subject)} <span class="reminder-meta">${escapeHtml(wake)} · ${mode}</span></span>
-            <button class="wake-now-btn" type="button" data-id="${escapeAttr(email.id)}">Wake now</button>
+            <button class="wake-now-btn" type="button" data-id="${escapeAttr(email.id)}">Wake now</button>${orphanActions}
         </div>`;
     }).join('');
+}
+
+async function archiveReminder(emailId) {
+    try {
+        // Clear the custom Reminders membership first; then the existing
+        // archive action can file the orphan cleanly in every provider.
+        await api('POST', `/emails/${emailId}/cancel-reminder`);
+        await api('POST', `/emails/${emailId}/archive`);
+        showStatus('Reminder archived', 'success');
+        await loadReminders();
+    } catch (err) {
+        showStatus('Archive failed: ' + err.message, 'error');
+    }
 }
 
 async function wakeReminder(emailId) {
