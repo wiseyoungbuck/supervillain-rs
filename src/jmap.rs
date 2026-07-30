@@ -1231,13 +1231,18 @@ const ITIP_BOUNDARY: &str = "supervillain-itip";
 /// `REQUEST` for invites, `REPLY` for RSVPs. It becomes the MIME
 /// `Content-Type: text/calendar; method=<token>` parameter that tells the
 /// recipient's calendar client how to process the object (RFC 5546 §3.2).
-/// `lines()` leaves a trailing `\r` on CRLF input, hence the trim.
+/// `str::lines` strips CRLF terminators. Lines beginning with whitespace are
+/// folded continuations, not calendar-level properties, and must not be
+/// mistaken for METHOD if their payload happens to contain that text.
 fn ics_method(ics: &str) -> Option<String> {
-    ics.lines().find_map(|l| {
-        let l = l.trim();
-        let (key, val) = l.split_once(':')?;
-        if key.eq_ignore_ascii_case("METHOD") {
-            Some(val.trim().to_string())
+    ics.lines().find_map(|line| {
+        if line.starts_with([' ', '\t']) {
+            return None;
+        }
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("METHOD") && !value.is_empty() {
+            Some(value.to_string())
         } else {
             None
         }
@@ -1264,13 +1269,20 @@ fn ics_method(ics: &str) -> Option<String> {
 /// takes the bytes as input so it stays network-free and testable; the
 /// caller (`send_itip_via_import`) downloads each blob. Cc rides on a `Cc:`
 /// header; Bcc is envelope-only and never appears in the headers.
-fn build_itip_mime(sub: &EmailSubmission, from_addr: &str, attachment_bytes: &[Vec<u8>]) -> String {
+fn build_itip_mime(
+    sub: &EmailSubmission,
+    from_addr: &str,
+    attachment_bytes: &[Vec<u8>],
+) -> Result<String, Error> {
     let ics = sub
         .calendar_ics
         .as_deref()
-        .expect("build_itip_mime requires calendar_ics");
-    let method = ics_method(ics)
-        .expect("build_itip_mime: ICS must contain a METHOD line (REQUEST or REPLY)");
+        .ok_or_else(|| Error::Internal("build_itip_mime requires calendar_ics".to_string()))?;
+    let method = ics_method(ics).ok_or_else(|| {
+        Error::Internal(
+            "build_itip_mime: ICS must contain a METHOD line (REQUEST or REPLY)".to_string(),
+        )
+    })?;
     let to = sub
         .to
         .iter()
@@ -1313,26 +1325,27 @@ fn build_itip_mime(sub: &EmailSubmission, from_addr: &str, attachment_bytes: &[V
         cal = base64_mime_lines(ics.as_bytes()),
     ));
     for (att, bytes) in sub.attachments.iter().zip(attachment_bytes) {
-        let mt = if att.mime_type.is_empty() {
-            "application/octet-stream"
-        } else {
-            att.mime_type.as_str()
-        };
-        // strip_crlf guards against header injection; dropping `"`/`\` keeps
-        // the quoted-string parameter intact (filenames rarely carry them).
-        let name = strip_crlf(&att.name).replace(['"', '\\'], "");
-        body.push_str(&format!(
-            "--{b}\r\n\
-             Content-Type: {mt}; name=\"{name}\"\r\n\
-             Content-Transfer-Encoding: base64\r\n\
-             Content-Disposition: attachment; filename=\"{name}\"\r\n\
-             \r\n\
-             {data}\r\n",
-            data = base64_mime_lines(bytes),
-        ));
+        let mime_type = crate::imip::sanitize_attachment_mime_type(&att.mime_type);
+        body.push_str(&format!("--{b}\r\n"));
+        crate::imip::push_attachment_parameter_header(
+            &mut body,
+            &format!("Content-Type: {mime_type}"),
+            "name",
+            &att.name,
+        );
+        body.push_str("Content-Transfer-Encoding: base64\r\n");
+        crate::imip::push_attachment_parameter_header(
+            &mut body,
+            "Content-Disposition: attachment",
+            "filename",
+            &att.name,
+        );
+        body.push_str("\r\n");
+        body.push_str(&base64_mime_lines(bytes));
+        body.push_str("\r\n");
     }
     body.push_str(&format!("--{b}--\r\n"));
-    format!("{headers}{body}")
+    Ok(format!("{headers}{body}"))
 }
 
 /// Human-readable detail for a failed create in a `/set`-style method
@@ -1400,7 +1413,7 @@ async fn send_itip_via_import(
         let (_, bytes) = download_blob(s, &att.blob_id, &att.name).await?;
         attachment_bytes.push(bytes);
     }
-    let mime = build_itip_mime(sub, from_addr, &attachment_bytes);
+    let mime = build_itip_mime(sub, from_addr, &attachment_bytes)?;
     let (blob_id, _) = upload_blob(s, "message/rfc822", mime.as_bytes()).await?;
 
     let mut patch = serde_json::Map::new();
@@ -4365,13 +4378,27 @@ END:VCALENDAR";
     // --- build_itip_mime tests (kata vt0m) ---
 
     #[test]
+    fn itip_mime_rejects_missing_or_folded_method_without_panicking() {
+        let mut sub = itip_submission();
+        sub.calendar_ics = Some(
+            "BEGIN:VCALENDAR\r\nDESCRIPTION:long text\r\n METHOD:REPLY\r\nEND:VCALENDAR\r\n".into(),
+        );
+        let err = build_itip_mime(&sub, "bob@example.com", &[])
+            .expect_err("a folded continuation is not a calendar METHOD property");
+        assert!(
+            matches!(err, Error::Internal(ref message) if message.contains("METHOD line")),
+            "missing METHOD must be a regular send error, got {err:?}"
+        );
+    }
+
+    #[test]
     fn itip_mime_ascii_subject_passes_through_and_non_ascii_is_rfc2047() {
         let mut sub = itip_submission();
         sub.subject = "Re: Team Standup".into();
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         assert!(mime.contains("Subject: Re: Team Standup\r\n"));
 
-        let mime = build_itip_mime(&itip_submission(), "bob@example.com", &[]);
+        let mime = build_itip_mime(&itip_submission(), "bob@example.com", &[]).unwrap();
         let subject_line = mime
             .lines()
             .find(|l| l.starts_with("Subject: "))
@@ -4390,7 +4417,7 @@ END:VCALENDAR";
     fn itip_mime_long_non_ascii_subject_folds_into_short_encoded_words() {
         let mut sub = itip_submission();
         sub.subject = "Re: Réunion très importante de l'équipe européenne à Genève".into();
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         let subject_start = mime.find("Subject: ").unwrap() + "Subject: ".len();
         let subject_end = mime[subject_start..]
             .find("\r\nMIME-Version")
@@ -4410,7 +4437,7 @@ END:VCALENDAR";
     fn itip_mime_strips_crlf_header_injection() {
         let mut sub = itip_submission();
         sub.subject = "Re: x\r\nBcc: evil@example.com".into();
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         assert!(
             !mime.lines().any(|l| l.starts_with("Bcc:")),
             "CRLF in a subject must not inject a header line:\n{mime}"
@@ -4424,7 +4451,7 @@ END:VCALENDAR";
             "BEGIN:VCALENDAR\r\nMETHOD:REPLY\r\nDESCRIPTION:{}\r\nEND:VCALENDAR\r\n",
             "x".repeat(600)
         ));
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         for line in mime.lines() {
             assert!(
                 line.len() <= 78,
@@ -4438,7 +4465,7 @@ END:VCALENDAR";
     fn itip_mime_text_part_decodes_to_text_body() {
         use base64::Engine;
         let sub = itip_submission();
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         let text_start = mime.find("Content-Type: text/plain").unwrap();
         let b64_start = mime[text_start..].find("\r\n\r\n").unwrap() + text_start + 4;
         let b64_end = mime[b64_start..].find("\r\n--").unwrap() + b64_start;
@@ -5315,6 +5342,45 @@ END:VCALENDAR";
     }
 
     #[tokio::test]
+    async fn invite_upload_carries_bcc_in_envelope_only() {
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        sub.bcc = Some(vec!["secret@example.com".into()]);
+        send_email(&mut s, &sub, "bob@example.com", Some("ident1"))
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let up = reqs
+            .iter()
+            .find(|request| request.path.starts_with("/upload/"))
+            .expect("one upload");
+        let mime = String::from_utf8(up.body.clone()).unwrap();
+        assert!(
+            !mime.contains("secret@example.com") && !mime.contains("\r\nBcc:"),
+            "Bcc must remain envelope-only and absent from uploaded MIME: {mime}"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|request| request.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        let rcpt = body["methodCalls"][1][1]["create"]["send"]["envelope"]["rcptTo"]
+            .as_array()
+            .expect("envelope rcptTo");
+        assert!(
+            rcpt.iter()
+                .any(|recipient| recipient["email"] == "secret@example.com"),
+            "envelope rcptTo must include the bcc recipient: {rcpt:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn invite_import_inlines_attachments_byte_identical() {
         // Attachments are server-side blobs (from /api/upload); the import
         // path downloads each one and inlines it as a base64 part of the
@@ -5399,11 +5465,11 @@ END:VCALENDAR";
         assert_eq!(uploads[0].content_type.as_deref(), Some("message/rfc822"));
         let mime = String::from_utf8(uploads[0].body.clone()).unwrap();
         assert!(
-            mime.contains("Content-Type: application/pdf; name=\"report.pdf\""),
+            mime.contains("Content-Type: application/pdf; name=report.pdf"),
             "attachment part Content-Type with name: {mime}"
         );
         assert!(
-            mime.contains("Content-Disposition: attachment; filename=\"report.pdf\""),
+            mime.contains("Content-Disposition: attachment; filename=report.pdf"),
             "attachment part Content-Disposition: {mime}"
         );
         let disp = mime.find("Content-Disposition: attachment").unwrap();
@@ -5527,7 +5593,7 @@ END:VCALENDAR";
             mime_type: "application/pdf".into(),
             size: bytes.len() as i64,
         }];
-        let mime = build_itip_mime(&sub, "bob@example.com", std::slice::from_ref(&bytes));
+        let mime = build_itip_mime(&sub, "bob@example.com", std::slice::from_ref(&bytes)).unwrap();
         assert!(
             mime.contains("Content-Type: text/calendar; method=REQUEST; charset=utf-8"),
             "method must be derived from the ICS METHOD line: {mime}"
@@ -5537,11 +5603,11 @@ END:VCALENDAR";
             "cc must ride on a Cc header: {mime}"
         );
         assert!(
-            mime.contains("Content-Type: application/pdf; name=\"report.pdf\""),
+            mime.contains("Content-Type: application/pdf; name=report.pdf"),
             "attachment Content-Type with name: {mime}"
         );
         assert!(
-            mime.contains("Content-Disposition: attachment; filename=\"report.pdf\""),
+            mime.contains("Content-Disposition: attachment; filename=report.pdf"),
             "attachment Content-Disposition: {mime}"
         );
         let disp = mime.find("Content-Disposition: attachment").unwrap();
@@ -5561,13 +5627,66 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn itip_mime_attachment_metadata_cannot_inject_headers() {
+        let mut sub = invite_submission();
+        sub.attachments = vec![Attachment {
+            blob_id: "blob-evil".into(),
+            name: "report.pdf\r\nBcc: evil@example.com".into(),
+            mime_type: "application/pdf\r\nBcc: evil@example.com".into(),
+            size: 4,
+        }];
+        let mime = build_itip_mime(&sub, "bob@example.com", &[b"data".to_vec()]).unwrap();
+        assert!(
+            !mime.contains("\r\nBcc: evil@example.com"),
+            "attachment name/type must not inject a header: {mime}"
+        );
+        assert!(
+            mime.contains("Content-Type: application/octet-stream;"),
+            "malformed attachment MIME type must fall back safely: {mime}"
+        );
+    }
+
+    #[test]
+    fn itip_mime_rfc2231_encodes_unicode_and_long_attachment_names() {
+        for name in [
+            "résumé.pdf".to_string(),
+            format!("{}.pdf", "report-".repeat(30)),
+        ] {
+            let mut sub = invite_submission();
+            sub.attachments = vec![Attachment {
+                blob_id: "blob-name".into(),
+                name: name.clone(),
+                mime_type: "application/pdf".into(),
+                size: 4,
+            }];
+            let mime = build_itip_mime(&sub, "bob@example.com", &[b"data".to_vec()]).unwrap();
+            assert!(
+                mime.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+                    || mime.contains("filename*0*=UTF-8''report-"),
+                "filename must use an RFC 2231 extended parameter: {mime}"
+            );
+            assert!(
+                !mime.contains("résumé.pdf"),
+                "raw non-ASCII must not appear in attachment headers: {mime}"
+            );
+            for line in mime.lines() {
+                assert!(
+                    line.len() <= 78,
+                    "MIME line exceeds 78 chars ({}): {line:?}",
+                    line.len()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn itip_mime_long_ascii_subject_is_folded_within_line_limits() {
         // roborev 416 #3: ASCII subjects from third-party ICS can be
         // arbitrarily long; they must not produce a header line beyond
         // RFC 5322 limits.
         let mut sub = itip_submission();
         sub.subject = format!("Re: {}", "x".repeat(400));
-        let mime = build_itip_mime(&sub, "bob@example.com", &[]);
+        let mime = build_itip_mime(&sub, "bob@example.com", &[]).unwrap();
         for line in mime.lines() {
             assert!(
                 line.len() <= 78,
