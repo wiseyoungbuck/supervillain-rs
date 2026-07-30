@@ -6280,4 +6280,143 @@ END:VCALENDAR";
             "no PUT may be issued when no writable calendar exists: {rec:?}"
         );
     }
+
+    #[tokio::test]
+    async fn caldav_discovery_coordinates_concurrent_first_callers() {
+        // The OnceCell swap (roborev 431): two CalDAV calls racing on a fresh
+        // session both need the collection URL, but `get_or_try_init`
+        // coordinates them - only one runs the two-PROPFIND discovery while
+        // the other awaits its result. Asserts propfind_count == 2 (not 4).
+        // The old `Mutex<Option<String>>` would race and issue four PROPFINDs.
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/u_name@fastmail.com/",
+            &default_coll_path("u_name@fastmail.com"),
+            axum::http::StatusCode::OK,
+            TEST_ICS.as_bytes().to_vec(),
+        )
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        // Two concurrent ops on the same fresh session — both reach
+        // resolve_calendar_collection before the cache is populated.
+        let (put, get) = tokio::join!(
+            add_to_calendar(&sess, TEST_ICS, "uid-wybm", false),
+            get_calendar_event(&sess, "uid-wybm"),
+        );
+        assert!(put.is_ok(), "concurrent add should succeed: {put:?}");
+        assert!(get.is_ok(), "concurrent get should succeed: {get:?}");
+
+        let rec = recorded.lock().unwrap();
+        assert_eq!(
+            propfind_count(&rec),
+            2,
+            "concurrent first-callers must share ONE discovery (two PROPFINDs), not race to four: {rec:?}"
+        );
+        // Both ops still landed on the resolved collection.
+        assert_eq!(recorded_by_method(&rec, "PUT").len(), 1);
+        assert_eq!(recorded_by_method(&rec, "GET").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn caldav_discovery_failure_is_not_cached_retries_next_call() {
+        // The retry-on-failure contract (roborev 431): a failed discovery must
+        // NOT cache the failure — `get_or_try_init` leaves the OnceCell empty
+        // on Err (and releases the init permit on cancellation, no poisoning),
+        // so the next call re-runs discovery. A recorder that 404s the home
+        // PROPFIND once, then serves the real multistatus: first
+        // add_to_calendar yields CalendarDiscoveryFailed (no PUT), second
+        // succeeds (PUT lands), and four PROPFINDs total were issued (two per
+        // attempt). Pins the contract so a future swap to `get_or_init` (which
+        // can't return Err / would cache a failure) regresses loudly.
+        use caldav_recorder::{CalCollection, CalKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let principal_xml = std::sync::Arc::new(caldav_recorder::principal_multistatus(
+            "/dav/principals/user/u_name@fastmail.com/",
+        ));
+        let collections = vec![
+            CalCollection {
+                href: "/dav/calendars/user/u_name@fastmail.com/".into(),
+                displayname: "Home".into(),
+                kind: CalKind::PlainCollection,
+                writable: true,
+            },
+            CalCollection {
+                href: default_coll_path("u_name@fastmail.com"),
+                displayname: "General (FastMail)".into(),
+                kind: CalKind::Calendar,
+                writable: true,
+            },
+        ];
+        let home_xml = std::sync::Arc::new(caldav_recorder::home_multistatus(&collections));
+        let home_path = "/dav/calendars/user/u_name@fastmail.com/".to_string();
+        // First home PROPFIND 404s; subsequent ones return the real listing.
+        let home_attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let (base, recorded) = caldav_recorder::spawn_scripted({
+            let principal_xml = principal_xml.clone();
+            let home_xml = home_xml.clone();
+            let home_path = home_path.clone();
+            let home_attempts = home_attempts.clone();
+            move |method, path| {
+                if method == "PROPFIND" && path == "/dav/calendars" {
+                    (
+                        axum::http::StatusCode::MULTI_STATUS,
+                        principal_xml.as_bytes().to_vec(),
+                    )
+                } else if method == "PROPFIND" && path == home_path {
+                    let n = home_attempts.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            b"Mailbox does not exist".to_vec(),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::MULTI_STATUS,
+                            home_xml.as_bytes().to_vec(),
+                        )
+                    }
+                } else {
+                    (axum::http::StatusCode::CREATED, Vec::new())
+                }
+            }
+        })
+        .await;
+        let mut sess = JmapSession::new(
+            "u.name@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        let r1 = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        assert!(
+            matches!(r1, Err(Error::CalendarDiscoveryFailed(_))),
+            "first call must surface discovery failure, got: {r1:?}"
+        );
+        let r2 = add_to_calendar(&sess, TEST_ICS, "uid-wybm", false).await;
+        assert!(
+            r2.is_ok(),
+            "second call must succeed (failure was not cached, discovery retried): {r2:?}"
+        );
+
+        let rec = recorded.lock().unwrap();
+        // Two PROPFINDs per attempt (root + home), two attempts => four total.
+        assert_eq!(
+            propfind_count(&rec),
+            4,
+            "discovery must re-run after a failure (two PROPFINDs per attempt): {rec:?}"
+        );
+        // First attempt failed before PUT; only the second PUTs.
+        assert_eq!(
+            recorded_by_method(&rec, "PUT").len(),
+            1,
+            "only the retried (successful) attempt may PUT: {rec:?}"
+        );
+    }
 }
