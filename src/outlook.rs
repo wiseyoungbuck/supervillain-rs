@@ -3170,23 +3170,42 @@ async fn respond_to_event_at(
     }
 }
 
-/// Fetch the current calendar event from Graph API by iCalUId.
-/// Returns a CalendarEvent with current attendee statuses, or None if not found.
-pub async fn get_calendar_event(
+/// Clonable Graph Calendar read capability. Token refresh happens while the
+/// session lock is briefly held; the event lookup then awaits only owned data.
+#[derive(Clone)]
+pub(crate) struct CalendarEventReader {
+    client: reqwest::Client,
+    access_token: String,
+    graph_base: String,
+}
+
+pub(crate) async fn calendar_event_reader(
     session: &OutlookSession,
+) -> Result<CalendarEventReader, Error> {
+    Ok(CalendarEventReader {
+        client: session.client.clone(),
+        access_token: access_token(session).await?,
+        graph_base: session.graph_base.clone(),
+    })
+}
+
+/// Fetch the current calendar event from Graph API by iCalUId with a detached
+/// read capability.
+pub(crate) async fn get_calendar_event_with_reader(
+    reader: &CalendarEventReader,
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
-    let token = access_token(session).await?;
     let safe_uid = uid.replace('\'', "''");
     let url = format!(
-        "{GRAPH_BASE}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id,subject,start,end,location,body,organizer,attendees,iCalUId"
+        "{}/me/events?$filter=iCalUId eq '{safe_uid}'&$select=id,subject,start,end,location,body,organizer,attendees,iCalUId",
+        reader.graph_base
     );
 
     let resp = send_graph_json(
-        session
+        reader
             .client
             .get(&url)
-            .bearer_auth(&token)
+            .bearer_auth(&reader.access_token)
             // roborev 296 #1: without this, Graph returns the event body
             // HTML-wrapped by default. That HTML skeleton never equals the
             // plain-text DESCRIPTION parsed from the incoming ICS, so the
@@ -3204,6 +3223,14 @@ pub async fn get_calendar_event(
     };
 
     Ok(parse_graph_event(uid, event_json))
+}
+
+pub async fn get_calendar_event(
+    session: &OutlookSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    let reader = calendar_event_reader(session).await?;
+    get_calendar_event_with_reader(&reader, uid).await
 }
 
 /// Parse a Graph API event JSON object into a CalendarEvent.

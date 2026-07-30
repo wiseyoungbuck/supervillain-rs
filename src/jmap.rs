@@ -151,7 +151,7 @@ pub struct JmapSession {
     /// init permit, no poisoning), so a transient discovery failure retries
     /// on the next call while a permanent one (no writable calendar) keeps
     /// surfacing. The four `&self` CalDAV functions populate it without `&mut`.
-    pub caldav_collection_url: tokio::sync::OnceCell<String>,
+    pub caldav_collection_url: std::sync::Arc<tokio::sync::OnceCell<String>>,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
     pub upload_url: Option<String>,
@@ -186,7 +186,7 @@ impl JmapSession {
             auth_header: format!("Bearer {api_token}"),
             caldav_auth_header: basic_auth_header(username, app_password),
             caldav_base: "https://caldav.fastmail.com".into(),
-            caldav_collection_url: tokio::sync::OnceCell::new(),
+            caldav_collection_url: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             api_url: None,
             account_id: None,
             upload_url: None,
@@ -508,12 +508,12 @@ pub async fn get_emails(
 
     let account_id = s.account_id.as_ref().ok_or(Error::NotConnected)?;
 
-    // Normal Email fetches (lists and bodies) include enough MIME data to
-    // identify a genuine iTIP part without a per-row blob download. Split
-    // counting uses properties_override and deliberately stays metadata-only.
-    // `fetchAllBodyValues` is bounded per part: unusually huge ICS payloads
-    // truncate and safely produce no list chip rather than bloating the hot
-    // path without limit.
+    // Normal fetches include bodyStructure so list rows can identify genuine
+    // text/calendar leaves. Split counting uses properties_override and stays
+    // metadata-only. List calls deliberately do NOT request bodyValues here:
+    // fetchAllBodyValues returns every text/* part per row, so calendar values
+    // are downloaded separately only for the rare calendar blob IDs found in
+    // bodyStructure (and with a hard byte cap).
     let include_invite_data = properties_override.is_none();
     let mut properties = if let Some(overrides) = properties_override {
         overrides.to_vec()
@@ -533,12 +533,11 @@ pub async fn get_emails(
             "hasAttachment",
             "size",
             "inReplyTo",
-            "bodyValues",
             "bodyStructure",
         ]
     };
     if fetch_body {
-        properties.extend_from_slice(&["textBody", "htmlBody"]);
+        properties.extend_from_slice(&["bodyValues", "textBody", "htmlBody"]);
     }
 
     let mut extra_args = serde_json::Map::new();
@@ -547,14 +546,10 @@ pub async fn get_emails(
     extra_args.insert("properties".into(), serde_json::json!(properties));
     extra_args.insert("fetchHTMLBodyValues".into(), serde_json::json!(fetch_body));
     extra_args.insert("fetchTextBodyValues".into(), serde_json::json!(fetch_body));
-    extra_args.insert(
-        "fetchAllBodyValues".into(),
-        serde_json::json!(include_invite_data),
-    );
-    extra_args.insert(
-        "maxBodyValueBytes".into(),
-        serde_json::json!(if fetch_body { 1_000_000 } else { 131_072 }),
-    );
+    extra_args.insert("fetchAllBodyValues".into(), serde_json::json!(false));
+    if fetch_body {
+        extra_args.insert("maxBodyValueBytes".into(), serde_json::json!(1_000_000));
+    }
     if include_invite_data {
         extra_args.insert(
             "bodyProperties".into(),
@@ -573,13 +568,144 @@ pub async fn get_emails(
 
     let resp = jmap_call(s, vec![serde_json::json!(["Email/get", extra_args, "0"])]).await?;
 
-    let raw_emails: Vec<JmapEmailRaw> = extract_list(&resp, 0, "Email/get")?;
+    let mut raw_emails: Vec<JmapEmailRaw> = extract_list(&resp, 0, "Email/get")?;
+    if include_invite_data && !fetch_body {
+        enrich_list_calendar_values(s, &mut raw_emails).await;
+    }
     let emails = raw_emails
         .into_iter()
         .map(|raw| parse_jmap_email_from_raw(raw, fetch_body))
         .collect();
 
     Ok(emails)
+}
+
+const LIST_CALENDAR_VALUE_MAX_BYTES: usize = 128 * 1024;
+
+#[derive(Clone)]
+struct ListCalendarBlobReader {
+    client: reqwest::Client,
+    auth_header: String,
+    account_id: String,
+    download_url: String,
+    limiter: std::sync::Arc<RateLimiter>,
+}
+
+fn real_calendar_blob(part: &BodyStructurePart) -> Option<(&str, &str, &str, i64)> {
+    let essence = part.mime_type.split(';').next().unwrap_or("").trim();
+    if essence.eq_ignore_ascii_case("text/calendar")
+        && let Some(part_id) = part.part_id.as_deref()
+        && let Some(blob_id) = part.blob_id.as_deref()
+    {
+        return Some((
+            part_id,
+            blob_id,
+            part.name.as_deref().unwrap_or("invite.ics"),
+            part.size,
+        ));
+    }
+    part.sub_parts.iter().find_map(real_calendar_blob)
+}
+
+async fn download_list_calendar_value(
+    reader: &ListCalendarBlobReader,
+    blob_id: &str,
+    filename: &str,
+) -> Result<Option<String>, Error> {
+    let url = reader
+        .download_url
+        .replace("{accountId}", &reader.account_id)
+        .replace("{blobId}", blob_id)
+        .replace("{name}", &percent_encode_path(filename))
+        .replace("{type}", "text/calendar");
+    let mut response = reader
+        .limiter
+        .execute("blob.download.list-calendar", || async {
+            reader
+                .client
+                .get(&url)
+                .header("Authorization", &reader.auth_header)
+                .send()
+                .await
+        })
+        .await?;
+    if !response.status().is_success() {
+        return Err(Error::NotFound("Calendar MIME part not found".into()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > LIST_CALENDAR_VALUE_MAX_BYTES as u64)
+    {
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > LIST_CALENDAR_VALUE_MAX_BYTES {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// Populate only text/calendar body values for list rows. Ordinary text/plain,
+/// text/html, and other text/* blobs are never requested, and each calendar
+/// download is bounded even if the server's bodyStructure size is inaccurate.
+async fn enrich_list_calendar_values(s: &JmapSession, emails: &mut [JmapEmailRaw]) {
+    let Some(account_id) = s.account_id.clone() else {
+        return;
+    };
+    let Some(download_url) = s.download_url.clone() else {
+        return;
+    };
+    let reader = ListCalendarBlobReader {
+        client: s.client.clone(),
+        auth_header: s.auth_header.clone(),
+        account_id,
+        download_url,
+        limiter: s.limiter.clone(),
+    };
+
+    let mut downloads = tokio::task::JoinSet::new();
+    for (email_index, raw) in emails.iter().enumerate() {
+        let Some((part_id, blob_id, filename, size)) =
+            raw.body_structure.as_ref().and_then(real_calendar_blob)
+        else {
+            continue;
+        };
+        if size > LIST_CALENDAR_VALUE_MAX_BYTES as i64 {
+            continue;
+        }
+        let reader = reader.clone();
+        let part_id = part_id.to_string();
+        let blob_id = blob_id.to_string();
+        let filename = filename.to_string();
+        downloads.spawn(async move {
+            let value = download_list_calendar_value(&reader, &blob_id, &filename).await;
+            (email_index, part_id, value)
+        });
+    }
+
+    while let Some(joined) = downloads.join_next().await {
+        match joined {
+            Ok((email_index, part_id, Ok(Some(value)))) => {
+                emails[email_index]
+                    .body_values
+                    .insert(part_id, BodyValue { value });
+            }
+            Ok((_, _, Ok(None))) => {
+                tracing::warn!(
+                    "JMAP calendar MIME part exceeded list enrichment limit; omitting invite chip"
+                );
+            }
+            Ok((email_index, _, Err(error))) => tracing::warn!(
+                email_id = %emails[email_index].id,
+                "JMAP calendar MIME download failed; omitting invite chip: {error}"
+            ),
+            Err(error) => tracing::warn!("JMAP calendar MIME download task panicked: {error}"),
+        }
+    }
 }
 
 fn parse_jmap_email_from_raw(mut raw: JmapEmailRaw, fetch_body: bool) -> Email {
@@ -2376,14 +2502,13 @@ fn absolute_url(base: &str, href: &str) -> String {
 /// is the gate: reqwest follows redirects by default, but a PROPFIND that
 /// 301's to a GET would return 200 (not 207) and surface here.
 async fn caldav_propfind(
-    s: &JmapSession,
+    client: &reqwest::Client,
     auth: &str,
     url: &str,
     depth: &str,
     body: &str,
 ) -> Result<String, Error> {
-    let resp = s
-        .client
+    let resp = client
         .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
         .header("Authorization", auth)
         .header("Depth", depth)
@@ -2412,7 +2537,11 @@ async fn caldav_propfind(
 /// append `/{uid}.ics`). Each step's failure surfaces a specific
 /// `CalendarDiscoveryFailed` message so the operator log names the broken
 /// step.
-async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
+async fn discover_calendar_collection(
+    client: &reqwest::Client,
+    caldav_base: &str,
+    auth: &str,
+) -> Result<String, Error> {
     // Step 1: PROPFIND the calendars root for current-user-principal. We hit
     // `{caldav_base}/dav/calendars` directly rather than RFC 6764's
     // `/.well-known/caldav` because the well-known 301-redirects to exactly
@@ -2420,8 +2549,8 @@ async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<Str
     // across a 301 — so PROPFINDing the well-known would arrive as a GET.
     // `/dav/calendars` is the redirect target and exposes
     // `current-user-principal` directly (verified live).
-    let root = format!("{}/dav/calendars", s.caldav_base);
-    let principal_xml = caldav_propfind(s, auth, &root, "0", PROPFIND_PRINCIPAL_BODY).await?;
+    let root = format!("{caldav_base}/dav/calendars");
+    let principal_xml = caldav_propfind(client, auth, &root, "0", PROPFIND_PRINCIPAL_BODY).await?;
     let principal_href = parse_current_user_principal(&principal_xml).ok_or_else(|| {
         Error::CalendarDiscoveryFailed(
             "PROPFIND of calendars root returned no current-user-principal".into(),
@@ -2434,10 +2563,10 @@ async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<Str
             "cannot derive calendar home from principal href {principal_href}"
         ))
     })?;
-    let home_url = absolute_url(&s.caldav_base, &home_path);
+    let home_url = absolute_url(caldav_base, &home_path);
 
     // Step 3: PROPFIND the home Depth:1 and enumerate calendar collections.
-    let home_xml = caldav_propfind(s, auth, &home_url, "1", PROPFIND_HOME_BODY).await?;
+    let home_xml = caldav_propfind(client, auth, &home_url, "1", PROPFIND_HOME_BODY).await?;
     let collections = parse_calendar_collections(&home_xml);
     let default = pick_default_calendar(&collections).ok_or_else(|| {
         Error::CalendarDiscoveryFailed(format!(
@@ -2450,7 +2579,7 @@ async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<Str
     // `/{uid}.ics` with a single slash — Cyrus lists collection hrefs with a
     // trailing `/`; keeping it would yield `…/COLLID//uid.ics`.
     let href = default.href.trim_end_matches('/');
-    Ok(absolute_url(&s.caldav_base, href))
+    Ok(absolute_url(caldav_base, href))
 }
 
 /// Resolve the session's default calendar collection URL, discovering it once
@@ -2466,33 +2595,67 @@ async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<Str
 /// keeps surfacing honestly each time. `auth` is the `require_caldav_auth`
 /// header; discovery is only reached when the app password is configured (the
 /// m5yp guard runs first in each caller).
-async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
-    // `get_or_try_init` runs `discover_calendar_collection` only if the cell
-    // is empty; concurrent callers await the one in-flight init. `.clone()`
-    // releases the shared borrow before the caller builds its per-call URL.
-    Ok(s.caldav_collection_url
-        .get_or_try_init(|| discover_calendar_collection(s, auth))
+async fn resolve_calendar_collection_parts(
+    client: &reqwest::Client,
+    caldav_base: &str,
+    collection_url: &tokio::sync::OnceCell<String>,
+    auth: &str,
+) -> Result<String, Error> {
+    // `get_or_try_init` runs discovery only if the cell is empty; concurrent
+    // callers await the one in-flight init. `.clone()` releases the shared
+    // borrow before the caller builds its per-call URL.
+    Ok(collection_url
+        .get_or_try_init(|| discover_calendar_collection(client, caldav_base, auth))
         .await?
         .clone())
 }
 
-/// Fetch the current calendar event from CalDAV by UID.
-/// Returns a parsed CalendarEvent, or None if the event doesn't exist.
-pub async fn get_calendar_event(
-    s: &JmapSession,
+async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
+    resolve_calendar_collection_parts(&s.client, &s.caldav_base, &s.caldav_collection_url, auth)
+        .await
+}
+
+/// Clonable CalDAV read capability for list-status lookups. It shares the
+/// session's discovery OnceCell but owns every value needed by the network
+/// request, allowing routes to release the session RwLock before awaiting I/O.
+#[derive(Clone)]
+pub(crate) struct CalendarEventReader {
+    client: reqwest::Client,
+    auth_header: String,
+    caldav_base: String,
+    collection_url: std::sync::Arc<tokio::sync::OnceCell<String>>,
+}
+
+pub(crate) fn calendar_event_reader(s: &JmapSession) -> Result<CalendarEventReader, Error> {
+    let auth_header = require_caldav_auth(s)?.to_string();
+    Ok(CalendarEventReader {
+        client: s.client.clone(),
+        auth_header,
+        caldav_base: s.caldav_base.clone(),
+        collection_url: s.caldav_collection_url.clone(),
+    })
+}
+
+/// Fetch the current calendar event from CalDAV by UID using a detached read
+/// capability. Returns a parsed CalendarEvent, or None if it doesn't exist.
+pub(crate) async fn get_calendar_event_with_reader(
+    reader: &CalendarEventReader,
     uid: &str,
     primary_tz: chrono_tz::Tz,
 ) -> Result<Option<CalendarEvent>, Error> {
-    let auth = require_caldav_auth(s)?;
-    // Resolve the default writable calendar collection via PROPFIND (cached on
-    // the session) — never the hardcoded /Default/ that 301→404'd (kata wybm).
-    let collection = resolve_calendar_collection(s, auth).await?;
+    let collection = resolve_calendar_collection_parts(
+        &reader.client,
+        &reader.caldav_base,
+        &reader.collection_url,
+        &reader.auth_header,
+    )
+    .await?;
     let caldav_url = format!("{}/{}.ics", collection, percent_encode_path(uid));
 
-    let resp = s
+    let resp = reader
         .client
         .get(&caldav_url)
-        .header("Authorization", auth)
+        .header("Authorization", &reader.auth_header)
         .send()
         .await?;
 
@@ -2509,6 +2672,15 @@ pub async fn get_calendar_event(
 
     let ics_data = resp.text().await?;
     Ok(calendar::parse_ics(&ics_data, primary_tz))
+}
+
+pub async fn get_calendar_event(
+    s: &JmapSession,
+    uid: &str,
+    primary_tz: chrono_tz::Tz,
+) -> Result<Option<CalendarEvent>, Error> {
+    let reader = calendar_event_reader(s)?;
+    get_calendar_event_with_reader(&reader, uid, primary_tz).await
 }
 
 pub async fn add_to_calendar(
@@ -2963,6 +3135,84 @@ mod tests {
             "partId": "invite"
         }));
         assert!(invite_ics_from_body_values(&named_only, &values).is_none());
+    }
+
+    #[tokio::test]
+    async fn list_fetch_downloads_only_bounded_calendar_body_value() {
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR";
+        let ics_response = ics.as_bytes().to_vec();
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |_method, path| {
+            if path == "/jmap" {
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "methodResponses": [["Email/get", {
+                            "list": [{
+                                "id": "e1",
+                                "bodyStructure": {
+                                    "type": "multipart/mixed",
+                                    "subParts": [
+                                        {
+                                            "type": "text/plain",
+                                            "partId": "text",
+                                            "blobId": "blob-text",
+                                            "size": 50_000
+                                        },
+                                        {
+                                            "type": "text/calendar; method=REQUEST",
+                                            "partId": "invite",
+                                            "blobId": "blob-calendar",
+                                            "name": "invite.ics",
+                                            "size": 52
+                                        }
+                                    ]
+                                }
+                            }]
+                        }, "0"]]
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+            } else if path.contains("/blob-calendar/") {
+                (axum::http::StatusCode::OK, ics_response.clone())
+            } else {
+                (axum::http::StatusCode::NOT_FOUND, Vec::new())
+            }
+        })
+        .await;
+        let mut session = JmapSession::new("bob@example.com", "token", None);
+        session.api_url = Some(format!("{base}/jmap"));
+        session.account_id = Some("acc1".into());
+        session.download_url = Some(format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}"));
+
+        let emails = get_emails(&session, &["e1".into()], false, None)
+            .await
+            .unwrap();
+        assert_eq!(emails[0].calendar_ics.as_deref(), Some(ics));
+
+        let requests = recorded.lock().unwrap();
+        let jmap_request = requests
+            .iter()
+            .find(|request| request.path == "/jmap")
+            .expect("one Email/get request");
+        let request_json: serde_json::Value = serde_json::from_slice(&jmap_request.body).unwrap();
+        let args = &request_json["methodCalls"][0][1];
+        assert_eq!(args["fetchAllBodyValues"], false);
+        assert!(
+            !args["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|property| property == "bodyValues"),
+            "list Email/get must request structure, not every text body value"
+        );
+        let downloads: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "GET")
+            .collect();
+        assert_eq!(downloads.len(), 1);
+        assert!(downloads[0].path.contains("/blob-calendar/"));
+        assert!(!downloads[0].path.contains("blob-text"));
     }
 
     #[test]

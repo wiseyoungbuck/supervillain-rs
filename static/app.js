@@ -2197,6 +2197,7 @@ function renderInviteChip(email) {
         'ACCEPTED':     { label: 'Accepted',       cls: 'accepted' },
         'TENTATIVE':    { label: 'Tentative',      cls: 'tentative' },
         'DECLINED':     { label: 'Declined',       cls: 'declined' },
+        'DELEGATED':    { label: 'Delegated',      cls: 'delegated' },
         'NEEDS-ACTION': { label: 'Needs response', cls: 'needs-action' },
     };
     const presentation = presentations[status] || presentations['NEEDS-ACTION'];
