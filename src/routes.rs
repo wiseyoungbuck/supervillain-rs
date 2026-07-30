@@ -1172,8 +1172,134 @@ fn is_safe_path_segment(s: &str) -> bool {
 
 fn sanitize_filename_for_header(name: &str) -> String {
     name.chars()
-        .filter(|&c| c != '"' && c != '\\' && c != '\r' && c != '\n' && c != '\0')
+        .filter(|&c| c != '"' && c != '\\' && !c.is_control())
         .collect()
+}
+
+/// Encode a UTF-8 filename as an RFC 5987 `ext-value` payload.  Keeping the
+/// wire representation ASCII-only is required for both HTTP response headers
+/// and the browser-owned `X-Filename` upload header.
+fn rfc5987_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        // RFC 5987's attr-char set (RFC 2231 minus "*", "'", and "%").
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn valid_percent_triplets(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+/// Decode the coordinated browser/server upload contract.  New clients send
+/// an RFC 5987 UTF-8 extended value (`UTF-8''...`); plain ASCII and raw UTF-8
+/// remain accepted for old clients and command-line API users.
+fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
+    let Some(value) = value else {
+        return "attachment".to_string();
+    };
+
+    // HeaderValue::to_str deliberately rejects obs-text.  Try UTF-8 bytes as a
+    // compatibility path before falling back to ISO-8859-1 byte mapping for
+    // legacy browsers that put accented Latin directly in a ByteString header.
+    let raw = match value.to_str() {
+        Ok(value) => value.to_string(),
+        Err(_) => match std::str::from_utf8(value.as_bytes()) {
+            Ok(value) => value.to_string(),
+            Err(_) => value.as_bytes().iter().map(|&byte| byte as char).collect(),
+        },
+    };
+
+    let decoded = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UTF-8''"))
+    {
+        let encoded = &raw[7..];
+        if !valid_percent_triplets(encoded) {
+            None
+        } else {
+            percent_encoding::percent_decode_str(encoded)
+                .decode_utf8()
+                .ok()
+                .map(|value| value.into_owned())
+        }
+    } else if raw
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ISO-8859-1'"))
+    {
+        // The app's contract is UTF-8 only.  Treat another advertised charset
+        // as malformed instead of displaying percent escapes as a filename.
+        None
+    } else {
+        Some(raw)
+    };
+
+    decoded
+        .map(|name| sanitize_filename_for_header(&name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+fn attachment_filename_fallback(filename: &str) -> String {
+    if filename.is_ascii() {
+        return filename.to_string();
+    }
+
+    // filename* carries the real Unicode name.  Keep a safe ASCII extension in
+    // the legacy filename fallback so older download clients still know the
+    // file type instead of receiving a bare "attachment".
+    filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(|extension| format!("attachment.{extension}"))
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+fn attachment_content_disposition(filename: &str) -> String {
+    let filename = sanitize_filename_for_header(filename);
+    let filename = if filename.is_empty() {
+        "attachment".to_string()
+    } else {
+        filename
+    };
+    let fallback = attachment_filename_fallback(&filename);
+    format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        rfc5987_encode(&filename)
+    )
 }
 
 async fn download_attachment(
@@ -1190,7 +1316,7 @@ async fn download_attachment(
 
     let (content_type, bytes) = provider::download_blob(&session, &blob_id, &filename).await?;
 
-    let safe_filename = sanitize_filename_for_header(&filename);
+    let content_disposition = attachment_content_disposition(&filename);
     // X-Content-Type-Options: nosniff prevents browsers from sniffing past the
     // declared Content-Type. Combined with Content-Disposition: attachment,
     // this neutralizes the sender-controlled-filename-→-mime-type attack
@@ -1200,10 +1326,7 @@ async fn download_attachment(
         StatusCode::OK,
         [
             ("content-type", content_type),
-            (
-                "content-disposition",
-                format!("attachment; filename=\"{}\"", safe_filename),
-            ),
+            ("content-disposition", content_disposition),
             ("x-content-type-options", "nosniff".to_string()),
         ],
         bytes,
@@ -1447,11 +1570,7 @@ async fn upload_blob(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let raw_filename = headers
-        .get("x-filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("attachment");
-    let filename = sanitize_filename_for_header(raw_filename);
+    let filename = decode_upload_filename(headers.get("x-filename"));
 
     let session_lock = resolve_session(&state, params.account.as_deref()).await?;
     let session = session_lock.read().await;
@@ -2225,6 +2344,7 @@ async fn send_invite_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use axum::response::IntoResponse;
 
     // main.rs is the binary entry; embedding it here lets the form test pin
@@ -2479,6 +2599,93 @@ mod tests {
             sanitize_filename_for_header("file\\\"name.txt"),
             "filename.txt"
         );
+    }
+
+    #[test]
+    fn upload_filename_rfc5987_decodes_real_unicode_names() {
+        for (wire, expected) in [
+            (
+                "UTF-8''%E6%B7%BB%E4%BB%98%E8%B3%87%E6%96%99.pdf",
+                "添付資料.pdf",
+            ),
+            ("UTF-8''launch-%F0%9F%9A%80.zip", "launch-🚀.zip"),
+            ("UTF-8''r%C3%A9sum%C3%A9.pdf", "résumé.pdf"),
+        ] {
+            let value = HeaderValue::from_str(wire).expect("RFC 5987 value is ASCII");
+            assert_eq!(decode_upload_filename(Some(&value)), expected);
+        }
+    }
+
+    #[test]
+    fn upload_filename_parser_keeps_legacy_ascii_and_rejects_bad_ext_values() {
+        let ascii = HeaderValue::from_static("annual report.pdf");
+        assert_eq!(
+            decode_upload_filename(Some(&ascii)),
+            "annual report.pdf",
+            "old clients that sent plain ASCII must remain compatible"
+        );
+        assert_eq!(decode_upload_filename(None), "attachment");
+
+        for malformed in [
+            "UTF-8''bad%ZZname.pdf",
+            "UTF-8''%F0%28%8C%28.txt",
+            "ISO-8859-1''r%E9sum%E9.pdf",
+        ] {
+            let value = HeaderValue::from_str(malformed).unwrap();
+            assert_eq!(
+                decode_upload_filename(Some(&value)),
+                "attachment",
+                "invalid or unsupported extended value must fail closed: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_content_disposition_uses_ascii_fallback_and_filename_star() {
+        for (name, encoded, fallback) in [
+            (
+                "添付資料.pdf",
+                "%E6%B7%BB%E4%BB%98%E8%B3%87%E6%96%99.pdf",
+                "attachment.pdf",
+            ),
+            ("launch-🚀.zip", "launch-%F0%9F%9A%80.zip", "attachment.zip"),
+            ("résumé.pdf", "r%C3%A9sum%C3%A9.pdf", "attachment.pdf"),
+        ] {
+            let disposition = attachment_content_disposition(name);
+            assert!(
+                disposition.contains(&format!("filename=\"{fallback}\"")),
+                "legacy fallback should retain the extension: {disposition}"
+            );
+            assert!(
+                disposition.contains(&format!("filename*=UTF-8''{encoded}")),
+                "Unicode name must use RFC 5987 filename*: {disposition}"
+            );
+            HeaderValue::from_str(&disposition)
+                .unwrap_or_else(|e| panic!("generated header must be ASCII-valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn both_frontends_use_the_encoded_upload_contract_and_server_name() {
+        for (bundle, src, decl) in [
+            ("app.js", APP_JS, "function uploadAttachment("),
+            (
+                "mobile/app.js",
+                MOBILE_APP_JS,
+                "async function uploadComposeAttachment(",
+            ),
+        ] {
+            let block = js_fn_body(src, decl);
+            assert!(
+                block.contains("'X-Filename', encodeFilenameHeader(file.name)")
+                    || block.contains("'X-Filename': encodeFilenameHeader(file.name)"),
+                "{bundle} must send the shared ASCII-safe filename encoding"
+            );
+            assert!(
+                block.contains("att.name = data.name"),
+                "{bundle} must display and submit the server-decoded filename"
+            );
+        }
     }
 
     #[test]
