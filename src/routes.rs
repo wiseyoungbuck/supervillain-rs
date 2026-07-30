@@ -919,22 +919,24 @@ async fn get_email(
     let mut calendar_event = None;
     if email.has_calendar
         && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
-        && let Some(mut event) = calendar::parse_ics(&ics_data)
+        && let primary_tz = configured_primary_tz(&state)
+        && let Some(mut event) = calendar::parse_ics(&ics_data, primary_tz)
     {
         // Fetch the stored calendar event once — reused for both the SEQUENCE
         // update decision (REQUEST) and the PARTSTAT merge below. None when the
         // event isn't in the calendar yet or the lookup failed (degrade to the
         // first-time add path / email ICS).
-        let stored_event = match provider::get_calendar_event(&session, &event.uid).await {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!(
-                    "Calendar fetch failed for {}, falling back to email ICS: {e}",
-                    event.uid
-                );
-                None
-            }
-        };
+        let stored_event =
+            match provider::get_calendar_event(&session, &event.uid, primary_tz).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        "Calendar fetch failed for {}, falling back to email ICS: {e}",
+                        event.uid
+                    );
+                    None
+                }
+            };
 
         // On an Update (rescheduled invite from the verified organizer) we must
         // NOT re-apply the stale stored PARTSTAT — the response is being reset.
@@ -988,7 +990,8 @@ async fn get_email(
                         if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                             let s = s_lock.read().await;
                             if let Err(e) =
-                                provider::add_to_calendar(&s, &ics_clone, &uid, true).await
+                                provider::add_to_calendar(&s, &ics_clone, &uid, true, primary_tz)
+                                    .await
                             {
                                 surface_caldav_spawn_failure(
                                     &state_clone,
@@ -1025,7 +1028,8 @@ async fn get_email(
                         if let Ok(s_lock) = resolve_session(&state_clone, Some(&acct)).await {
                             let s = s_lock.read().await;
                             if let Err(e) =
-                                provider::add_to_calendar(&s, &ics_clone, &uid, false).await
+                                provider::add_to_calendar(&s, &ics_clone, &uid, false, primary_tz)
+                                    .await
                             {
                                 surface_caldav_spawn_failure(
                                     &state_clone,
@@ -1532,7 +1536,8 @@ async fn rsvp(
         .await?
         .ok_or_else(|| Error::NotFound("No calendar data found".into()))?;
 
-    let event = calendar::parse_ics(&ics_data)
+    let primary_tz = configured_primary_tz(&state);
+    let event = calendar::parse_ics(&ics_data, primary_tz)
         .ok_or_else(|| Error::Internal("Failed to parse calendar data".into()))?;
 
     // Determine attendee email (use account username as fallback)
@@ -1551,11 +1556,6 @@ async fn rsvp(
         determine_attendee_email(email, &event, session_guard.username())
     };
 
-    let reply_tz = timezone::primary_tz(&timezone::load_config(
-        &state.timezone_config_path,
-        timezone_env_override().as_deref(),
-    ));
-
     // Serialize against `get_email`'s background invite-update overwrite for
     // the same uid (kata f7mm #1) — see `calendar_uid_lock`'s doc comment.
     // Held across the provider call so the RSVP's own remove+re-add can't
@@ -1570,7 +1570,7 @@ async fn rsvp(
         &event,
         &attendee_email,
         &body.status,
-        reply_tz,
+        primary_tz,
     )
     .await?;
 
@@ -1599,14 +1599,15 @@ async fn add_to_calendar(
         .await?
         .ok_or_else(|| Error::NotFound("No calendar data found".into()))?;
 
-    let event = calendar::parse_ics(&ics_data)
+    let primary_tz = configured_primary_tz(&state);
+    let event = calendar::parse_ics(&ics_data, primary_tz)
         .ok_or_else(|| Error::Internal("Failed to parse calendar data".into()))?;
 
     // Cancellations should remove, not add
     let success = if event.method == "CANCEL" {
         provider::remove_from_calendar(&session, &event.uid).await?
     } else {
-        provider::add_to_calendar(&session, &ics_data, &event.uid, false).await?
+        provider::add_to_calendar(&session, &ics_data, &event.uid, false, primary_tz).await?
     };
 
     if success {
@@ -1960,6 +1961,13 @@ fn default_true_bool() -> bool {
 
 fn timezone_env_override() -> Option<String> {
     std::env::var("SUPERVILLAIN_TIMEZONE").ok()
+}
+
+fn configured_primary_tz(state: &AppState) -> chrono_tz::Tz {
+    timezone::primary_tz(&timezone::load_config(
+        &state.timezone_config_path,
+        timezone_env_override().as_deref(),
+    ))
 }
 
 async fn get_timezone(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -7419,9 +7427,17 @@ white   = '#fdf6e3'
             src.contains("calendar::InviteAction::Update =>"),
             "get_email must handle the Update arm"
         );
+        let update_arm = src
+            .split("calendar::InviteAction::Update => {")
+            .nth(1)
+            .expect("Update arm must exist");
+        let update_call = update_arm
+            .split("provider::add_to_calendar(")
+            .nth(1)
+            .expect("add_to_calendar call must exist in the Update arm");
         assert!(
-            src.contains("provider::add_to_calendar(&s, &ics_clone, &uid, false)"),
-            "the Update arm must add with only_if_new = false (overwrite)"
+            update_call.contains("false,") && update_call.contains("primary_tz,"),
+            "the Update arm must add with only_if_new = false and the configured primary timezone"
         );
         assert!(
             src.contains("event.is_update = true;"),
@@ -7534,7 +7550,7 @@ white   = '#fdf6e3'
             .nth(1)
             .expect("Update arm must exist");
         let update_arm_before_add = update_arm
-            .split("provider::add_to_calendar(&s, &ics_clone, &uid, false)")
+            .split("provider::add_to_calendar(")
             .next()
             .expect("add_to_calendar call must exist in the Update arm");
         assert!(
@@ -9870,11 +9886,17 @@ white   = '#fdf6e3'
                    DTSTART:20260101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
         // add-to-calendar route path: provider::add_to_calendar must propagate.
-        let add_err = provider::add_to_calendar(&session, ics, "uid-m5yp", false)
-            .await
-            .expect_err(
-                "provider::add_to_calendar must surface CalendarAuthUnconfigured, not Ok(false)+warn!",
-            );
+        let add_err = provider::add_to_calendar(
+            &session,
+            ics,
+            "uid-m5yp",
+            false,
+            chrono_tz::Tz::UTC,
+        )
+        .await
+        .expect_err(
+            "provider::add_to_calendar must surface CalendarAuthUnconfigured, not Ok(false)+warn!",
+        );
         assert!(
             matches!(add_err, Error::CalendarAuthUnconfigured),
             "expected Error::CalendarAuthUnconfigured, got {add_err:?}"
