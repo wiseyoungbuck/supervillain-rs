@@ -299,10 +299,20 @@
         }
 
         .account-provider {
+            display: inline-flex;
+            align-items: center;
             font-size: 11px;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
+        }
+
+        .provider-icon {
+            display: block;
+            width: 18px;
+            height: 18px;
+            object-fit: contain;
+            flex: 0 0 auto;
         }
 
         /* Toasts — one fixed flex stack holds both as normal flow children

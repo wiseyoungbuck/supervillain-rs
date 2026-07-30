@@ -91,6 +91,10 @@ const ICON_180: &[u8] = include_bytes!("../static/icon-180.png");
 const ICON_192: &[u8] = include_bytes!("../static/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../static/icon-512.png");
 const SUPERVILLAIN_JPG: &[u8] = include_bytes!("../static/supervillain.jpg");
+const PROVIDER_GMAIL_SVG: &[u8] = include_bytes!("../static/provider-icons/gmail.svg");
+const PROVIDER_OUTLOOK_SVG: &[u8] =
+    include_bytes!("../static/provider-icons/microsoft-outlook.svg");
+const PROVIDER_FASTMAIL_SVG: &[u8] = include_bytes!("../static/provider-icons/fastmail.svg");
 const FONT_JBM_REGULAR: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Regular.woff2");
 const FONT_JBM_SEMIBOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-SemiBold.woff2");
 const FONT_JBM_BOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Bold.woff2");
@@ -202,6 +206,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/icon-192.png", get(icon_192))
         .route("/icon-512.png", get(icon_512))
         .route("/supervillain.jpg", get(supervillain_jpg))
+        .route("/provider-icons/gmail.svg", get(provider_gmail_svg))
+        .route(
+            "/provider-icons/microsoft-outlook.svg",
+            get(provider_outlook_svg),
+        )
+        .route("/provider-icons/fastmail.svg", get(provider_fastmail_svg))
         // Mobile PWA
         .route("/mobile", get(mobile_html))
         .route("/mobile/", get(mobile_html))
@@ -404,6 +414,22 @@ async fn icon_512() -> impl IntoResponse {
 
 async fn supervillain_jpg() -> impl IntoResponse {
     ([("content-type", "image/jpeg")], SUPERVILLAIN_JPG)
+}
+
+fn provider_svg(svg: &'static [u8]) -> impl IntoResponse {
+    ([("content-type", "image/svg+xml")], svg)
+}
+
+async fn provider_gmail_svg() -> impl IntoResponse {
+    provider_svg(PROVIDER_GMAIL_SVG)
+}
+
+async fn provider_outlook_svg() -> impl IntoResponse {
+    provider_svg(PROVIDER_OUTLOOK_SVG)
+}
+
+async fn provider_fastmail_svg() -> impl IntoResponse {
+    provider_svg(PROVIDER_FASTMAIL_SVG)
 }
 
 // =============================================================================
@@ -4697,6 +4723,35 @@ mod tests {
         );
     }
 
+    async fn assert_svg_icon(resp: axum::response::Response, label: &str) {
+        assert_eq!(resp.status(), StatusCode::OK, "{label} icon should be OK");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .expect("provider icon must set content-type")
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "image/svg+xml", "{label} icon should be SVG");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(b"<svg") && body.ends_with(b"</svg>"),
+            "{label} icon should contain a complete SVG document"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_brand_icons_are_embedded_svgs() {
+        for (label, resp) in [
+            ("Gmail", provider_gmail_svg().await.into_response()),
+            ("Outlook", provider_outlook_svg().await.into_response()),
+            ("Fastmail", provider_fastmail_svg().await.into_response()),
+        ] {
+            assert_svg_icon(resp, label).await;
+        }
+    }
+
     #[test]
     fn shared_api_js_handles_auth_errors() {
         // 401 and 403 must map to ApiAuthError, not plain ApiError
@@ -5683,6 +5738,109 @@ mod tests {
             .find("\n}")
             .unwrap_or_else(|| panic!("{decl} must close"));
         &rest[..end]
+    }
+
+    // Provider brand marks (kata 8w06): desktop and mobile intentionally use
+    // the same renderer so accessibility and unknown-provider fallback cannot
+    // drift between the two account pickers.
+    #[test]
+    fn provider_icon_renderers_are_accessible_self_hosted_and_identical() {
+        let desktop = js_fn_body(APP_JS, "function providerIcon(");
+        let mobile = js_fn_body(MOBILE_APP_JS, "function providerIcon(");
+        assert_eq!(
+            desktop, mobile,
+            "desktop and mobile providerIcon must remain byte-identical"
+        );
+        assert!(
+            desktop.contains(r#"alt="${icon.label}""#)
+                && desktop.contains(r#"title="${icon.label}""#),
+            "known provider icons need an accessible name and hover label"
+        );
+        assert!(
+            desktop.contains("provider-icon-fallback") && desktop.contains("escapeHtml(label)"),
+            "unknown providers need a safe visible text fallback"
+        );
+
+        for src in [APP_JS, MOBILE_APP_JS] {
+            for path in [
+                "/provider-icons/gmail.svg",
+                "/provider-icons/microsoft-outlook.svg",
+                "/provider-icons/fastmail.svg",
+            ] {
+                assert!(
+                    src.contains(path),
+                    "provider renderer must use vendored {path}"
+                );
+            }
+            assert!(
+                !src.contains("cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons"),
+                "provider icons must not depend on an external CDN"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_account_labels_render_provider_icons() {
+        assert!(
+            js_fn_body(APP_JS, "function renderAccounts(").contains("providerIcon(acc.provider)"),
+            "desktop account selector must render the provider mark"
+        );
+        assert!(
+            js_fn_body(APP_JS, "function renderSettings(").contains("providerIcon(a.provider)"),
+            "desktop settings account list must render the provider mark"
+        );
+        assert!(
+            js_fn_body(APP_JS, "function renderWizSuccess(").contains("providerIcon(provider)"),
+            "wizard success summary must render the provider mark"
+        );
+        assert!(
+            js_fn_body(APP_JS, "function tailorWizCreds(").contains("providerIcon(provider)"),
+            "wizard continue action must render the selected provider mark"
+        );
+    }
+
+    #[test]
+    fn mobile_account_labels_render_provider_icons() {
+        assert!(
+            js_fn_body(MOBILE_APP_JS, "function renderAccountPicker(")
+                .contains("providerIcon(a.provider)"),
+            "mobile account selector must render the provider mark"
+        );
+        for path in [
+            "/provider-icons/gmail.svg",
+            "/provider-icons/microsoft-outlook.svg",
+            "/provider-icons/fastmail.svg",
+        ] {
+            assert!(
+                MOBILE_SW.contains(path),
+                "mobile offline shell must cache provider icon {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_wizard_picker_uses_accessible_brand_icons() {
+        for (label, path) in [
+            ("Gmail", "/provider-icons/gmail.svg"),
+            ("Outlook", "/provider-icons/microsoft-outlook.svg"),
+            ("Fastmail", "/provider-icons/fastmail.svg"),
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!(r#"src="{path}""#))
+                    && INDEX_HTML.contains(&format!(r#"alt="{label}""#))
+                    && INDEX_HTML.contains(&format!(r#"aria-label="{label}"#)),
+                "wizard picker needs a self-hosted, accessible {label} icon"
+            );
+        }
+        assert!(
+            !INDEX_HTML.contains(r#"<span class="wiz-name">"#),
+            "wizard provider words should be replaced by brand marks"
+        );
+        let focus = js_fn_body(APP_JS, "function focusWizProvider(");
+        assert!(
+            focus.contains("setAttribute('aria-selected', String(selected))"),
+            "keyboard movement must keep listbox selection accessible"
+        );
     }
 
     #[test]

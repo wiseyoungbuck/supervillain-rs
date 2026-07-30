@@ -428,6 +428,18 @@ body {
     color: inherit;
 }
 
+/* Provider marks are vendored SVGs. Their intrinsic brand colors work on
+   both themes; fixed dimensions keep a missing asset's alt-text fallback from
+   disturbing surrounding layout. */
+.provider-icon {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    object-fit: contain;
+    vertical-align: middle;
+    flex: 0 0 auto;
+}
+
 /* Account selector */
 #account-selector {
     padding: 8px 0;
@@ -472,9 +484,16 @@ body {
 }
 
 .account-item .account-provider {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     font-size: 10px;
     color: var(--fg-dim);
+}
+.account-provider-status,
+.account-item .provider-icon-fallback {
     text-transform: uppercase;
+    white-space: nowrap;
 }
 
 .account-item.pending .account-email {
@@ -1740,8 +1759,13 @@ body:not(.light-theme) .compose-quote a * {
     white-space: nowrap;
 }
 .account-row-provider {
+    display: inline-flex;
+    align-items: center;
     color: var(--fg-dim);
     font-size: 11px;
+}
+.account-row-provider .provider-icon-fallback {
+    text-transform: uppercase;
 }
 .account-row.add-row {
     color: var(--fg-dim);
@@ -2025,7 +2049,7 @@ body:not(.light-theme) .compose-quote a * {
 .wiz-picker { display: flex; flex-direction: column; gap: 1px; }
 .wiz-row {
     display: grid;
-    grid-template-columns: 28px 24px 1fr auto auto;
+    grid-template-columns: 28px 28px 1fr auto;
     align-items: center;
     gap: 12px;
     padding: 8px 12px;
@@ -2053,9 +2077,8 @@ body:not(.light-theme) .compose-quote a * {
     font-size: 11px;
 }
 .wiz-row.focused .wiz-kbd { color: var(--accent); border-color: var(--accent); }
-.wiz-gly { color: var(--fg-dim); text-align: center; font-size: 14px; }
-.wiz-row.focused .wiz-gly { color: var(--accent); }
-.wiz-name { color: inherit; font-weight: 600; }
+.wiz-gly { display: flex; align-items: center; justify-content: center; }
+.wiz-gly .provider-icon { width: 20px; height: 20px; }
 .wiz-desc { color: var(--fg-dim); font-size: 12px; }
 .wiz-badge {
     color: var(--fg-dim);
