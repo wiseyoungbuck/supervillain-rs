@@ -2554,8 +2554,10 @@ async fn send_invite_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request};
     use axum::response::IntoResponse;
+    use tower::ServiceExt;
 
     // main.rs is the binary entry; embedding it here lets the form test pin
     // that it actually wires the compression layer (the behavioral test in
@@ -8739,6 +8741,87 @@ white   = '#fdf6e3'
             body,
             serde_json::json!({"success": true, "emailId": "message-1"})
         );
+    }
+
+    #[tokio::test]
+    async fn outlook_invite_route_accepts_202_without_message_id() {
+        let graph = axum::Router::new().route(
+            "/me/sendMail",
+            axum::routing::post(|| async { StatusCode::ACCEPTED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, graph).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        let outlook = crate::outlook::OutlookSession {
+            client: reqwest::Client::new(),
+            token: tokio::sync::Mutex::new(crate::outlook::OutlookToken {
+                access_token: "test-token".into(),
+                refresh_token: "test-refresh".into(),
+                token_expiry: chrono::Utc::now() + chrono::Duration::hours(1),
+            }),
+            client_id: "test-client".into(),
+            token_path: temp.path().join("outlook-token.json"),
+            email: "boss@example.com".into(),
+            folder_cache: tokio::sync::Mutex::new(None),
+            page_cache: tokio::sync::Mutex::new(HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+            identity_cache: tokio::sync::Mutex::new(Some(crate::outlook::IdentityCacheEntry {
+                fetched_at: std::time::Instant::now(),
+                identities: vec![Identity {
+                    id: "boss@example.com".into(),
+                    email: "boss@example.com".into(),
+                    name: "Boss".into(),
+                }],
+            })),
+            folder_role_cache: tokio::sync::Mutex::new(None),
+            limiter: crate::outlook::build_outlook_limiter(),
+            graph_base,
+        };
+        let state = test_state(&[], "outlook");
+        {
+            let mut registry = state.accounts.write().await;
+            registry.account_configs.insert(
+                "outlook".into(),
+                accounts::AccountConfig::Outlook {
+                    client_id: "test-client".into(),
+                    email: Some("boss@example.com".into()),
+                    signature: None,
+                },
+            );
+            registry.sessions.insert(
+                "outlook".into(),
+                Arc::new(tokio::sync::RwLock::new(
+                    provider::ProviderSession::Outlook(Box::new(outlook)),
+                )),
+            );
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/calendar/invite?account=outlook")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "to": ["guest@example.com"],
+                    "subject": "Team Standup",
+                    "summary": "Team Standup",
+                    "start": "2026-08-01T10:00:00",
+                    "end": "2026-08-01T11:00:00",
+                    "tz": "UTC"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router(Arc::new(state)).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, serde_json::json!({"success": true}));
     }
 
     // =========================================================================

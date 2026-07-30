@@ -167,6 +167,131 @@ fn quote_param_token(s: &str) -> String {
     quote_string(s)
 }
 
+/// Validate an attachment Content-Type before it reaches a hand-built MIME
+/// header. CR/LF is stripped first as a direct injection guard, then the value
+/// must be a short RFC 2045 type/subtype token; malformed client input falls
+/// back to a safe generic type.
+pub(crate) fn sanitize_attachment_mime_type(raw: &str) -> String {
+    let value = strip_crlf(raw);
+    let valid_token = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii() && !c.is_control() && c != ' ' && !is_tspecial(c))
+    };
+    let valid = value
+        .split_once('/')
+        .is_some_and(|(top, sub)| !sub.contains('/') && valid_token(top) && valid_token(sub));
+    if valid && value.len() <= 60 {
+        value
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn sanitize_attachment_name(raw: &str) -> String {
+    let clean: String = strip_crlf(raw)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if clean.is_empty() {
+        "attachment".to_string()
+    } else {
+        clean
+    }
+}
+
+fn attachment_name_fallback(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .map(|extension| format!("attachment.{extension}"))
+        .unwrap_or_else(|| "attachment".to_string())
+}
+
+fn is_rfc2231_attr_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+/// Percent-encode UTF-8 bytes into RFC 2231 continuation chunks without ever
+/// splitting a `%XX` escape. The conservative chunk width leaves ample room
+/// for ` filename*NN*=` and keeps every folded header line below 78 chars.
+fn rfc2231_chunks(value: &str) -> Vec<String> {
+    const CHUNK_LEN: usize = 42;
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    for byte in value.bytes() {
+        let unit = if is_rfc2231_attr_char(byte) {
+            char::from(byte).to_string()
+        } else {
+            format!("%{byte:02X}")
+        };
+        if !chunk.is_empty() && chunk.len() + unit.len() > CHUNK_LEN {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.push_str(&unit);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Emit a MIME header with a filename-like parameter. Short ASCII values keep
+/// the ordinary `name=` / `filename=` form. Non-ASCII or long values get an
+/// ASCII fallback plus RFC 2231 UTF-8 extended parameter; long encoded values
+/// use numbered continuations, folded so physical lines stay within 78 chars.
+pub(crate) fn push_attachment_parameter_header(
+    out: &mut String,
+    header_value: &str,
+    parameter: &str,
+    raw_value: &str,
+) {
+    let value = sanitize_attachment_name(raw_value);
+    let plain = format!("{parameter}={}", quote_param_token(&value));
+    if value.is_ascii() && header_value.len() + 2 + plain.len() <= 78 {
+        out.push_str(&format!("{header_value}; {plain}\r\n"));
+        return;
+    }
+
+    let fallback = attachment_name_fallback(&value);
+    out.push_str(&format!(
+        "{header_value};\r\n {parameter}={};\r\n",
+        quote_param_token(&fallback)
+    ));
+    let chunks = rfc2231_chunks(&value);
+    if chunks.len() == 1 {
+        out.push_str(&format!(
+            " {parameter}*=UTF-8''{}\r\n",
+            chunks
+                .first()
+                .expect("sanitized attachment name is non-empty")
+        ));
+        return;
+    }
+    for (index, chunk) in chunks.iter().enumerate() {
+        let charset = if index == 0 { "UTF-8''" } else { "" };
+        let separator = if index + 1 == chunks.len() {
+            "\r\n"
+        } else {
+            ";\r\n"
+        };
+        out.push_str(&format!(
+            " {parameter}*{index}*={charset}{chunk}{separator}"
+        ));
+    }
+}
+
 /// Format an RFC 5322 `mailbox` (`Name <addr>` or bare `addr`). The display
 /// name is header-injection-guarded and quoted when it contains special
 /// chars. Recipient lists (`to`/`cc`/`bcc`) arrive as bare email strings, so
@@ -197,14 +322,11 @@ fn format_recipient_list(addrs: &[String]) -> String {
 pub(crate) fn extract_ics_method(ics: &str) -> String {
     for line in ics.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("METHOD:")
-            .or_else(|| trimmed.strip_prefix("method:"))
+        if let Some((key, value)) = trimmed.split_once(':')
+            && key.eq_ignore_ascii_case("METHOD")
+            && !value.trim().is_empty()
         {
-            let val = rest.trim();
-            if !val.is_empty() {
-                return val.to_string();
-            }
+            return value.trim().to_string();
         }
     }
     "REQUEST".to_string()
@@ -315,12 +437,21 @@ pub(crate) fn build_imip_mime(
         out.push_str(&alt);
         for (name, mime, bytes) in attachments {
             out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
-            let quoted_name = quote_param_token(name);
-            out.push_str(&format!("Content-Type: {mime}; name={quoted_name}\r\n"));
+            let mime = sanitize_attachment_mime_type(mime);
+            push_attachment_parameter_header(
+                &mut out,
+                &format!("Content-Type: {mime}"),
+                "name",
+                name,
+            );
             out.push_str("Content-Transfer-Encoding: base64\r\n");
-            out.push_str(&format!(
-                "Content-Disposition: attachment; filename={quoted_name}\r\n\r\n"
-            ));
+            push_attachment_parameter_header(
+                &mut out,
+                "Content-Disposition: attachment",
+                "filename",
+                name,
+            );
+            out.push_str("\r\n");
             out.push_str(&base64_mime_lines(bytes));
             out.push_str("\r\n");
         }
@@ -382,8 +513,10 @@ mod tests {
 
     #[test]
     fn extract_method_case_insensitive_key() {
-        let ics = "BEGIN:VCALENDAR\r\nmethod:request\r\nEND:VCALENDAR\r\n";
-        assert_eq!(extract_ics_method(ics), "request");
+        for key in ["method", "Method", "mEtHoD"] {
+            let ics = format!("BEGIN:VCALENDAR\r\n{key}:request\r\nEND:VCALENDAR\r\n");
+            assert_eq!(extract_ics_method(&ics), "request");
+        }
     }
 
     #[test]
@@ -640,6 +773,78 @@ mod tests {
             3,
             "1 alternative + 2 attachments = 3 mixed opening delimiters: {s}"
         );
+    }
+
+    #[test]
+    fn invite_mime_attachment_headers_reject_crlf_injection() {
+        let attachment = (
+            "report.pdf\r\n--supervillain-imip-mixed\r\nBcc: evil@example.com".into(),
+            "application/pdf\r\nBcc: evil@example.com".into(),
+            b"data".to_vec(),
+        );
+        let raw = build_imip_mime(
+            "boss@example.com",
+            None,
+            &["guest@example.com".into()],
+            &[],
+            None,
+            "S",
+            "b",
+            sample_ics(),
+            &[attachment],
+        );
+        let s = decode_mime_body(&raw);
+        assert!(
+            !s.contains("\r\nBcc: evil@example.com"),
+            "attachment metadata must not inject a header: {s}"
+        );
+        assert_eq!(
+            s.matches("--supervillain-imip-mixed\r\n").count(),
+            2,
+            "filename metadata must not inject a forged MIME boundary: {s}"
+        );
+        assert!(
+            s.contains("Content-Type: application/octet-stream;"),
+            "malformed MIME types must use the safe fallback: {s}"
+        );
+    }
+
+    #[test]
+    fn invite_mime_rfc2231_encodes_unicode_and_long_attachment_names() {
+        for name in [
+            "résumé.pdf".to_string(),
+            format!("quarterly-{}-report.pdf", "planning".repeat(12)),
+        ] {
+            let attachment = (name.clone(), "application/pdf".into(), b"data".to_vec());
+            let raw = build_imip_mime(
+                "boss@example.com",
+                None,
+                &["guest@example.com".into()],
+                &[],
+                None,
+                "S",
+                "b",
+                sample_ics(),
+                &[attachment],
+            );
+            let s = decode_mime_body(&raw);
+            assert!(
+                s.contains("filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+                    || s.contains("filename*0*=UTF-8''quarterly-"),
+                "real filename must use an RFC 2231 extended parameter: {s}"
+            );
+            assert!(
+                !s.contains("résumé.pdf"),
+                "raw non-ASCII must not appear in MIME headers: {s}"
+            );
+            for line in s.lines() {
+                assert!(
+                    line.len() <= 78,
+                    "MIME line exceeds 78 chars ({}): {line:?}",
+                    line.len()
+                );
+            }
+        }
     }
 
     // ---- header injection + encoding guards ----

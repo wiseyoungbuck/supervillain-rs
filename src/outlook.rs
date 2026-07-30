@@ -2364,6 +2364,34 @@ async fn resolve_all_attachments(
     Ok(out)
 }
 
+/// Best-effort identity loading shared by regular new mail and raw-MIME iMIP
+/// invites. A failed lookup must not block sending, but an explicit override
+/// makes the loss observable because it can no longer be honored safely.
+async fn load_identities_for_send_path(
+    session: &OutlookSession,
+    path: SendPath,
+    from_addr: Option<&str>,
+    identity_id_override: Option<&str>,
+) -> Vec<Identity> {
+    if !matches!(path, SendPath::NewMail) || from_addr.is_none_or(str::is_empty) {
+        return Vec::new();
+    }
+    match get_identities(session).await {
+        Ok(identities) => identities,
+        Err(error) => {
+            if identity_id_override.is_some() {
+                tracing::error!(
+                    error = %error,
+                    ?identity_id_override,
+                    "Outlook send: failed to load identities; cannot honor \
+                     identity_id_override on this send"
+                );
+            }
+            Vec::new()
+        }
+    }
+}
+
 /// Send an iMIP calendar invite via Graph's MIME-mode `sendMail` (kata zs8n).
 ///
 /// Graph's JSON Message resource has no channel for the `method`
@@ -2460,24 +2488,13 @@ pub async fn send_email(
     // below don't apply. Resolving the From display name mirrors the
     // NewMail path (best-effort; identity cache may already be warm).
     if sub.calendar_ics.is_some() {
-        let identities = if from_addr.is_some_and(|a| !a.is_empty()) {
-            match get_identities(session).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    if identity_id_override.is_some() {
-                        tracing::error!(
-                            error = %e,
-                            ?identity_id_override,
-                            "Outlook invite send: failed to load identities; \
-                             cannot honor identity_id_override on this send"
-                        );
-                    }
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        let identities = load_identities_for_send_path(
+            session,
+            SendPath::NewMail,
+            from_addr,
+            identity_id_override,
+        )
+        .await;
         let from_name = pick_from_name_for_send_path(
             SendPath::NewMail,
             from_addr,
@@ -2524,7 +2541,7 @@ pub async fn send_email(
         );
     } else if identity_id_override.is_some()
         && matches!(path, SendPath::NewMail)
-        && from_addr.is_none()
+        && from_addr.is_none_or(str::is_empty)
     {
         tracing::warn!(
             ?identity_id_override,
@@ -2532,31 +2549,12 @@ pub async fn send_email(
              frontend should send both; ignoring override"
         );
     }
-    // Resolve display name. Only NewMail with from_addr ever invokes
-    // the picker (see pick_from_name_for_send_path). Roborev 183 #3:
-    // identities come from the 60s-TTL cache to avoid an extra
-    // /me RTT on every send. Roborev 183 #4: if the load fails and we
-    // had an override to honor, emit a tracing::error so the operator
-    // sees the real cause rather than the misleading "override unknown"
-    // warn the picker would emit on an empty identity list.
-    let identities = if matches!(path, SendPath::NewMail) && from_addr.is_some() {
-        match get_identities(session).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                if identity_id_override.is_some() {
-                    tracing::error!(
-                        error = %e,
-                        ?identity_id_override,
-                        "Outlook send: failed to load identities; cannot \
-                         honor identity_id_override on this send"
-                    );
-                }
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    // Resolve display name. Only NewMail with a non-empty from_addr invokes
+    // the picker (see pick_from_name_for_send_path). Identities come from the
+    // 60s-TTL cache; the shared helper logs an explicit override that cannot
+    // be honored if loading fails.
+    let identities =
+        load_identities_for_send_path(session, path, from_addr, identity_id_override).await;
     let from_name =
         pick_from_name_for_send_path(path, from_addr, identity_id_override, &identities);
     let new_id = match path {
