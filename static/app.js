@@ -1304,9 +1304,12 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
 
 async function loadReminders({ skipNotify = false, full = false } = {}) {
     try {
-        // full=1 forces the provider mailbox scan (orphan detection) — only
-        // the Reminders view needs it; the background poll stays cheap.
-        const reminders = await api('GET', full ? '/reminders?full=1' : '/reminders');
+        // full=true forces the provider mailbox scan (orphan detection). Any
+        // refresh while the Reminders view is open must be full — a cheap []
+        // response would wipe visible orphan rows, which only exist in the
+        // provider mailbox (roborev 444). The background poll stays cheap.
+        const wantFull = full || state.currentMailbox?.role === 'reminders';
+        const reminders = await api('GET', wantFull ? '/reminders?full=true' : '/reminders');
         const previous = new Map(state.reminders.map(item => [item.email_id, item]));
         state.reminders = reminders || [];
         const currentIds = new Set(state.reminders.map(item => item.email_id));

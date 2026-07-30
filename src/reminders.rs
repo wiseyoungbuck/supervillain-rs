@@ -690,15 +690,21 @@ mod tests {
     #[test]
     fn thread_identity_failure_fails_open() {
         // The reply gate must fail OPEN: a provider error while checking for
-        // replies means "wake anyway", never "swallow the reminder". Point the
-        // session at a dead port so every provider call errors.
+        // replies means "wake anyway", never "swallow the reminder". Bind an
+        // ephemeral port and drop the listener so the address is known-dead —
+        // connection refused is immediate, unlike a fixed port that some host
+        // service might actually be listening on (roborev 444).
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             let mut jmap = crate::jmap::JmapSession::new("gate@example.com", "token", None);
-            jmap.api_url = Some("http://127.0.0.1:9/jmap".into());
+            jmap.api_url = Some(format!("http://127.0.0.1:{dead_port}/jmap"));
             jmap.account_id = Some("a1".into());
             let session = provider::ProviderSession::Fastmail(Box::new(jmap));
             let result = thread_has_new_reply(&session, "email-1", Utc::now()).await;

@@ -1902,7 +1902,20 @@ struct ReminderListParams {
     /// email fetch, sustained rate-limit pressure on Gmail) when the durable
     /// store has nothing for the account. Orphan detection only needs the
     /// provider listing, and orphans are only actionable from the view.
-    full: Option<bool>,
+    ///
+    /// String, not bool: axum's Query goes through serde_urlencoded, whose
+    /// bool only accepts the literal "true"/"false" — `full=1` would 400
+    /// before the handler runs (roborev 444).
+    full: Option<String>,
+}
+
+/// Presence-as-true with explicit opt-outs, so `full=1`, `full=true`, and a
+/// bare `full=` all enable the provider scan.
+fn reminder_full_requested(full: Option<&str>) -> bool {
+    match full {
+        None => false,
+        Some(value) => !matches!(value.trim(), "false" | "0"),
+    }
 }
 
 async fn list_reminders(
@@ -1911,7 +1924,7 @@ async fn list_reminders(
 ) -> Result<impl IntoResponse, Error> {
     let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
     let records = state.reminders.records_for_account(&account_id);
-    if records.is_empty() && !params.full.unwrap_or(false) {
+    if records.is_empty() && !reminder_full_requested(params.full.as_deref()) {
         return Ok(Json(Vec::new()));
     }
     let session_lock = resolve_session(&state, Some(&account_id)).await?;
@@ -4277,6 +4290,94 @@ mod tests {
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
         }
+    }
+
+    #[test]
+    fn reminder_full_param_accepts_both_client_spellings() {
+        // roborev 444: Option<bool> rejected `full=1` with a 400 before the
+        // handler ran. Pin the lenient parse for every spelling a client
+        // might send, plus the explicit opt-outs.
+        for value in [Some("1"), Some("true"), Some("")] {
+            assert!(
+                reminder_full_requested(value),
+                "{value:?} must request a full listing"
+            );
+        }
+        for value in [None, Some("false"), Some("0")] {
+            assert!(
+                !reminder_full_requested(value),
+                "{value:?} must keep the cheap path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_reminders_short_circuits_without_session_when_store_empty() {
+        // The 30s background poll must not need a provider session (or any
+        // provider round-trip) when the durable store has nothing for the
+        // account: test_state has NO sessions, so reaching resolve_session
+        // would error — an Ok(empty) response proves the early return fired.
+        let state = Arc::new(test_state(&["known"], "known"));
+        let response = list_reminders(
+            State(state.clone()),
+            Query(ReminderListParams {
+                account: None,
+                full: None,
+            }),
+        )
+        .await
+        .expect("empty store + cheap poll must not touch the provider")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.is_empty(), "cheap path must return an empty listing");
+
+        // full=1 must attempt the provider scan — with no session that is an
+        // error, which proves the short-circuit did NOT swallow the request.
+        let err = list_reminders(
+            State(state),
+            Query(ReminderListParams {
+                account: None,
+                full: Some("1".into()),
+            }),
+        )
+        .await;
+        assert!(err.is_err(), "full listing must reach the provider path");
+    }
+
+    #[tokio::test]
+    async fn reminder_daemon_keeps_records_for_configured_but_disconnected_accounts() {
+        // roborev 443 High: a due record whose account is configured but has
+        // no live session (OAuth pending, startup connect failure) must
+        // survive the tick — only records for removed accounts may be
+        // dropped.
+        let state = Arc::new(test_state(&["known"], "known"));
+        let due = chrono::Utc::now() - chrono::Duration::minutes(5);
+        for account in ["known", "removed-account"] {
+            state.reminders.insert(crate::reminders::ReminderRecord {
+                account_id: account.into(),
+                email_id: format!("email-{account}"),
+                original_inbox_id: "inbox".into(),
+                wake_at: due,
+                mode: crate::reminders::ReminderMode::IfNoReply,
+                snoozed_at: due,
+            });
+        }
+        crate::reminders::tick_reminder_daemon(&state, chrono::Utc::now()).await;
+        assert!(
+            state.reminders.get("known", "email-known").is_some(),
+            "configured-but-disconnected account must keep its reminder"
+        );
+        assert!(
+            state
+                .reminders
+                .get("removed-account", "email-removed-account")
+                .is_none(),
+            "records for accounts gone from the config are dropped"
+        );
     }
 
     #[tokio::test]
