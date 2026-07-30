@@ -54,6 +54,13 @@ pub struct OutlookSession {
     /// aggressively per-app/per-mailbox; this is the single place that
     /// intent lives (see [`build_outlook_limiter`]).
     pub limiter: std::sync::Arc<RateLimiter>,
+    /// Microsoft Graph API base. [`GRAPH_BASE`] in production; tests point it
+    /// at a loopback recorder (same pattern as `GmailSession::gmail_base` and
+    /// `JmapSession::caldav_base`). Today only the iMIP invite send path
+    /// (kata zs8n) reads it — the rest of the module still uses the
+    /// `GRAPH_BASE` const directly — so loopback tests can exercise the
+    /// invite `sendMail` (raw-MIME) shape end to end.
+    pub graph_base: String,
 }
 
 /// Outlook rate-limit tuning. 4 concurrent × 125ms spacing ≈ 8 RPS
@@ -137,7 +144,7 @@ struct TokenResponse {
 // requires publisher verification (MPN ID).
 const AUTH_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
 const TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
-const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+pub(crate) const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const REDIRECT_URI: &str = "http://localhost:8400/callback";
 
 // User.Read is required for Graph /me to reliably return mail / userPrincipalName;
@@ -319,6 +326,7 @@ pub fn load_tokens(token_path: &std::path::Path, client_id: &str) -> Option<Outl
         identity_cache: tokio::sync::Mutex::new(None),
         folder_role_cache: tokio::sync::Mutex::new(None),
         limiter: build_outlook_limiter(),
+        graph_base: GRAPH_BASE.to_string(),
     })
 }
 
@@ -360,6 +368,7 @@ pub async fn oauth_flow(
         identity_cache: tokio::sync::Mutex::new(None),
         folder_role_cache: tokio::sync::Mutex::new(None),
         limiter: build_outlook_limiter(),
+        graph_base: GRAPH_BASE.to_string(),
     };
 
     // `save_tokens` uses `blocking_lock`, which panics inside a tokio runtime.
@@ -2329,6 +2338,73 @@ async fn resolve_all_attachments(
     Ok(out)
 }
 
+/// Send an iMIP calendar invite via Graph's MIME-mode `sendMail` (kata zs8n).
+///
+/// Graph's JSON Message resource has no channel for the `method`
+/// Content-Type parameter on a body part, so an invite sent via
+/// `send_new_mail` would lose the `text/calendar; method=REQUEST` part
+/// (the bug: `calendar_ics` was silently dropped). MIME-mode sendMail
+/// takes a base64 raw RFC822 with `Content-Type: text/plain` (see
+/// `learn.microsoft.com/graph/outlook-send-mime-message`), giving full
+/// MIME control — so the iMIP envelope built by [`crate::imip::build_imip_mime`]
+/// reaches the recipient byte-for-byte. `_at` URL-injection variant (mirrors
+/// the wca3 `*_at` calendar helpers) so loopback tests can pin the wire
+/// shape; `send_email` calls this with [`GRAPH_BASE`].
+///
+/// Returns `Ok(None)` — sendMail answers 202 with no body and no Sent
+/// message id (the same Graph limitation as `send_new_mail`).
+async fn send_invite_via_mime_at(
+    session: &OutlookSession,
+    sub: &EmailSubmission,
+    resolved: &[(String, String, Vec<u8>)],
+    base_url: &str,
+    from_addr: Option<&str>,
+    from_name: Option<&str>,
+) -> Result<Option<String>, Error> {
+    let ics = sub
+        .calendar_ics
+        .as_ref()
+        .expect("send_invite_via_mime_at requires calendar_ics — send_email must gate this call");
+    // Graph MIME-mode derives recipients from the MIME headers; the From
+    // header must carry a real address, so fall back to the session's own
+    // mailbox when the caller passed none/empty.
+    let from = from_addr
+        .filter(|a| !a.is_empty())
+        .unwrap_or(&session.email);
+    let mime = crate::imip::build_imip_mime(
+        from,
+        from_name,
+        &sub.to,
+        &sub.cc,
+        sub.bcc.as_deref(),
+        &sub.subject,
+        &sub.text_body,
+        ics,
+        resolved,
+    );
+    use base64::Engine;
+    let body = base64::engine::general_purpose::STANDARD.encode(&mime);
+    let token = access_token(session).await?;
+    let resp = session
+        .client
+        .post(format!("{base_url}/me/sendMail"))
+        .bearer_auth(&token)
+        // MIME-mode sendMail: the body is a base64 raw RFC822, and the
+        // request Content-Type MUST be text/plain (not application/json);
+        // a JSON content-type would make Graph try to parse the base64 as a
+        // Message resource and fail.
+        .header("Content-Type", "text/plain")
+        .body(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(classify_outlook_error("sendMail", status, &text));
+    }
+    Ok(None)
+}
+
 /// Send via the chosen Graph path. Top-5 greats finding: branch on
 /// `pick_send_path` so no-attachment replies take 1 RTT, with-attachment
 /// replies eat the 3-RTT createReply → PATCH → send dance. Orphan-draft
@@ -2348,6 +2424,54 @@ pub async fn send_email(
     // ReplyOneShot branch validates the upload cache state (resolves to
     // Ok(vec![]) cheaply when there are none).
     let resolved = resolve_all_attachments(session, &sub.attachments).await?;
+
+    // iMIP invite path (kata zs8n): `calendar_ics` needs a
+    // `text/calendar; method=<METHOD>` MIME part that Graph's JSON Message
+    // resource can't express (no channel for the method Content-Type
+    // parameter on a body part). Route to the raw-MIME `sendMail` path,
+    // which gives full MIME control. Invites are new messages
+    // (`send_invite_handler` sets in_reply_to=None), so the reply paths
+    // below don't apply. Resolving the From display name mirrors the
+    // NewMail path (best-effort; identity cache may already be warm).
+    if sub.calendar_ics.is_some() {
+        let identities = if from_addr.is_some_and(|a| !a.is_empty()) {
+            match get_identities(session).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    if identity_id_override.is_some() {
+                        tracing::error!(
+                            error = %e,
+                            ?identity_id_override,
+                            "Outlook invite send: failed to load identities; \
+                             cannot honor identity_id_override on this send"
+                        );
+                    }
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let from_name = pick_from_name_for_send_path(
+            SendPath::NewMail,
+            from_addr,
+            identity_id_override,
+            &identities,
+        );
+        let result = send_invite_via_mime_at(
+            session,
+            sub,
+            &resolved,
+            &session.graph_base,
+            from_addr,
+            from_name.as_deref(),
+        )
+        .await?;
+        drain_consumed_synthetic_blobs(session, &sub.attachments).await;
+        invalidate_caches_after_mutation(session).await;
+        return Ok(result);
+    }
+
     let path = pick_send_path(sub);
     // Roborev 181 #10: replace expect() with ok_or_else so a future
     // contributor synthesizing a SendPath from outside pick_send_path
@@ -3520,6 +3644,7 @@ mod tests {
             identity_cache: tokio::sync::Mutex::new(None),
             folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
+            graph_base: GRAPH_BASE.to_string(),
         };
 
         save_tokens(&session).unwrap();
@@ -4036,6 +4161,7 @@ mod tests {
             identity_cache: tokio::sync::Mutex::new(None),
             folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
+            graph_base: GRAPH_BASE.to_string(),
         }
     }
 
@@ -6171,6 +6297,210 @@ mod tests {
         assert_eq!(pick_send_path(&sub), SendPath::ReplyOneShot);
     }
 
+    // ---- kata zs8n: calendar_ics invite send path (raw-MIME sendMail) ----
+    //
+    // Before zs8n, outlook::send_email silently dropped
+    // EmailSubmission.calendar_ics, so /api/calendar/invite?account=outlook
+    // produced a bare text/plain message with no text/calendar part. Graph's
+    // JSON Message resource has no channel for the `method` Content-Type
+    // parameter on a body part, so invites go out via Graph's MIME-mode
+    // sendMail: POST /me/sendMail with `Content-Type: text/plain` and a
+    // base64 raw RFC822 body (the documented MIME-send shape). These pin
+    // that wire shape end to end through send_email.
+
+    fn invite_ics() -> String {
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
+         BEGIN:VEVENT\r\nUID:zs8n-outlook@example.test\r\nSUMMARY:Team Standup\r\n\
+         DTSTART:20260801T100000Z\r\nDTEND:20260801T103000Z\r\n\
+         ORGANIZER:mailto:boss@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            .into()
+    }
+
+    fn invite_submission(subject: &str) -> EmailSubmission {
+        EmailSubmission {
+            to: vec!["guest@example.com".into()],
+            cc: vec!["observer@example.com".into()],
+            subject: subject.into(),
+            text_body: "You're invited".into(),
+            bcc: None,
+            html_body: None,
+            in_reply_to: None,
+            references: None,
+            attachments: vec![],
+            calendar_ics: Some(invite_ics()),
+        }
+    }
+
+    /// Loopback recorder that captures `(method, path, content-type, raw body)`
+    /// for every request and answers a fixed status. The sendMail MIME-mode
+    /// body is a base64 STRING (not JSON), so — unlike `spawn_graph_recorder`
+    /// — this keeps the raw bytes and the Content-Type header.
+    type RecordedSendMail =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>>;
+
+    async fn spawn_sendmail_recorder(status: u16) -> (String, RecordedSendMail) {
+        let recorded: RecordedSendMail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs = recorded.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let reqs = reqs.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let content_type = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default()
+                    .to_vec();
+                reqs.lock()
+                    .unwrap()
+                    .push((method, path, content_type, body));
+                (axum::http::StatusCode::from_u16(status).unwrap(), "")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), recorded)
+    }
+
+    /// Seed the identity cache so `get_identities` is served without an HTTP
+    /// call (the invite branch resolves a From display name like the NewMail
+    /// path); the cache hit keeps the loopback test off the real Graph `/me`.
+    async fn seed_identity_cache(session: &OutlookSession, email: &str, name: &str) {
+        *session.identity_cache.lock().await = Some(IdentityCacheEntry {
+            fetched_at: Instant::now(),
+            identities: vec![Identity {
+                id: email.to_string(),
+                email: email.to_string(),
+                name: name.to_string(),
+            }],
+        });
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_posts_raw_mime_to_sendmail() {
+        let (base, recorded) = spawn_sendmail_recorder(202).await;
+        let mut session = make_outlook_test_session();
+        session.graph_base = base.clone();
+        // Point the const-based get_identities at the loopback too by seeding
+        // the cache (the invite branch resolves a From display name).
+        seed_identity_cache(&session, "boss@example.com", "Big Boss").await;
+
+        let result = send_email(
+            &session,
+            &invite_submission("Team Standup"),
+            Some("boss@example.com"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one sendMail POST: {reqs:?}");
+        let (method, path, ct, body) = &reqs[0];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/me/sendMail");
+        assert!(
+            ct.contains("text/plain"),
+            "MIME-mode sendMail must use Content-Type: text/plain, got: {ct}"
+        );
+        use base64::Engine;
+        let mime = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("sendMail body is base64 raw MIME");
+        let s = String::from_utf8_lossy(&mime);
+        assert!(
+            s.contains("text/calendar; method=REQUEST"),
+            "calendar part missing: {s}"
+        );
+        assert!(
+            s.contains("multipart/alternative"),
+            "alternative wrapper missing: {s}"
+        );
+        assert!(
+            s.contains("Content-Transfer-Encoding: base64"),
+            "calendar part must use base64 CTE: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_carries_from_display_name_and_cc() {
+        let (base, recorded) = spawn_sendmail_recorder(202).await;
+        let mut session = make_outlook_test_session();
+        session.graph_base = base;
+        seed_identity_cache(&session, "boss@example.com", "Big Boss").await;
+
+        let result = send_email(
+            &session,
+            &invite_submission("With cc"),
+            Some("boss@example.com"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+
+        let reqs = recorded.lock().unwrap();
+        let (_, _, _, body) = &reqs[0];
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        let s = String::from_utf8_lossy(&decoded);
+        assert!(
+            s.contains("From: Big Boss <boss@example.com>"),
+            "From display name from the identity cache missing: {s}"
+        );
+        assert!(
+            s.contains("Cc: observer@example.com"),
+            "cc missing from invite MIME: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_with_calendar_ics_and_attachment_wraps_mixed() {
+        let (base, recorded) = spawn_sendmail_recorder(202).await;
+        let mut session = make_outlook_test_session();
+        session.graph_base = base;
+        seed_identity_cache(&session, "boss@example.com", "Boss").await;
+        // Upload a synthetic attachment so resolve_all_attachments succeeds.
+        let (blob_id, _) = upload_blob(&session, "application/pdf", b"%PDF-fake")
+            .await
+            .unwrap();
+        let mut sub = invite_submission("With attachment");
+        sub.attachments = vec![crate::types::Attachment {
+            blob_id,
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size: 9,
+        }];
+
+        let result = send_email(&session, &sub, Some("boss@example.com"), None).await;
+        assert!(result.is_ok(), "invite send must succeed: {result:?}");
+
+        let reqs = recorded.lock().unwrap();
+        let (_, _, _, body) = &reqs[0];
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        let s = String::from_utf8_lossy(&decoded);
+        assert!(s.contains("multipart/mixed"), "mixed wrapper missing: {s}");
+        assert!(
+            s.contains("multipart/alternative"),
+            "alternative nested inside mixed missing: {s}"
+        );
+        assert!(
+            s.contains("text/calendar; method=REQUEST"),
+            "calendar part missing: {s}"
+        );
+        assert!(s.contains("report.pdf"), "attachment missing: {s}");
+    }
+
     // ---- build_graph_message ----
     //
     // Pure: constructs the Graph Message JSON resource used by the
@@ -6674,6 +7004,7 @@ mod tests {
             identity_cache: tokio::sync::Mutex::new(None),
             folder_role_cache: tokio::sync::Mutex::new(None),
             limiter: build_outlook_limiter(),
+            graph_base: GRAPH_BASE.to_string(),
         }
     }
 
