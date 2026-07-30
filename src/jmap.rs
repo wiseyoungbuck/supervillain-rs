@@ -141,12 +141,17 @@ pub struct JmapSession {
     /// discovered once via CalDAV PROPFIND and cached for the session
     /// lifetime (kata wybm). Replaces the hardcoded `/Default/` that
     /// 301→404'd on real Fastmail accounts. Populated lazily on first CalDAV
-    /// use by `resolve_calendar_collection`; the four CalDAV functions append
-    /// `/{uid}.ics` to it. `None` means "not yet discovered / discovery
-    /// failed (retry next call)". Held in a `std::sync::Mutex`
-    /// (set-once-read-many, no await while held) so the four `&self` CalDAV
-    /// functions can populate it without `&mut`.
-    pub caldav_collection_url: std::sync::Mutex<Option<String>>,
+    /// use by `resolve_calendar_collection` via `OnceCell::get_or_try_init`;
+    /// the four CalDAV functions append `/{uid}.ics` to it. `tokio::sync::OnceCell`
+    /// (not `std::sync::Mutex`) because it coordinates concurrent first-callers
+    /// on the same session — the `get_email` flow spawns fire-and-forget
+    /// writers — so only one runs the two-PROPFIND discovery while the rest
+    /// await its result (the "one discovery per session" contract, not per
+    /// call). A failed init leaves the cell empty (cancellation releases the
+    /// init permit, no poisoning), so a transient discovery failure retries
+    /// on the next call while a permanent one (no writable calendar) keeps
+    /// surfacing. The four `&self` CalDAV functions populate it without `&mut`.
+    pub caldav_collection_url: tokio::sync::OnceCell<String>,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
     pub upload_url: Option<String>,
@@ -181,7 +186,7 @@ impl JmapSession {
             auth_header: format!("Bearer {api_token}"),
             caldav_auth_header: basic_auth_header(username, app_password),
             caldav_base: "https://caldav.fastmail.com".into(),
-            caldav_collection_url: std::sync::Mutex::new(None),
+            caldav_collection_url: tokio::sync::OnceCell::new(),
             api_url: None,
             account_id: None,
             upload_url: None,
@@ -2072,10 +2077,14 @@ fn caldav_failure(method: &str, url: &str, status: reqwest::StatusCode, body: &s
 // expose is `current-user-principal`, and — critically — its href encodes the
 // Cyrus *underscore-munged* user segment (`matt_coburn@…`, NOT the dotted
 // session username `matt.coburn@…`). The calendar home is the principal path
-// with `principals`→`calendars` substituted. Cyrus also tags the `calendar`
-// resourcetype under the OLDER `urn:ietf:params:xml:ns:caldav` namespace, not
-// RFC 4791's `urn:ietf:params:calDav:` — the parser matches both. End-to-end
-// verified: PUT/GET/DELETE through the resolved URL succeed (201/200/204/404).
+// with `principals`→`calendars` substituted. Cyrus tags the `calendar`
+// resourcetype under RFC 4791's `urn:ietf:params:xml:ns:caldav` namespace (the
+// standard — verified against the RFC text, §12.1; there is no other CalDAV
+// namespace); the parser matches `calendar` by *local* element name so it's
+// robust to the server's prefix choice (C:, X27CD:, …) and to a default-
+// namespace serialization (`<calendar xmlns="urn:ietf:params:xml:ns:caldav"/>`).
+// End-to-end verified: PUT/GET/DELETE through the resolved URL succeed
+// (201/200/204/404).
 // =============================================================================
 
 /// PROPFIND body for step 1: ask the calendars root for
@@ -2087,7 +2096,7 @@ const PROPFIND_PRINCIPAL_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><
 /// calendar collection — `resourcetype`, `displayname`, and
 /// `current-user-privilege-set`.
 const PROPFIND_HOME_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:calDav:"><D:prop><D:resourcetype/><D:displayname/><D:current-user-privilege-set/></D:prop></D:propfind>"#;
+<D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:displayname/><D:current-user-privilege-set/></D:prop></D:propfind>"#;
 
 // --- XML parsing helpers ---
 //
@@ -2118,10 +2127,13 @@ static RESOURCETYPE_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static regex")
 });
 static CALENDAR_ELEM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // `<…:calendar/>` or `<…:calendar>` — the `\s*/?>` after `calendar` stops
-    // this matching `calendar-home-set` / `calendar-color` /
-    // `supported-calendar-component-set` (those have `-` after `calendar`).
-    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?calendar\s*/?>").expect("static regex")
+    // `<…:calendar .../>` or `<…:calendar ...>` — the `(?:\s[^>]*)?` after
+    // `calendar` allows attributes (notably the default-namespace form
+    // `<calendar xmlns="urn:ietf:params:xml:ns:caldav"/>`), while still
+    // excluding `calendar-home-set` / `calendar-color` /
+    // `supported-calendar-component-set` (those have `-` after `calendar`, not
+    // whitespace or `/>`/`>`).
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?calendar(?:\s[^>]*)?/?>").expect("static regex")
 });
 static SCHEDULE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?schedule-(?:inbox|outbox)\b").expect("static regex")
@@ -2137,12 +2149,13 @@ static PRIVILEGE_SET_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static regex")
 });
 static WRITE_PRIV_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // `<…:write/>` / `<…:write>` — does NOT match `write-properties` /
-    // `write-content` (those have `-` after `write`).
-    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?write\s*/?>").expect("static regex")
+    // `<…:write .../>` / `<…:write ...>` — allows attributes; does NOT match
+    // `write-properties` / `write-content` (those have `-` after `write`).
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?write(?:\s[^>]*)?/?>").expect("static regex")
 });
-static ALL_PRIV_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?all\s*/?>").expect("static regex"));
+static ALL_PRIV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?all(?:\s[^>]*)?/?>").expect("static regex")
+});
 static CDATA_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<!\[CDATA\[(.*?)\]\]>").expect("static regex"));
 
@@ -2173,7 +2186,10 @@ fn parse_current_user_principal(xml: &str) -> Option<String> {
 /// segment (a shape we don't recognize — surface rather than guess).
 fn derive_calendar_home(principal_href: &str) -> Option<String> {
     if principal_href.contains("/principals/") {
-        Some(principal_href.replace("/principals/", "/calendars/"))
+        // `replacen` (not `replace`) so only the collection-class segment is
+        // substituted — a server-controlled user segment that happened to
+        // contain `/principals/` wouldn't be corrupted.
+        Some(principal_href.replacen("/principals/", "/calendars/", 1))
     } else {
         None
     }
@@ -2243,9 +2259,12 @@ fn href_last_segment(href: &str) -> &str {
 ///   a. `displayname == "Default"` — a legacy/default-named calendar.
 ///   b. href segment `Default` or ending `.Default` — the Fastmail
 ///      `username.Default` convention (the old `/Default/` 301 target shape).
-///   c. `displayname` contains `(FastMail)` (and not `task`) — Fastmail's
-///      system-default events calendar marker (empirically `General (FastMail)`;
-///      the tasks calendar is `DEFAULT_TASK_CALENDAR_NAME`, no marker).
+///   c. `displayname` contains `(Fastmail)` case-insensitively (and not
+///      `task`) — Fastmail's system-default events calendar marker
+///      (empirically `General (FastMail)`; the tasks calendar is
+///      `DEFAULT_TASK_CALENDAR_NAME`, no marker). Case-insensitive because the
+///      live value is `(FastMail)` but the brand is `Fastmail` — don't 503 a
+///      multi-calendar account on a casing drift.
 ///   d. exactly one writable calendar collection — single-calendar accounts.
 /// Schedule-inbox/outbox and non-writable collections are excluded throughout.
 fn pick_default_calendar(colls: &[CalCollectionInfo]) -> Option<&CalCollectionInfo> {
@@ -2266,9 +2285,10 @@ fn pick_default_calendar(colls: &[CalCollectionInfo]) -> Option<&CalCollectionIn
         return Some(c);
     }
     if let Some(c) = writable.iter().find(|c| {
-        c.displayname
-            .as_deref()
-            .is_some_and(|d| d.contains("(FastMail)") && !d.to_lowercase().contains("task"))
+        c.displayname.as_deref().is_some_and(|d| {
+            let lower = d.to_lowercase();
+            lower.contains("(fastmail)") && !lower.contains("task")
+        })
     }) {
         return Some(c);
     }
@@ -2375,19 +2395,25 @@ async fn discover_calendar_collection(s: &JmapSession, auth: &str) -> Result<Str
 
 /// Resolve the session's default calendar collection URL, discovering it once
 /// via PROPFIND and caching the result in `caldav_collection_url` for the
-/// session lifetime (one discovery per session, not per CalDAV call). On a
-/// cache hit no HTTP is issued. Discovery failure is NOT cached — the field
-/// stays `None` so a transient failure retries on the next call while a
-/// permanent one (no writable calendar) keeps surfacing honestly each time.
-/// `auth` is the `require_caldav_auth` header; discovery is only reached when
-/// the app password is configured (the m5yp guard runs first in each caller).
+/// session lifetime (one discovery per session, not per CalDAV call).
+/// `OnceCell::get_or_try_init` coordinates concurrent first-callers on the
+/// same session — only one runs the two-PROPFIND discovery while the rest
+/// await its result — so the `get_email` flow's fire-and-forget writers don't
+/// each re-discover. On a cache hit no HTTP is issued. Discovery failure is
+/// NOT cached — `get_or_try_init` leaves the cell empty on Err (and releases
+/// the init permit on cancellation, no poisoning) so a transient failure
+/// retries on the next call while a permanent one (no writable calendar)
+/// keeps surfacing honestly each time. `auth` is the `require_caldav_auth`
+/// header; discovery is only reached when the app password is configured (the
+/// m5yp guard runs first in each caller).
 async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
-    if let Some(url) = s.caldav_collection_url.lock().unwrap().clone() {
-        return Ok(url);
-    }
-    let url = discover_calendar_collection(s, auth).await?;
-    *s.caldav_collection_url.lock().unwrap() = Some(url.clone());
-    Ok(url)
+    // `get_or_try_init` runs `discover_calendar_collection` only if the cell
+    // is empty; concurrent callers await the one in-flight init. `.clone()`
+    // releases the shared borrow before the caller builds its per-call URL.
+    Ok(s.caldav_collection_url
+        .get_or_try_init(|| discover_calendar_collection(s, auth))
+        .await?
+        .clone())
 }
 
 /// Fetch the current calendar event from CalDAV by UID.
@@ -2764,12 +2790,12 @@ pub(crate) mod caldav_recorder {
     /// Build the PROPFIND Depth:1 response for the calendar home, listing the
     /// given collections. Mimics the *real* Cyrus shape captured live so the
     /// parser is pinned against what the server actually emits: the `calendar`
-    /// resourcetype is tagged under the older `urn:ietf:params:xml:ns:caldav`
-    /// namespace (Cyrus uses `C:` there, NOT the RFC 4791 `urn:ietf:params:
-    /// calDav:`), displaynames are CDATA-wrapped, and `current-user-privilege-
-    /// set` carries `<D:write/>` (alongside `<D:write-properties/>` etc., to
-    /// exercise the write-vs-`write-properties` distinction the parser must
-    /// get right) when `writable` is true.
+    /// resourcetype is tagged under RFC 4791's `urn:ietf:params:xml:ns:caldav`
+    /// namespace (Cyrus binds it to prefix `C:`), displaynames are CDATA-
+    /// wrapped, and `current-user-privilege-set` carries `<D:write/>`
+    /// (alongside `<D:write-properties/>` etc., to exercise the
+    /// write-vs-`write-properties` distinction the parser must get right) when
+    /// `writable` is true.
     pub fn home_multistatus(collections: &[CalCollection]) -> String {
         let mut out = String::from(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -2779,8 +2805,8 @@ pub(crate) mod caldav_recorder {
             out.push_str("  <D:response>\n");
             out.push_str(&format!("    <D:href>{}</D:href>\n", c.href));
             out.push_str("    <D:propstat>\n      <D:prop>\n");
-            // resourcetype — Cyrus tags calendar/schedule-* under the older
-            // caldav namespace (C:), collection under D:.
+            // resourcetype — Cyrus tags calendar/schedule-* under RFC 4791's
+            // `urn:ietf:params:xml:ns:caldav` namespace (C:), collection under D:.
             out.push_str("        <D:resourcetype>\n          <D:collection/>\n");
             match c.kind {
                 CalKind::Calendar => out.push_str("          <C:calendar/>\n"),
@@ -5768,8 +5794,9 @@ END:VCALENDAR";
     // PROPFIND home → pick default writable calendar) against loopback
     // recorders, plus the caching and honest-failure contracts. The parser
     // unit tests above them pin the XML parsing and the default-selection
-    // heuristic in isolation, including the Cyrus older-namespace quirk that
-    // an RFC-only parser would miss (the vt0m lesson).
+    // heuristic in isolation, including prefix-independence and the default-
+    // namespace serialization of the RFC 4791 `calendar` element (the vt0m
+    // lesson: pin the real server shape, not an RFC-reasoned guess).
     // =========================================================================
 
     // --- parser unit tests ---
@@ -5831,8 +5858,8 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn parse_calendar_collections_handles_cyrus_older_namespace_and_flags() {
-        // The builder emits `calendar` under Cyrus's older
+    fn parse_calendar_collections_handles_rfc4791_namespace_and_flags() {
+        // The builder emits `calendar` under RFC 4791's
         // `urn:ietf:params:xml:ns:caldav` namespace (C:), CDATA displaynames,
         // and `write`/`write-properties`/`all` privileges — the real shape.
         use caldav_recorder::{CalCollection, CalKind};
@@ -5877,7 +5904,7 @@ END:VCALENDAR";
         let general = by_href("/dav/calendars/user/u/COLLID/").expect("general parsed");
         assert!(
             general.is_calendar,
-            "General is a calendar (older namespace matched)"
+            "General is a calendar (RFC 4791 namespace matched by local name)"
         );
         assert!(general.writable);
         assert_eq!(general.displayname.as_deref(), Some("General (FastMail)"));
@@ -5890,26 +5917,37 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn parse_calendar_collections_accepts_rfc4791_namespace_too() {
-        // Robustness: the parser matches `calendar` by local name, so the RFC
-        // 4791 namespace (`urn:ietf:params:calDav:`) is also recognized — not
-        // just Cyrus's older `urn:ietf:params:xml:ns:caldav`. A server that
-        // switches to (or uses) the RFC namespace still discovers.
+    fn parse_calendar_collections_matches_calendar_across_prefixes_and_default_ns() {
+        // Robustness: the parser matches `calendar` by *local* element name,
+        // so it's immune to the server's prefix choice and to a default-
+        // namespace serialization — both legit RFC 4791 serializations of the
+        // same `urn:ietf:params:xml:ns:caldav` `calendar` element. Cyrus binds
+        // it to `C:`; another server might bind it to `cal:` or use the
+        // default namespace (`<calendar xmlns="…"/>`). All must discover.
+        //
+        // Two collections in one response: one with an alternate prefix
+        // `cal:`, one with the default-namespace serialization
+        // `<calendar xmlns="…"/>` (the attribute-on-element form the strict
+        // regex would miss — roborev finding).
         let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:calDav:\">\
-<D:response><D:href>/dav/calendars/user/u/C/</D:href><D:propstat><D:prop>\
-<D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\
-<D:displayname><![CDATA[General (FastMail)]]></D:displayname>\
+<D:multistatus xmlns:D=\"DAV:\" xmlns:cal=\"urn:ietf:params:xml:ns:caldav\">\
+<D:response><D:href>/dav/calendars/user/u/C1/</D:href><D:propstat><D:prop>\
+<D:resourcetype><D:collection/><cal:calendar/></D:resourcetype>\
+<D:current-user-privilege-set><D:privilege><D:write/></D:privilege></D:current-user-privilege-set>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
+<D:response><D:href>/dav/calendars/user/u/C2/</D:href><D:propstat><D:prop>\
+<D:resourcetype><D:collection/><calendar xmlns=\"urn:ietf:params:xml:ns:caldav\"/></D:resourcetype>\
 <D:current-user-privilege-set><D:privilege><D:write/></D:privilege></D:current-user-privilege-set>\
 </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\
 </D:multistatus>";
         let parsed = parse_calendar_collections(xml);
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.len(), 2, "both responses must parse");
         assert!(
-            parsed[0].is_calendar,
-            "RFC-4791-namespace calendar must be recognized"
+            parsed.iter().all(|c| c.is_calendar),
+            "alternate-prefix `cal:calendar` AND default-namespace `<calendar/>` \
+             must both be recognized as calendars: {parsed:?}"
         );
-        assert!(parsed[0].writable);
+        assert!(parsed.iter().all(|c| c.writable));
     }
 
     // --- default-selection heuristic unit tests ---
