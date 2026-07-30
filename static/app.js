@@ -1054,7 +1054,7 @@ function renderSplitTabs() {
         const countBadge = count != null ? `<span class="split-count">${escapeHtml(String(count))}</span>` : '';
         return `
         <div class="split-tab ${state.currentSplit === split.id ? 'active' : ''}"
-             data-split="${split.id}" title="Ctrl+${idx + 1}">
+             data-split="${escapeAttr(split.id)}" title="Ctrl+${idx + 1}">
             <span class="split-name">${getSplitIcon(split)}${escapeHtml(split.name)}</span>${countBadge}
         </div>
     `;
@@ -3693,8 +3693,10 @@ function handleCommandPaletteKey(e) {
         const selected = els.commandResults.querySelector('.command-item.selected');
         if (selected) {
             executeCommand(selected.dataset.action);
+            closeCommandPalette();
+        } else {
+            closeCommandPalette({ cancelled: true });
         }
-        closeCommandPalette();
         e.preventDefault();
     } else if (e.key === 'ArrowDown') {
         state.commandPaletteIndex++;
@@ -4617,11 +4619,16 @@ function closeCommandPalette({ cancelled = false } = {}) {
         const previousMode = commandPalettePreviousMode;
         commandPalettePreviousFocus = null;
         commandPalettePreviousMode = 'normal';
-        if (previousFocus?.isConnected) previousFocus.focus();
+        let focusRestored = false;
+        if (previousFocus?.isConnected) {
+            previousFocus.focus();
+            focusRestored = document.activeElement === previousFocus;
+        }
         // Native focus listeners restore compose/wizard insert mode. Dense
         // settings fields have no focus listener, so use the captured mode as
-        // a fallback when focus itself left the palette mode unchanged.
-        if (state.mode === 'command') setMode(previousMode);
+        // a fallback only when focus was really restored. A disconnected field
+        // must not leave body focus trapped in insert mode.
+        if (state.mode === 'command') setMode(focusRestored ? previousMode : 'normal');
         return;
     }
 
@@ -5208,7 +5215,8 @@ function providerIcon(provider) {
     const label = typeof provider === 'string' && provider ? provider : 'Unknown provider';
     const icon = PROVIDER_ICONS.get(label.toLowerCase());
     if (!icon) return `<span class="provider-icon-fallback">${escapeHtml(label)}</span>`;
-    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${icon.label}" title="${icon.label}">`;
+    const escapedLabel = escapeAttr(icon.label);
+    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${escapedLabel}" title="${escapedLabel}">`;
 }
 
 // escapeHtml is safe for text content but textContent's serializer doesn't

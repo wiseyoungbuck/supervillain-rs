@@ -1160,9 +1160,9 @@ async fn get_email(
 
     // Check for calendar event
     let mut calendar_event = None;
+    let primary_tz = configured_primary_tz(&state);
     if email.has_calendar
         && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
-        && let primary_tz = configured_primary_tz(&state)
         && let Some(mut event) = calendar::parse_ics(&ics_data, primary_tz)
     {
         // Fetch the stored calendar event once — reused for both the SEQUENCE
@@ -1460,9 +1460,43 @@ fn valid_percent_triplets(value: &str) -> bool {
     true
 }
 
-/// Decode the coordinated browser/server upload contract.  New clients send
-/// an RFC 5987 UTF-8 extended value (`UTF-8''...`); plain ASCII and raw UTF-8
-/// remain accepted for old clients and command-line API users.
+/// Recognize RFC 5987's `charset'language'value` shape. The charset is a MIME
+/// token; language is intentionally left uninterpreted because filenames do
+/// not use it, but locating the second apostrophe lets valid `UTF-8'en'...`
+/// values take the same path as the app's usual `UTF-8''...` form.
+fn split_upload_ext_value(raw: &str) -> Option<(&str, &str, &str)> {
+    let (charset, rest) = raw.split_once('\'')?;
+    if charset.is_empty()
+        || !charset.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+    {
+        return None;
+    }
+    let (language, encoded) = rest.split_once('\'')?;
+    Some((charset, language, encoded))
+}
+
+/// Decode the coordinated browser/server upload contract. New clients send
+/// an RFC 5987 UTF-8 extended value (`UTF-8''...`); valid language tags are
+/// accepted too. Plain ASCII and raw UTF-8 remain accepted for old clients
+/// and command-line API users, while any advertised non-UTF-8 charset fails
+/// closed instead of leaking percent-escaped wire text into the filename.
 fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
     let Some(value) = value else {
         return "attachment".to_string();
@@ -1479,12 +1513,8 @@ fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
         },
     };
 
-    let decoded = if raw
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UTF-8''"))
-    {
-        let encoded = &raw[7..];
-        if !valid_percent_triplets(encoded) {
+    let decoded = if let Some((charset, _language, encoded)) = split_upload_ext_value(&raw) {
+        if !charset.eq_ignore_ascii_case("UTF-8") || !valid_percent_triplets(encoded) {
             None
         } else {
             percent_encoding::percent_decode_str(encoded)
@@ -1492,13 +1522,6 @@ fn decode_upload_filename(value: Option<&axum::http::HeaderValue>) -> String {
                 .ok()
                 .map(|value| value.into_owned())
         }
-    } else if raw
-        .get(..11)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ISO-8859-1'"))
-    {
-        // The app's contract is UTF-8 only.  Treat another advertised charset
-        // as malformed instead of displaying percent escapes as a filename.
-        None
     } else {
         Some(raw)
     };
@@ -1866,7 +1889,8 @@ async fn surface_caldav_spawn_failure(
             },
         )
         .await;
-    } else if matches!(err, Error::CalendarDiscoveryFailed(_)) {
+    } else if matches!(&err, Error::CalendarDiscoveryFailed(_)) {
+        tracing::warn!("Calendar {op} discovery failed for {uid}: {err}");
         accounts::push_error_if_absent(
             state,
             crate::types::AccountError {
@@ -2581,8 +2605,10 @@ async fn send_invite_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request};
     use axum::response::IntoResponse;
+    use tower::ServiceExt;
 
     // main.rs is the binary entry; embedding it here lets the form test pin
     // that it actually wires the compression layer (the behavioral test in
@@ -2887,6 +2913,7 @@ mod tests {
             ),
             ("UTF-8''launch-%F0%9F%9A%80.zip", "launch-🚀.zip"),
             ("UTF-8''r%C3%A9sum%C3%A9.pdf", "résumé.pdf"),
+            ("UTF-8'en'r%C3%A9sum%C3%A9.pdf", "résumé.pdf"),
         ] {
             let value = HeaderValue::from_str(wire).expect("RFC 5987 value is ASCII");
             assert_eq!(decode_upload_filename(Some(&value)), expected);
@@ -2907,6 +2934,8 @@ mod tests {
             "UTF-8''bad%ZZname.pdf",
             "UTF-8''%F0%28%8C%28.txt",
             "ISO-8859-1''r%E9sum%E9.pdf",
+            "utf-16''%FF%FEr%00e%00p%00o%00r%00t%00.pdf",
+            "us-ascii''report.pdf",
         ] {
             let value = HeaderValue::from_str(malformed).unwrap();
             assert_eq!(
@@ -2915,6 +2944,23 @@ mod tests {
                 "invalid or unsupported extended value must fail closed: {malformed}"
             );
         }
+    }
+
+    #[test]
+    fn upload_filename_parser_supports_legacy_obs_text_bytes() {
+        let raw_utf8 = HeaderValue::from_bytes("résumé.pdf".as_bytes()).unwrap();
+        assert_eq!(
+            decode_upload_filename(Some(&raw_utf8)),
+            "résumé.pdf",
+            "raw UTF-8 obs-text from legacy clients must stay compatible"
+        );
+
+        let latin1 = HeaderValue::from_bytes(b"r\xE9sum\xE9.pdf").unwrap();
+        assert_eq!(
+            decode_upload_filename(Some(&latin1)),
+            "résumé.pdf",
+            "invalid UTF-8 obs-text falls back to ISO-8859-1 byte mapping"
+        );
     }
 
     #[test]
@@ -6000,9 +6046,10 @@ mod tests {
             "desktop and mobile providerIcon must remain byte-identical"
         );
         assert!(
-            desktop.contains(r#"alt="${icon.label}""#)
-                && desktop.contains(r#"title="${icon.label}""#),
-            "known provider icons need an accessible name and hover label"
+            desktop.contains("escapeAttr(icon.label)")
+                && desktop.contains(r#"alt="${escapedLabel}""#)
+                && desktop.contains(r#"title="${escapedLabel}""#),
+            "known provider icons need attribute-escaped accessible and hover labels"
         );
         assert!(
             desktop.contains("provider-icon-fallback") && desktop.contains("escapeHtml(label)"),
@@ -6051,8 +6098,8 @@ mod tests {
     fn mobile_account_labels_render_provider_icons() {
         assert!(
             js_fn_body(MOBILE_APP_JS, "function renderAccountPicker(")
-                .contains("providerIcon(a.provider)"),
-            "mobile account selector must render the provider mark"
+                .contains("a.provider ? providerIcon(a.provider) : ''"),
+            "mobile account selector must render a provider mark only when provider data exists"
         );
         for path in [
             "/provider-icons/gmail.svg",
@@ -8141,33 +8188,34 @@ white   = '#fdf6e3'
         // decision spawns add_to_calendar with only_if_new = false, and sets
         // is_update so the client banners it.
         let src = include_str!("routes.rs");
+        let handler_src = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
-            src.contains("calendar::invite_update_decision("),
+            handler_src.contains("calendar::invite_update_decision("),
             "get_email must call the pure decision helper"
         );
         assert!(
-            src.contains("calendar::InviteAction::Update =>"),
+            handler_src.contains("calendar::InviteAction::Update =>"),
             "get_email must handle the Update arm"
         );
-        let update_arm = src
+        let update_arm = handler_src
             .split("calendar::InviteAction::Update => {")
             .nth(1)
-            .expect("Update arm must exist");
-        let update_call = update_arm
-            .split("provider::add_to_calendar(")
-            .nth(1)
-            .expect("add_to_calendar call must exist in the Update arm");
+            .expect("Update arm must exist")
+            .split("calendar::InviteAction::RejectSpoof =>")
+            .next()
+            .expect("Update arm must end before RejectSpoof");
         assert!(
-            update_call.contains("false,") && update_call.contains("primary_tz,"),
+            update_arm
+                .contains("provider::add_to_calendar(&s, &ics_clone, &uid, false, primary_tz)"),
             "the Update arm must add with only_if_new = false and the configured primary timezone"
         );
         assert!(
-            src.contains("event.is_update = true;"),
+            update_arm.contains("event.is_update = true;"),
             "the Update arm must flag the event as an update"
         );
         // RejectSpoof must write nothing — no add_to_calendar in that arm.
         assert!(
-            src.contains("calendar::InviteAction::RejectSpoof =>"),
+            handler_src.contains("calendar::InviteAction::RejectSpoof =>"),
             "get_email must handle the RejectSpoof arm"
         );
     }
@@ -8805,6 +8853,87 @@ white   = '#fdf6e3'
             body,
             serde_json::json!({"success": true, "emailId": "message-1"})
         );
+    }
+
+    #[tokio::test]
+    async fn outlook_invite_route_accepts_202_without_message_id() {
+        let graph = axum::Router::new().route(
+            "/me/sendMail",
+            axum::routing::post(|| async { StatusCode::ACCEPTED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let graph_base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, graph).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        let outlook = crate::outlook::OutlookSession {
+            client: reqwest::Client::new(),
+            token: tokio::sync::Mutex::new(crate::outlook::OutlookToken {
+                access_token: "test-token".into(),
+                refresh_token: "test-refresh".into(),
+                token_expiry: chrono::Utc::now() + chrono::Duration::hours(1),
+            }),
+            client_id: "test-client".into(),
+            token_path: temp.path().join("outlook-token.json"),
+            email: "boss@example.com".into(),
+            folder_cache: tokio::sync::Mutex::new(None),
+            page_cache: tokio::sync::Mutex::new(HashMap::new()),
+            upload_cache: tokio::sync::Mutex::new(HashMap::new()),
+            identity_cache: tokio::sync::Mutex::new(Some(crate::outlook::IdentityCacheEntry {
+                fetched_at: std::time::Instant::now(),
+                identities: vec![Identity {
+                    id: "boss@example.com".into(),
+                    email: "boss@example.com".into(),
+                    name: "Boss".into(),
+                }],
+            })),
+            folder_role_cache: tokio::sync::Mutex::new(None),
+            limiter: crate::outlook::build_outlook_limiter(),
+            graph_base,
+        };
+        let state = test_state(&[], "outlook");
+        {
+            let mut registry = state.accounts.write().await;
+            registry.account_configs.insert(
+                "outlook".into(),
+                accounts::AccountConfig::Outlook {
+                    client_id: "test-client".into(),
+                    email: Some("boss@example.com".into()),
+                    signature: None,
+                },
+            );
+            registry.sessions.insert(
+                "outlook".into(),
+                Arc::new(tokio::sync::RwLock::new(
+                    provider::ProviderSession::Outlook(Box::new(outlook)),
+                )),
+            );
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/calendar/invite?account=outlook")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "to": ["guest@example.com"],
+                    "subject": "Team Standup",
+                    "summary": "Team Standup",
+                    "start": "2026-08-01T10:00:00",
+                    "end": "2026-08-01T11:00:00",
+                    "tz": "UTC"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router(Arc::new(state)).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, serde_json::json!({"success": true}));
     }
 
     // =========================================================================
@@ -10437,8 +10566,17 @@ white   = '#fdf6e3'
             .find("previousFocus.focus()")
             .expect("the cancel path must restore the pre-palette focus");
         assert!(
-            focus_idx > cancel_idx && close.contains("setMode(previousMode)"),
-            "closeCommandPalette must refocus and restore mode only on its cancel path (kata sqke)"
+            focus_idx > cancel_idx && close.contains("focusRestored ? previousMode : 'normal'"),
+            "closeCommandPalette must restore the captured mode only after focus was restored (kata sqke)"
+        );
+    }
+
+    #[test]
+    fn split_tab_ids_are_attribute_escaped() {
+        let body = js_fn_body(APP_JS, "function renderSplitTabs(");
+        assert!(
+            body.contains("data-split=\"${escapeAttr(split.id)}\""),
+            "renderSplitTabs must escape quote-bearing split ids at the data-split attribute boundary"
         );
     }
 

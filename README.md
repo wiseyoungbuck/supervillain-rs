@@ -553,6 +553,10 @@ GET /api/timezone HTTP/1.1
 { "success": true, "emailId": "M1234abcdef" }
 ```
 
+For successful `/api/calendar/invite` and `/api/emails/send` requests,
+`emailId` is optional. It is absent for Microsoft Graph sends because Graph
+accepts them with HTTP 202 and no response body or sent-message ID.
+
 400 if `end <= start` or `tz` is unknown; 409 from `/api/timezone/dismiss-change`
 when `seen_system` doesn't match the current OS TZ.
 

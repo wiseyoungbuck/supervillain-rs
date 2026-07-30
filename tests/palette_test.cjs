@@ -353,6 +353,77 @@ test('sqke: cancelling the palette restores the insert-mode field and focus', ()
     assert.equal(state.mode, 'normal', 'action close retains the normal fallback');
 });
 
+test('sqke: cancelling after the previous field disconnects falls back to normal mode', () => {
+    const state = { mode: 'insert', commandPaletteIndex: 0 };
+    let focusCalls = 0;
+    const previousField = {
+        isConnected: true,
+        focus() { focusCalls++; },
+    };
+    const document = { activeElement: previousField };
+    const els = {
+        commandPalette: {
+            classList: {
+                add() {},
+                remove() {},
+            },
+        },
+        commandInput: {
+            value: '',
+            focus() {
+                document.activeElement = this;
+            },
+        },
+    };
+    const setMode = (mode) => { state.mode = mode; };
+    const lifecycle = loadPaletteLifecycle(state, els, document, () => {}, setMode);
+
+    lifecycle.openCommandPalette();
+    previousField.isConnected = false;
+    lifecycle.closeCommandPalette({ cancelled: true });
+
+    assert.equal(focusCalls, 0, 'a disconnected field cannot be refocused');
+    assert.equal(state.mode, 'normal', 'body focus must not remain in insert mode');
+});
+
+test('sqke: Enter with no selected command closes as a cancellation', () => {
+    const state = { commandPaletteIndex: 0 };
+    const els = {
+        commandResults: {
+            querySelector() { return null; },
+        },
+    };
+    let closeOptions;
+    let executeCalls = 0;
+    let prevented = false;
+    const handlerCode = extractFunction(APP_JS, 'function handleCommandPaletteKey(')
+        + '\nreturn handleCommandPaletteKey;';
+    // eslint-disable-next-line no-new-func
+    const handleCommandPaletteKey = new Function(
+        'state',
+        'els',
+        'closeCommandPalette',
+        'executeCommand',
+        'renderCommandPalette',
+        handlerCode,
+    )(
+        state,
+        els,
+        (options) => { closeOptions = options; },
+        () => { executeCalls++; },
+        () => {},
+    );
+
+    handleCommandPaletteKey({
+        key: 'Enter',
+        preventDefault() { prevented = true; },
+    });
+
+    assert.deepEqual(closeOptions, { cancelled: true });
+    assert.equal(executeCalls, 0, 'no command may execute without a selection');
+    assert.equal(prevented, true);
+});
+
 test('sqke: Ctrl+Enter in settings normal mode does not enter edit mode', () => {
     const state = { selectedAccountId: 'acct-1', settingsMode: 'view' };
     const els = {

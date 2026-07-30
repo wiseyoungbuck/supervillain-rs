@@ -115,6 +115,10 @@ function escapeHtml(text) {
                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function escapeAttr(text) {
+    return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // Self-hosted dashboard-icons assets. A non-empty img alt is both the
 // accessible provider name and the browser's text fallback if an asset cannot
 // be rendered. Unknown future providers fall back to escaped visible text.
@@ -128,7 +132,8 @@ function providerIcon(provider) {
     const label = typeof provider === 'string' && provider ? provider : 'Unknown provider';
     const icon = PROVIDER_ICONS.get(label.toLowerCase());
     if (!icon) return `<span class="provider-icon-fallback">${escapeHtml(label)}</span>`;
-    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${icon.label}" title="${icon.label}">`;
+    const escapedLabel = escapeAttr(icon.label);
+    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${escapedLabel}" title="${escapedLabel}">`;
 }
 
 // ============================================================================
@@ -419,7 +424,7 @@ function renderAccountPicker() {
         const cls = 'account-row' + (current ? ' current' : '') + (pending ? ' pending' : '');
         return '<button class="' + cls + '" data-id="' + escapeHtml(a.id) + '">'
             + '<span>' + escapeHtml(a.email || a.id) + (pending ? ' (needs authorization)' : '') + '</span>'
-            + '<span class="account-provider">' + providerIcon(a.provider) + '</span>'
+            + '<span class="account-provider">' + (a.provider ? providerIcon(a.provider) : '') + '</span>'
             + '</button>';
     }).join('');
 }
