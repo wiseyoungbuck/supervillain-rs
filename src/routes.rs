@@ -1914,7 +1914,7 @@ struct ReminderListParams {
 fn reminder_full_requested(full: Option<&str>) -> bool {
     match full {
         None => false,
-        Some(value) => !matches!(value.trim(), "false" | "0"),
+        Some(value) => !matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0"),
     }
 }
 
@@ -4284,9 +4284,18 @@ mod tests {
             config_error_baseline: std::sync::RwLock::new(Vec::new()),
             prefetch: std::sync::Arc::new(crate::prefetch::PrefetchCache::new()),
             prefetch_cache_path: std::env::temp_dir().join("supervillain-test-prefetch-cache.json"),
-            reminders: crate::reminders::ReminderStore::new(
-                std::env::temp_dir().join("supervillain-test-reminders.json"),
-            ),
+            reminders: crate::reminders::ReminderStore::new(std::env::temp_dir().join(format!(
+                // Unique per call: tests that mutate the store trigger save(),
+                // and a shared fixed path races across concurrent cargo test
+                // invocations (roborev 445).
+                "supervillain-test-reminders-{}-{}.json",
+                std::process::id(),
+                {
+                    static N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+            ))),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
         }
@@ -4303,7 +4312,7 @@ mod tests {
                 "{value:?} must request a full listing"
             );
         }
-        for value in [None, Some("false"), Some("0")] {
+        for value in [None, Some("false"), Some("False"), Some("FALSE"), Some("0")] {
             assert!(
                 !reminder_full_requested(value),
                 "{value:?} must keep the cheap path"

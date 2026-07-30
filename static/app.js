@@ -1307,7 +1307,9 @@ async function loadReminders({ skipNotify = false, full = false } = {}) {
         // full=true forces the provider mailbox scan (orphan detection). Any
         // refresh while the Reminders view is open must be full — a cheap []
         // response would wipe visible orphan rows, which only exist in the
-        // provider mailbox (roborev 444). The background poll stays cheap.
+        // provider mailbox (roborev 444). The background poll stays cheap
+        // except while the view is parked open: that recurring full scan is a
+        // deliberate correctness-over-cost tradeoff (roborev 445).
         const wantFull = full || state.currentMailbox?.role === 'reminders';
         const reminders = await api('GET', wantFull ? '/reminders?full=true' : '/reminders');
         const previous = new Map(state.reminders.map(item => [item.email_id, item]));
