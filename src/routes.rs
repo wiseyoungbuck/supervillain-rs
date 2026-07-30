@@ -462,7 +462,7 @@ async fn supervillain_jpg() -> impl IntoResponse {
 }
 
 fn provider_svg(svg: &'static [u8]) -> impl IntoResponse {
-    ([("content-type", "image/svg+xml")], svg)
+    (binary_asset_headers("image/svg+xml"), svg)
 }
 
 async fn provider_gmail_svg() -> impl IntoResponse {
@@ -1636,6 +1636,16 @@ fn split_upload_ext_value(raw: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let (language, encoded) = rest.split_once('\'')?;
+    // RFC 5987 language tags are ALPHA/DIGIT/`-` only (or empty). Without
+    // this check an ordinary filename with two apostrophes ("bob's brother's
+    // notes.pdf") parses as charset `bob` / language `s brother` and the
+    // whole name collapses to the fallback instead of passing through.
+    if !language
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
     Some((charset, language, encoded))
 }
 
@@ -1884,15 +1894,29 @@ async fn cancel_reminder(
     Ok(Json(serde_json::json!({"success": success})))
 }
 
+#[derive(serde::Deserialize)]
+struct ReminderListParams {
+    account: Option<String>,
+    /// Set by the Reminders view. The background 30s poll omits it, letting
+    /// the handler skip the provider round-trip (mailbox listing + up-to-500
+    /// email fetch, sustained rate-limit pressure on Gmail) when the durable
+    /// store has nothing for the account. Orphan detection only needs the
+    /// provider listing, and orphans are only actionable from the view.
+    full: Option<bool>,
+}
+
 async fn list_reminders(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<AccountParam>,
+    Query(params): Query<ReminderListParams>,
 ) -> Result<impl IntoResponse, Error> {
     let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let records = state.reminders.records_for_account(&account_id);
+    if records.is_empty() && !params.full.unwrap_or(false) {
+        return Ok(Json(Vec::new()));
+    }
     let session_lock = resolve_session(&state, Some(&account_id)).await?;
     let session = session_lock.read().await;
     let emails = provider::list_reminders(&session).await?;
-    let records = state.reminders.records_for_account(&account_id);
     let mut by_id: HashMap<String, crate::reminders::ReminderRecord> = records
         .into_iter()
         .map(|record| (record.email_id.clone(), record))
@@ -3031,6 +3055,15 @@ mod tests {
             (icon_192().await.into_response(), "image/png"),
             (icon_512().await.into_response(), "image/png"),
             (supervillain_jpg().await.into_response(), "image/jpeg"),
+            (provider_gmail_svg().await.into_response(), "image/svg+xml"),
+            (
+                provider_outlook_svg().await.into_response(),
+                "image/svg+xml",
+            ),
+            (
+                provider_fastmail_svg().await.into_response(),
+                "image/svg+xml",
+            ),
         ] {
             let headers = resp.headers();
             assert_eq!(

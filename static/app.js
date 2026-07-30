@@ -1134,10 +1134,18 @@ function selectSplitByIndex(index) {
     }
 }
 
-function localReminderDate(days, hour = 8) {
+// The user's "Default time for date-only reminders" setting (HH:MM). Falls
+// back to 08:00 when unset or malformed.
+function reminderDefaultTime() {
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(state.reminderSettings.default_time || '');
+    return m ? [Number(m[1]), Number(m[2])] : [8, 0];
+}
+
+function localReminderDate(days, hour = null, minute = null) {
+    const [defaultHour, defaultMinute] = reminderDefaultTime();
     const date = new Date();
     date.setDate(date.getDate() + days);
-    date.setHours(hour, 0, 0, 0);
+    date.setHours(hour ?? defaultHour, minute ?? defaultMinute, 0, 0);
     while (state.reminderSettings.skip_weekends && (date.getDay() === 0 || date.getDay() === 6)) {
         date.setDate(date.getDate() + 1);
     }
@@ -1147,8 +1155,8 @@ function localReminderDate(days, hour = 8) {
 function reminderQuickDate(kind) {
     if (kind === 'hour') return new Date(Date.now() + 60 * 60 * 1000);
     if (kind === 'later') return new Date(Date.now() + 4 * 60 * 60 * 1000);
-    if (kind === 'tomorrow') return localReminderDate(1, 8);
-    return localReminderDate(7, 8);
+    if (kind === 'tomorrow') return localReminderDate(1);
+    return localReminderDate(7);
 }
 
 function renderRemindMode() {
@@ -1237,7 +1245,7 @@ function resolveReminderInput() {
     }
     const match = natural.toLowerCase().match(/^(tomorrow|next week)(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?$/);
     if (match) {
-        const date = localReminderDate(match[1] === 'tomorrow' ? 1 : 7, 8);
+        const date = localReminderDate(match[1] === 'tomorrow' ? 1 : 7);
         if (match[2]) {
             let hour = Number(match[2]);
             if (match[4] === 'pm' && hour < 12) hour += 12;
@@ -1279,7 +1287,7 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     }
     try {
         await api('POST', `/emails/${emailId}/remind`, { wake_at: wakeAt, mode });
-        loadReminders();
+        loadReminders({ skipNotify: true });
         loadSplitCounts();
     } catch (err) {
         state.undoStack.pop();
@@ -1294,14 +1302,21 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     }
 }
 
-async function loadReminders() {
+async function loadReminders({ skipNotify = false, full = false } = {}) {
     try {
-        const reminders = await api('GET', '/reminders');
+        // full=1 forces the provider mailbox scan (orphan detection) — only
+        // the Reminders view needs it; the background poll stays cheap.
+        const reminders = await api('GET', full ? '/reminders?full=1' : '/reminders');
         const previous = new Map(state.reminders.map(item => [item.email_id, item]));
         state.reminders = reminders || [];
         const currentIds = new Set(state.reminders.map(item => item.email_id));
         for (const [emailId, oldReminder] of previous) {
-            if (!currentIds.has(emailId) && oldReminder.wake_at
+            // A record can disappear because the user cancelled it (here or on
+            // another device) — only records whose wake time has actually
+            // passed plausibly woke. skipNotify covers locally-initiated
+            // mutations (wake-now, undo, new reminder) where the diff is ours.
+            if (!skipNotify && !currentIds.has(emailId) && oldReminder.wake_at
+                && new Date(oldReminder.wake_at) <= new Date()
                 && typeof Notification !== 'undefined'
                 && Notification.permission === 'granted') {
                 new Notification('Reminder ready', {
@@ -1327,7 +1342,7 @@ function selectReminders() {
     state.selectedIndex = 0;
     updateMailboxNameDisplay();
     renderMailboxes();
-    loadReminders();
+    loadReminders({ full: true });
 }
 
 function renderReminderList() {
@@ -1356,7 +1371,7 @@ async function archiveReminder(emailId) {
         await api('POST', `/emails/${emailId}/cancel-reminder`);
         await api('POST', `/emails/${emailId}/archive`);
         showStatus('Reminder archived', 'success');
-        await loadReminders();
+        await loadReminders({ skipNotify: true });
     } catch (err) {
         showStatus('Archive failed: ' + err.message, 'error');
     }
@@ -1366,7 +1381,7 @@ async function wakeReminder(emailId) {
     try {
         await api('POST', `/emails/${emailId}/cancel-reminder`);
         showStatus('Reminder woken', 'success');
-        await loadReminders();
+        await loadReminders({ skipNotify: true });
         if (state.currentMailbox?.role === 'reminders') renderReminderList();
     } catch (err) {
         showStatus('Wake failed: ' + err.message, 'error');
@@ -1498,7 +1513,7 @@ let lastRenderedContext = null;
 async function loadEmails() {
     if (!state.currentMailbox) return;
     if (state.currentMailbox.role === 'reminders') {
-        await loadReminders();
+        await loadReminders({ full: true });
         renderReminderList();
         return;
     }
@@ -5501,6 +5516,7 @@ async function performUndo() {
     try {
         if (item.action === 'reminded') {
             await api('POST', `/emails/${item.emailId}/cancel-reminder`);
+            loadReminders({ skipNotify: true });
         } else {
             const inbox = state.mailboxes.find(m => m.role === 'inbox');
             if (inbox) {

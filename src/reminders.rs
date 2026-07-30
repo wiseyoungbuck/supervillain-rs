@@ -434,13 +434,24 @@ pub async fn tick_reminder_daemon(
 ) -> Vec<WokenEmail> {
     let due = state.reminders.due(now);
     let mut woken = Vec::new();
+    let mut mutated = false;
     for record in due {
-        let session_lock = {
+        let (session_lock, account_configured) = {
             let accounts = state.accounts.read().await;
-            accounts.sessions.get(&record.account_id).cloned()
+            (
+                accounts.sessions.get(&record.account_id).cloned(),
+                accounts.account_configs.contains_key(&record.account_id),
+            )
         };
         let Some(session_lock) = session_lock else {
-            state.reminders.remove(&record.account_id, &record.email_id);
+            // A missing session is transient when the account is still
+            // configured (OAuth not yet authorized, startup connect failure).
+            // Deleting the record then would strand the email in Reminders
+            // and lose the wake — only drop records for removed accounts.
+            if !account_configured {
+                state.reminders.remove(&record.account_id, &record.email_id);
+                mutated = true;
+            }
             continue;
         };
         let session = session_lock.read().await;
@@ -453,12 +464,14 @@ pub async fn tick_reminder_daemon(
         };
         if decide_due(record.mode, has_reply) == ReminderDecision::Suppress {
             state.reminders.remove(&record.account_id, &record.email_id);
+            mutated = true;
             continue;
         }
         match provider::move_to_inbox(&session, &record.email_id).await {
             Ok(true) => {
                 let _ = provider::mark_unread(&session, &record.email_id).await;
                 state.reminders.remove(&record.account_id, &record.email_id);
+                mutated = true;
                 state.prefetch.invalidate(&record.account_id).await;
                 woken.push(WokenEmail {
                     account_id: record.account_id.clone(),
@@ -469,7 +482,7 @@ pub async fn tick_reminder_daemon(
             Err(error) => tracing::warn!("Reminder wake failed for {}: {error}", record.email_id),
         }
     }
-    if let Err(error) = state.reminders.save() {
+    if mutated && let Err(error) = state.reminders.save() {
         tracing::warn!("Failed to persist reminder daemon update: {error}");
     }
     woken
@@ -676,8 +689,23 @@ mod tests {
 
     #[test]
     fn thread_identity_failure_fails_open() {
-        let mut replies: HashMap<String, bool> = HashMap::new();
-        replies.insert("unresolvable".into(), false);
-        assert!(!replies["unresolvable"]);
+        // The reply gate must fail OPEN: a provider error while checking for
+        // replies means "wake anyway", never "swallow the reminder". Point the
+        // session at a dead port so every provider call errors.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut jmap = crate::jmap::JmapSession::new("gate@example.com", "token", None);
+            jmap.api_url = Some("http://127.0.0.1:9/jmap".into());
+            jmap.account_id = Some("a1".into());
+            let session = provider::ProviderSession::Fastmail(Box::new(jmap));
+            let result = thread_has_new_reply(&session, "email-1", Utc::now()).await;
+            assert!(
+                !result.expect("provider errors must not propagate"),
+                "fetch failure must fail open (no reply detected -> wake)"
+            );
+        });
     }
 }
