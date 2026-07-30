@@ -1721,6 +1721,14 @@ function addComposeAttachment(file) {
     uploadComposeAttachment(file, id, controller);
 }
 
+// HTTP headers cannot carry a JavaScript Unicode string directly.  Match the
+// desktop/server contract by sending an ASCII-only RFC 5987 extended value;
+// the upload response returns the decoded UTF-8 name used below.
+function encodeFilenameHeader(filename) {
+    return "UTF-8''" + encodeURIComponent(filename).replace(/['()*]/g, char =>
+        '%' + char.charCodeAt(0).toString(16).toUpperCase());
+}
+
 async function uploadComposeAttachment(file, id, controller) {
     const url = '/api/upload?account=' + encodeURIComponent(state.currentAccount.id);
     let data;
@@ -1729,7 +1737,7 @@ async function uploadComposeAttachment(file, id, controller) {
             method: 'POST',
             headers: {
                 'Content-Type': file.type || 'application/octet-stream',
-                'X-Filename': file.name,
+                'X-Filename': encodeFilenameHeader(file.name),
             },
             body: file,
             signal: controller.signal,
@@ -1750,6 +1758,8 @@ async function uploadComposeAttachment(file, id, controller) {
     const att = state.pendingAttachments.find(a => a._id === id);
     if (att) {
         att.blob_id = data.blob_id;
+        // Keep display and send metadata on the same server-decoded value.
+        att.name = data.name || att.name;
         att.status = 'ready';
         att.controller = null;
         renderComposeAttachments();

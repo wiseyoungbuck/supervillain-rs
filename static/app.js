@@ -4377,11 +4377,20 @@ function handleFileSelect() {
     els.composeFileInput.value = '';
 }
 
+// HTTP headers are byte strings, so assigning a Unicode File.name directly
+// throws for Japanese/emoji and turns Latin-1 into bytes HeaderValue::to_str
+// rejects.  Send one ASCII-only RFC 5987 extended value; the upload handler
+// decodes it back to UTF-8 before returning the attachment metadata.
+function encodeFilenameHeader(filename) {
+    return "UTF-8''" + encodeURIComponent(filename).replace(/['()*]/g, char =>
+        '%' + char.charCodeAt(0).toString(16).toUpperCase());
+}
+
 function uploadAttachment(file, id, controller) {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/upload');
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-    xhr.setRequestHeader('X-Filename', file.name);
+    xhr.setRequestHeader('X-Filename', encodeFilenameHeader(file.name));
 
     xhr.upload.onprogress = (e) => {
         if (!e.lengthComputable) return;
@@ -4412,6 +4421,9 @@ function uploadAttachment(file, id, controller) {
         const att = state.pendingAttachments.find(a => a._id === id);
         if (att) {
             att.blob_id = data.blob_id;
+            // The server-decoded value is authoritative for both the compose
+            // display and the later send payload.
+            att.name = data.name || att.name;
             att.status = 'ready';
             att.progress = 100;
             att.controller = null;
