@@ -159,6 +159,21 @@ pub fn parse_ics(data: &str, primary_tz: Tz) -> Option<CalendarEvent> {
     })
 }
 
+/// Parse iTIP carried by an email calendar part. Unlike [`parse_ics`], this
+/// requires METHOD to be explicitly present at VCALENDAR level. Standalone
+/// calendar exports commonly have a valid VEVENT but no METHOD; treating those
+/// as invitations is the `hasCalendar` conflation the inbox chip must avoid.
+///
+/// The MIME layer is checked by each provider before it sets `Email::calendar_ics`;
+/// this is the shared content-level half of real invite detection (kata trbx).
+pub fn parse_email_itip(data: &str, primary_tz: Tz) -> Option<CalendarEvent> {
+    let data = data.trim();
+    let vevent_start = data.find("BEGIN:VEVENT")?;
+    let calendar_header = unfold_lines(&data[..vevent_start]);
+    extract_property(&calendar_header, "METHOD")?;
+    parse_ics(data, primary_tz)
+}
+
 // =============================================================================
 // Invite update decision (RFC 5546 SEQUENCE semantics + anti-spoof)
 // =============================================================================
@@ -1732,6 +1747,26 @@ END:VEVENT\r\n\
 END:VCALENDAR";
         let event = parse_ics(ics, Tz::UTC).unwrap();
         assert_ne!(event.method, "REQUEST");
+        assert!(
+            parse_email_itip(ics, Tz::UTC).is_none(),
+            "an ordinary .ics export without METHOD is not email iTIP"
+        );
+    }
+
+    #[test]
+    fn email_itip_requires_calendar_level_method() {
+        let event = parse_email_itip(SAMPLE_ICS, Tz::UTC).expect("METHOD:REQUEST invite");
+        assert_eq!(event.method, "REQUEST");
+
+        // A METHOD-shaped property inside VEVENT must not satisfy the gate:
+        // RFC 5546 places METHOD on VCALENDAR, and scanning the whole payload
+        // would let event content masquerade as transport semantics.
+        let event_only_method = SAMPLE_ICS.replace("METHOD:REQUEST\r\n", "").replace(
+            "SUMMARY:Team Standup",
+            "METHOD:REQUEST\r\nSUMMARY:Team Standup",
+        );
+        assert!(parse_ics(&event_only_method, Tz::UTC).is_some());
+        assert!(parse_email_itip(&event_only_method, Tz::UTC).is_none());
     }
 
     #[test]

@@ -476,6 +476,27 @@
             font-size: 14px;
         }
 
+        .email-invite {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            border: 1px solid currentColor;
+            border-radius: 9px;
+            padding: 2px 5px;
+            background: var(--surface-hover);
+            font-size: 10px;
+            font-weight: 600;
+            line-height: 1.15;
+            white-space: nowrap;
+        }
+
+        .email-invite--needs-action,
+        .email-invite--tentative { color: var(--warning); }
+        .email-invite--accepted { color: var(--success); }
+        .email-invite--declined { color: var(--accent); }
+        .email-invite--updated { color: var(--accent); }
+        .email-invite-icon { font-size: 11px; line-height: 1; }
+
         .empty-state {
             display: flex;
             align-items: center;

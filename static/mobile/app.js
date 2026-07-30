@@ -768,6 +768,26 @@ function submitSearch() {
 // Rendering
 // ============================================================================
 
+function renderInviteChip(email) {
+    if (!email.isInviteToMe || email.inviteMethod !== 'REQUEST') return '';
+
+    const status = email.inviteIsUpdated
+        ? 'UPDATED'
+        : String(email.inviteStatus || 'NEEDS-ACTION').toUpperCase();
+    const presentations = {
+        'UPDATED':      { label: 'Updated',        cls: 'updated' },
+        'ACCEPTED':     { label: 'Accepted',       cls: 'accepted' },
+        'TENTATIVE':    { label: 'Tentative',      cls: 'tentative' },
+        'DECLINED':     { label: 'Declined',       cls: 'declined' },
+        'NEEDS-ACTION': { label: 'Needs response', cls: 'needs-action' },
+    };
+    const presentation = presentations[status] || presentations['NEEDS-ACTION'];
+    const accessibleLabel = 'Calendar invite: ' + presentation.label;
+    return '<span class="email-invite email-invite--' + presentation.cls + '" title="' + accessibleLabel
+        + '" aria-label="' + accessibleLabel + '"><span class="email-invite-icon" aria-hidden="true">📅</span>'
+        + '<span class="email-invite-label">' + presentation.label + '</span></span>';
+}
+
 // Renders rows for `emails`, threading the date-divider group through
 // `startGroup` so appended pages continue the sequence instead of
 // repeating a divider. Returns the HTML and the group the sequence ended on.
@@ -805,6 +825,7 @@ function renderEmailRows(emails, startGroup) {
                     '<div class="email-row-indicators">' +
                         (email.isFlagged ? '<span class="star">★</span>' : '') +
                         (email.hasAttachment ? '<span class="attach">📎</span>' : '') +
+                        renderInviteChip(email) +
                     '</div>' +
                 '</div>' +
             '</div>';
@@ -1567,7 +1588,14 @@ async function rsvpToEvent(status) {
     if (!event || event.user_rsvp_status === status) return;
 
     const prevStatus = event.user_rsvp_status;
+    const listItem = state.emails.find(e => e.id === emailId);
+    const prevInviteStatus = listItem?.inviteStatus;
+    const prevInviteIsUpdated = listItem?.inviteIsUpdated;
     event.user_rsvp_status = status;
+    if (listItem?.isInviteToMe) {
+        listItem.inviteStatus = status;
+        listItem.inviteIsUpdated = false;
+    }
     updateCalendarCard(emailId, event);
 
     try {
@@ -1578,6 +1606,10 @@ async function rsvpToEvent(status) {
         }
     } catch (err) {
         event.user_rsvp_status = prevStatus;
+        if (listItem?.isInviteToMe) {
+            listItem.inviteStatus = prevInviteStatus;
+            listItem.inviteIsUpdated = prevInviteIsUpdated;
+        }
         updateCalendarCard(emailId, event);
         showError('RSVP', err);
     }

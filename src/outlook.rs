@@ -661,6 +661,11 @@ pub(crate) fn parse_graph_message(
     let has_attachment =
         json["hasAttachments"].as_bool().unwrap_or(false) || !attachments.is_empty();
     let has_calendar = attachments.iter().any(|a| is_calendar_mime(&a.mime_type));
+    // `$expand=attachments` includes fileAttachment.contentBytes, so list-time
+    // invite detection reuses the message request already in flight. Require
+    // a calendar MIME type here; a filename ending in `.ics` alone is not an
+    // invite. routes.rs subsequently requires an explicit iTIP METHOD.
+    let calendar_ics = invite_ics_from_graph_attachments(&json["attachments"]);
 
     // Graph's message size field is "size" — not Gmail's "sizeEstimate".
     let size = json["size"].as_i64().unwrap_or(0);
@@ -684,6 +689,7 @@ pub(crate) fn parse_graph_message(
         text_body,
         html_body,
         has_calendar,
+        calendar_ics,
         attachments,
         // Drafts (the only consumer) are Fastmail-only in v1 — not read from
         // Graph's internetMessageHeaders yet.
@@ -798,6 +804,26 @@ fn parse_graph_attachments(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Decode the first real calendar MIME fileAttachment returned by Graph.
+/// Exchange-processed invitations are `application/ics` (verified in wca3),
+/// while forwarded iTIP commonly remains `text/calendar`. Names are ignored:
+/// an arbitrary `agenda.ics` attachment is not enough to earn an invite chip.
+fn invite_ics_from_graph_attachments(arr_json: &serde_json::Value) -> Option<String> {
+    use base64::Engine;
+
+    arr_json.as_array()?.iter().find_map(|att| {
+        let content_type = att["contentType"].as_str()?;
+        if !is_calendar_mime(content_type) {
+            return None;
+        }
+        let encoded = att["contentBytes"].as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        String::from_utf8(bytes).ok()
+    })
 }
 
 /// Map a Graph mailFolder ID to our canonical `Mailbox.role`. Returns `None`
@@ -5567,6 +5593,8 @@ mod tests {
         // meeting request as contentType "application/ics", not
         // "text/calendar". Matching only the latter made every real invite
         // invisible — no RSVP UI, and /rsvp 404'd on "No calendar data".
+        use base64::Engine;
+        let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR";
         let mut j = graph_message_minimal();
         j["hasAttachments"] = serde_json::json!(true);
         j["attachments"] = serde_json::json!([{
@@ -5574,10 +5602,29 @@ mod tests {
             "id": "ATT_ICS",
             "name": "invite.ics",
             "contentType": "application/ics",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(ics),
             "size": 1585
         }]);
         let m = parse_graph_message(&j, true);
         assert!(m.has_calendar);
+        assert_eq!(m.calendar_ics.as_deref(), Some(ics));
+    }
+
+    #[test]
+    fn graph_ics_filename_without_calendar_mime_is_not_invite_data() {
+        use base64::Engine;
+        let mut j = graph_message_minimal();
+        j["attachments"] = serde_json::json!([{
+            "id": "ATT_ICS",
+            "name": "invite.ics",
+            "contentType": "application/octet-stream",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(
+                "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR"
+            ),
+            "size": 100
+        }]);
+        let email = parse_graph_message(&j, false);
+        assert!(email.calendar_ics.is_none());
     }
 
     #[test]

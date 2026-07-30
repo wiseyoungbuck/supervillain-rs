@@ -37,6 +37,13 @@ pub struct Email {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub has_calendar: bool,
+    /// Raw data from a MIME calendar part when it was available in the same
+    /// provider response as this Email. List rendering parses this with the
+    /// configured timezone and requires an explicit iTIP METHOD before it
+    /// treats the message as an invite. A filename ending in `.ics` alone is
+    /// deliberately not enough (kata trbx).
+    #[serde(default)]
+    pub calendar_ics: Option<String>,
     pub attachments: Vec<Attachment>,
     /// In-Reply-To of the message (first Message-ID when the header lists
     /// several). Populated by the JMAP fetch path so a restored draft keeps
@@ -520,6 +527,7 @@ mod tests {
             text_body: None,
             html_body: None,
             has_calendar: false,
+            calendar_ics: None,
             attachments: vec![],
             in_reply_to: None,
         }
