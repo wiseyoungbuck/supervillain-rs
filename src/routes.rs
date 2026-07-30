@@ -1132,9 +1132,9 @@ async fn get_email(
 
     // Check for calendar event
     let mut calendar_event = None;
+    let primary_tz = configured_primary_tz(&state);
     if email.has_calendar
         && let Ok(Some(ics_data)) = provider::get_calendar_data(&session, &email_id).await
-        && let primary_tz = configured_primary_tz(&state)
         && let Some(mut event) = calendar::parse_ics(&ics_data, primary_tz)
     {
         // Fetch the stored calendar event once — reused for both the SEQUENCE
@@ -8074,33 +8074,34 @@ white   = '#fdf6e3'
         // decision spawns add_to_calendar with only_if_new = false, and sets
         // is_update so the client banners it.
         let src = include_str!("routes.rs");
+        let handler_src = src.split("#[cfg(test)]").next().unwrap_or(src);
         assert!(
-            src.contains("calendar::invite_update_decision("),
+            handler_src.contains("calendar::invite_update_decision("),
             "get_email must call the pure decision helper"
         );
         assert!(
-            src.contains("calendar::InviteAction::Update =>"),
+            handler_src.contains("calendar::InviteAction::Update =>"),
             "get_email must handle the Update arm"
         );
-        let update_arm = src
+        let update_arm = handler_src
             .split("calendar::InviteAction::Update => {")
             .nth(1)
-            .expect("Update arm must exist");
-        let update_call = update_arm
-            .split("provider::add_to_calendar(")
-            .nth(1)
-            .expect("add_to_calendar call must exist in the Update arm");
+            .expect("Update arm must exist")
+            .split("calendar::InviteAction::RejectSpoof =>")
+            .next()
+            .expect("Update arm must end before RejectSpoof");
         assert!(
-            update_call.contains("false,") && update_call.contains("primary_tz,"),
+            update_arm
+                .contains("provider::add_to_calendar(&s, &ics_clone, &uid, false, primary_tz)"),
             "the Update arm must add with only_if_new = false and the configured primary timezone"
         );
         assert!(
-            src.contains("event.is_update = true;"),
+            update_arm.contains("event.is_update = true;"),
             "the Update arm must flag the event as an update"
         );
         // RejectSpoof must write nothing — no add_to_calendar in that arm.
         assert!(
-            src.contains("calendar::InviteAction::RejectSpoof =>"),
+            handler_src.contains("calendar::InviteAction::RejectSpoof =>"),
             "get_email must handle the RejectSpoof arm"
         );
     }

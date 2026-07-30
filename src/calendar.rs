@@ -1510,6 +1510,30 @@ END:VCALENDAR\r\n";
         assert_eq!(event.dtstart.minute(), 0);
     }
 
+    /// Explicit TZIDs use the same lenient DST-gap resolution as floating
+    /// datetimes, but the TZID must win over a different configured primary
+    /// timezone.
+    #[test]
+    fn parse_explicit_tzid_dst_gap_shifts_forward_in_tzid() {
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Test//EN\r\n\
+METHOD:REQUEST\r\n\
+BEGIN:VEVENT\r\n\
+UID:explicit-dst-gap@example.com\r\n\
+SUMMARY:Spring forward with TZID\r\n\
+DTSTART;TZID=America/New_York:20260308T023000\r\n\
+ORGANIZER:mailto:alice@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let primary_tz = "Pacific/Honolulu".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz)
+            .expect("an explicit-TZID DTSTART in a DST gap must not drop the event");
+        assert_eq!(event.dtstart.hour(), 7);
+        assert_eq!(event.dtstart.minute(), 0);
+    }
+
     // --- generate_rsvp tests ---
 
     fn sample_event() -> CalendarEvent {
