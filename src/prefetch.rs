@@ -8,10 +8,11 @@
 //! Gmail split-counts).
 
 use crate::error::Error;
-use crate::types::{Email, EmailSort, Identity, Mailbox};
+use crate::types::{CalendarEvent, Email, EmailSort, Identity, Mailbox};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 /// Hard cap on how many bodies `AccountEntry::body_cache` holds in memory,
@@ -27,6 +28,12 @@ use tokio::sync::{Mutex, RwLock};
 /// still bounding worst-case resident memory for an account with heavy
 /// `get_email` traffic across many distinct messages.
 const BODY_CACHE_MAX: usize = 2000;
+
+/// Stored calendar RSVP status changes rarely, but inbox polling is frequent.
+/// A short cache removes repeated CalDAV/Graph lookups without making another
+/// client's RSVP change look fresh for long.
+const CALENDAR_STATUS_TTL: Duration = Duration::from_secs(15);
+const CALENDAR_STATUS_CACHE_MAX: usize = 64;
 
 /// Lookup key for the cached inbox email list. Two cache hits must share
 /// the same mailbox, limit, and sort order; otherwise the cached payload
@@ -75,6 +82,11 @@ struct InboxList {
 /// email bodies — fed both by the warmer's top-N prefetch and by `get_email`
 /// route hits, keyed by provider message id (unique within an account, so no
 /// account-id prefix needed).
+struct CachedCalendarStatus {
+    fetched_at: Instant,
+    event: Option<CalendarEvent>,
+}
+
 #[derive(Default)]
 struct AccountEntry {
     mailboxes: Option<Vec<Mailbox>>,
@@ -82,6 +94,9 @@ struct AccountEntry {
     inbox_lists: HashMap<InboxKey, InboxList>,
     split_counts: Option<(String, HashMap<String, u32>)>,
     body_cache: HashMap<String, Email>,
+    /// Per-UID current calendar copies for invite chips. Not persisted; the
+    /// short TTL only coalesces repeated live list polls.
+    calendar_status: HashMap<String, CachedCalendarStatus>,
     /// Recency order for `body_cache`, oldest-first, used to LRU-evict once
     /// `body_cache` exceeds `BODY_CACHE_MAX`. Updated on every read *and*
     /// write of `body_cache` (see `touch_body`) so an entry a user keeps
@@ -171,6 +186,53 @@ impl PrefetchCache {
         entry.lock().await.identities = Some(identities);
     }
 
+    /// `None` means cache miss; `Some(None)` is a cached provider "not found".
+    pub async fn get_calendar_status(
+        &self,
+        account: &str,
+        uid: &str,
+    ) -> Option<Option<CalendarEvent>> {
+        let entry = self.entry(account).await;
+        let mut guard = entry.lock().await;
+        if let Some(cached) = guard.calendar_status.get(uid)
+            && cached.fetched_at.elapsed() < CALENDAR_STATUS_TTL
+        {
+            return Some(cached.event.clone());
+        }
+        guard.calendar_status.remove(uid);
+        None
+    }
+
+    pub async fn set_calendar_status(
+        &self,
+        account: &str,
+        uid: String,
+        event: Option<CalendarEvent>,
+    ) {
+        let entry = self.entry(account).await;
+        let mut guard = entry.lock().await;
+        guard
+            .calendar_status
+            .retain(|_, cached| cached.fetched_at.elapsed() < CALENDAR_STATUS_TTL);
+        if guard.calendar_status.len() >= CALENDAR_STATUS_CACHE_MAX
+            && let Some(evicted) = guard.calendar_status.keys().next().cloned()
+        {
+            guard.calendar_status.remove(&evicted);
+        }
+        guard.calendar_status.insert(
+            uid,
+            CachedCalendarStatus {
+                fetched_at: Instant::now(),
+                event,
+            },
+        );
+    }
+
+    pub async fn invalidate_calendar_status(&self, account: &str, uid: &str) {
+        let entry = self.entry(account).await;
+        entry.lock().await.calendar_status.remove(uid);
+    }
+
     pub async fn get_inbox_list(&self, account: &str, key: &InboxKey) -> Option<Vec<Email>> {
         let entry = self.entry(account).await;
         let guard = entry.lock().await;
@@ -226,8 +288,9 @@ impl PrefetchCache {
         entry.lock().await.split_counts = Some((mailbox_id, counts));
     }
 
-    /// Clears all four cached fields and bumps the version counter. Called
-    /// from mutation routes (archive / mark-read / delete / move / star) so
+    /// Clears the account-level payload caches plus short-lived calendar
+    /// status entries, and bumps the version counter. Called from mutation
+    /// routes (archive / mark-read / delete / move / star) so
     /// the next read repopulates from the live provider instead of serving
     /// pre-mutation data.
     ///
@@ -245,6 +308,7 @@ impl PrefetchCache {
         e.identities = None;
         e.inbox_lists.clear();
         e.split_counts = None;
+        e.calendar_status.clear();
         // body_cache deliberately survives: per-mutation invalidates fire
         // on every mark-read / archive / flag-toggle, but the email's
         // text/html content doesn't change with those operations. The
@@ -268,6 +332,7 @@ impl PrefetchCache {
         e.split_counts = None;
         e.body_cache.clear();
         e.body_order.clear();
+        e.calendar_status.clear();
         e.version = e.version.wrapping_add(1);
     }
 
@@ -672,6 +737,7 @@ impl PrefetchCache {
                     .collect(),
                 split_counts: snap.split_counts,
                 body_cache: snap.body_cache,
+                calendar_status: HashMap::new(),
                 body_order,
                 version: 0,
             };
@@ -1328,6 +1394,24 @@ mod tests {
         cache.set_identities("acc-1", vec![ident("primary")]).await;
         let got = cache.get_identities("acc-1").await.unwrap();
         assert_eq!(got[0].id, "primary");
+    }
+
+    #[tokio::test]
+    async fn calendar_status_cache_distinguishes_miss_from_cached_not_found() {
+        let cache = PrefetchCache::new();
+        assert!(cache.get_calendar_status("acc-1", "uid-1").await.is_none());
+
+        cache
+            .set_calendar_status("acc-1", "uid-1".into(), None)
+            .await;
+        assert!(matches!(
+            cache.get_calendar_status("acc-1", "uid-1").await,
+            Some(None)
+        ));
+        assert!(cache.get_calendar_status("acc-2", "uid-1").await.is_none());
+
+        cache.invalidate_calendar_status("acc-1", "uid-1").await;
+        assert!(cache.get_calendar_status("acc-1", "uid-1").await.is_none());
     }
 
     #[tokio::test]

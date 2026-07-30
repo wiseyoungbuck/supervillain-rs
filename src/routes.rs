@@ -762,29 +762,74 @@ struct InviteListFields {
     is_updated: bool,
 }
 
+struct AttendeeResolution {
+    email: String,
+    plausibly_user: bool,
+}
+
 fn attendee_email_for_event(
     email: &Email,
     event: &CalendarEvent,
     fallback: &str,
-) -> Option<String> {
-    email
-        .to
+) -> Option<AttendeeResolution> {
+    let recipients: Vec<&EmailAddress> = email.to.iter().chain(email.cc.iter()).collect();
+    let is_attendee = |address: &str| {
+        event
+            .attendees
+            .iter()
+            .any(|attendee| attendee.email.eq_ignore_ascii_case(address))
+    };
+
+    // Multi-guest invites routinely put every attendee in To. Prefer the
+    // account address rather than borrowing the first guest's PARTSTAT.
+    if let Some(address) = recipients
         .iter()
-        .chain(email.cc.iter())
-        .find(|addr| {
-            event
-                .attendees
-                .iter()
-                .any(|a| a.email.eq_ignore_ascii_case(&addr.email))
-        })
-        .map(|addr| addr.email.clone())
-        .or_else(|| {
-            event
-                .attendees
-                .iter()
-                .find(|a| a.email.eq_ignore_ascii_case(fallback))
-                .map(|a| a.email.clone())
-        })
+        .find(|address| address.email.eq_ignore_ascii_case(fallback) && is_attendee(&address.email))
+    {
+        return Some(AttendeeResolution {
+            email: address.email.clone(),
+            plausibly_user: true,
+        });
+    }
+
+    // Bcc delivery can omit the account from To/Cc even though the ICS names
+    // it explicitly. That attendee identity is still stronger evidence than
+    // another guest's earlier recipient position.
+    if let Some(attendee) = event
+        .attendees
+        .iter()
+        .find(|attendee| attendee.email.eq_ignore_ascii_case(fallback))
+    {
+        return Some(AttendeeResolution {
+            email: attendee.email.clone(),
+            plausibly_user: true,
+        });
+    }
+
+    // Keep the historical first To/Cc attendee heuristic for aliases and the
+    // RSVP fallback, but be conservative when deciding whether to show a list
+    // chip. One attendee-addressed recipient with no explicit account address
+    // is plausibly an alias. Multiple matching guests are ambiguous, while an
+    // explicit account recipient absent from ATTENDEE is an FYI copy.
+    if let Some(address) = recipients
+        .iter()
+        .find(|address| is_attendee(&address.email))
+    {
+        let username_is_recipient = recipients
+            .iter()
+            .any(|recipient| recipient.email.eq_ignore_ascii_case(fallback));
+        let matching_attendees: std::collections::HashSet<String> = recipients
+            .iter()
+            .filter(|recipient| is_attendee(&recipient.email))
+            .map(|recipient| recipient.email.to_ascii_lowercase())
+            .collect();
+        return Some(AttendeeResolution {
+            email: address.email.clone(),
+            plausibly_user: !username_is_recipient && matching_attendees.len() == 1,
+        });
+    }
+
+    None
 }
 
 fn canonical_invite_status(status: &str) -> String {
@@ -792,6 +837,7 @@ fn canonical_invite_status(status: &str) -> String {
         "ACCEPTED" => "ACCEPTED",
         "TENTATIVE" => "TENTATIVE",
         "DECLINED" => "DECLINED",
+        "DELEGATED" => "DELEGATED",
         _ => "NEEDS-ACTION",
     }
     .to_string()
@@ -818,9 +864,13 @@ fn invite_list_fields(
         return fields;
     }
 
-    let Some(attendee_email) = attendee_email_for_event(email, event, username) else {
+    let Some(attendee) = attendee_email_for_event(email, event, username) else {
         return fields;
     };
+    if !attendee.plausibly_user {
+        return fields;
+    }
+    let attendee_email = attendee.email;
     let Some(incoming_attendee) = event
         .attendees
         .iter()
@@ -854,10 +904,38 @@ fn invite_list_fields(
     fields
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct InviteLookupGroup {
+    uid: String,
+    email_indices: Vec<usize>,
+}
+
+fn invite_lookup_groups(
+    fields: &[InviteListFields],
+    events: &[Option<CalendarEvent>],
+) -> Vec<InviteLookupGroup> {
+    let mut groups: Vec<InviteLookupGroup> = Vec::new();
+    for (index, (field, event)) in fields.iter().zip(events).enumerate() {
+        if !field.is_invite_to_me {
+            continue;
+        }
+        let Some(event) = event else { continue };
+        if let Some(group) = groups.iter_mut().find(|group| group.uid == event.uid) {
+            group.email_indices.push(index);
+        } else if groups.len() < MAX_LIST_INVITE_STATUS_LOOKUPS {
+            groups.push(InviteLookupGroup {
+                uid: event.uid.clone(),
+                email_indices: vec![index],
+            });
+        }
+    }
+    groups
+}
+
 /// Parse real calendar MIME payloads and enrich actionable invite rows from
-/// the current stored calendar state. The provider reads are invite-only,
-/// concurrent, and strictly capped; this avoids the old design's feared
-/// one-calendar-round-trip-per-email hot path while keeping RSVP status real.
+/// the current stored calendar state. Reads are deduplicated per UID, cached
+/// briefly across polls, concurrent, and strictly capped. A detached provider
+/// reader releases the session lock before calendar network I/O.
 async fn invite_fields_for_list(
     state: &Arc<AppState>,
     account_id: &str,
@@ -892,38 +970,72 @@ async fn invite_fields_for_list(
         return Ok(fields);
     }
 
-    let mut lookups = tokio::task::JoinSet::new();
-    for (idx, event) in events.iter().enumerate() {
-        if !fields[idx].is_invite_to_me || lookups.len() >= MAX_LIST_INVITE_STATUS_LOOKUPS {
-            continue;
+    let mut misses = Vec::new();
+    for group in invite_lookup_groups(&fields, &events) {
+        if let Some(stored) = state
+            .prefetch
+            .get_calendar_status(account_id, &group.uid)
+            .await
+        {
+            for &index in &group.email_indices {
+                fields[index] = invite_list_fields(
+                    &emails[index],
+                    events[index].as_ref(),
+                    &username,
+                    stored.as_ref(),
+                );
+            }
+        } else {
+            misses.push(group);
         }
-        let Some(event) = event else { continue };
-        let session_lock = session_lock.clone();
-        let uid = event.uid.clone();
+    }
+    if misses.is_empty() {
+        return Ok(fields);
+    }
+
+    let reader = {
+        let session = session_lock.read().await;
+        match provider::calendar_event_reader(&session).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                tracing::debug!(
+                    "invite list calendar reader setup failed; using incoming PARTSTAT: {error}"
+                );
+                return Ok(fields);
+            }
+        }
+    };
+    let mut lookups = tokio::task::JoinSet::new();
+    for group in misses {
+        let reader = reader.clone();
         lookups.spawn(async move {
-            let session = session_lock.read().await;
-            (
-                idx,
-                provider::get_calendar_event(&session, &uid, primary_tz).await,
-            )
+            let result =
+                provider::get_calendar_event_with_reader(&reader, &group.uid, primary_tz).await;
+            (group, result)
         });
     }
 
     while let Some(joined) = lookups.join_next().await {
         match joined {
-            Ok((idx, Ok(stored))) => {
-                fields[idx] = invite_list_fields(
-                    &emails[idx],
-                    events[idx].as_ref(),
-                    &username,
-                    stored.as_ref(),
-                );
+            Ok((group, Ok(stored))) => {
+                state
+                    .prefetch
+                    .set_calendar_status(account_id, group.uid, stored.clone())
+                    .await;
+                for index in group.email_indices {
+                    fields[index] = invite_list_fields(
+                        &emails[index],
+                        events[index].as_ref(),
+                        &username,
+                        stored.as_ref(),
+                    );
+                }
             }
-            Ok((idx, Err(e))) => tracing::debug!(
-                email_id = %emails[idx].id,
-                "invite list status lookup failed; using incoming PARTSTAT: {e}"
+            Ok((group, Err(error))) => tracing::debug!(
+                uid = %group.uid,
+                "invite list status lookup failed; using incoming PARTSTAT: {error}"
             ),
-            Err(e) => tracing::warn!("invite list status task panicked: {e}"),
+            Err(error) => tracing::warn!("invite list status task panicked: {error}"),
         }
     }
     Ok(fields)
@@ -2030,7 +2142,9 @@ async fn upload_blob(
 }
 
 fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str) -> String {
-    attendee_email_for_event(email, event, fallback).unwrap_or_else(|| fallback.to_string())
+    attendee_email_for_event(email, event, fallback)
+        .map(|attendee| attendee.email)
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
@@ -2083,7 +2197,8 @@ async fn rsvp(
     Query(params): Query<AccountParam>,
     Json(body): Json<RsvpBody>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&account_id)).await?;
     let mut session_guard = session_lock.write().await;
 
     // Get calendar data
@@ -2128,6 +2243,7 @@ async fn rsvp(
         primary_tz,
     )
     .await?;
+    drop(session_guard);
 
     // Update the parsed event's attendee status for the frontend response
     let mut updated_event = event;
@@ -2139,6 +2255,14 @@ async fn rsvp(
         att.status = body.status.as_ics_str().to_string();
     }
     updated_event.user_rsvp_status = Some(body.status.as_ics_str().to_string());
+    state
+        .prefetch
+        .set_calendar_status(
+            &account_id,
+            updated_event.uid.clone(),
+            Some(updated_event.clone()),
+        )
+        .await;
     Ok(Json(serde_json::json!({ "calendarEvent": updated_event })))
 }
 
@@ -2147,7 +2271,8 @@ async fn add_to_calendar(
     Path(email_id): Path<String>,
     Query(params): Query<AccountParam>,
 ) -> Result<impl IntoResponse, Error> {
-    let session_lock = resolve_session(&state, params.account.as_deref()).await?;
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let session_lock = resolve_session(&state, Some(&account_id)).await?;
     let session = session_lock.read().await;
 
     let ics_data = provider::get_calendar_data(&session, &email_id)
@@ -2164,8 +2289,15 @@ async fn add_to_calendar(
     } else {
         provider::add_to_calendar(&session, &ics_data, &event.uid, false, primary_tz).await?
     };
+    drop(session);
 
     if success {
+        let uid = event.uid.clone();
+        let cached_event = (event.method != "CANCEL").then_some(event);
+        state
+            .prefetch
+            .set_calendar_status(&account_id, uid, cached_event)
+            .await;
         Ok(Json(serde_json::json!({"success": true})))
     } else {
         Err(Error::Internal("Failed to update calendar".into()))
@@ -8134,6 +8266,86 @@ white   = '#fdf6e3'
         assert!(
             !invite_list_fields(&email, Some(&not_to_me), "bob@example.com", None).is_invite_to_me
         );
+    }
+
+    #[test]
+    fn invite_list_fields_prefers_account_attendee_on_multi_guest_invites() {
+        let email = test_email_with_recipients(
+            vec!["alice@example.com", "BOB@example.com", "carol@example.com"],
+            vec![],
+        );
+        let mut event = test_calendar_event(vec![
+            "alice@example.com",
+            "bob@example.com",
+            "carol@example.com",
+        ]);
+        event.attendees[0].status = "ACCEPTED".into();
+        event.attendees[1].status = "NEEDS-ACTION".into();
+        event.attendees[2].status = "DECLINED".into();
+
+        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        assert!(fields.is_invite_to_me);
+        assert_eq!(
+            fields.status.as_deref(),
+            Some("NEEDS-ACTION"),
+            "the chip must show the account owner's status, not the first guest's"
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_hides_fyi_copy_when_account_is_not_an_attendee() {
+        let email =
+            test_email_with_recipients(vec!["alice@example.com", "bob@example.com"], vec![]);
+        let mut event = test_calendar_event(vec!["alice@example.com"]);
+        event.attendees[0].status = "ACCEPTED".into();
+
+        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        assert!(
+            !fields.is_invite_to_me,
+            "an FYI recipient must not inherit another guest's actionable chip"
+        );
+        assert!(fields.status.is_none());
+    }
+
+    #[test]
+    fn invite_list_fields_accepts_unambiguous_account_alias() {
+        let email = test_email_with_recipients(vec!["alias@example.com"], vec![]);
+        let event = test_calendar_event(vec!["alias@example.com"]);
+        let fields = invite_list_fields(&email, Some(&event), "primary@example.com", None);
+        assert!(fields.is_invite_to_me);
+    }
+
+    #[test]
+    fn invite_status_lookup_plan_deduplicates_duplicate_uids() {
+        let event = test_calendar_event(vec!["bob@example.com"]);
+        let mut other = event.clone();
+        other.uid = "other@example.com".into();
+        let fields = vec![
+            InviteListFields {
+                is_invite_to_me: true,
+                ..InviteListFields::default()
+            },
+            InviteListFields {
+                is_invite_to_me: true,
+                ..InviteListFields::default()
+            },
+            InviteListFields {
+                is_invite_to_me: true,
+                ..InviteListFields::default()
+            },
+        ];
+        let groups =
+            invite_lookup_groups(&fields, &[Some(event.clone()), Some(event), Some(other)]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].uid, "uid@example.com");
+        assert_eq!(groups[0].email_indices, vec![0, 1]);
+        assert_eq!(groups[1].uid, "other@example.com");
+        assert_eq!(groups[1].email_indices, vec![2]);
+    }
+
+    #[test]
+    fn delegated_partstat_stays_delegated() {
+        assert_eq!(canonical_invite_status("delegated"), "DELEGATED");
     }
 
     #[test]

@@ -36,6 +36,7 @@ for (const [surface, relativePath] of [
             ['ACCEPTED', 'Accepted', 'accepted'],
             ['TENTATIVE', 'Tentative', 'tentative'],
             ['DECLINED', 'Declined', 'declined'],
+            ['DELEGATED', 'Delegated', 'delegated'],
         ]) {
             const html = renderInviteChip({
                 inviteMethod: 'REQUEST',

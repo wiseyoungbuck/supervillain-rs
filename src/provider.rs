@@ -168,9 +168,12 @@ pub async fn get_emails(
             outlook::get_emails(s, ids, fetch_body, priority).await
         }
         ProviderSession::Gmail(s) => {
-            // properties_override is JMAP-specific; Gmail always returns the full payload.
-            let _ = properties_override;
-            gmail::get_emails(s, ids, fetch_body, priority).await
+            // A properties override marks metadata-only bulk work (currently
+            // split counts). Gmail has no arbitrary property projection, but
+            // it can preserve the same intent with format=metadata and by
+            // skipping calendar MIME enrichment.
+            let include_invite_data = properties_override.is_none();
+            gmail::get_emails(s, ids, fetch_body, include_invite_data, priority).await
         }
     }
 }
@@ -371,6 +374,49 @@ pub async fn get_calendar_data(
         ProviderSession::Fastmail(s) => jmap::get_calendar_data(s, email_id).await,
         ProviderSession::Outlook(s) => outlook::get_calendar_data(s, email_id).await,
         ProviderSession::Gmail(s) => gmail::get_calendar_data(s, email_id).await,
+    }
+}
+
+/// Detached calendar-read capability used by list enrichment so the provider
+/// session RwLock is not held across CalDAV/Graph/Google Calendar I/O.
+#[derive(Clone)]
+pub(crate) enum CalendarEventReader {
+    Fastmail(jmap::CalendarEventReader),
+    Outlook(outlook::CalendarEventReader),
+    Gmail(gmail::CalendarEventReader),
+}
+
+pub(crate) async fn calendar_event_reader(
+    session: &ProviderSession,
+) -> Result<CalendarEventReader, Error> {
+    match session {
+        ProviderSession::Fastmail(session) => Ok(CalendarEventReader::Fastmail(
+            jmap::calendar_event_reader(session)?,
+        )),
+        ProviderSession::Outlook(session) => Ok(CalendarEventReader::Outlook(
+            outlook::calendar_event_reader(session).await?,
+        )),
+        ProviderSession::Gmail(session) => Ok(CalendarEventReader::Gmail(
+            gmail::calendar_event_reader(session).await?,
+        )),
+    }
+}
+
+pub(crate) async fn get_calendar_event_with_reader(
+    reader: &CalendarEventReader,
+    uid: &str,
+    primary_tz: chrono_tz::Tz,
+) -> Result<Option<CalendarEvent>, Error> {
+    match reader {
+        CalendarEventReader::Fastmail(reader) => {
+            jmap::get_calendar_event_with_reader(reader, uid, primary_tz).await
+        }
+        CalendarEventReader::Outlook(reader) => {
+            outlook::get_calendar_event_with_reader(reader, uid).await
+        }
+        CalendarEventReader::Gmail(reader) => {
+            gmail::get_calendar_event_with_reader(reader, uid).await
+        }
     }
 }
 

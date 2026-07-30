@@ -1063,18 +1063,23 @@ pub async fn get_emails(
     session: &GmailSession,
     ids: &[String],
     fetch_body: bool,
+    include_invite_data: bool,
     priority: bool,
 ) -> Result<Vec<Email>, Error> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let token = access_token(session).await?;
-    // Gmail's metadata format omits the MIME tree entirely. Use `full` for
-    // list rows too so calendar semantics come from a real text/calendar
-    // part rather than a `.ics` filename guess. This replaces the existing
-    // messages.get request; it does not add one request per email. Only an
-    // attachment-backed calendar part needs the invite-only follow-up below.
-    let format = "full";
+    // Normal list/detail rows need the MIME tree to identify genuine
+    // text/calendar parts. Bulk callers such as split-count sampling request
+    // minimal properties through provider.rs; keep those on metadata format
+    // and skip invite enrichment so a 1500-row count pass never downloads
+    // full payloads or attachment-backed ICS data.
+    let format = if fetch_body || include_invite_data {
+        "full"
+    } else {
+        "metadata"
+    };
 
     let mut join_set = tokio::task::JoinSet::new();
     for (idx, id) in ids.iter().enumerate() {
@@ -1101,42 +1106,46 @@ pub async fn get_emails(
                 ));
             }
             let msg: GmailMessage = resp.json().await?;
-            let calendar_ics = match find_calendar_ics(&msg.payload) {
-                Some(IcsSource::Inline(ics)) => Some(ics),
-                Some(IcsSource::Attachment(att_id)) => {
-                    match fetch_attachment_bytes_at(
-                        &client,
-                        &limiter,
-                        &gmail_base,
-                        &token,
-                        &id,
-                        &att_id,
-                        priority,
-                    )
-                    .await
-                    {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(ics) => Some(ics),
-                            Err(_) => {
+            let calendar_ics = if include_invite_data {
+                match find_calendar_ics(&msg.payload) {
+                    Some(IcsSource::Inline(ics)) => Some(ics),
+                    Some(IcsSource::Attachment(att_id)) => {
+                        match fetch_attachment_bytes_at(
+                            &client,
+                            &limiter,
+                            &gmail_base,
+                            &token,
+                            &id,
+                            &att_id,
+                            priority,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => match String::from_utf8(bytes) {
+                                Ok(ics) => Some(ics),
+                                Err(_) => {
+                                    tracing::warn!(
+                                        msg_id = %id,
+                                        "Gmail text/calendar part was not UTF-8; omitting invite chip"
+                                    );
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                // Invite enrichment is not load-bearing for the
+                                // mailbox. Keep the row and degrade to no chip.
                                 tracing::warn!(
                                     msg_id = %id,
-                                    "Gmail text/calendar part was not UTF-8; omitting invite chip"
+                                    "Gmail calendar attachment fetch failed; omitting invite chip: {e}"
                                 );
                                 None
                             }
-                        },
-                        Err(e) => {
-                            // Invite enrichment is not load-bearing for the
-                            // mailbox. Keep the row and degrade to no chip.
-                            tracing::warn!(
-                                msg_id = %id,
-                                "Gmail calendar attachment fetch failed; omitting invite chip: {e}"
-                            );
-                            None
                         }
                     }
+                    None => None,
                 }
-                None => None,
+            } else {
+                None
             };
             let mut email = parse_message_to_email(msg, fetch_body);
             email.calendar_ics = calendar_ics;
@@ -2713,21 +2722,46 @@ pub(crate) fn mutate_attendee_status(
     found
 }
 
-/// Look up a calendar event by its iCalUID. Returns the parsed event with
-/// up-to-date attendee statuses, or `None` if not in the calendar.
-pub async fn get_calendar_event(
+/// Clonable Google Calendar read capability. The access token is refreshed
+/// while the session lock is briefly held; the subsequent Calendar network
+/// request uses only owned/cloned values so list status lookups release it.
+#[derive(Clone)]
+pub(crate) struct CalendarEventReader {
+    client: reqwest::Client,
+    access_token: String,
+    limiter: Arc<RateLimiter>,
+    calendar_base: String,
+}
+
+pub(crate) async fn calendar_event_reader(
     session: &GmailSession,
+) -> Result<CalendarEventReader, Error> {
+    Ok(CalendarEventReader {
+        client: session.client.clone(),
+        access_token: access_token(session).await?,
+        limiter: session.limiter.clone(),
+        calendar_base: session.calendar_base.clone(),
+    })
+}
+
+/// Look up a calendar event by its iCalUID with a detached read capability.
+pub(crate) async fn get_calendar_event_with_reader(
+    reader: &CalendarEventReader,
     uid: &str,
 ) -> Result<Option<CalendarEvent>, Error> {
-    let token = access_token(session).await?;
     // See `find_event_id_by_ical_uid`: `encode_path_segment`'s escape set is a
     // superset of query-component requirements, so reusing it here is safe.
     let encoded = encode_path_segment(uid);
-    let url = format!("{}/events?iCalUID={encoded}", session.calendar_base);
-    let resp = session
+    let url = format!("{}/events?iCalUID={encoded}", reader.calendar_base);
+    let resp = reader
         .limiter
         .execute("calendar.events.list?iCalUID", || async {
-            session.client.get(&url).bearer_auth(&token).send().await
+            reader
+                .client
+                .get(&url)
+                .bearer_auth(&reader.access_token)
+                .send()
+                .await
         })
         .await?;
     let status = resp.status();
@@ -2742,6 +2776,14 @@ pub async fn get_calendar_event(
     let parsed: serde_json::Value = resp.json().await?;
     let first = parsed["items"].as_array().and_then(|arr| arr.first());
     Ok(first.and_then(|ev| parse_google_event(uid, ev)))
+}
+
+pub async fn get_calendar_event(
+    session: &GmailSession,
+    uid: &str,
+) -> Result<Option<CalendarEvent>, Error> {
+    let reader = calendar_event_reader(session).await?;
+    get_calendar_event_with_reader(&reader, uid).await
 }
 
 /// Add a parsed CalendarEvent to the user's primary Google Calendar via
@@ -5407,6 +5449,42 @@ mod tests {
         assert_eq!(session.limiter.name(), "gmail");
         assert_eq!(session.limiter.concurrency(), 5);
         assert_eq!(session.limiter.spacing(), Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn get_emails_minimal_uses_metadata_and_skips_ics_enrichment() {
+        let message = serde_json::json!({
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [],
+                "parts": [{
+                    "mimeType": "text/calendar",
+                    "body": { "attachmentId": "calendar-attachment" }
+                }]
+            }
+        });
+        let (base, recorded) =
+            spawn_calendar_recorder(vec![(("GET", "/messages/m1"), (200, message.to_string()))])
+                .await;
+        let mut session = test_session();
+        session.gmail_base = base;
+
+        let emails = get_emails(&session, &["m1".into()], false, false, false)
+            .await
+            .unwrap();
+        assert_eq!(emails.len(), 1);
+        assert!(emails[0].calendar_ics.is_none());
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "minimal fetch must not issue messages.attachments.get"
+        );
+        assert_eq!(requests[0].path, "/messages/m1");
+        assert_eq!(requests[0].query.as_deref(), Some("format=metadata"));
     }
 
     // ---- Google Calendar RSVP round-trip pins (kata awxa) ----

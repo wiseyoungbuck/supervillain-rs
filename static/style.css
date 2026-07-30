@@ -718,6 +718,7 @@ body {
 .email-invite--tentative { color: var(--warning); }
 .email-invite--accepted { color: var(--success); }
 .email-invite--declined { color: var(--danger); }
+.email-invite--delegated { color: var(--text-muted); }
 .email-invite--updated { color: var(--accent); }
 
 .email-invite-icon {
