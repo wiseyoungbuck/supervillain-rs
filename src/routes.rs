@@ -1838,7 +1838,8 @@ async fn surface_caldav_spawn_failure(
             },
         )
         .await;
-    } else if matches!(err, Error::CalendarDiscoveryFailed(_)) {
+    } else if matches!(&err, Error::CalendarDiscoveryFailed(_)) {
+        tracing::warn!("Calendar {op} discovery failed for {uid}: {err}");
         accounts::push_error_if_absent(
             state,
             crate::types::AccountError {
