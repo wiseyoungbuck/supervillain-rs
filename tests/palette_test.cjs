@@ -114,6 +114,28 @@ function renderCommands(state, getCommands, query = '') {
     return commandResults.innerHTML;
 }
 
+// Load the real open/close functions in one closure, just as they live in
+// app.js. The two `let`s mirror their module state; all behavior under test is
+// still the production function body extracted with the js_fn_body pattern.
+function loadPaletteLifecycle(state, els, document, renderCommandPalette, setMode) {
+    const code = [
+        'let commandPalettePreviousFocus = null;',
+        "let commandPalettePreviousMode = 'normal';",
+        extractFunction(APP_JS, 'function openCommandPalette('),
+        extractFunction(APP_JS, 'function closeCommandPalette('),
+        'return { openCommandPalette, closeCommandPalette };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    return new Function(
+        'state',
+        'els',
+        'document',
+        'renderCommandPalette',
+        'setMode',
+        code,
+    )(state, els, document, renderCommandPalette, setMode);
+}
+
 // Minimal stub state: every field commandsForView reads (view, selectedIndex,
 // currentEmail, accounts). visibleRows is injected separately because it is a
 // module-level function in app.js, not a state field.
@@ -283,4 +305,100 @@ test('fhtz: account labels containing markup render as literal command text', ()
 
     assert.ok(markup.includes('Remove Account: &lt;svg onload="window.__xss_account=1"&gt;'));
     assert.ok(!markup.includes('<svg'), 'the account-label payload must not survive as a live tag');
+});
+
+test('sqke: cancelling the palette restores the insert-mode field and focus', () => {
+    const state = { mode: 'insert', commandPaletteIndex: 0 };
+    let restored = 0;
+    const previousField = {
+        isConnected: true,
+        focus() {
+            restored++;
+            document.activeElement = previousField;
+            // Dense settings inputs do not have a focus listener. The captured
+            // mode must therefore provide the insert-mode fallback.
+        },
+    };
+    const document = { activeElement: previousField };
+    const classes = new Set(['hidden']);
+    const els = {
+        commandPalette: {
+            classList: {
+                add(value) { classes.add(value); },
+                remove(value) { classes.delete(value); },
+            },
+        },
+        commandInput: {
+            value: 'stale',
+            focus() {
+                document.activeElement = this;
+                state.mode = 'normal'; // model the previous field's blur
+            },
+        },
+    };
+    const setMode = (mode) => { state.mode = mode; };
+    const lifecycle = loadPaletteLifecycle(state, els, document, () => {}, setMode);
+
+    lifecycle.openCommandPalette();
+    assert.equal(state.mode, 'command');
+    assert.equal(document.activeElement, els.commandInput);
+    lifecycle.closeCommandPalette({ cancelled: true });
+    assert.equal(restored, 1, 'Escape/cancel must refocus the previous field');
+    assert.equal(document.activeElement, previousField);
+    assert.equal(state.mode, 'insert', 'cancel must restore the captured insert mode');
+
+    lifecycle.openCommandPalette();
+    lifecycle.closeCommandPalette();
+    assert.equal(restored, 1, 'an executed action close must not restore stale focus');
+    assert.equal(state.mode, 'normal', 'action close retains the normal fallback');
+});
+
+test('sqke: Ctrl+Enter in settings normal mode does not enter edit mode', () => {
+    const state = { selectedAccountId: 'acct-1', settingsMode: 'view' };
+    const els = {
+        acctConfirmDelete: {
+            classList: { contains(value) { return value === 'hidden'; } },
+        },
+    };
+    const code = extractFunction(APP_JS, 'function handleSettingsNormalKey(')
+        + '\nreturn handleSettingsNormalKey;';
+    // eslint-disable-next-line no-new-func
+    const handleSettingsNormalKey = new Function('state', 'els', code)(state, els);
+    let prevented = false;
+
+    handleSettingsNormalKey({
+        key: 'Enter',
+        ctrlKey: true,
+        metaKey: false,
+        altKey: false,
+        preventDefault() { prevented = true; },
+    });
+
+    assert.equal(state.settingsMode, 'view');
+    assert.equal(prevented, false, 'Ctrl+Enter must fall through in settings normal mode');
+});
+
+test('sqke: repeated ArrowDown stays on the final filtered command', () => {
+    const state = makeState({ view: 'compose', commandPaletteIndex: 0 });
+    const getCommands = loadGetCommands(state, () => []);
+    const commands = getCommands();
+    state.commandPaletteIndex = commands.length - 1;
+
+    const handlerCode = extractFunction(APP_JS, 'function handleCommandPaletteKey(')
+        + '\nreturn handleCommandPaletteKey;';
+    const rerender = () => { renderCommands(state, getCommands); };
+    // eslint-disable-next-line no-new-func
+    const handleCommandPaletteKey = new Function(
+        'state',
+        'renderCommandPalette',
+        handlerCode,
+    )(state, rerender);
+
+    let prevented = false;
+    handleCommandPaletteKey({
+        key: 'ArrowDown',
+        preventDefault() { prevented = true; },
+    });
+    assert.equal(state.commandPaletteIndex, commands.length - 1);
+    assert.equal(prevented, true);
 });
