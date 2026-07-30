@@ -2293,13 +2293,21 @@ function renderCommandPalette() {
         c.desc.toLowerCase().includes(query)
     );
 
-    els.commandResults.innerHTML = filtered.map((cmd, idx) => `
+    // Commands can include user-controlled split names, account labels, and
+    // ids. Escape each value at the final innerHTML boundary so command data
+    // is always text/attribute content, never markup (kata fhtz).
+    els.commandResults.innerHTML = filtered.map((cmd, idx) => {
+        const action = escapeAttr(cmd.action);
+        const name = escapeHtml(cmd.name);
+        const shortcut = escapeHtml(cmd.shortcut);
+        return `
         <div class="command-item ${idx === state.commandPaletteIndex ? 'selected' : ''}"
-             data-action="${escapeAttr(cmd.action)}">
-            <span>${escapeHtml(cmd.name)}</span>
-            <span class="shortcut">${escapeHtml(cmd.shortcut)}</span>
+             data-action="${action}">
+            <span>${name}</span>
+            <span class="shortcut">${shortcut}</span>
         </div>
-    `).join('');
+    `;
+    }).join('');
 
     els.commandResults.querySelectorAll('.command-item').forEach(el => {
         el.addEventListener('click', () => {

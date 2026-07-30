@@ -9690,7 +9690,7 @@ white   = '#fdf6e3'
 
     #[test]
     fn palette_render_escapes_command_markup() {
-        // sefy-final/roborev 393-394: command name/shortcut (rendered into
+        // kata fhtz / sefy-final roborev 393-394: command name/shortcut (rendered into
         // innerHTML) built from user/server-controlled strings (split.name in
         // `Delete Split: ...`, acct.email in `Remove Account: ...`) were
         // interpolated unescaped — a split name or account email containing
@@ -9711,6 +9711,12 @@ white   = '#fdf6e3'
         assert!(
             body.contains("escapeAttr(cmd.action)"),
             "renderCommandPalette must escapeAttr the data-action attribute — escapeHtml (div.textContent) does not encode quotes, so a quote in cmd.action breaks out of the attribute (sefy-final/roborev 394)"
+        );
+        assert!(
+            !body.contains("${cmd.name}")
+                && !body.contains("${cmd.shortcut}")
+                && !body.contains("${cmd.action}"),
+            "renderCommandPalette must not interpolate raw cmd.* values into innerHTML (kata fhtz)"
         );
     }
 

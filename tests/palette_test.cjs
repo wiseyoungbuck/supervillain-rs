@@ -54,6 +54,66 @@ function loadGetCommands(state, visibleRows) {
     return new Function('state', 'visibleRows', code + '\nreturn getCommands;')(state, visibleRows);
 }
 
+// Extract one real column-0 function body from app.js. This follows the same
+// js_fn_body convention as the Rust contract tests and extractGetCommands.
+function extractFunction(src, declaration) {
+    const start = src.indexOf(declaration);
+    assert.notStrictEqual(start, -1, `${declaration} must exist in app.js`);
+    const close = src.indexOf('\n}', start);
+    assert.notStrictEqual(close, -1, `${declaration} must close with a column-0 brace`);
+    return src.slice(start, close + 2);
+}
+
+// escapeHtml relies on the browser's textContent -> innerHTML serialization.
+// Keep this shim exact: encode text metacharacters, but leave quotes for
+// escapeAttr to encode according to the surrounding attribute context.
+function makeEscapeDocument() {
+    return {
+        createElement() {
+            let text = '';
+            return {
+                set textContent(value) { text = String(value); },
+                get innerHTML() {
+                    return text
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+                },
+            };
+        },
+    };
+}
+
+// Evaluate the real renderCommandPalette together with the real escape
+// helpers. commandResults intentionally records the assigned markup before a
+// browser parses it, which lets the tests prove the single-quote escapeAttr
+// branch emitted &#39; as well as checking that tags are text.
+function renderCommands(state, getCommands, query = '') {
+    const code = [
+        extractFunction(APP_JS, 'function renderCommandPalette('),
+        extractFunction(APP_JS, 'function escapeHtml('),
+        extractFunction(APP_JS, 'function escapeAttr('),
+        'return renderCommandPalette;',
+    ].join('\n');
+    const commandResults = {
+        innerHTML: '',
+        querySelectorAll() { return []; },
+    };
+    const els = {
+        commandInput: { value: query },
+        commandResults,
+    };
+    // eslint-disable-next-line no-new-func
+    const render = new Function('state', 'els', 'document', 'getCommands', code)(
+        state,
+        els,
+        makeEscapeDocument(),
+        getCommands,
+    );
+    render();
+    return commandResults.innerHTML;
+}
+
 // Minimal stub state: every field commandsForView reads (view, selectedIndex,
 // currentEmail, accounts). visibleRows is injected separately because it is a
 // module-level function in app.js, not a state field.
@@ -189,4 +249,38 @@ test('sefy: unknown view falls back to the defensive global set (roborev 378 #6)
         'default branch must not offer RSVP — that is detail + calendar-gated',
     );
     assert.ok(!a.includes('archive'), 'default branch must not offer Archive — that is view-native');
+});
+
+test('fhtz: split command names render markup as text and escape quote-bearing ids', () => {
+    const state = makeState({
+        view: 'list',
+        commandPaletteIndex: 0,
+        splits: [{
+            id: `split\"double'single`,
+            name: '<img src=x onerror="window.__xss_palette=1">',
+        }],
+    });
+    const getCommands = loadGetCommands(state, () => []);
+    const markup = renderCommands(state, getCommands);
+
+    assert.ok(markup.includes('Delete Split: &lt;img src=x onerror="window.__xss_palette=1"&gt;'));
+    assert.ok(!markup.includes('<img'), 'the split-name payload must not survive as a live tag');
+    assert.ok(markup.includes('&quot;double'), 'escapeAttr must encode the double-quote branch');
+    assert.ok(markup.includes('&#39;single'), 'escapeAttr must encode the single-quote branch');
+});
+
+test('fhtz: account labels containing markup render as literal command text', () => {
+    const state = makeState({
+        view: 'settings',
+        commandPaletteIndex: 0,
+        accounts: [{
+            id: 'acct-1',
+            email: '<svg onload="window.__xss_account=1">',
+        }],
+    });
+    const getCommands = loadGetCommands(state, () => []);
+    const markup = renderCommands(state, getCommands);
+
+    assert.ok(markup.includes('Remove Account: &lt;svg onload="window.__xss_account=1"&gt;'));
+    assert.ok(!markup.includes('<svg'), 'the account-label payload must not survive as a live tag');
 });
