@@ -214,24 +214,21 @@
                                         Pick the service that hosts your email. Supervillain opens your browser to sign you in &mdash; your password never touches this app.
                                     </div>
                                     <div class="wiz-picker" id="wiz-picker" role="listbox" aria-label="Provider">
-                                        <button type="button" class="wiz-row focused" data-wiz-provider="gmail" data-wiz-idx="0" role="option">
-                                            <span class="wiz-kbd">1</span>
-                                            <span class="wiz-gly">G</span>
-                                            <span class="wiz-name">Gmail</span>
+                                        <button type="button" class="wiz-row focused" data-wiz-provider="gmail" data-wiz-idx="0" role="option" aria-selected="true" aria-label="Gmail — Google Workspace or personal — OAuth">
+                                            <span class="wiz-kbd" aria-hidden="true">1</span>
+                                            <span class="wiz-gly"><img class="provider-icon" src="/provider-icons/gmail.svg" width="20" height="20" alt="Gmail" title="Gmail"></span>
                                             <span class="wiz-desc">Google &mdash; Workspace or personal</span>
                                             <span class="wiz-badge">OAuth</span>
                                         </button>
-                                        <button type="button" class="wiz-row" data-wiz-provider="outlook" data-wiz-idx="1" role="option">
-                                            <span class="wiz-kbd">2</span>
-                                            <span class="wiz-gly">O</span>
-                                            <span class="wiz-name">Outlook</span>
+                                        <button type="button" class="wiz-row" data-wiz-provider="outlook" data-wiz-idx="1" role="option" aria-selected="false" aria-label="Outlook — Microsoft 365 work or personal — OAuth">
+                                            <span class="wiz-kbd" aria-hidden="true">2</span>
+                                            <span class="wiz-gly"><img class="provider-icon" src="/provider-icons/microsoft-outlook.svg" width="20" height="20" alt="Outlook" title="Outlook"></span>
                                             <span class="wiz-desc">Microsoft 365 &mdash; work or personal</span>
                                             <span class="wiz-badge">OAuth</span>
                                         </button>
-                                        <button type="button" class="wiz-row" data-wiz-provider="fastmail" data-wiz-idx="2" role="option">
-                                            <span class="wiz-kbd">3</span>
-                                            <span class="wiz-gly">F</span>
-                                            <span class="wiz-name">Fastmail</span>
+                                        <button type="button" class="wiz-row" data-wiz-provider="fastmail" data-wiz-idx="2" role="option" aria-selected="false" aria-label="Fastmail — JMAP, fast and privacy-focused — API token">
+                                            <span class="wiz-kbd" aria-hidden="true">3</span>
+                                            <span class="wiz-gly"><img class="provider-icon" src="/provider-icons/fastmail.svg" width="20" height="20" alt="Fastmail" title="Fastmail"></span>
                                             <span class="wiz-desc">JMAP &mdash; fast, privacy-focused</span>
                                             <span class="wiz-badge">API token</span>
                                         </button>
@@ -288,7 +285,7 @@
                                         <div class="wiz-actions">
                                             <button type="button" class="wiz-btn" data-wiz-action="back-to-1">&larr; Back</button>
                                             <button type="submit" class="wiz-btn primary wiz-actions-right" id="wiz-continue-btn">
-                                                Continue with <span id="wiz-continue-provider">Google</span> &rarr;
+                                                Continue with <span id="wiz-continue-provider"><img class="provider-icon" src="/provider-icons/gmail.svg" width="16" height="16" alt="Gmail" title="Gmail"></span> &rarr;
                                             </button>
                                         </div>
                                     </form>
@@ -349,6 +346,9 @@
                         <form id="account-form" class="account-form hidden" autocomplete="off">
                             <div class="modal-field">
                                 <label>Provider:</label>
+                                <!-- Native option elements cannot render images. Keep this
+                                     edit-only control textual rather than replacing its native
+                                     keyboard and screen-reader behavior with a custom select. -->
                                 <select id="acct-provider">
                                     <option value="fastmail">Fastmail (JMAP)</option>
                                     <option value="outlook">Outlook (OAuth)</option>

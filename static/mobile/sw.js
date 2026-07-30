@@ -12,6 +12,9 @@ const APP_SHELL = [
     '/mobile/app.js',
     '/api.js',
     '/mobile/manifest.json',
+    '/provider-icons/gmail.svg',
+    '/provider-icons/microsoft-outlook.svg',
+    '/provider-icons/fastmail.svg',
 ];
 
 self.addEventListener('install', (event) => {

@@ -818,7 +818,7 @@ function showAccountErrors(errors) {
     const list = errors.map(e => {
         const acctText = escapeHtml(e.account);
         const acctAttr = escapeAttr(e.account);
-        const prov = escapeHtml(e.provider);
+        const prov = e.provider ? providerIcon(e.provider) : '';
         const body = escapeHtml(e.error);
         // The Authorize button is purely structural — gated on authStatus,
         // independent of error text. The backend can reword "Not authorized
@@ -890,7 +890,7 @@ function renderAccounts() {
              data-id="${escapeAttr(acc.id)}">
             <span class="account-key">${idx + 1}</span>
             <span class="account-email">${escapeHtml(acc.email || acc.id)}</span>
-            <span class="account-provider">${escapeHtml(acc.provider)}${pending ? (acc.provider === 'fastmail' ? ' · not connected' : ' · needs auth') : ''}</span>
+            <span class="account-provider">${providerIcon(acc.provider)}${pending ? `<span class="account-provider-status">${acc.provider === 'fastmail' ? '· not connected' : '· needs auth'}</span>` : ''}</span>
         </div>
     `;
     }).join('');
@@ -2421,7 +2421,7 @@ function renderSettings() {
             <div class="account-row ${isSel ? 'selected' : ''}" data-id="${escapeHtml(a.id)}">
                 <span class="account-row-key">${idx + 1}</span>
                 <span class="account-row-email">${star} ${escapeHtml(a.email || a.id)}</span>
-                <span class="account-row-provider">${escapeHtml(a.provider)}</span>
+                <span class="account-row-provider">${providerIcon(a.provider)}</span>
             </div>`;
     }).join('');
 
@@ -2751,7 +2751,9 @@ function focusWizProvider(idx) {
     const n = WIZ_PROVIDERS.length;
     state.wizardProviderIdx = ((idx % n) + n) % n;
     document.querySelectorAll('.wiz-row').forEach((r, i) => {
-        r.classList.toggle('focused', i === state.wizardProviderIdx);
+        const selected = i === state.wizardProviderIdx;
+        r.classList.toggle('focused', selected);
+        r.setAttribute('aria-selected', String(selected));
     });
 }
 
@@ -2778,7 +2780,6 @@ const WIZ_FIELD_LABELS = {
 };
 const WIZ_DESCRIPTORS = {
     gmail: {
-        label: 'Google',
         title: 'Bring your own keys',
         blurb: `Supervillain talks to <em>Google</em> through an OAuth app <strong>you</strong> register &mdash; your inbox flows through your credentials, not ours.`,
         host: 'accounts.google.com',
@@ -2798,7 +2799,6 @@ const WIZ_DESCRIPTORS = {
             </ol>`,
     },
     outlook: {
-        label: 'Microsoft',
         title: 'Bring your own keys',
         blurb: `Supervillain talks to <em>Microsoft 365</em> through an OAuth app <strong>you</strong> register in Azure.`,
         host: 'login.microsoftonline.com',
@@ -2815,7 +2815,6 @@ const WIZ_DESCRIPTORS = {
             </ol>`,
     },
     fastmail: {
-        label: 'Fastmail',
         title: 'Paste your Fastmail credentials',
         blurb: `Fastmail doesn&rsquo;t use OAuth. You need two separate credentials: an <em>API token</em> (JMAP) and an <em>app password</em> (CalDAV/calendar sync) &mdash; Fastmail&rsquo;s API tokens can&rsquo;t be used for CalDAV.`,
         host: null,           // no browser/loopback step
@@ -2908,7 +2907,7 @@ function tailorWizCreds() {
     const why = document.getElementById('wiz-creds-why');
     why.innerHTML = d.instructionsHtml;
     why.style.display = '';
-    document.getElementById('wiz-continue-provider').textContent = d.label;
+    document.getElementById('wiz-continue-provider').innerHTML = providerIcon(provider);
 
     // Show only the fields this provider needs; reset their placeholders.
     document.querySelectorAll('.wiz-field[data-wiz-field]').forEach(f => f.classList.add('hidden'));
@@ -3070,11 +3069,8 @@ function renderWizSuccess() {
     const id = state.wizardSavedId;
     const acct = state.accounts.find(a => a.id === id);
     const provider = WIZ_PROVIDERS[state.wizardProviderIdx];
-    const providerLabel = provider === 'gmail'   ? 'Gmail (Google)'
-                        : provider === 'outlook' ? 'Outlook (Microsoft 365)'
-                        :                          'Fastmail';
     document.getElementById('wiz-success-email').textContent = (acct && acct.email) || '(syncing…)';
-    document.getElementById('wiz-success-provider').textContent = providerLabel;
+    document.getElementById('wiz-success-provider').innerHTML = providerIcon(provider);
     document.getElementById('wiz-success-name').textContent = id || '';
     document.getElementById('wiz-set-default').checked = !!(acct && acct.isDefault);
 }
@@ -5176,6 +5172,22 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// Self-hosted dashboard-icons assets. A non-empty img alt is both the
+// accessible provider name and the browser's text fallback if an asset cannot
+// be rendered. Unknown future providers fall back to escaped visible text.
+const PROVIDER_ICONS = new Map([
+    ['gmail', { label: 'Gmail', src: '/provider-icons/gmail.svg' }],
+    ['outlook', { label: 'Outlook', src: '/provider-icons/microsoft-outlook.svg' }],
+    ['fastmail', { label: 'Fastmail', src: '/provider-icons/fastmail.svg' }],
+]);
+
+function providerIcon(provider) {
+    const label = typeof provider === 'string' && provider ? provider : 'Unknown provider';
+    const icon = PROVIDER_ICONS.get(label.toLowerCase());
+    if (!icon) return `<span class="provider-icon-fallback">${escapeHtml(label)}</span>`;
+    return `<img class="provider-icon" src="${icon.src}" width="16" height="16" alt="${icon.label}" title="${icon.label}">`;
 }
 
 // escapeHtml is safe for text content but textContent's serializer doesn't
