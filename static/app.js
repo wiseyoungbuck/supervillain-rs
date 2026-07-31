@@ -5,6 +5,11 @@ const state = {
     mode: 'normal',           // normal, insert, command, search, awaiting
     view: 'list',             // list, detail, compose, settings
     accounts: [],
+    // The account-error banner's current entries ({account, provider, error}).
+    // loadAccounts resets it from /api/accounts; in-session failures (e.g. a
+    // calendar-config RSVP error) upsert into it so surfacing one error never
+    // clobbers another account's still-unresolved banner line (roborev 446).
+    accountErrors: [],
     currentAccount: null,
     mailboxes: [],
     currentMailbox: null,
@@ -799,9 +804,9 @@ async function loadAccounts() {
         state.accounts = data.accounts;
         renderAccounts();
 
-        const nonSetupErrors = (data.errors || []).filter(e => e.provider !== 'setup');
-        if (nonSetupErrors.length > 0) {
-            showAccountErrors(nonSetupErrors);
+        state.accountErrors = (data.errors || []).filter(e => e.provider !== 'setup');
+        if (state.accountErrors.length > 0) {
+            showAccountErrors(state.accountErrors);
         } else {
             els.accountErrorBanner.classList.add('hidden');
         }
@@ -6391,18 +6396,27 @@ async function rsvpToEvent(status) {
             listItem.inviteIsUpdated = prevInviteIsUpdated;
             renderEmailList();
         }
-        // A 400/503 from this route is a calendar-config problem the user must
-        // fix (m5yp: no app password; wybm: no discoverable calendar), not a
-        // transient hiccup — surface it in the persistent account-error banner,
-        // the same surface the server-side auto-add path pushes these to
-        // (surface_caldav_spawn_failure), so the actionable message outlives
-        // the 3s toast.
-        if (err instanceof ApiError && (err.status === 400 || err.status === 503) && state.currentAccount) {
-            showAccountErrors([{
+        // A calendar-config failure (m5yp: no app password; wybm: no
+        // discoverable calendar) is a problem the user must fix, not a
+        // transient hiccup — surface it in the persistent account-error
+        // banner, the same surface the server-side auto-add path pushes these
+        // to (surface_caldav_spawn_failure), so the actionable message
+        // outlives the 3s toast. Gated on the body's machine-readable code
+        // (src/error.rs) so a generic 400/503 stays toast-only. Upsert into
+        // state.accountErrors — replacing the list would clobber other
+        // accounts' still-unresolved banner lines (roborev 446).
+        const calendarConfigError = err instanceof ApiError
+            && (err.code === 'calendar_auth_unconfigured' || err.code === 'calendar_discovery_failed');
+        if (calendarConfigError && state.currentAccount) {
+            const entry = {
                 account: state.currentAccount.id,
                 provider: state.currentAccount.provider,
                 error: err.message,
-            }]);
+            };
+            if (!state.accountErrors.some(e => e.account === entry.account && e.error === entry.error)) {
+                state.accountErrors.push(entry);
+            }
+            showAccountErrors(state.accountErrors);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
     }
