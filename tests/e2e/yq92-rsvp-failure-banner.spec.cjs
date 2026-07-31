@@ -226,6 +226,66 @@ test('yq92: a successful RSVP retires the earlier failure\'s banner line', async
   await expect(page.locator('#account-error-banner')).toBeHidden();
 });
 
+test('yq92: deleting the failing account drops its banner line on the next accounts refresh', async ({ page }) => {
+  // Deleting the account is a legitimate remediation for a calendar-config
+  // failure. The client-sourced line's only other retirement path (a
+  // successful RSVP on that account) is then impossible, so loadAccounts'
+  // rebuild must drop lines whose account no longer exists (roborev 448) —
+  // otherwise the banner shows an unfixable "needs attention" line forever.
+  const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
+  const acct2 = { id: 'acct-2', email: 'other@example.com', provider: 'gmail', authStatus: 'pending', isDefault: false };
+  const acct2Error = { account: 'acct-2', provider: 'gmail', error: 'Not authorized — click Authorize' };
+  let accountsCalls = 0;
+  await mockApi(page, {
+    emails: [email],
+    extra: {
+      emailById: { [email.id]: email },
+      routes: {
+        '**/api/emails/*/rsvp*': (route) =>
+          route.fulfill({
+            status: 400,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: AUTH_MSG, code: 'calendar_auth_unconfigured' }),
+          }),
+        '**/api/accounts/*/authorize': (route) =>
+          route.fulfill({
+            status: 502,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'oauth failed' }),
+          }),
+        // Stateful: acct-1 exists at boot, then "has been deleted" — every
+        // later fetch omits it.
+        '**/api/accounts': (route) => {
+          accountsCalls += 1;
+          const acct1 = { id: 'acct-1', email: 'me@example.com', provider: 'fastmail', authStatus: 'connected', isDefault: true };
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              accounts: accountsCalls === 1 ? [acct1, acct2] : [acct2],
+              errors: [acct2Error],
+            }),
+          });
+        },
+      },
+    },
+  });
+  await page.goto('/');
+  await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
+  await page.locator('#email-list .email-row').first().click();
+  await expect(page.locator('.calendar-card')).toBeVisible({ timeout: 10_000 });
+
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#account-error-details')).toContainText(AUTH_MSG);
+
+  // Trigger the rebuild ([Authorize] re-runs loadAccounts first): acct-1 is
+  // gone from the response, so its client line must go with it while acct-2's
+  // server line stays.
+  await page.locator('.banner-authorize-link[data-account-id="acct-2"]').click();
+  await expect(page.locator('#account-error-details')).not.toContainText(AUTH_MSG);
+  await expect(page.locator('#account-error-details')).toContainText(acct2Error.error);
+});
+
 test('yq92: a successful RSVP retires only its own line — other accounts\' errors stay visible', async ({ page }) => {
   // The other retire branch: when the client line goes but another account's
   // error remains, the banner must re-render (still visible) with only the

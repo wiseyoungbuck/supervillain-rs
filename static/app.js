@@ -1007,8 +1007,10 @@ function selectAccount(account) {
 // a Gmail id under account "gmail" can't collide with the same string
 // under account "outlook-aristotle", and re-selecting an account finds
 // its previous cache entries instead of a cold fetch.
-function cacheKey(emailId) {
-    return (state.currentAccount?.id ?? '') + ':' + emailId;
+// account defaults to the current one; pass an explicit account when keying
+// after an await, where the user may have switched mid-flight (rsvpToEvent).
+function cacheKey(emailId, account = state.currentAccount) {
+    return (account?.id ?? '') + ':' + emailId;
 }
 
 async function loadSplits() {
@@ -6369,12 +6371,13 @@ async function rsvpToEvent(status) {
 
     const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     let prevEvent = null;
-    // The account this RSVP is for, captured before the await: api() binds the
-    // account at call time, so if the user switches accounts mid-flight the
-    // banner bookkeeping below must target THIS account, not whichever is
-    // current when the response lands (roborev 448).
+    // The account and email this RSVP is for, captured before the await: the
+    // request is issued for these, so if the user switches accounts or opens
+    // another email mid-flight, every post-await write below must target THEM
+    // — not whatever is current when the response lands (roborev 448/449).
     const rsvpAccount = state.currentAccount;
-    const listItem = state.emails.find(e => e.id === state.currentEmail.id);
+    const rsvpEmail = state.currentEmail;
+    const listItem = state.emails.find(e => e.id === rsvpEmail.id);
     const prevInviteStatus = listItem?.inviteStatus;
     const prevInviteIsUpdated = listItem?.inviteIsUpdated;
 
@@ -6402,11 +6405,15 @@ async function rsvpToEvent(status) {
     showStatus(`RSVP: ${label}`, 'success');
 
     try {
-        const result = await api('POST', `/emails/${state.currentEmail.id}/rsvp`, { status });
+        const result = await api('POST', `/emails/${rsvpEmail.id}/rsvp`, { status });
         if (result.calendarEvent) {
-            state.currentEmail.calendarEvent = result.calendarEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
-            renderCalendarCard(result.calendarEvent);
+            rsvpEmail.calendarEvent = result.calendarEvent;
+            emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
+            // Only repaint if the RSVP'd email is still the one on screen — a
+            // stale response must not overwrite another email's card.
+            if (state.currentEmail?.id === rsvpEmail.id) {
+                renderCalendarCard(result.calendarEvent);
+            }
         }
         // A successful RSVP proves this account's calendar path works again —
         // retire its client-sourced config lines (mirror of the server
@@ -6419,11 +6426,14 @@ async function rsvpToEvent(status) {
             else els.accountErrorBanner.classList.add('hidden');
         }
     } catch (err) {
-        // Revert optimistic update if we had one
+        // Revert optimistic update if we had one — on the RSVP'd email, which
+        // may no longer be the one on screen (see rsvpEmail capture above).
         if (prevEvent) {
-            state.currentEmail.calendarEvent = prevEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
-            renderCalendarCard(prevEvent);
+            rsvpEmail.calendarEvent = prevEvent;
+            emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
+            if (state.currentEmail?.id === rsvpEmail.id) {
+                renderCalendarCard(prevEvent);
+            }
         }
         if (listItem?.isInviteToMe) {
             listItem.inviteStatus = prevInviteStatus;
