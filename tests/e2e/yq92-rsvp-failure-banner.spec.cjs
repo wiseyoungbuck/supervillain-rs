@@ -125,6 +125,107 @@ test('yq92: an RSVP failure merges into the banner — other accounts\' errors a
   await expect(page.locator('#account-error-details')).toContainText(bootError.error);
 });
 
+test('yq92: the RSVP-sourced banner line survives an in-session accounts refresh', async ({ page }) => {
+  // The RSVP-failure line exists only in client state; /api/accounts never
+  // returns it. Clicking [Authorize] on ANOTHER account's line re-runs
+  // loadAccounts — the rebuild must carry the client line, not drop it
+  // (roborev 447: the same clobber bug, in the other direction).
+  const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
+  const acct2Error = { account: 'acct-2', provider: 'gmail', error: 'Not authorized — click Authorize' };
+  await mockApi(page, {
+    emails: [email],
+    extra: {
+      emailById: { [email.id]: email },
+      routes: {
+        '**/api/emails/*/rsvp*': (route) =>
+          route.fulfill({
+            status: 400,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: AUTH_MSG, code: 'calendar_auth_unconfigured' }),
+          }),
+        '**/api/accounts/*/authorize': (route) =>
+          route.fulfill({
+            status: 502,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: 'oauth failed' }),
+          }),
+        '**/api/accounts': (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              accounts: [
+                { id: 'acct-1', email: 'me@example.com', provider: 'fastmail', authStatus: 'connected', isDefault: true },
+                { id: 'acct-2', email: 'other@example.com', provider: 'gmail', authStatus: 'pending', isDefault: false },
+              ],
+              errors: [acct2Error],
+            }),
+          }),
+      },
+    },
+  });
+  await page.goto('/');
+  await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
+  await page.locator('#email-list .email-row').first().click();
+  await expect(page.locator('.calendar-card')).toBeVisible({ timeout: 10_000 });
+
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#account-error-details')).toContainText(AUTH_MSG);
+  await expect(page.locator('#account-error-details')).toContainText(acct2Error.error);
+
+  // The refresh: [Authorize] on acct-2's line re-runs loadAccounts before
+  // kicking off the (mocked, failing) OAuth flow.
+  await page.locator('.banner-authorize-link[data-account-id="acct-2"]').click();
+
+  await expect(page.locator('#account-error-details')).toContainText(acct2Error.error);
+  await expect(page.locator('#account-error-details')).toContainText(AUTH_MSG);
+});
+
+test('yq92: a successful RSVP retires the earlier failure\'s banner line', async ({ page }) => {
+  // First attempt fails (app password missing), second succeeds (user fixed
+  // it): the success must retire the client-sourced line — the banner's own
+  // remediation would otherwise keep shouting after being followed.
+  const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
+  let calls = 0;
+  await mockApi(page, {
+    emails: [email],
+    extra: {
+      emailById: { [email.id]: email },
+      routes: {
+        '**/api/emails/*/rsvp*': (route) => {
+          calls += 1;
+          if (calls === 1) {
+            return route.fulfill({
+              status: 400,
+              contentType: 'application/json',
+              body: JSON.stringify({ error: AUTH_MSG, code: 'calendar_auth_unconfigured' }),
+            });
+          }
+          const updated = JSON.parse(JSON.stringify(email.calendarEvent));
+          updated.user_rsvp_status = route.request().postDataJSON().status;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ calendarEvent: updated }),
+          });
+        },
+      },
+    },
+  });
+  await page.goto('/');
+  await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
+  await page.locator('#email-list .email-row').first().click();
+  await expect(page.locator('.calendar-card')).toBeVisible({ timeout: 10_000 });
+
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#account-error-banner')).toBeVisible();
+
+  // The failure reverted the optimistic state, so Accept re-sends.
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#rsvp-status-label')).toHaveText('You responded Accepted');
+  await expect(page.locator('#account-error-banner')).toBeHidden();
+});
+
 test('yq92: a successful RSVP does NOT raise the account-error banner', async ({ page }) => {
   const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
   await mockApi(page, {

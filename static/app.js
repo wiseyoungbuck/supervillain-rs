@@ -282,6 +282,11 @@ function init() {
         els.sortToggle.addEventListener('click', toggleSortOrder);
     }
     renderSortToggle();
+    // Visual-only dismissal (deliberate): state.accountErrors keeps its
+    // entries, so the next showAccountErrors call — a new failure or a
+    // loadAccounts refresh — re-reveals every still-unresolved line, old and
+    // new. An unresolved problem must not stay hidden forever behind one
+    // dismiss (roborev 447).
     els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
         els.accountErrorBanner.classList.add('hidden');
     });
@@ -804,7 +809,16 @@ async function loadAccounts() {
         state.accounts = data.accounts;
         renderAccounts();
 
-        state.accountErrors = (data.errors || []).filter(e => e.provider !== 'setup');
+        const serverErrors = (data.errors || []).filter(e => e.provider !== 'setup');
+        // Client-sourced entries (a calendar-config RSVP failure) never appear
+        // in /api/accounts' errors, so a wholesale rebuild would silently drop
+        // a still-unresolved line on any in-session refresh — e.g. clicking
+        // [Authorize] on another account's line (roborev 447). Carry them
+        // across, deduped against a server line now reporting the same
+        // problem; they retire on a successful RSVP for their account.
+        const clientErrors = state.accountErrors.filter(e =>
+            e.source === 'client' && !serverErrors.some(s => s.account === e.account && s.error === e.error));
+        state.accountErrors = serverErrors.concat(clientErrors);
         if (state.accountErrors.length > 0) {
             showAccountErrors(state.accountErrors);
         } else {
@@ -6384,6 +6398,16 @@ async function rsvpToEvent(status) {
             emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
             renderCalendarCard(result.calendarEvent);
         }
+        // A successful RSVP proves this account's calendar path works again —
+        // retire its client-sourced config lines (mirror of the server
+        // retiring its pushed entries when the config is corrected).
+        const remaining = state.accountErrors.filter(e =>
+            !(e.source === 'client' && e.account === state.currentAccount?.id));
+        if (remaining.length !== state.accountErrors.length) {
+            state.accountErrors = remaining;
+            if (remaining.length) showAccountErrors(remaining);
+            else els.accountErrorBanner.classList.add('hidden');
+        }
     } catch (err) {
         // Revert optimistic update if we had one
         if (prevEvent) {
@@ -6412,6 +6436,9 @@ async function rsvpToEvent(status) {
                 account: state.currentAccount.id,
                 provider: state.currentAccount.provider,
                 error: err.message,
+                // Marks this as client-known-only, so loadAccounts' rebuild
+                // carries it and a later successful RSVP retires it.
+                source: 'client',
             };
             if (!state.accountErrors.some(e => e.account === entry.account && e.error === entry.error)) {
                 state.accountErrors.push(entry);
