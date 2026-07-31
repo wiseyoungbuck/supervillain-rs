@@ -226,6 +226,66 @@ test('yq92: a successful RSVP retires the earlier failure\'s banner line', async
   await expect(page.locator('#account-error-banner')).toBeHidden();
 });
 
+test('yq92: a successful RSVP retires only its own line — other accounts\' errors stay visible', async ({ page }) => {
+  // The other retire branch: when the client line goes but another account's
+  // error remains, the banner must re-render (still visible) with only the
+  // surviving line — retiring one line must not hide someone else's problem,
+  // and the fixed line must not keep shouting.
+  const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
+  const acct2Error = { account: 'acct-2', provider: 'gmail', error: 'Not authorized — click Authorize' };
+  let calls = 0;
+  await mockApi(page, {
+    emails: [email],
+    extra: {
+      emailById: { [email.id]: email },
+      routes: {
+        '**/api/emails/*/rsvp*': (route) => {
+          calls += 1;
+          if (calls === 1) {
+            return route.fulfill({
+              status: 400,
+              contentType: 'application/json',
+              body: JSON.stringify({ error: AUTH_MSG, code: 'calendar_auth_unconfigured' }),
+            });
+          }
+          const updated = JSON.parse(JSON.stringify(email.calendarEvent));
+          updated.user_rsvp_status = route.request().postDataJSON().status;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ calendarEvent: updated }),
+          });
+        },
+        '**/api/accounts': (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              accounts: [
+                { id: 'acct-1', email: 'me@example.com', provider: 'fastmail', authStatus: 'connected', isDefault: true },
+                { id: 'acct-2', email: 'other@example.com', provider: 'gmail', authStatus: 'pending', isDefault: false },
+              ],
+              errors: [acct2Error],
+            }),
+          }),
+      },
+    },
+  });
+  await page.goto('/');
+  await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
+  await page.locator('#email-list .email-row').first().click();
+  await expect(page.locator('.calendar-card')).toBeVisible({ timeout: 10_000 });
+
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#account-error-details')).toContainText(AUTH_MSG);
+
+  await page.locator('#rsvp-accept').click();
+  await expect(page.locator('#rsvp-status-label')).toHaveText('You responded Accepted');
+  await expect(page.locator('#account-error-banner')).toBeVisible();
+  await expect(page.locator('#account-error-details')).toContainText(acct2Error.error);
+  await expect(page.locator('#account-error-details')).not.toContainText(AUTH_MSG);
+});
+
 test('yq92: a successful RSVP does NOT raise the account-error banner', async ({ page }) => {
   const email = inviteEmail({ method: 'REQUEST', summary: 'Sync' });
   await mockApi(page, {

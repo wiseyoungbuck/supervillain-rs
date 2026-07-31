@@ -815,9 +815,14 @@ async function loadAccounts() {
         // a still-unresolved line on any in-session refresh — e.g. clicking
         // [Authorize] on another account's line (roborev 447). Carry them
         // across, deduped against a server line now reporting the same
-        // problem; they retire on a successful RSVP for their account.
+        // problem; they retire on a successful RSVP for their account — or
+        // here, when the account itself is gone (deleting the account is a
+        // legitimate remediation; its line would otherwise be unfixable,
+        // roborev 448).
         const clientErrors = state.accountErrors.filter(e =>
-            e.source === 'client' && !serverErrors.some(s => s.account === e.account && s.error === e.error));
+            e.source === 'client'
+            && state.accounts.some(a => a.id === e.account)
+            && !serverErrors.some(s => s.account === e.account && s.error === e.error));
         state.accountErrors = serverErrors.concat(clientErrors);
         if (state.accountErrors.length > 0) {
             showAccountErrors(state.accountErrors);
@@ -6364,6 +6369,11 @@ async function rsvpToEvent(status) {
 
     const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     let prevEvent = null;
+    // The account this RSVP is for, captured before the await: api() binds the
+    // account at call time, so if the user switches accounts mid-flight the
+    // banner bookkeeping below must target THIS account, not whichever is
+    // current when the response lands (roborev 448).
+    const rsvpAccount = state.currentAccount;
     const listItem = state.emails.find(e => e.id === state.currentEmail.id);
     const prevInviteStatus = listItem?.inviteStatus;
     const prevInviteIsUpdated = listItem?.inviteIsUpdated;
@@ -6402,7 +6412,7 @@ async function rsvpToEvent(status) {
         // retire its client-sourced config lines (mirror of the server
         // retiring its pushed entries when the config is corrected).
         const remaining = state.accountErrors.filter(e =>
-            !(e.source === 'client' && e.account === state.currentAccount?.id));
+            !(e.source === 'client' && e.account === rsvpAccount?.id));
         if (remaining.length !== state.accountErrors.length) {
             state.accountErrors = remaining;
             if (remaining.length) showAccountErrors(remaining);
@@ -6431,10 +6441,10 @@ async function rsvpToEvent(status) {
         // accounts' still-unresolved banner lines (roborev 446).
         const calendarConfigError = err instanceof ApiError
             && (err.code === 'calendar_auth_unconfigured' || err.code === 'calendar_discovery_failed');
-        if (calendarConfigError && state.currentAccount) {
+        if (calendarConfigError && rsvpAccount) {
             const entry = {
-                account: state.currentAccount.id,
-                provider: state.currentAccount.provider,
+                account: rsvpAccount.id,
+                provider: rsvpAccount.provider,
                 error: err.message,
                 // Marks this as client-known-only, so loadAccounts' rebuild
                 // carries it and a later successful RSVP retires it.
