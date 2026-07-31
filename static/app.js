@@ -6410,8 +6410,11 @@ async function rsvpToEvent(status) {
             rsvpEmail.calendarEvent = result.calendarEvent;
             emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
             // Only repaint if the RSVP'd email is still the one on screen — a
-            // stale response must not overwrite another email's card.
-            if (state.currentEmail?.id === rsvpEmail.id) {
+            // stale response must not overwrite another email's card. Both
+            // clauses matter: email ids are only unique per account (the
+            // cacheKey rationale), so an id match alone could collide across
+            // a mid-flight account switch.
+            if (state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id) {
                 renderCalendarCard(result.calendarEvent);
             }
         }
@@ -6431,7 +6434,7 @@ async function rsvpToEvent(status) {
         if (prevEvent) {
             rsvpEmail.calendarEvent = prevEvent;
             emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
-            if (state.currentEmail?.id === rsvpEmail.id) {
+            if (state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id) {
                 renderCalendarCard(prevEvent);
             }
         }

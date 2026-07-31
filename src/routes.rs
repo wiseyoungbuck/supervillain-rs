@@ -9135,8 +9135,11 @@ white   = '#fdf6e3'
             "should update emailCache after RSVP (account-scoped key pinned to the pre-await account)"
         );
         assert!(
-            rsvp_fn.contains("state.currentEmail?.id === rsvpEmail.id"),
-            "should only repaint the card if the RSVP'd email is still on screen"
+            rsvp_fn.contains(
+                "state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id"
+            ),
+            "should only repaint the card if the RSVP'd email is still on screen \
+             (account-scoped: email ids are only unique per account)"
         );
     }
 
