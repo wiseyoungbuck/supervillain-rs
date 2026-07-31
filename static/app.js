@@ -6391,6 +6391,19 @@ async function rsvpToEvent(status) {
             listItem.inviteIsUpdated = prevInviteIsUpdated;
             renderEmailList();
         }
+        // A 400/503 from this route is a calendar-config problem the user must
+        // fix (m5yp: no app password; wybm: no discoverable calendar), not a
+        // transient hiccup — surface it in the persistent account-error banner,
+        // the same surface the server-side auto-add path pushes these to
+        // (surface_caldav_spawn_failure), so the actionable message outlives
+        // the 3s toast.
+        if (err instanceof ApiError && (err.status === 400 || err.status === 503) && state.currentAccount) {
+            showAccountErrors([{
+                account: state.currentAccount.id,
+                provider: state.currentAccount.provider,
+                error: err.message,
+            }]);
+        }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
     }
 }

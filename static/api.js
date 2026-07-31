@@ -29,6 +29,20 @@ class ApiAuthError extends ApiError {
     }
 }
 
+// The server wraps every error body as {"error": message} (src/error.rs
+// IntoResponse). Unwrap it so err.message is the human-facing message the UI
+// renders; fall back to the raw body for non-JSON errors (proxies, panics).
+async function errorMessage(resp) {
+    const text = await resp.text();
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.error === 'string') return parsed.error;
+    } catch {
+        // not JSON — fall through to the raw body
+    }
+    return text;
+}
+
 // makeApi(accountId) → async api(method, path, body, signal) bound to one
 // account. Pass a falsy accountId for an unscoped instance (global routes,
 // or before accounts are loaded). Make a new instance on account switch.
@@ -58,10 +72,10 @@ function makeApi(accountId) {
             throw new ApiError('Network error: ' + err.message);
         }
         if (resp.status === 401 || resp.status === 403) {
-            throw new ApiAuthError(await resp.text(), resp.status);
+            throw new ApiAuthError(await errorMessage(resp), resp.status);
         }
         if (!resp.ok) {
-            throw new ApiError(await resp.text(), resp.status);
+            throw new ApiError(await errorMessage(resp), resp.status);
         }
         if (resp.status === 204) return { data: null, headers: resp.headers };
         const text = await resp.text();

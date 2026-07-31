@@ -1596,6 +1596,13 @@ body:not(.light-theme) .compose-quote a * {
     margin-top: 4px;
 }
 
+/* renderCalendarCard toggles .hidden on the label; without this rule the
+   stale "You responded ..." text stayed visible after a failed-RSVP revert
+   (kata yq92). */
+.rsvp-status-label.hidden {
+    display: none;
+}
+
 /* Attachment card */
 #attachments.hidden {
     display: none;

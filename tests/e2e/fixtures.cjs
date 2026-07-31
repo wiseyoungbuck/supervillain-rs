@@ -64,7 +64,20 @@ const ONE_EMAIL_LIST = [
 // consumes). method drives the nt9e gate: 'REQUEST' shows RSVP buttons, anything
 // else hides them. Reuse for both the REQUEST and REPLY cases by overriding
 // calendarEvent.method per spec.
-function inviteEmail({ method, summary = 'Sync', emailId = 'e-cal' }) {
+//
+// Variants (kata yq92):
+//   isUpdate:   a rescheduled invite (incremented SEQUENCE). Mirrors the
+//               server: user_rsvp_status is reset to null and the list row
+//               carries inviteIsUpdated so the chip shows 'Updated'.
+//   userStatus: the user's existing RSVP (e.g. 'ACCEPTED' for an
+//               already-answered invite). Sets both user_rsvp_status and the
+//               'me' attendee's PARTSTAT, plus the list row's inviteStatus.
+//
+// The list-row invite fields (isInviteToMe/inviteMethod/inviteStatus/
+// inviteIsUpdated) mirror what list_emails emits (src/routes.rs) so the trbx
+// inbox chip renders from the same fixture.
+function inviteEmail({ method, summary = 'Sync', emailId = 'e-cal', isUpdate = false, userStatus = null }) {
+  const status = userStatus || 'NEEDS-ACTION';
   return {
     id: emailId,
     subject: 'Invite: ' + summary,
@@ -74,17 +87,27 @@ function inviteEmail({ method, summary = 'Sync', emailId = 'e-cal' }) {
     isUnread: false,
     preview: 'calendar invite',
     account: 'acct-1',
+    // Inbox-row chip fields (trbx). renderInviteChip gates on
+    // isInviteToMe && inviteMethod === 'REQUEST', matching the server's
+    // "an invite addressed to me" computation.
+    isInviteToMe: method === 'REQUEST',
+    inviteMethod: method,
+    inviteStatus: method === 'REQUEST' ? status : null,
+    inviteIsUpdated: isUpdate,
     calendarEvent: {
       method, // 'REQUEST' | 'REPLY' | 'CANCEL' | 'PUBLISH' | ...
       summary,
       dtstart: '2026-08-01T15:00:00Z',
       dtend: '2026-08-01T16:00:00Z',
       location: 'Zoom',
+      isUpdate,
       attendees: [
-        { email: 'me@example.com', name: 'Me', status: 'NEEDS-ACTION' },
+        { email: 'me@example.com', name: 'Me', status: isUpdate ? 'NEEDS-ACTION' : status },
         { email: 'org@example.com', name: 'Organizer', status: 'ACCEPTED' },
       ],
-      user_rsvp_status: method === 'REQUEST' ? 'NEEDS-ACTION' : null,
+      // The server resets the response on an update (the user must answer
+      // again); otherwise a REQUEST carries the user's current PARTSTAT.
+      user_rsvp_status: isUpdate ? null : (method === 'REQUEST' ? status : null),
     },
   };
 }
