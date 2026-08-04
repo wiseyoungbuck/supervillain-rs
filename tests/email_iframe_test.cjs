@@ -385,6 +385,44 @@ test('w5ba: the poll self-clears once its iframe leaves the DOM', () => {
     assert.equal(timers.liveIntervals(), 0, 'the poll must clearInterval itself on detach (w5ba)');
 });
 
+// roborev 461: sender CSS whose viewport-relative feedback EXCEEDS the
+// epsilon (min-height:110vh, big body margins) satisfies the poll's gate on
+// every tick. The consecutive-grow streak must stop the poll after a few
+// grows — a real stuck email catches up (a tick with h - cur < epsilon
+// resets the streak); a ratchet never does.
+test('roborev 461: the poll stops growing a supra-epsilon viewport ratchet after a short streak', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    // Feedback content: always 10% + 100px taller than whatever the iframe
+    // currently is — every poll tick sees h - cur >= 64, forever.
+    const iframe = { style: { height: '0px' }, isConnected: true };
+    const el = {
+        get scrollHeight() { return Math.round((parseFloat(iframe.style.height) || 100) * 1.1) + 100; },
+        getBoundingClientRect() { return { height: this.scrollHeight }; },
+    };
+    iframe.contentDocument = {
+        body: el,
+        documentElement: el,
+        fonts: { ready: new Promise(() => {}) },
+        querySelectorAll: () => [],
+    };
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    for (let i = 0; i < 3; i++) timers.tickIntervals(); // streak allowance
+    const settled = curH(iframe);
+    for (let i = 0; i < 10; i++) timers.tickIntervals(); // ratchet keeps trying
+    assert.equal(
+        curH(iframe),
+        settled,
+        'after the streak allowance the poll must stop feeding a viewport-relative ratchet (roborev 461)',
+    );
+});
+
 // ---------------------------------------------------------------------------
 // renderHtmlBodyIframe: first-open hold-then-reveal + reopen fast path (w5ba)
 // ---------------------------------------------------------------------------
@@ -552,6 +590,34 @@ test('roborev 457: a stale reveal must not clobber the next email\'s scroll posi
         container.scrollTop,
         7,
         'a replaced iframe\'s reveal must not write the container scrollTop (roborev 457)',
+    );
+});
+
+// roborev 461: the teardown path must actively stop the prior iframe's poll —
+// the isConnected self-clear is only the backstop for renders that bypass
+// renderHtmlBodyIframe.
+test('roborev 461: rendering over an old iframe clears its safety-net poll', () => {
+    const timers = fakeTimers();
+    const iframeEl = makeIframeEl();
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: () => {},
+    });
+
+    // A previously-rendered iframe with a live poll sits in the container.
+    const old = makeIframeEl();
+    old.className = 'email-iframe';
+    old._pollTimer = timers.setInterval(() => {});
+    container.appendChild(old);
+    assert.equal(timers.liveIntervals(), 1);
+
+    render(container, '<p>next</p>', {});
+    assert.equal(
+        timers.liveIntervals(),
+        0,
+        'renderHtmlBodyIframe must clearInterval the prior iframe\'s poll on teardown (roborev 461)',
     );
 });
 

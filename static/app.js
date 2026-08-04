@@ -6194,7 +6194,22 @@ function sizeIframeToContent(iframe) {
                 EMAIL_IFRAME_MAX_HEIGHT
             );
             const cur = parseFloat(iframe.style.height) || 0;
-            if (h - cur >= EMAIL_IFRAME_RATCHET_EPSILON) grow();
+            if (h - cur >= EMAIL_IFRAME_RATCHET_EPSILON) {
+                // Consecutive-grow suppression (roborev 461, mirrors the
+                // observer path's streak): sender CSS whose viewport-relative
+                // feedback EXCEEDS the epsilon (min-height:110vh, big body
+                // margins) satisfies the gate on every tick — our own write
+                // raises the viewport and the content follows. A real stuck
+                // email needs a grow or two and then catches up (the next
+                // tick sees h - cur < epsilon, resetting the streak); a
+                // ratchet never catches up. Cap the streak so the poll can't
+                // relayout every 500ms all the way to EMAIL_IFRAME_MAX_HEIGHT.
+                iframe._pollGrowStreak = (iframe._pollGrowStreak || 0) + 1;
+                if (iframe._pollGrowStreak > 3) return;
+                grow();
+            } else {
+                iframe._pollGrowStreak = 0;
+            }
         } catch (_) { /* allow-same-origin should always succeed */ }
     };
     try {

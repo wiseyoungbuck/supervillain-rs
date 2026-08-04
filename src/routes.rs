@@ -8183,6 +8183,13 @@ white   = '#fdf6e3'
             block.contains("h - cur >= EMAIL_IFRAME_RATCHET_EPSILON"),
             "the poll must gate on the ratchet epsilon so viewport-relative sender CSS (min-height:100vh) can't self-feed at poll cadence (w5ba)"
         );
+        // Supra-epsilon ratchets (min-height:110vh, big body margins) satisfy
+        // the gate on every tick — the consecutive-grow streak is what bounds
+        // them (roborev 461).
+        assert!(
+            block.contains("_pollGrowStreak"),
+            "the poll must suppress consecutive grows (_pollGrowStreak) — supra-epsilon viewport feedback passes the epsilon gate on every tick (roborev 461)"
+        );
         assert!(
             block.contains("if (!iframe.isConnected)")
                 && block.contains("clearInterval(iframe._pollTimer)"),
