@@ -81,6 +81,14 @@ const state = {
 const emailCache = {};
 // Scroll position cache: email id -> scrollTop
 const scrollPositions = {};
+// Settled iframe height cache: email id -> last height sizeIframeToContent
+// wrote (kata w5ba). Reopening a previously-viewed email pre-sizes the iframe
+// to this height BEFORE the srcdoc parses, so the body paints full-height
+// immediately — no hold, no top-inch flash, instant scroll-position restore.
+// Session-only and account-scoped via cacheKey(), like scrollPositions. May be
+// stale after a pane resize; the sizing machinery still runs on load and
+// corrects drift.
+const iframeHeightCache = {};
 
 // Rolling email cache
 const CACHE_LIMIT = 150;
@@ -1226,6 +1234,10 @@ async function loadEmails() {
             renderEmailList();
             harvestContacts(emails, state.currentAccount?.id);
         }
+        // Warm bodies for the on-screen rows (even when the repaint was
+        // skipped — a poll tick may have surfaced new uncached emails, and
+        // when everything is already cached this is a cheap no-op).
+        prefetchVisibleEmails();
 
         if (headers.get('x-supervillain-stale') === '1') {
             scheduleStaleRevalidate(context);
@@ -1261,6 +1273,7 @@ async function maybeRefillEmails() {
             splitListCache[context] = [...state.emails];
             renderEmailList();
             harvestContacts(newEmails, state.currentAccount?.id);
+            prefetchVisibleEmails();
         }
     } catch (err) {
         console.warn('Refill failed:', err);
@@ -1618,6 +1631,38 @@ function prefetchAdjacentEmails() {
                 .catch(() => {}); // Swallow — prefetch is best-effort
         }
     }
+}
+
+// Warm the body cache for the rows on screen so the FIRST open of any visible
+// email is instant too (kata w5ba: "opening an email should be cached and open
+// instantly"). Complements prefetchAdjacentEmails, which warms the
+// archive-walk path from the currently OPEN email — this one runs off the
+// list render, before anything is open. Fire-and-forget with a small worker
+// pool; mark_read=false so background warm-up never silently consumes unread
+// state (roborev 302, fix 2). A generation counter drops in-flight loops on
+// account/mailbox switch; keys are captured at schedule time so even a
+// late-landing response files under the account it was fetched for.
+const PREFETCH_VISIBLE_LIMIT = 20;
+const PREFETCH_VISIBLE_CONCURRENCY = 3;
+let prefetchVisibleGen = 0;
+function prefetchVisibleEmails() {
+    const gen = ++prefetchVisibleGen;
+    const targets = visibleRows()
+        .slice(0, PREFETCH_VISIBLE_LIMIT)
+        .map(r => ({ id: r.emailId, key: cacheKey(r.emailId) }))
+        .filter(t => !emailCache[t.key]);
+    if (!targets.length) return;
+    let next = 0;
+    const worker = async () => {
+        while (next < targets.length && gen === prefetchVisibleGen) {
+            const t = targets[next++];
+            if (emailCache[t.key]) continue; // opened for real while queued
+            try {
+                emailCache[t.key] = await api('GET', `/emails/${t.id}?mark_read=false`);
+            } catch (_) { /* Swallow — prefetch is best-effort */ }
+        }
+    };
+    for (let i = 0; i < PREFETCH_VISIBLE_CONCURRENCY; i++) worker();
 }
 
 async function emailAction(type, emailId) {
@@ -2273,8 +2318,15 @@ function renderEmailDetail() {
         // Pass the saved scroll position so the iframe's load handler can
         // restore it once the iframe is sized and the parent pane is
         // scrollable (the parent can't scroll until the iframe has height).
+        // knownHeight pre-sizes the iframe from the last open's settled
+        // height (instant full-height reopen, no hold); onHeight keeps that
+        // cache tracking the latest settled height (kata w5ba).
         const key = cacheKey(e.id);
-        renderHtmlBodyIframe(els.emailBody, e.htmlBody, { scrollTop: scrollPositions[key] || 0 });
+        renderHtmlBodyIframe(els.emailBody, e.htmlBody, {
+            scrollTop: scrollPositions[key] || 0,
+            knownHeight: iframeHeightCache[key] || 0,
+            onHeight: (h) => { iframeHeightCache[key] = h; },
+        });
         els.emailBody.classList.add('html-content');
     } else {
         els.emailBody.innerHTML = linkifyText(e.textBody || '(no content)');
@@ -5113,6 +5165,7 @@ function renderComposeQuote(headerHtml, quotedHtml, quotedText) {
 function renderHtmlBodyIframe(container, html, opts) {
     const autosize = !!(opts && opts.autosize);
     const scrollTop = (opts && opts.scrollTop) || 0;
+    const knownHeight = (opts && opts.knownHeight) || 0;
     // Disconnect a prior iframe's ResizeObserver so it can't pin the previous
     // email's DOM in memory across navigations.
     const oldIframe = container.querySelector('iframe.email-iframe');
@@ -5128,13 +5181,62 @@ function renderHtmlBodyIframe(container, html, opts) {
         autosize ? 'allow-same-origin' : 'allow-same-origin allow-popups allow-popups-to-escape-sandbox'
     );
     iframe.className = 'email-iframe';
-    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
-    iframe.addEventListener('load', () => {
-        sizeIframeToContent(iframe);
+    iframe._onHeight = (opts && opts.onHeight) || null;
+    // Reopen fast path (kata w5ba): the settled height from the last open of
+    // this email is known, so pre-size the iframe before the srcdoc even
+    // parses and paint immediately — no hold, no top-inch flash. The sizing
+    // machinery still runs on load and corrects any drift (pane resized since
+    // the last open, late images).
+    if (knownHeight > 0) iframe.style.height = knownHeight + 'px';
+    // Hold-then-reveal (kata w5ba/ceph): on a FIRST open the load-time layout
+    // is incomplete (dimensionless images, web fonts, large tables), so an
+    // immediately-visible iframe paints the "top inch" and then visibly grows.
+    // Keep the iframe invisible until layout settles, then reveal full-height.
+    // visibility:hidden (via .settling) keeps layout running, so every
+    // measurement cue in sizeIframeToContent works while hidden. Reveal fires
+    // on fonts.ready + one frame (the post-font-reflow measure has applied —
+    // the common case, well under 100ms) with a hard time cap so a slow font
+    // fetch or a never-firing load can't hold the body hostage. The cap is
+    // armed at CREATION, not at load, so the iframe can never be stranded
+    // invisible.
+    const hold = !autosize && !(knownHeight > 0);
+    const reveal = () => {
+        if (iframe._revealed) return;
+        iframe._revealed = true;
+        iframe.classList.remove('settling');
         // Restore the saved scroll position now that the iframe is sized and
         // the parent pane is scrollable. Compose-quote (autosize) sits in a
         // non-scrolling host, so there is nothing to restore.
         if (!autosize) container.scrollTop = scrollTop;
+    };
+    if (hold) {
+        iframe.classList.add('settling');
+        setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS);
+    }
+    iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
+    iframe.addEventListener('load', () => {
+        // Firefox-family browsers (Zen; kata w5ba) can fire an extra load
+        // event for the iframe's initial about:blank document before the
+        // srcdoc one. Sizing that blank document is useless, and (worse) it
+        // used to latch the one-shot ResizeObserver attach onto the blank
+        // body, leaving the real email body unobserved. wrapEmailHtml always
+        // injects <base>, so its absence identifies the blank document —
+        // skip it; the srcdoc navigation fires its own load next.
+        try {
+            const doc = iframe.contentDocument;
+            if (!doc || !doc.querySelector('base')) return;
+        } catch (_) { /* allow-same-origin should always succeed */ }
+        sizeIframeToContent(iframe);
+        if (hold) {
+            // Early reveal: fonts settled + one frame for the reflow measure.
+            // The creation-time cap above still bounds the total hold.
+            try {
+                const fonts = iframe.contentDocument?.fonts;
+                if (fonts?.ready) fonts.ready.then(() => requestAnimationFrame(reveal));
+            } catch (_) { /* allow-same-origin should always succeed */ }
+        } else {
+            reveal();
+        }
     });
     container.appendChild(iframe);
 }
@@ -5182,6 +5284,10 @@ function renderHtmlBodyIframe(container, html, opts) {
 // growing from observer-driven cues (roborev on ceph).
 const EMAIL_IFRAME_MAX_HEIGHT = 200_000;
 const EMAIL_IFRAME_RATCHET_EPSILON = 64; // ~wrapper padding; smaller grows are noise
+// Hard cap on the first-open hold (renderHtmlBodyIframe's .settling state):
+// long enough for parse + first layout + the typical font swap, short enough
+// that a slow font fetch never reads as a hung open.
+const EMAIL_IFRAME_REVEAL_CAP_MS = 300;
 
 function sizeIframeToContent(iframe) {
     // `canShrink` distinguishes the load burst (only-grow — a stale small read
@@ -5200,6 +5306,13 @@ function sizeIframeToContent(iframe) {
     //     100vh sender CSS) self-sustains ONLY on this recurring path, growing
     //     ~48px per tick to the cap. Suppress after N consecutive sub-epsilon
     //     grows; any real grow (>= epsilon) or any shrink resets the count.
+    // Every height write funnels through here so the caller can track the
+    // latest settled height (renderHtmlBodyIframe's opts.onHeight feeds the
+    // reopen fast path's iframeHeightCache; kata w5ba).
+    const setHeight = (h) => {
+        iframe.style.height = h + 'px';
+        if (iframe._onHeight) iframe._onHeight(h);
+    };
     const measure = (mode) => () => {
         try {
             const doc = iframe.contentDocument;
@@ -5339,7 +5452,7 @@ function sizeIframeToContent(iframe) {
                     }
                     iframe._pendingShrink = undefined;
                     iframe._smallGrowStreak = 0;
-                    iframe.style.height = h + 'px';
+                    setHeight(h);
                 } else {
                     // Grow on a settled path — clears any pending shrink (the
                     // content grew, the earlier smaller read was transient) and
@@ -5400,7 +5513,7 @@ function sizeIframeToContent(iframe) {
                     } else {
                         iframe._smallGrowStreak = 0;
                     }
-                    iframe.style.height = h + 'px';
+                    setHeight(h);
                 }
             } else if (h > cur) {
                 // Burst: only-grow, no epsilon guard (a genuine small
@@ -5414,7 +5527,7 @@ function sizeIframeToContent(iframe) {
                 // for the life of the view (roborev 390).
                 iframe._shrinkStreak = 0;
                 iframe._shrinkEscapeCount = 0;
-                iframe.style.height = h + 'px';
+                setHeight(h);
             }
         } catch (_) { /* allow-same-origin should always succeed */ }
     };
@@ -5436,19 +5549,26 @@ function sizeIframeToContent(iframe) {
     // Ongoing re-measure for images loading after open. Recurring settled cue:
     // shrink-capable, grow with consecutive-small suppression (the ratchet
     // defense). Assign _ro BEFORE observe() so a thrown observer is still
-    // disconnectable; attach is effectively one-shot from the load handler, so
-    // if body is null here ongoing tracking is lost for this open (rare — body
-    // exists at load in practice) (roborev on ceph).
-    if (!iframe._sized) {
-        try {
-            const body = iframe.contentDocument && iframe.contentDocument.body;
-            if (!body) return;
+    // disconnectable. Attach is tracked PER DOCUMENT (_sizedDoc), not per
+    // iframe: Firefox-family browsers can fire an extra load for the initial
+    // about:blank document before the srcdoc one, and a one-shot boolean
+    // latched on that first load left the observer watching the blank body
+    // forever — the real email body was never observed, killing the observer
+    // path in Zen (kata w5ba). renderHtmlBodyIframe now skips the blank-doc
+    // load outright; this per-document re-attach is the belt-and-braces layer
+    // so a second call for a NEW document always rewires the observer.
+    try {
+        const doc = iframe.contentDocument;
+        const body = doc && doc.body;
+        if (!body) return;
+        if (iframe._sizedDoc !== doc) {
+            if (iframe._ro) iframe._ro.disconnect();
             const ro = new ResizeObserver(observerFn);
             iframe._ro = ro;
             ro.observe(body);
-            iframe._sized = true;
-        } catch (_) { /* allow-same-origin should always succeed */ }
-    }
+            iframe._sizedDoc = doc;
+        }
+    } catch (_) { /* allow-same-origin should always succeed */ }
     // ceph remaining gap: a late-loading image (no explicit dimensions) grows
     // body.scrollHeight but, under height-pinned sender CSS (html,body{height:
     // 100%} — common in email templates), does NOT change body's border-box, so
@@ -5465,6 +5585,9 @@ function sizeIframeToContent(iframe) {
         if (idoc && idoc.querySelectorAll) {
             const imgs = idoc.querySelectorAll('img');
             if (imgs && imgs.length) {
+                // A second call for a new document (per-document re-attach
+                // above) must not leak the previous document's listeners.
+                if (iframe._imgLoadAc) iframe._imgLoadAc.abort();
                 const ac = new AbortController();
                 iframe._imgLoadAc = ac;
                 imgs.forEach((img) => {

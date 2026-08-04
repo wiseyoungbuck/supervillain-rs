@@ -179,6 +179,236 @@ test('ceph: late image grows the iframe to full height even when body border-box
     );
 });
 
+// w5ba: sizeIframeToContent may run more than once for the SAME iframe with
+// DIFFERENT documents — Firefox-family browsers (Zen) can fire an extra load
+// for the initial about:blank document before the srcdoc one. The
+// ResizeObserver attach must be per-DOCUMENT, not a one-shot per-iframe
+// boolean: latched on the blank document, the observer watches a dead body
+// forever and the real email body is never observed (the "stuck partial"
+// symptom persisting after the ceph fixes).
+test('w5ba: a second call with a new document re-attaches the ResizeObserver to the new body', () => {
+    const timers = fakeTimers();
+    const roInstances = [];
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver(roInstances),
+    });
+
+    const mkDoc = (h) => {
+        const el = {
+            get scrollHeight() { return h.value; },
+            getBoundingClientRect: () => ({ height: h.value }),
+        };
+        return {
+            body: el,
+            documentElement: el,
+            fonts: { ready: new Promise(() => {}) },
+            querySelectorAll: () => [],
+        };
+    };
+
+    const iframe = { style: { height: '0px' } };
+    const hA = { value: 50 };
+    iframe.contentDocument = mkDoc(hA); // the about:blank-era document
+    sizeIframeToContent(iframe);
+    timers.flush();
+    assert.equal(curH(iframe), 50);
+
+    // The real srcdoc document replaces the blank one; the browser fires a
+    // second load and sizeIframeToContent runs again for the same iframe.
+    const hB = { value: 120 };
+    iframe.contentDocument = mkDoc(hB);
+    sizeIframeToContent(iframe);
+    timers.flush();
+    assert.equal(curH(iframe), 120);
+
+    // Late content grows the REAL document's body. Only an observer attached
+    // to the new body can see this — the old `_sized` boolean left the RO on
+    // the blank body and the iframe stayed clipped at 120.
+    hB.value = 900;
+    for (const ro of roInstances) ro.tick();
+    timers.flush();
+    assert.equal(
+        curH(iframe),
+        900,
+        'the ResizeObserver must follow the current document — a one-shot per-iframe attach strands it on the about:blank body (w5ba)',
+    );
+});
+
+// w5ba: every height write must be reported through iframe._onHeight so the
+// caller can cache the settled height (the reopen fast path pre-sizes the
+// iframe from it).
+test('w5ba: height writes report through iframe._onHeight for the reopen height cache', () => {
+    const timers = fakeTimers();
+    const roInstances = [];
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver(roInstances),
+    });
+
+    const img = makeImg();
+    const { iframe, state } = makeMockIframe({
+        partialHeight: 120,
+        fullHeight: 1200,
+        imgs: [img],
+        bodyBorderBox: 'pinned',
+    });
+    const reported = [];
+    iframe._onHeight = (h) => reported.push(h);
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    state.imageLoaded = true;
+    img.fire('load');
+    timers.flush();
+
+    assert.equal(curH(iframe), 1200);
+    assert.equal(
+        reported[reported.length - 1],
+        1200,
+        'the final height write must be reported via _onHeight so the reopen cache tracks the settled height (w5ba)',
+    );
+});
+
+// ---------------------------------------------------------------------------
+// renderHtmlBodyIframe: first-open hold-then-reveal + reopen fast path (w5ba)
+// ---------------------------------------------------------------------------
+
+function extractRenderHtmlBodyIframe(src) {
+    const fnStart = src.indexOf('function renderHtmlBodyIframe');
+    assert.notStrictEqual(fnStart, -1, 'function renderHtmlBodyIframe must exist in app.js');
+    const close = src.indexOf('\n}', fnStart);
+    assert.notStrictEqual(close, -1, 'renderHtmlBodyIframe must close with a column-0 brace');
+    return src.slice(fnStart, close + 2);
+}
+
+// Load the real renderHtmlBodyIframe with faked collaborators. wrapEmailHtml/
+// linkifyHtml become identity — the srcdoc string is not under test here.
+function loadRenderHtmlBodyIframe({ document, setTimeout, requestAnimationFrame, sizeIframeToContent }) {
+    const code = extractRenderHtmlBodyIframe(APP_JS);
+    // eslint-disable-next-line no-new-func
+    return new Function(
+        'document', 'setTimeout', 'requestAnimationFrame', 'sizeIframeToContent',
+        'wrapEmailHtml', 'linkifyHtml', 'EMAIL_IFRAME_REVEAL_CAP_MS',
+        code + '\nreturn renderHtmlBodyIframe;',
+    )(document, setTimeout, requestAnimationFrame, sizeIframeToContent, (h) => h, (h) => h, 300);
+}
+
+function makeIframeEl() {
+    const classes = new Set();
+    const listeners = {};
+    return {
+        style: {},
+        classList: {
+            add: (c) => classes.add(c),
+            remove: (c) => classes.delete(c),
+            contains: (c) => classes.has(c),
+        },
+        setAttribute() {},
+        addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
+        fire(type) { for (const fn of listeners[type] || []) fn(); },
+        contentDocument: null,
+    };
+}
+
+function makeContainer() {
+    return { scrollTop: -1, querySelector: () => null, replaceChildren() {}, appendChild() {} };
+}
+
+const realDoc = (fontsReady) => ({
+    querySelector: (sel) => (sel === 'base' ? {} : null), // wrapEmailHtml injects <base>
+    fonts: { ready: fontsReady },
+});
+
+test('w5ba: first open holds the iframe hidden (.settling) and reveals after fonts settle', async () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const iframeEl = makeIframeEl();
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>hi</p>', { scrollTop: 42 });
+    assert.ok(iframeEl.classList.contains('settling'), 'first open must start hidden');
+
+    iframeEl.contentDocument = realDoc(Promise.resolve());
+    iframeEl.fire('load');
+    assert.equal(sized.length, 1, 'load must run the sizing machinery');
+    assert.ok(iframeEl.classList.contains('settling'), 'still held until fonts settle + a frame');
+
+    await new Promise((r) => setImmediate(r)); // fonts.ready.then(...)
+    timers.flush(); // the rAF reveal
+    assert.ok(!iframeEl.classList.contains('settling'), 'must reveal after fonts.ready + one frame');
+    assert.equal(container.scrollTop, 42, 'scroll position restores at reveal');
+});
+
+test('w5ba: the reveal cap is armed at creation — the iframe can never be stranded invisible', () => {
+    const timers = fakeTimers();
+    const iframeEl = makeIframeEl();
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: () => {},
+    });
+
+    render(container, '<p>hi</p>', {});
+    assert.ok(iframeEl.classList.contains('settling'));
+    // No load event ever fires (pathological). The creation-time cap alone
+    // must still reveal the iframe.
+    timers.flush();
+    assert.ok(
+        !iframeEl.classList.contains('settling'),
+        'the time cap must reveal even if load never fires (w5ba)',
+    );
+});
+
+test('w5ba: a load for a document without the wrapper <base> (Firefox about:blank) is skipped', () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const iframeEl = makeIframeEl();
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>hi</p>', {});
+    // Firefox fires an early load for the initial about:blank document — no
+    // <base>, so it must be ignored (sizing it latches state on a dead doc).
+    iframeEl.contentDocument = { querySelector: () => null, fonts: { ready: new Promise(() => {}) } };
+    iframeEl.fire('load');
+    assert.equal(sized.length, 0, 'the about:blank load must not run the sizing machinery');
+
+    // The real srcdoc load follows and must size normally.
+    iframeEl.contentDocument = realDoc(new Promise(() => {}));
+    iframeEl.fire('load');
+    assert.equal(sized.length, 1, 'the srcdoc load must run the sizing machinery');
+});
+
+test('w5ba: reopen with a known height pre-sizes the iframe and paints immediately (no hold)', () => {
+    const timers = fakeTimers();
+    const iframeEl = makeIframeEl();
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: () => {},
+    });
+
+    render(container, '<p>hi</p>', { scrollTop: 7, knownHeight: 555 });
+    assert.equal(iframeEl.style.height, '555px', 'reopen must pre-size the iframe before the srcdoc parses');
+    assert.ok(!iframeEl.classList.contains('settling'), 'reopen must not hold — instant paint');
+
+    iframeEl.contentDocument = realDoc(new Promise(() => {}));
+    iframeEl.fire('load');
+    assert.equal(container.scrollTop, 7, 'scroll position restores on load without waiting for fonts');
+});
+
 // Harness sanity + non-regression: when the body border-box is NOT pinned
 // (body{height:auto}), the existing ResizeObserver path already grows the
 // iframe — WITHOUT needing the image-load listener. This confirms the mock
