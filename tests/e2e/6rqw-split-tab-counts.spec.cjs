@@ -36,8 +36,9 @@ test('kata 6rqw: account with splits shows the tab bar with a count badge per ta
   await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
 
   await expect(page.locator('#split-tabs')).toBeVisible();
-  // "All" first, then one tab per configured split.
-  await expect(page.locator('#split-tabs .split-tab')).toHaveCount(3);
+  // "All" first, then one tab per configured split — order pinned because
+  // renderSplitTabs binds Ctrl+1/2/3 by index (roborev 454).
+  await expect(page.locator('#split-tabs .split-tab .split-name')).toHaveText(['All', 'Work', 'News']);
   await expect(tabNamed(page, 'All').locator('.split-count')).toHaveText('42');
   await expect(tabNamed(page, 'Work').locator('.split-count')).toHaveText('7');
   await expect(tabNamed(page, 'News').locator('.split-count')).toHaveText('3');

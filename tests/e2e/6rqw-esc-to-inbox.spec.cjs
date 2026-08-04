@@ -29,8 +29,10 @@ const HTML_EMAIL = {
 };
 
 // Boot, open the one email, and wait until the detail view is the active one.
+// (The **/api/emails/* mock resolves single-email GETs from `emails` by id —
+// no emailById override needed.)
 async function openEmail(page) {
-  await mockApi(page, { emails: [HTML_EMAIL], extra: { emailById: { [HTML_EMAIL.id]: HTML_EMAIL } } });
+  await mockApi(page, { emails: [HTML_EMAIL] });
   await page.goto('/');
   await expect(page.locator('#email-list .email-row')).toHaveCount(1, { timeout: 10_000 });
   await page.locator('#email-list .email-row').first().click();
@@ -48,19 +50,39 @@ test('kata 6rqw: Escape in the detail view returns to the inbox list', async ({ 
 });
 
 test('kata 6rqw: Escape still returns to the list after clicking into the email-body iframe', async ({ page }) => {
+  // Count parent-window blur events so the test can prove focus actually
+  // LEFT the parent for the iframe before asserting the bounce brought it
+  // back. Without this, a future change that stops clicks from focusing the
+  // iframe at all would leave the not-iframe wait below trivially satisfied
+  // and silently degrade this test into a copy of the basic one
+  // (roborev 454).
+  await page.addInitScript(() => {
+    window.__blurCount = 0;
+    window.addEventListener('blur', () => { window.__blurCount += 1; });
+  });
   await openEmail(page);
 
   // The real sandboxed iframe must be there — clicking it is the whole point.
   const iframe = page.locator('#email-detail-view iframe.email-iframe');
   await expect(iframe).toBeVisible();
+  // Snapshot before the click: rendering the detail view can itself steal
+  // focus into the iframe (and fire a blur), so pin the CLICK's steal by
+  // requiring the counter to advance past this point.
+  const blursBeforeClick = await page.evaluate(() => window.__blurCount);
   await iframe.click();
 
-  // The click moves focus into the cross-origin iframe; the window-blur
-  // focus-bounce (setTimeout 0) must hand it back to the parent document,
-  // otherwise the keydown below dies inside the iframe and never reaches
-  // handleKeyDown. Wait for the bounce to land rather than racing it — if
-  // the bounce is broken, this times out and the test goes RED here, naming
-  // the actual failure instead of a generic "list never appeared".
+  // The click moves focus into the cross-origin iframe (window blur fires —
+  // asserted via the counter); the window-blur focus-bounce (setTimeout 0)
+  // must hand it back to the parent document, otherwise the keydown below
+  // dies inside the iframe and never reaches handleKeyDown. Wait for the
+  // bounce to land rather than racing it — if the bounce is broken, this
+  // times out and the test goes RED here, naming the actual failure instead
+  // of a generic "list never appeared".
+  await page.waitForFunction(
+    (prev) => window.__blurCount > prev,
+    blursBeforeClick,
+    { timeout: 5_000 },
+  );
   await page.waitForFunction(
     () => !document.activeElement?.classList?.contains('email-iframe'),
     undefined,
