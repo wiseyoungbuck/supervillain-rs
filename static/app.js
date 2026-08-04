@@ -5864,6 +5864,7 @@ function renderHtmlBodyIframe(container, html, opts) {
     // "this iframe was replaced", and keeps the poll alive even if the
     // container itself is briefly detached (isConnected is transitive and
     // would silently revert that render to load-only initialization).
+    let pollTicks = 0;
     const initWhenParsed = () => {
         if (!container.contains(iframe)) return; // replaced / navigated away — stop
         let parsed = false;
@@ -5872,8 +5873,20 @@ function renderHtmlBodyIframe(container, html, opts) {
             parsed = !!(doc && doc.body && doc.readyState !== 'loading'
                 && doc.querySelector('base'));
         } catch (_) { /* allow-same-origin should always succeed */ }
-        if (parsed) onDocReady();
-        else requestAnimationFrame(initWhenParsed);
+        if (parsed) {
+            onDocReady();
+            return;
+        }
+        // Lifetime cap (roborev 467): if the CONTAINER itself is torn down
+        // with the iframe still inside (compose-quote teardown replaces the
+        // quote host's children), contains() stays true forever while the
+        // discarded browsing context keeps contentDocument null — without a
+        // terminating condition this becomes an immortal per-frame loop. A
+        // srcdoc document parses within a few frames; ~300 (≈5s) is far past
+        // any real navigation, and after the cap the load listener remains
+        // as the (degraded, pre-round-3) initialization path.
+        if (++pollTicks > 300) return;
+        requestAnimationFrame(initWhenParsed);
     };
     requestAnimationFrame(initWhenParsed);
 }

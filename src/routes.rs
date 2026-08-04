@@ -8268,6 +8268,10 @@ white   = '#fdf6e3'
             render.contains("if (!container.contains(iframe)) return;"),
             "the readyState poll must die when the iframe is replaced (same predicate as reveal; container.contains survives a briefly-detached container) — it must not accumulate across navigations (w5ba round 3, roborev 466)"
         );
+        assert!(
+            render.contains("if (++pollTicks > 300) return;"),
+            "the readyState poll must have a lifetime cap — a container torn down with its iframe inside keeps contains() true forever and would make the rAF loop immortal (roborev 467)"
+        );
     }
 
     // w5ba: "when an email opens it should be cached and open instantly."

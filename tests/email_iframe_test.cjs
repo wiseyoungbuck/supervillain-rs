@@ -129,6 +129,7 @@ function fakeTimers() {
         tickIntervals: () => { for (const fn of [...intervals]) if (fn) fn(); },
         liveIntervals: () => intervals.filter(Boolean).length,
         pending: () => queue.filter(Boolean).length,
+        pendingRafs: () => rafs.filter(Boolean).length,
         // One frame: runs only the rAFs queued at entry — a self-re-arming
         // rAF (initWhenParsed) queues into the NEXT frame instead of hanging
         // the drain loop (roborev 466).
@@ -877,6 +878,67 @@ test('roborev 466: the readyState poll re-arms across frames until the document 
     assert.equal(sized.length, 1, 'the frame after parsing completes must initialize (roborev 466)');
     timers.tickRafs();
     assert.equal(sized.length, 1, 'the poll is one-shot — no re-initialization on later frames');
+});
+
+// roborev 467: the poll-death path — a second render replaces the iframe, and
+// the old parse-poll's next tick must return without re-arming.
+test('roborev 467: a replaced iframe\'s parse-poll dies and never sizes the old iframe', () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const els = [makeIframeEl(), makeIframeEl()];
+    els[0].contentDocument = {
+        readyState: 'loading', // still parsing when the user navigates away
+        body: {},
+        querySelector: (sel) => (sel === 'base' ? {} : null),
+        fonts: { ready: new Promise(() => {}) },
+    };
+    els[1].contentDocument = {
+        readyState: 'interactive',
+        body: {},
+        querySelector: (sel) => (sel === 'base' ? {} : null),
+        fonts: { ready: new Promise(() => {}) },
+    };
+    let n = 0;
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => els[n++] },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>A</p>', {});
+    timers.tickRafs(); // A's poll: still loading — re-arms
+    render(container, '<p>B</p>', {}); // replaceChildren removes A
+    els[0].contentDocument.readyState = 'interactive'; // A finishes parsing too late
+    for (let i = 0; i < 5; i++) timers.tickRafs();
+    assert.ok(!sized.includes(els[0]), 'the replaced iframe must never be sized (roborev 467)');
+    assert.ok(sized.includes(els[1]), 'the current iframe initializes normally');
+    assert.equal(timers.pendingRafs(), 0, 'the old poll must stop re-arming — rAF queue quiescent');
+});
+
+// roborev 467: the immortal-poll backstop — a container torn down WITH the
+// iframe still inside keeps contains() true forever while the discarded
+// browsing context keeps contentDocument null; the lifetime cap must
+// eventually stop the loop.
+test('roborev 467: the parse-poll\'s lifetime cap stops an orphaned container\'s loop', () => {
+    const timers = fakeTimers();
+    const iframeEl = makeIframeEl(); // contentDocument stays null — discarded context
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: () => {},
+    });
+
+    render(container, '<p>quote</p>', { autosize: true });
+    // The container is detached with the iframe still a child: contains()
+    // stays true, the document never appears. The cap must end the loop.
+    for (let i = 0; i < 310; i++) timers.tickRafs();
+    assert.equal(
+        timers.pendingRafs(),
+        0,
+        'the parse-poll must not re-arm forever when its container is orphaned (roborev 467)',
+    );
 });
 
 // roborev 466: "load stays as an idempotent re-measure" — after the parse
