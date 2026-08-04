@@ -329,10 +329,12 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
     // surface plain fg text is painted on. Candidates blend fg toward BOTH
     // poles (a failing surface can sit on the opposite side of bg's luminance
     // — dark bg with a light bg-secondary needs a repair toward black),
-    // least-changed candidate first, preferring the pole opposite bg. Only a
-    // candidate clearing EVERY floor is applied: a partial improvement would
-    // churn the theme's fg without making it readable, so a palette whose
-    // floors no blend candidate can satisfy keeps its own fg.
+    // least-changed candidate first, preferring the pole opposite bg.
+    // Tiered: (1) a candidate clearing EVERY floor; (2) when the floors are
+    // jointly unsatisfiable AND fg fails even on --bg — the dominant surface,
+    // where body text lives — the candidate that clears the primary floor
+    // with the best worst-secondary contrast; (3) otherwise keep the theme's
+    // own fg (a partial improvement that fixes nothing fully is just churn).
     let mut fg = fg0;
     {
         let surfaces = [
@@ -348,10 +350,21 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
             } else {
                 [black, white]
             };
-            let repaired = [0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0]
+            let candidates: Vec<[u8; 3]> = [0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0]
                 .iter()
                 .flat_map(|&t| poles.iter().map(move |&p| mix(fg0, p, t)))
-                .find(|&c| ok(c));
+                .collect();
+            let repaired = candidates.iter().copied().find(|&c| ok(c)).or_else(|| {
+                if contrast(fg0, bg) >= MIN_FG {
+                    return None;
+                }
+                let worst_secondary = |c: [u8; 3]| contrast(c, bg2).min(contrast(c, bg3));
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|&c| contrast(c, bg) >= MIN_FG)
+                    .max_by(|a, b| worst_secondary(*a).total_cmp(&worst_secondary(*b)))
+            });
             if let Some(repaired) = repaired {
                 fg = repaired;
                 colors.insert("fg".into(), fg);
@@ -1289,6 +1302,27 @@ palette = 15=#d3c6aa
         let fg = css_var(&out, "fg");
         assert!(contrast(fg, [0x00, 0x00, 0x00]) >= MIN_FG);
         assert!(contrast(fg, [0xe0, 0xe0, 0xe0]) >= MIN_FG_SECONDARY);
+    }
+
+    #[test]
+    fn sanitize_prioritizes_primary_surface_when_floors_unsatisfiable() {
+        // Mid-gray bg with fg == bg and a black bg-secondary: no candidate
+        // clears every floor (readable-on-mid-gray means near-a-pole, and the
+        // black secondary rules out the black pole while white misses 4.5:1).
+        // fg failed the PRIMARY floor, so tier 2 must still repair it for
+        // --bg — body text on the dominant surface — rather than keep an
+        // invisible fg.
+        let css = "\
+:root {
+    --bg: #7a7a7a;
+    --bg-secondary: #000000;
+    --fg: #7a7a7a;
+}
+";
+        let out = sanitize_theme_css(css);
+        let fg = css_var(&out, "fg");
+        assert_ne!(fg, [0x7a, 0x7a, 0x7a]);
+        assert!(contrast(fg, [0x7a, 0x7a, 0x7a]) >= MIN_FG);
     }
 
     #[test]
