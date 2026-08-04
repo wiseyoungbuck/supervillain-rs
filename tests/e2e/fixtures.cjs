@@ -118,6 +118,7 @@ async function mockApi(page, {
   mailboxes = MAILBOXES_WITH_XSS,
   emails = ONE_EMAIL_LIST,
   splits = [],
+  splitCounts = {},
   extra = {},
 } = {}) {
   await page.route('**/api/accounts', (route) =>
@@ -145,7 +146,9 @@ async function mockApi(page, {
   // unintended UI state that killed the deploy poll and shifted layout.
   await page.route('**/api/identities**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
   await page.route('**/api/splits**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(splits) }));
-  await page.route('**/api/split-counts**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));
+  // splitCounts mirrors the server's per-split map ({"all": 215, "<split-id>": 7,
+  // ...}); the handler returns {} when the account has no splits (kata 6rqw).
+  await page.route('**/api/split-counts**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(splitCounts) }));
   await page.route('**/api/theme', (route) => route.fulfill({ status: 200, contentType: 'text/css', body: '' }));
   await page.route('**/api/timezone**', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }));
   await page.route('**/api/timezone/zones', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
