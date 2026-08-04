@@ -326,11 +326,13 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
     let accent = colors.get("accent").copied();
 
     // --fg is the anchor every repair blends from; fix it first, against every
-    // surface plain fg text is painted on. Repair blends toward the pole
-    // opposite bg's luminance, least-changed candidate first. When surfaces
-    // conflict (light bg with a dark bg-secondary) no color can satisfy every
-    // floor — keep the theme's own fg unless a candidate genuinely scores
-    // better, so impossible palettes aren't churned.
+    // surface plain fg text is painted on. Candidates blend fg toward BOTH
+    // poles (a failing surface can sit on the opposite side of bg's luminance
+    // — dark bg with a light bg-secondary needs a repair toward black),
+    // least-changed candidate first, preferring the pole opposite bg. Only a
+    // candidate clearing EVERY floor is applied: a partial improvement would
+    // churn the theme's fg without making it readable, so a palette whose
+    // floors no blend candidate can satisfy keeps its own fg.
     let mut fg = fg0;
     {
         let surfaces = [
@@ -338,29 +340,18 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
             (bg2, MIN_FG_SECONDARY),
             (bg3, MIN_FG_SECONDARY),
         ];
-        let score = |c: [u8; 3]| {
-            surfaces
-                .iter()
-                .map(|&(s, min)| contrast(c, s) / min)
-                .fold(f64::INFINITY, f64::min)
-        };
-        if score(fg0) < 1.0 {
-            let pole = if luminance(bg) < 0.5 {
-                [0xff, 0xff, 0xff]
+        let ok = |c: [u8; 3]| surfaces.iter().all(|&(s, min)| contrast(c, s) >= min);
+        if !ok(fg0) {
+            let (white, black) = ([0xff, 0xff, 0xff], [0x00, 0x00, 0x00]);
+            let poles = if luminance(bg) < 0.5 {
+                [white, black]
             } else {
-                [0x00, 0x00, 0x00]
+                [black, white]
             };
-            let candidates = [0.25, 0.5, 0.75, 1.0].map(|t| mix(fg0, pole, t));
-            let repaired = candidates
+            let repaired = [0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0]
                 .iter()
-                .copied()
-                .find(|&c| score(c) >= 1.0)
-                .or_else(|| {
-                    let best = candidates
-                        .into_iter()
-                        .max_by(|a, b| score(*a).total_cmp(&score(*b)))?;
-                    (score(best) > score(fg0)).then_some(best)
-                });
+                .flat_map(|&t| poles.iter().map(move |&p| mix(fg0, p, t)))
+                .find(|&c| ok(c));
             if let Some(repaired) = repaired {
                 fg = repaired;
                 colors.insert("fg".into(), fg);
@@ -443,16 +434,17 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
     changed
 }
 
-/// Find the first `target` byte at or after `from`, skipping `/* … */`
-/// comments (theme CSS is arbitrary user/template content, so a `}` inside a
-/// comment must not close the block). Returns None on an unclosed comment.
-fn find_outside_comments(s: &str, from: usize, target: u8) -> Option<usize> {
+/// Find the first occurrence of `needle` at or after `from`, skipping
+/// `/* … */` comments (theme CSS is arbitrary user/template content, so a `}`
+/// — or a `:root` mention — inside a comment must not anchor the block).
+/// Returns None when absent or on an unclosed comment.
+fn find_outside_comments(s: &str, from: usize, needle: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = from;
     while i < bytes.len() {
         if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
             i = i + 2 + s[i + 2..].find("*/")? + 2;
-        } else if bytes[i] == target {
+        } else if bytes[i..].starts_with(needle.as_bytes()) {
             return Some(i);
         } else {
             i += 1;
@@ -474,13 +466,13 @@ fn find_outside_comments(s: &str, from: usize, target: u8) -> Option<usize> {
 /// generated fallback) at serve time, because both inherit the same
 /// palette-slot collisions from the terminal color scheme they mirror.
 pub fn sanitize_theme_css(css: &str) -> String {
-    let Some(root_pos) = css.find(":root") else {
+    let Some(root_pos) = find_outside_comments(css, 0, ":root") else {
         return css.to_string();
     };
-    let Some(open) = find_outside_comments(css, root_pos, b'{') else {
+    let Some(open) = find_outside_comments(css, root_pos, "{") else {
         return css.to_string();
     };
-    let Some(close) = find_outside_comments(css, open + 1, b'}') else {
+    let Some(close) = find_outside_comments(css, open + 1, "}") else {
         return css.to_string();
     };
     let block = &css[open + 1..close];
@@ -1266,8 +1258,10 @@ palette = 15=#d3c6aa
 
     #[test]
     fn sanitize_keeps_fg_when_surfaces_conflict() {
-        // Light bg with a dark bg-secondary: no color can satisfy every fg
-        // floor, so the theme's own fg must survive rather than churn.
+        // Light bg with a dark bg-secondary: the floors leave only a sliver
+        // of luminance space that none of the blend candidates lands in, so
+        // the theme's own fg must survive rather than churn to a color that
+        // is still unreadable somewhere.
         let css = "\
 :root {
     --bg: #fdf6e3;
@@ -1277,6 +1271,43 @@ palette = 15=#d3c6aa
 ";
         let out = sanitize_theme_css(css);
         assert_eq!(css_var(&out, "fg"), [0x58, 0x6e, 0x75]);
+    }
+
+    #[test]
+    fn sanitize_repairs_fg_toward_opposite_pole() {
+        // Dark bg, light bg-secondary, fg == bg-secondary: the fix lies
+        // toward BLACK even though bg's luminance points the primary pole at
+        // white. The candidate search must try both directions.
+        let css = "\
+:root {
+    --bg: #000000;
+    --bg-secondary: #e0e0e0;
+    --fg: #e0e0e0;
+}
+";
+        let out = sanitize_theme_css(css);
+        let fg = css_var(&out, "fg");
+        assert!(contrast(fg, [0x00, 0x00, 0x00]) >= MIN_FG);
+        assert!(contrast(fg, [0xe0, 0xe0, 0xe0]) >= MIN_FG_SECONDARY);
+    }
+
+    #[test]
+    fn sanitize_ignores_root_mention_inside_comment() {
+        let css = "\
+/* themes may document :root { --fg: #000000; } in a header comment */
+:root {
+    --bg: #2d353b;
+    --fg: #d3c6aa;
+    --fg-dim: #2d353b;
+}
+";
+        let out = sanitize_theme_css(css);
+        // The real block must be the one repaired…
+        assert!(contrast(css_var(&out, "fg-dim"), [0x2d, 0x35, 0x3b]) >= MIN_DIM);
+        // …and the comment must come through untouched.
+        assert!(
+            out.contains("/* themes may document :root { --fg: #000000; } in a header comment */")
+        );
     }
 
     #[test]
