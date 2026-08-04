@@ -8209,6 +8209,10 @@ white   = '#fdf6e3'
             "the recovery probe must clamp its write to a few epsilons — a full-h probe makes a viewport-feedback ratchet's crawl exponential (roborev 463)"
         );
         assert!(
+            block.contains("if (h - probeH < EMAIL_IFRAME_RATCHET_EPSILON) probeH = h"),
+            "the probe must absorb a sub-epsilon remainder — a 256..320px backlog would otherwise strand 1..63px below the epsilon gate forever (roborev 464)"
+        );
+        assert!(
             block.contains("_probePending"),
             "the probe outcome must be tracked (_probePending) — content not chasing the probe proves a real email and lifts suppression (roborev 463)"
         );

@@ -438,12 +438,13 @@ test('roborev 461/463: a supra-epsilon ratchet degrades to a sparse, clamped lin
         postDeltas.length <= 6,
         `post-allowance ratchet writes must be sparse (probe cadence ~1 per 3 ticks); got ${postDeltas.length} in 15 ticks`,
     );
-    // Linear: every post-allowance write is clamped — a full-h write here
-    // means the crawl went exponential again (roborev 463).
+    // Linear: every post-allowance write is clamped (4*epsilon, or 5*epsilon
+    // when a sub-epsilon remainder is absorbed, roborev 464) — a full-h
+    // write here means the crawl went exponential again (roborev 463).
     for (const d of postDeltas) {
         assert.ok(
-            d <= 4 * 64,
-            `post-allowance ratchet writes must be clamped to 4*epsilon; got a ${d}px write`,
+            d <= 5 * 64,
+            `post-allowance ratchet writes must be clamped to <=5*epsilon; got a ${d}px write`,
         );
     }
     assert.ok(allowanceEnd >= 1, 'harness sanity: the allowance phase grew');
@@ -534,6 +535,49 @@ test('roborev 462: a locked-out poll recovers via the stability probe once conte
         curH(iframe),
         2400,
         'content not chasing the probe proves a real email — suppression lifts and the full grow applies (roborev 462/463)',
+    );
+});
+
+// roborev 464: a locked-out backlog just past the clamp (256..320px) must
+// recover EXACTLY — the plain clamp left a sub-epsilon remainder (1..63px)
+// that no later tick could ever apply.
+test('roborev 464: the probe absorbs a sub-epsilon remainder so a 300px backlog recovers exactly', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const content = { value: 100 };
+    const iframe = { style: { height: '0px' }, isConnected: true };
+    const el = {
+        get scrollHeight() { return content.value; },
+        getBoundingClientRect() { return { height: content.value }; },
+    };
+    iframe.contentDocument = {
+        body: el,
+        documentElement: el,
+        fonts: { ready: new Promise(() => {}) },
+        querySelectorAll: () => [],
+    };
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+
+    // Lockout at cur=1800 with a 300px backlog — inside the (256, 320)px
+    // window where the plain clamp (1800+256=2056) would strand a 44px
+    // remainder below the epsilon gate forever.
+    for (const v of [600, 1200, 1800, 2100]) {
+        content.value = v;
+        timers.tickIntervals();
+    }
+    assert.equal(curH(iframe), 1800, 'the 4th consecutive grow must be suppressed');
+    timers.tickIntervals();
+    timers.tickIntervals();
+    assert.equal(
+        curH(iframe),
+        2100,
+        'a backlog in the clamp+epsilon window must be absorbed into the probe — a sub-epsilon remainder is unreachable forever (roborev 464)',
     );
 });
 

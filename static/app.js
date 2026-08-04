@@ -6237,7 +6237,15 @@ function sizeIframeToContent(iframe) {
                     iframe._pollLastH = h;
                     if (iframe._pollStableTicks >= 2) {
                         iframe._pollStableTicks = 0;
-                        const probeH = Math.min(h, cur + 4 * EMAIL_IFRAME_RATCHET_EPSILON);
+                        // Absorb a sub-epsilon remainder (roborev 464): a
+                        // backlog just over the clamp (256..320px) would
+                        // otherwise leave 1..63px — under the epsilon gate,
+                        // so no later tick ever applies it and a line or two
+                        // stays clipped for the life of the view. Writing h
+                        // in that window keeps the write bounded at
+                        // cur + 5*epsilon, so a ratchet's crawl stays linear.
+                        let probeH = Math.min(h, cur + 4 * EMAIL_IFRAME_RATCHET_EPSILON);
+                        if (h - probeH < EMAIL_IFRAME_RATCHET_EPSILON) probeH = h;
                         if (probeH > cur) {
                             iframe._probePending = true;
                             setHeight(probeH);
