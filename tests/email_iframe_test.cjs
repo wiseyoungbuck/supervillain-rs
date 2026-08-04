@@ -385,23 +385,13 @@ test('w5ba: the poll self-clears once its iframe leaves the DOM', () => {
     assert.equal(timers.liveIntervals(), 0, 'the poll must clearInterval itself on detach (w5ba)');
 });
 
-// roborev 461: sender CSS whose viewport-relative feedback EXCEEDS the
-// epsilon (min-height:110vh, big body margins) satisfies the poll's gate on
-// every tick. The consecutive-grow streak must stop the poll after a few
-// grows — a real stuck email catches up (a tick with h - cur < epsilon
-// resets the streak); a ratchet never does.
-test('roborev 461: the poll stops growing a supra-epsilon viewport ratchet after a short streak', () => {
-    const timers = fakeTimers();
-    const sizeIframeToContent = loadSizeIframeToContent({
-        ...timers,
-        ResizeObserver: mockResizeObserver([]),
-    });
-
-    // Feedback content: always 10% + 100px taller than whatever the iframe
-    // currently is — every poll tick sees h - cur >= 64, forever.
+// A viewport-feedback ratchet mock: content is always `gap` px taller than
+// whatever the iframe currently is — every poll tick sees h - cur >= gap,
+// forever, because the content chases our own writes.
+function makeFeedbackIframe(gap) {
     const iframe = { style: { height: '0px' }, isConnected: true };
     const el = {
-        get scrollHeight() { return Math.round((parseFloat(iframe.style.height) || 100) * 1.1) + 100; },
+        get scrollHeight() { return (parseFloat(iframe.style.height) || 100) + gap; },
         getBoundingClientRect() { return { height: this.scrollHeight }; },
     };
     iframe.contentDocument = {
@@ -410,22 +400,53 @@ test('roborev 461: the poll stops growing a supra-epsilon viewport ratchet after
         fonts: { ready: new Promise(() => {}) },
         querySelectorAll: () => [],
     };
+    return iframe;
+}
 
+// roborev 461/463: sender CSS whose viewport-relative feedback EXCEEDS the
+// epsilon (min-height:110vh, big body margins) satisfies the poll's gate on
+// every tick. After the 3-grow allowance, the poll must degrade to a LINEAR
+// clamped crawl: at most one write per ~3 ticks (the stability-probe
+// cadence), each write bounded by the probe clamp (4 * epsilon = 256px) —
+// never a full-h write, which made the crawl exponential (roborev 463).
+test('roborev 461/463: a supra-epsilon ratchet degrades to a sparse, clamped linear crawl', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const iframe = makeFeedbackIframe(500); // chase gap far above the clamp
     const writes = [];
     iframe._onHeight = (h) => writes.push(h);
 
     sizeIframeToContent(iframe);
     timers.flush();
-    const writesAfterBurst = writes.length;
-    for (let i = 0; i < 15; i++) timers.tickIntervals(); // ratchet keeps trying
-    const pollWrites = writes.length - writesAfterBurst;
-    // Unsuppressed, all 15 ticks would grow. The 3-grow allowance plus the
-    // stability-probe recovery (one probe per ~3 ticks once locked — the
-    // permanent-lockout fix, roborev 462) bounds this to a crawl.
+    for (let i = 0; i < 3; i++) timers.tickIntervals(); // the streak allowance
+
+    const allowanceEnd = writes.length;
+    let prev = curH(iframe);
+    const postDeltas = [];
+    for (let i = 0; i < 15; i++) {
+        const before = writes.length;
+        timers.tickIntervals();
+        if (writes.length > before) postDeltas.push(curH(iframe) - prev);
+        prev = curH(iframe);
+    }
+    // Sparse: the probe cadence is one write per ~3 ticks.
     assert.ok(
-        pollWrites <= 7,
-        `after the streak allowance the poll must only crawl, not feed the ratchet every tick (roborev 461); got ${pollWrites} grows in 15 ticks`,
+        postDeltas.length <= 6,
+        `post-allowance ratchet writes must be sparse (probe cadence ~1 per 3 ticks); got ${postDeltas.length} in 15 ticks`,
     );
+    // Linear: every post-allowance write is clamped — a full-h write here
+    // means the crawl went exponential again (roborev 463).
+    for (const d of postDeltas) {
+        assert.ok(
+            d <= 4 * 64,
+            `post-allowance ratchet writes must be clamped to 4*epsilon; got a ${d}px write`,
+        );
+    }
+    assert.ok(allowanceEnd >= 1, 'harness sanity: the allowance phase grew');
 });
 
 // roborev 462: the streak reset must keep the poll alive for a real stuck
@@ -502,13 +523,59 @@ test('roborev 462: a locked-out poll recovers via the stability probe once conte
     assert.equal(curH(iframe), 1800, 'the 4th consecutive grow must be suppressed');
 
     // Content now sits still at 2400 — a real email, not a ratchet. Two
-    // stable suppressed ticks earn the probe grow.
+    // stable suppressed ticks earn the CLAMPED probe (1800 + 4*64 = 2056,
+    // roborev 463); content does not chase it, which proves this is not a
+    // ratchet, so the next tick lifts the suppression and grows fully.
     timers.tickIntervals();
+    timers.tickIntervals();
+    assert.equal(curH(iframe), 2056, 'the probe must be clamped to 4*epsilon (roborev 463)');
     timers.tickIntervals();
     assert.equal(
         curH(iframe),
         2400,
-        'a stable locked-out email must recover via the probe grow — suppression is not a permanent lockout (roborev 462)',
+        'content not chasing the probe proves a real email — suppression lifts and the full grow applies (roborev 462/463)',
+    );
+});
+
+// roborev 463: a same-iframe document swap (the belt-and-braces re-attach)
+// must not inherit the previous document's suppression — the new document's
+// first supra-epsilon growth must apply immediately.
+test('roborev 463: a document swap resets the poll streak — the new document starts unsuppressed', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    // Document A is a ratchet: drive the streak into lockout.
+    const iframe = makeFeedbackIframe(500);
+    sizeIframeToContent(iframe);
+    timers.flush();
+    for (let i = 0; i < 6; i++) timers.tickIntervals();
+
+    // The document is swapped (Firefox about:blank → srcdoc path) and the
+    // sizing machinery re-runs for the same iframe element.
+    const content = { value: curH(iframe) + 900 };
+    const el = {
+        get scrollHeight() { return content.value; },
+        getBoundingClientRect() { return { height: content.value }; },
+    };
+    iframe.contentDocument = {
+        body: el,
+        documentElement: el,
+        fonts: { ready: new Promise(() => {}) },
+        querySelectorAll: () => [],
+    };
+    sizeIframeToContent(iframe);
+    timers.flush();
+
+    const before = curH(iframe);
+    content.value = before + 800; // first supra-epsilon growth on doc B
+    timers.tickIntervals();
+    assert.equal(
+        curH(iframe),
+        before + 800,
+        'the first supra-epsilon tick on a swapped-in document must grow — the streak must not carry across documents (roborev 463)',
     );
 });
 

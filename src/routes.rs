@@ -8199,6 +8199,19 @@ white   = '#fdf6e3'
             block.contains("_pollStableTicks"),
             "the poll's suppression must have a stability-probe recovery (_pollStableTicks) — permanent lockout re-creates the clipped-email symptom (roborev 462)"
         );
+        // The probe must be CLAMPED (a full grow made a 10%-feedback
+        // ratchet's crawl exponential — cap in ~a minute; the clamp keeps it
+        // linear), and probe outcomes must be discriminated via _probePending
+        // so a real email lifts suppression while a ratchet stays in the
+        // crawl (roborev 463).
+        assert!(
+            block.contains("Math.min(h, cur + 4 * EMAIL_IFRAME_RATCHET_EPSILON)"),
+            "the recovery probe must clamp its write to a few epsilons — a full-h probe makes a viewport-feedback ratchet's crawl exponential (roborev 463)"
+        );
+        assert!(
+            block.contains("_probePending"),
+            "the probe outcome must be tracked (_probePending) — content not chasing the probe proves a real email and lifts suppression (roborev 463)"
+        );
         // A same-iframe document swap must not inherit the previous
         // document's suppression state (roborev 462).
         let reattach = &block[block
