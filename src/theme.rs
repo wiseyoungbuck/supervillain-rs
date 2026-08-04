@@ -295,6 +295,9 @@ fn to_hex(rgb: [u8; 3]) -> String {
 // floor is well below the WCAG 4.5 body-text bar — just high enough to stay
 // legible on every surface it's painted over.
 const MIN_FG: f64 = 4.5;
+// Plain --fg also lands on bg-secondary/tertiary (#email-header, #sidebar,
+// hover rows); a lower floor there, since --bg is the dominant surface.
+const MIN_FG_SECONDARY: f64 = 2.5;
 const MIN_MUTED: f64 = 3.0;
 const MIN_DIM: f64 = 2.4;
 const MIN_ON_SELECTION: f64 = 2.5;
@@ -304,7 +307,9 @@ const MIN_ACCENT: f64 = 2.5;
 /// variables that were changed (empty when the theme was already readable).
 ///
 /// The pairs checked mirror how static/style.css layers the variables:
-/// - --fg on --bg (body text)
+/// - --fg on --bg (body text) and on --bg-secondary / --bg-tertiary
+///   (#email-header, #sidebar, hover rows — these set only a background, so
+///   the text inside inherits plain --fg)
 /// - --selection is a background under --fg / --fg-muted / --fg-dim / --accent
 ///   text (selected email rows, active mailbox)
 /// - --fg-muted on --bg / --bg-secondary / --bg-tertiary (subjects, meta)
@@ -316,22 +321,53 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
         return changed;
     };
 
-    // --fg is the anchor every repair blends from; fix it first. A theme whose
-    // fg fails against its own bg is fundamentally broken — snap to the pole.
-    let mut fg = fg0;
-    if contrast(fg, bg) < MIN_FG {
-        fg = if luminance(bg) < 0.5 {
-            [0xff, 0xff, 0xff]
-        } else {
-            [0x00, 0x00, 0x00]
-        };
-        colors.insert("fg".into(), fg);
-        changed.push("fg".into());
-    }
-
     let bg2 = colors.get("bg-secondary").copied().unwrap_or(bg);
     let bg3 = colors.get("bg-tertiary").copied().unwrap_or(bg);
     let accent = colors.get("accent").copied();
+
+    // --fg is the anchor every repair blends from; fix it first, against every
+    // surface plain fg text is painted on. Repair blends toward the pole
+    // opposite bg's luminance, least-changed candidate first. When surfaces
+    // conflict (light bg with a dark bg-secondary) no color can satisfy every
+    // floor — keep the theme's own fg unless a candidate genuinely scores
+    // better, so impossible palettes aren't churned.
+    let mut fg = fg0;
+    {
+        let surfaces = [
+            (bg, MIN_FG),
+            (bg2, MIN_FG_SECONDARY),
+            (bg3, MIN_FG_SECONDARY),
+        ];
+        let score = |c: [u8; 3]| {
+            surfaces
+                .iter()
+                .map(|&(s, min)| contrast(c, s) / min)
+                .fold(f64::INFINITY, f64::min)
+        };
+        if score(fg0) < 1.0 {
+            let pole = if luminance(bg) < 0.5 {
+                [0xff, 0xff, 0xff]
+            } else {
+                [0x00, 0x00, 0x00]
+            };
+            let candidates = [0.25, 0.5, 0.75, 1.0].map(|t| mix(fg0, pole, t));
+            let repaired = candidates
+                .iter()
+                .copied()
+                .find(|&c| score(c) >= 1.0)
+                .or_else(|| {
+                    let best = candidates
+                        .into_iter()
+                        .max_by(|a, b| score(*a).total_cmp(&score(*b)))?;
+                    (score(best) > score(fg0)).then_some(best)
+                });
+            if let Some(repaired) = repaired {
+                fg = repaired;
+                colors.insert("fg".into(), fg);
+                changed.push("fg".into());
+            }
+        }
+    }
 
     // --selection: a background tint. When it collides with the text drawn
     // over it (Everforest ships selection-background == foreground), rebuild
@@ -355,7 +391,8 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
 
     // Dimmed text roles: if any surface fails, re-derive from fg blended
     // toward bg — most-dimmed candidate first so the repaired color keeps its
-    // intended visual weight. Falls back to plain fg (readable by rule 1).
+    // intended visual weight. Falls back to plain fg (best effort: fg is only
+    // guaranteed against the surfaces its own repair above could satisfy).
     let mut repair_text = |name: &str, dim_steps: &[f64], surfaces: &[([u8; 3], f64)]| {
         let Some(&cur) = colors.get(name) else { return };
         let ok = |c: [u8; 3]| surfaces.iter().all(|&(s, min)| contrast(c, s) >= min);
@@ -406,11 +443,32 @@ fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -
     changed
 }
 
+/// Find the first `target` byte at or after `from`, skipping `/* … */`
+/// comments (theme CSS is arbitrary user/template content, so a `}` inside a
+/// comment must not close the block). Returns None on an unclosed comment.
+fn find_outside_comments(s: &str, from: usize, target: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i = i + 2 + s[i + 2..].find("*/")? + 2;
+        } else if bytes[i] == target {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Rewrite the `:root` variable block of a theme stylesheet so every text
 /// color stays readable on the surfaces style.css paints it over. CSS outside
-/// the `:root` block, unknown variables, and non-hex values pass through
-/// untouched; a stylesheet with no parseable `:root` (or one that is already
-/// readable) is returned unchanged.
+/// the `:root` block, unknown variables, non-hex values, and anything after a
+/// declaration's `;` (inline comments) pass through untouched; a stylesheet
+/// with no parseable `:root` (or one that is already readable) is returned
+/// unchanged. When a repair fires, line endings inside the block are
+/// normalized to LF, and duplicate declarations of a repaired variable all
+/// receive the repaired value.
 ///
 /// Applied to BOTH theme sources (a theme-shipped supervillain.css and our
 /// generated fallback) at serve time, because both inherit the same
@@ -419,10 +477,10 @@ pub fn sanitize_theme_css(css: &str) -> String {
     let Some(root_pos) = css.find(":root") else {
         return css.to_string();
     };
-    let Some(open) = css[root_pos..].find('{').map(|i| root_pos + i) else {
+    let Some(open) = find_outside_comments(css, root_pos, b'{') else {
         return css.to_string();
     };
-    let Some(close) = css[open..].find('}').map(|i| open + i) else {
+    let Some(close) = find_outside_comments(css, open + 1, b'}') else {
         return css.to_string();
     };
     let block = &css[open + 1..close];
@@ -431,7 +489,9 @@ pub fn sanitize_theme_css(css: &str) -> String {
     for line in block.lines() {
         if let Some(rest) = line.trim().strip_prefix("--")
             && let Some((name, value)) = rest.split_once(':')
-            && let Some(rgb) = parse_hex_rgb(value.trim().trim_end_matches(';').trim())
+            // Value runs to the `;`; anything after (inline comments) is not
+            // part of it.
+            && let Some(rgb) = parse_hex_rgb(value.split(';').next().unwrap_or("").trim())
         {
             colors.insert(name.trim().to_string(), rgb);
         }
@@ -447,12 +507,19 @@ pub fn sanitize_theme_css(css: &str) -> String {
         .map(|line| {
             if let Some(rest) = line.trim().strip_prefix("--")
                 && let Some((name, _)) = rest.split_once(':')
+                && changed.iter().any(|c| c == name.trim())
             {
-                let name = name.trim();
-                if changed.iter().any(|c| c == name) {
-                    let indent = &line[..line.len() - line.trim_start().len()];
-                    return format!("{indent}--{name}: {};", to_hex(colors[name]));
-                }
+                // Replace only the value span: everything up to the colon and
+                // everything after the `;` (inline comments) survive intact.
+                let colon = line.find(':').expect("split_once matched");
+                let after = &line[colon + 1..];
+                let suffix = after.find(';').map_or("", |i| &after[i + 1..]);
+                return format!(
+                    "{}: {};{}",
+                    &line[..colon],
+                    to_hex(colors[name.trim()]),
+                    suffix
+                );
             }
             line.to_string()
         })
@@ -1167,7 +1234,7 @@ palette = 15=#d3c6aa
     }
 
     #[test]
-    fn sanitize_snaps_fg_to_pole_when_fg_matches_bg() {
+    fn sanitize_repairs_fg_matching_bg() {
         let css = "\
 :root {
     --bg: #2d353b;
@@ -1175,6 +1242,75 @@ palette = 15=#d3c6aa
 }
 ";
         let out = sanitize_theme_css(css);
-        assert_eq!(css_var(&out, "fg"), [0xff, 0xff, 0xff]);
+        let fg = css_var(&out, "fg");
+        assert_ne!(fg, [0x2d, 0x35, 0x3b]);
+        assert!(contrast(fg, [0x2d, 0x35, 0x3b]) >= MIN_FG);
+    }
+
+    #[test]
+    fn sanitize_repairs_fg_colliding_with_secondary_surface() {
+        // fg reads fine on --bg but is the exact color of --bg-secondary —
+        // the same slot-reuse class as the Everforest --fg-dim collision.
+        let css = "\
+:root {
+    --bg: #000000;
+    --bg-secondary: #808080;
+    --fg: #808080;
+}
+";
+        let out = sanitize_theme_css(css);
+        let fg = css_var(&out, "fg");
+        assert!(contrast(fg, [0x00, 0x00, 0x00]) >= MIN_FG);
+        assert!(contrast(fg, [0x80, 0x80, 0x80]) >= MIN_FG_SECONDARY);
+    }
+
+    #[test]
+    fn sanitize_keeps_fg_when_surfaces_conflict() {
+        // Light bg with a dark bg-secondary: no color can satisfy every fg
+        // floor, so the theme's own fg must survive rather than churn.
+        let css = "\
+:root {
+    --bg: #fdf6e3;
+    --bg-secondary: #073642;
+    --fg: #586e75;
+}
+";
+        let out = sanitize_theme_css(css);
+        assert_eq!(css_var(&out, "fg"), [0x58, 0x6e, 0x75]);
+    }
+
+    #[test]
+    fn sanitize_ignores_braces_inside_comments() {
+        let css = "\
+:root {
+    /* } sneaky close */
+    --bg: #2d353b;
+    --fg: #d3c6aa;
+    --fg-dim: #2d353b;
+}
+
+body { color: red; }
+";
+        let out = sanitize_theme_css(css);
+        // fg-dim (== bg) after the comment must still get repaired…
+        assert!(contrast(css_var(&out, "fg-dim"), [0x2d, 0x35, 0x3b]) >= MIN_DIM);
+        // …and the rest of the sheet must come through uncorrupted.
+        assert!(out.contains("/* } sneaky close */"));
+        assert!(out.contains("body { color: red; }"));
+    }
+
+    #[test]
+    fn sanitize_preserves_declaration_suffixes() {
+        let css = "\
+:root {
+    --bg: #2d353b;
+    --fg: #d3c6aa;
+    --fg-dim: #2d353b; /* palette 8 */
+}
+";
+        let out = sanitize_theme_css(css);
+        let dim = css_var(&out, "fg-dim");
+        assert_ne!(dim, [0x2d, 0x35, 0x3b]);
+        assert!(out.contains(&format!("--fg-dim: {}; /* palette 8 */", to_hex(dim))));
     }
 }
