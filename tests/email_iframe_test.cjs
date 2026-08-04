@@ -107,13 +107,25 @@ function makeMockIframe({ partialHeight, fullHeight, imgs, bodyBorderBox }) {
     return { iframe, state };
 }
 
+// Ids are 1-based indices into a never-shrinking queue so clearTimeout can
+// REALLY drop the queued callback — the roborev-459 regression test asserts
+// the cancellation layer behaviorally, not just via the contains() backstop.
 function fakeTimers() {
     const queue = [];
     return {
-        requestAnimationFrame: (fn) => { queue.push(fn); return 1; },
-        setTimeout: (fn) => { queue.push(fn); return 1; },
-        clearTimeout: () => {},
-        flush: () => { while (queue.length) queue.shift()(); },
+        requestAnimationFrame: (fn) => { queue.push(fn); return queue.length; },
+        setTimeout: (fn) => { queue.push(fn); return queue.length; },
+        clearTimeout: (id) => { if (id) queue[id - 1] = null; },
+        pending: () => queue.filter(Boolean).length,
+        flush: () => {
+            let i = 0;
+            while (i < queue.length) {
+                const fn = queue[i];
+                queue[i] = null;
+                i++;
+                if (fn) fn();
+            }
+        },
     };
 }
 
@@ -417,15 +429,20 @@ test('roborev 457: a stale reveal must not clobber the next email\'s scroll posi
     render(container, '<p>A</p>', { scrollTop: 42 });
     els[0].contentDocument = realDoc(Promise.resolve());
     els[0].fire('load');
+    assert.equal(timers.pending(), 1, 'A arms exactly its reveal cap timer');
 
     // User navigates to email B before A's hold window closes. B is a
     // known-height reopen whose position restores to 7 on load.
     render(container, '<p>B</p>', { scrollTop: 7, knownHeight: 900 });
+    // First cancellation layer: teardown must clearTimeout A's cap (B holds
+    // nothing, so no pending timer may remain).
+    assert.equal(timers.pending(), 0, 'teardown must cancel A\'s reveal cap timer (roborev 457/459)');
     els[1].contentDocument = realDoc(new Promise(() => {}));
     els[1].fire('load');
     assert.equal(container.scrollTop, 7);
 
-    // A's stale cues fire now: the fonts.ready continuation and the cap timer.
+    // A's remaining stale cue fires now: the fonts.ready continuation (its
+    // cap timer is already cancelled). The contains() backstop must block it.
     await new Promise((r) => setImmediate(r));
     timers.flush();
     assert.equal(

@@ -4287,7 +4287,7 @@ function adoptDraftId(newId) {
         delete emailCache[oldKey];
         if (cached) {
             cached.id = newId;
-            emailCache[cacheKey(newId)] = cached;
+            cacheEmail(cacheKey(newId), cached);
         }
     }
     state.draftId = newId;
@@ -4315,7 +4315,7 @@ async function openDraftInCompose(emailId) {
     if (!draft || draft.textBody === undefined) {
         try {
             draft = await api('GET', `/emails/${emailId}`);
-            emailCache[cacheKey(emailId)] = draft;
+            cacheEmail(cacheKey(emailId), draft);
         } catch (err) {
             showStatus('Failed to load draft: ' + err.message, 'error');
             return;
@@ -5971,14 +5971,14 @@ async function rsvpToEvent(status) {
         const result = await api('POST', `/emails/${state.currentEmail.id}/rsvp`, { status });
         if (result.calendarEvent) {
             state.currentEmail.calendarEvent = result.calendarEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
+            cacheEmail(cacheKey(state.currentEmail.id), state.currentEmail);
             renderCalendarCard(result.calendarEvent);
         }
     } catch (err) {
         // Revert optimistic update if we had one
         if (prevEvent) {
             state.currentEmail.calendarEvent = prevEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
+            cacheEmail(cacheKey(state.currentEmail.id), state.currentEmail);
             renderCalendarCard(prevEvent);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');

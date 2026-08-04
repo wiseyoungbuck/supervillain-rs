@@ -6967,6 +6967,18 @@ white   = '#fdf6e3'
                 && js_fn_body(APP_JS, "function cacheEmail").contains("delete emailCache"),
             "emailCache writes must go through cacheEmail, which trims the oldest entries past EMAIL_CACHE_MAX (roborev 457)"
         );
+        // ... and "every write" must stay true (roborev 459): the ONLY direct
+        // `emailCache[...] = ...` assignment allowed is the one inside
+        // cacheEmail itself. Inserts that bypass it escape the bound.
+        let direct_writes: Vec<&str> = APP_JS
+            .lines()
+            .filter(|l| l.contains("emailCache[") && l.contains("] = "))
+            .map(str::trim)
+            .collect();
+        assert!(
+            direct_writes == vec!["emailCache[key] = email;"],
+            "the only direct emailCache assignment must be inside cacheEmail — inserts bypassing it escape the EMAIL_CACHE_MAX bound (roborev 459); found: {direct_writes:?}"
+        );
         let load = js_fn_body(APP_JS, "async function loadEmails");
         assert!(
             load.contains("prefetchVisibleEmails()"),
@@ -7831,9 +7843,11 @@ white   = '#fdf6e3'
         // After successful RSVP, the email cache should be updated
         let rsvp_fn_pos = APP_JS.find("async function rsvpToEvent").unwrap();
         let rsvp_fn = &APP_JS[rsvp_fn_pos..rsvp_fn_pos + 1500];
+        // Via cacheEmail (roborev 459): direct assignments bypass the
+        // EMAIL_CACHE_MAX bound.
         assert!(
-            rsvp_fn.contains("emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail"),
-            "should update emailCache after RSVP (account-scoped key via cacheKey)"
+            rsvp_fn.contains("cacheEmail(cacheKey(state.currentEmail.id), state.currentEmail)"),
+            "should update emailCache (through cacheEmail) after RSVP (account-scoped key via cacheKey)"
         );
     }
 
