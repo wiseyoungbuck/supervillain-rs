@@ -162,7 +162,20 @@ impl IntoResponse for Error {
                 (StatusCode::TOO_MANY_REQUESTS, "rate limited".to_string())
             }
         };
-        let body = serde_json::json!({ "error": client_message });
+        // Machine-readable code for the calendar config-state errors so the
+        // client can route them to the persistent account-error banner
+        // without sniffing message text or sweeping in generic 400/503s
+        // (roborev 446). Other errors carry no code — the message is the
+        // whole contract.
+        let code = match &self {
+            Error::CalendarAuthUnconfigured => Some("calendar_auth_unconfigured"),
+            Error::CalendarDiscoveryFailed(_) => Some("calendar_discovery_failed"),
+            _ => None,
+        };
+        let body = match code {
+            Some(code) => serde_json::json!({ "error": client_message, "code": code }),
+            None => serde_json::json!({ "error": client_message }),
+        };
         let mut resp = (status, axum::Json(body)).into_response();
         if let Some(v) = retry_after_header {
             resp.headers_mut()
@@ -262,6 +275,10 @@ mod tests {
             body.contains("Settings"),
             "body must point at Settings: {body}"
         );
+        assert!(
+            body.contains(r#""code":"calendar_auth_unconfigured""#),
+            "body must carry the machine-readable code the client banner-routes on: {body}"
+        );
     }
 
     #[tokio::test]
@@ -286,6 +303,10 @@ mod tests {
         assert!(
             !body.contains("u_name@fastmail.com"),
             "operator detail (account path) must not leak: {body}"
+        );
+        assert!(
+            body.contains(r#""code":"calendar_discovery_failed""#),
+            "body must carry the machine-readable code the client banner-routes on: {body}"
         );
         assert!(
             !body.contains("PROPFIND"),

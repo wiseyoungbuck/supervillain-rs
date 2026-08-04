@@ -3935,8 +3935,9 @@ mod tests {
         // (no leak window between wipe and refill) and preserves state
         // across switches — returning to an email finds its cached body.
         assert!(
-            APP_JS.contains("function cacheKey(emailId)"),
-            "static/app.js must define cacheKey() so emailCache/scrollPositions are account-scoped"
+            APP_JS.contains("function cacheKey(emailId, account = state.currentAccount)"),
+            "static/app.js must define cacheKey() so emailCache/scrollPositions are account-scoped \
+             (with an explicit-account override for post-await callers)"
         );
         assert!(
             APP_JS.contains("state.currentEmail = null"),
@@ -9124,11 +9125,21 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_updates_cache_after_rsvp() {
-        // After successful RSVP, the email cache should be updated.
+        // After successful RSVP, the email cache should be updated — keyed on
+        // the email/account captured BEFORE the await, so a mid-flight
+        // account/email switch can't cache the result under the wrong key
+        // (roborev 449).
         let rsvp_fn = js_fn_body(APP_JS, "async function rsvpToEvent(");
         assert!(
-            rsvp_fn.contains("emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail"),
-            "should update emailCache after RSVP (account-scoped key via cacheKey)"
+            rsvp_fn.contains("emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail"),
+            "should update emailCache after RSVP (account-scoped key pinned to the pre-await account)"
+        );
+        assert!(
+            rsvp_fn.contains(
+                "state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id"
+            ),
+            "should only repaint the card if the RSVP'd email is still on screen \
+             (account-scoped: email ids are only unique per account)"
         );
     }
 

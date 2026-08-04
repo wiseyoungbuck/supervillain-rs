@@ -15,18 +15,42 @@ const ACCOUNT_SCOPED_API = /^\/(emails|mailboxes|identities|splits|upload|split-
 // banner on auth problems must test `instanceof ApiAuthError` BEFORE
 // `instanceof ApiError` (the former extends the latter).
 class ApiError extends Error {
-    constructor(message, status = null) {
+    constructor(message, status = null, code = null) {
         super(message);
         this.name = 'ApiError';
         this.status = status;
+        // Machine-readable error code from the server body (src/error.rs),
+        // e.g. 'calendar_auth_unconfigured'; null when the body carries none.
+        this.code = code;
     }
 }
 
 class ApiAuthError extends ApiError {
-    constructor(message, status = null) {
-        super(message, status);
+    constructor(message, status = null, code = null) {
+        super(message, status, code);
         this.name = 'ApiAuthError';
     }
+}
+
+// The server wraps every error body as {"error": message} — plus a
+// machine-readable "code" for the calendar config-state errors (src/error.rs
+// IntoResponse). Unwrap it so err.message is the human-facing message the UI
+// renders and err.code is routable; fall back to the raw body for non-JSON
+// errors (proxies, panics).
+async function parseErrorBody(resp) {
+    const text = await resp.text();
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.error === 'string') {
+            return {
+                message: parsed.error,
+                code: typeof parsed.code === 'string' ? parsed.code : null,
+            };
+        }
+    } catch {
+        // not JSON — fall through to the raw body
+    }
+    return { message: text, code: null };
 }
 
 // makeApi(accountId) → async api(method, path, body, signal) bound to one
@@ -58,10 +82,12 @@ function makeApi(accountId) {
             throw new ApiError('Network error: ' + err.message);
         }
         if (resp.status === 401 || resp.status === 403) {
-            throw new ApiAuthError(await resp.text(), resp.status);
+            const { message, code } = await parseErrorBody(resp);
+            throw new ApiAuthError(message, resp.status, code);
         }
         if (!resp.ok) {
-            throw new ApiError(await resp.text(), resp.status);
+            const { message, code } = await parseErrorBody(resp);
+            throw new ApiError(message, resp.status, code);
         }
         if (resp.status === 204) return { data: null, headers: resp.headers };
         const text = await resp.text();

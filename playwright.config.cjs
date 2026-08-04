@@ -89,6 +89,12 @@ module.exports = defineConfig({
     baseURL: 'http://127.0.0.1:8765',
     trace: 'retain-on-failure',
     headless: true,
+    // The app renders times via toLocaleString(undefined, ...), i.e. the
+    // browser locale, and the context locale defaults to the HOST system
+    // locale — on a non-en machine the yq92 time-rendering assertions
+    // ("10:00 AM", "CDT") would see 24-hour clocks and "GMT-5"-style zone
+    // names. Pin the locale so the suite is machine-independent.
+    locale: 'en-US',
   },
   projects: [
     {

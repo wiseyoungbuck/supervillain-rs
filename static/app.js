@@ -5,6 +5,11 @@ const state = {
     mode: 'normal',           // normal, insert, command, search, awaiting
     view: 'list',             // list, detail, compose, settings
     accounts: [],
+    // The account-error banner's current entries ({account, provider, error}).
+    // loadAccounts resets it from /api/accounts; in-session failures (e.g. a
+    // calendar-config RSVP error) upsert into it so surfacing one error never
+    // clobbers another account's still-unresolved banner line (roborev 446).
+    accountErrors: [],
     currentAccount: null,
     mailboxes: [],
     currentMailbox: null,
@@ -277,6 +282,11 @@ function init() {
         els.sortToggle.addEventListener('click', toggleSortOrder);
     }
     renderSortToggle();
+    // Visual-only dismissal (deliberate): state.accountErrors keeps its
+    // entries, so the next showAccountErrors call — a new failure or a
+    // loadAccounts refresh — re-reveals every still-unresolved line, old and
+    // new. An unresolved problem must not stay hidden forever behind one
+    // dismiss (roborev 447).
     els.accountErrorBanner.querySelector('.error-banner-dismiss').addEventListener('click', () => {
         els.accountErrorBanner.classList.add('hidden');
     });
@@ -799,9 +809,23 @@ async function loadAccounts() {
         state.accounts = data.accounts;
         renderAccounts();
 
-        const nonSetupErrors = (data.errors || []).filter(e => e.provider !== 'setup');
-        if (nonSetupErrors.length > 0) {
-            showAccountErrors(nonSetupErrors);
+        const serverErrors = (data.errors || []).filter(e => e.provider !== 'setup');
+        // Client-sourced entries (a calendar-config RSVP failure) never appear
+        // in /api/accounts' errors, so a wholesale rebuild would silently drop
+        // a still-unresolved line on any in-session refresh — e.g. clicking
+        // [Authorize] on another account's line (roborev 447). Carry them
+        // across, deduped against a server line now reporting the same
+        // problem; they retire on a successful RSVP for their account — or
+        // here, when the account itself is gone (deleting the account is a
+        // legitimate remediation; its line would otherwise be unfixable,
+        // roborev 448).
+        const clientErrors = state.accountErrors.filter(e =>
+            e.source === 'client'
+            && state.accounts.some(a => a.id === e.account)
+            && !serverErrors.some(s => s.account === e.account && s.error === e.error));
+        state.accountErrors = serverErrors.concat(clientErrors);
+        if (state.accountErrors.length > 0) {
+            showAccountErrors(state.accountErrors);
         } else {
             els.accountErrorBanner.classList.add('hidden');
         }
@@ -983,8 +1007,10 @@ function selectAccount(account) {
 // a Gmail id under account "gmail" can't collide with the same string
 // under account "outlook-aristotle", and re-selecting an account finds
 // its previous cache entries instead of a cold fetch.
-function cacheKey(emailId) {
-    return (state.currentAccount?.id ?? '') + ':' + emailId;
+// account defaults to the current one; pass an explicit account when keying
+// after an await, where the user may have switched mid-flight (rsvpToEvent).
+function cacheKey(emailId, account = state.currentAccount) {
+    return (account?.id ?? '') + ':' + emailId;
 }
 
 async function loadSplits() {
@@ -6345,7 +6371,13 @@ async function rsvpToEvent(status) {
 
     const label = { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' }[status] || status;
     let prevEvent = null;
-    const listItem = state.emails.find(e => e.id === state.currentEmail.id);
+    // The account and email this RSVP is for, captured before the await: the
+    // request is issued for these, so if the user switches accounts or opens
+    // another email mid-flight, every post-await write below must target THEM
+    // — not whatever is current when the response lands (roborev 448/449).
+    const rsvpAccount = state.currentAccount;
+    const rsvpEmail = state.currentEmail;
+    const listItem = state.emails.find(e => e.id === rsvpEmail.id);
     const prevInviteStatus = listItem?.inviteStatus;
     const prevInviteIsUpdated = listItem?.inviteIsUpdated;
 
@@ -6373,23 +6405,68 @@ async function rsvpToEvent(status) {
     showStatus(`RSVP: ${label}`, 'success');
 
     try {
-        const result = await api('POST', `/emails/${state.currentEmail.id}/rsvp`, { status });
+        const result = await api('POST', `/emails/${rsvpEmail.id}/rsvp`, { status });
         if (result.calendarEvent) {
-            state.currentEmail.calendarEvent = result.calendarEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
-            renderCalendarCard(result.calendarEvent);
+            rsvpEmail.calendarEvent = result.calendarEvent;
+            emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
+            // Only repaint if the RSVP'd email is still the one on screen — a
+            // stale response must not overwrite another email's card. Both
+            // clauses matter: email ids are only unique per account (the
+            // cacheKey rationale), so an id match alone could collide across
+            // a mid-flight account switch.
+            if (state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id) {
+                renderCalendarCard(result.calendarEvent);
+            }
+        }
+        // A successful RSVP proves this account's calendar path works again —
+        // retire its client-sourced config lines (mirror of the server
+        // retiring its pushed entries when the config is corrected).
+        const remaining = state.accountErrors.filter(e =>
+            !(e.source === 'client' && e.account === rsvpAccount?.id));
+        if (remaining.length !== state.accountErrors.length) {
+            state.accountErrors = remaining;
+            if (remaining.length) showAccountErrors(remaining);
+            else els.accountErrorBanner.classList.add('hidden');
         }
     } catch (err) {
-        // Revert optimistic update if we had one
+        // Revert optimistic update if we had one — on the RSVP'd email, which
+        // may no longer be the one on screen (see rsvpEmail capture above).
         if (prevEvent) {
-            state.currentEmail.calendarEvent = prevEvent;
-            emailCache[cacheKey(state.currentEmail.id)] = state.currentEmail;
-            renderCalendarCard(prevEvent);
+            rsvpEmail.calendarEvent = prevEvent;
+            emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail;
+            if (state.currentAccount?.id === rsvpAccount?.id && state.currentEmail?.id === rsvpEmail.id) {
+                renderCalendarCard(prevEvent);
+            }
         }
         if (listItem?.isInviteToMe) {
             listItem.inviteStatus = prevInviteStatus;
             listItem.inviteIsUpdated = prevInviteIsUpdated;
             renderEmailList();
+        }
+        // A calendar-config failure (m5yp: no app password; wybm: no
+        // discoverable calendar) is a problem the user must fix, not a
+        // transient hiccup — surface it in the persistent account-error
+        // banner, the same surface the server-side auto-add path pushes these
+        // to (surface_caldav_spawn_failure), so the actionable message
+        // outlives the 3s toast. Gated on the body's machine-readable code
+        // (src/error.rs) so a generic 400/503 stays toast-only. Upsert into
+        // state.accountErrors — replacing the list would clobber other
+        // accounts' still-unresolved banner lines (roborev 446).
+        const calendarConfigError = err instanceof ApiError
+            && (err.code === 'calendar_auth_unconfigured' || err.code === 'calendar_discovery_failed');
+        if (calendarConfigError && rsvpAccount) {
+            const entry = {
+                account: rsvpAccount.id,
+                provider: rsvpAccount.provider,
+                error: err.message,
+                // Marks this as client-known-only, so loadAccounts' rebuild
+                // carries it and a later successful RSVP retires it.
+                source: 'client',
+            };
+            if (!state.accountErrors.some(e => e.account === entry.account && e.error === entry.error)) {
+                state.accountErrors.push(entry);
+            }
+            showAccountErrors(state.accountErrors);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
     }
