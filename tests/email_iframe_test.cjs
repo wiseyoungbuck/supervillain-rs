@@ -411,15 +411,104 @@ test('roborev 461: the poll stops growing a supra-epsilon viewport ratchet after
         querySelectorAll: () => [],
     };
 
+    const writes = [];
+    iframe._onHeight = (h) => writes.push(h);
+
     sizeIframeToContent(iframe);
     timers.flush();
-    for (let i = 0; i < 3; i++) timers.tickIntervals(); // streak allowance
-    const settled = curH(iframe);
-    for (let i = 0; i < 10; i++) timers.tickIntervals(); // ratchet keeps trying
+    const writesAfterBurst = writes.length;
+    for (let i = 0; i < 15; i++) timers.tickIntervals(); // ratchet keeps trying
+    const pollWrites = writes.length - writesAfterBurst;
+    // Unsuppressed, all 15 ticks would grow. The 3-grow allowance plus the
+    // stability-probe recovery (one probe per ~3 ticks once locked — the
+    // permanent-lockout fix, roborev 462) bounds this to a crawl.
+    assert.ok(
+        pollWrites <= 7,
+        `after the streak allowance the poll must only crawl, not feed the ratchet every tick (roborev 461); got ${pollWrites} grows in 15 ticks`,
+    );
+});
+
+// roborev 462: the streak reset must keep the poll alive for a real stuck
+// email that needs MANY rescues — supra-epsilon jumps separated by catch-up
+// ticks must all apply, no matter how many.
+test('roborev 462: jump/settle cycles reset the streak — every legitimate rescue applies', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const content = { value: 120 };
+    const iframe = { style: { height: '0px' }, isConnected: true };
+    const el = {
+        get scrollHeight() { return content.value; },
+        getBoundingClientRect() { return { height: content.value }; },
+    };
+    iframe.contentDocument = {
+        body: el,
+        documentElement: el,
+        fonts: { ready: new Promise(() => {}) },
+        querySelectorAll: () => [],
+    };
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    assert.equal(curH(iframe), 120);
+
+    for (let i = 0; i < 6; i++) {
+        content.value += 500; // supra-epsilon late layout
+        timers.tickIntervals(); // grow applies, cur catches up
+        timers.tickIntervals(); // settled tick — must reset the streak
+    }
     assert.equal(
         curH(iframe),
-        settled,
-        'after the streak allowance the poll must stop feeding a viewport-relative ratchet (roborev 461)',
+        120 + 6 * 500,
+        'every jump separated by a catch-up tick must apply — the streak reset keeps the poll alive (roborev 462)',
+    );
+});
+
+// roborev 462: suppression must not be a permanent lockout. After the streak
+// trips, a locked-out email whose content is STABLE (unlike a ratchet, whose
+// content chases every write) gets a recovery probe grow.
+test('roborev 462: a locked-out poll recovers via the stability probe once content stops moving', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const content = { value: 100 };
+    const iframe = { style: { height: '0px' }, isConnected: true };
+    const el = {
+        get scrollHeight() { return content.value; },
+        getBoundingClientRect() { return { height: content.value }; },
+    };
+    iframe.contentDocument = {
+        body: el,
+        documentElement: el,
+        fonts: { ready: new Promise(() => {}) },
+        querySelectorAll: () => [],
+    };
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+
+    // Four consecutive supra-epsilon growth ticks: 3 apply, the 4th trips
+    // the streak and is suppressed.
+    for (const v of [600, 1200, 1800, 2400]) {
+        content.value = v;
+        timers.tickIntervals();
+    }
+    assert.equal(curH(iframe), 1800, 'the 4th consecutive grow must be suppressed');
+
+    // Content now sits still at 2400 — a real email, not a ratchet. Two
+    // stable suppressed ticks earn the probe grow.
+    timers.tickIntervals();
+    timers.tickIntervals();
+    assert.equal(
+        curH(iframe),
+        2400,
+        'a stable locked-out email must recover via the probe grow — suppression is not a permanent lockout (roborev 462)',
     );
 });
 

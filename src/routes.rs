@@ -8190,6 +8190,24 @@ white   = '#fdf6e3'
             block.contains("_pollGrowStreak"),
             "the poll must suppress consecutive grows (_pollGrowStreak) — supra-epsilon viewport feedback passes the epsilon gate on every tick (roborev 461)"
         );
+        // Suppression must not be a permanent lockout: cur only catches up
+        // via a grow the suppressed poll no longer performs, so without a
+        // recovery probe a later legitimate growth stays clipped forever.
+        // The probe keys on h stability (a ratchet's h chases every write; a
+        // locked-out email's h sits still) (roborev 462).
+        assert!(
+            block.contains("_pollStableTicks"),
+            "the poll's suppression must have a stability-probe recovery (_pollStableTicks) — permanent lockout re-creates the clipped-email symptom (roborev 462)"
+        );
+        // A same-iframe document swap must not inherit the previous
+        // document's suppression state (roborev 462).
+        let reattach = &block[block
+            .find("_sizedDoc !== doc")
+            .expect("re-attach branch present")..];
+        assert!(
+            reattach.contains("_pollGrowStreak = 0"),
+            "the per-document re-attach must reset the poll streak — a new document must not start pre-suppressed (roborev 462)"
+        );
         assert!(
             block.contains("if (!iframe.isConnected)")
                 && block.contains("clearInterval(iframe._pollTimer)"),

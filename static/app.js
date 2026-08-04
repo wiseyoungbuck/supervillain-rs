@@ -6205,10 +6205,37 @@ function sizeIframeToContent(iframe) {
                 // ratchet never catches up. Cap the streak so the poll can't
                 // relayout every 500ms all the way to EMAIL_IFRAME_MAX_HEIGHT.
                 iframe._pollGrowStreak = (iframe._pollGrowStreak || 0) + 1;
-                if (iframe._pollGrowStreak > 3) return;
+                if (iframe._pollGrowStreak > 3) {
+                    // Recovery probe (roborev 462): suppression must not be a
+                    // permanent lockout — cur only catches up via a grow the
+                    // suppressed poll no longer performs, so later legitimate
+                    // growth would stay clipped forever (the exact symptom
+                    // this poll exists to prevent). Discriminate on h itself:
+                    // a ratchet's h moves after every write (content tracks
+                    // the viewport), a locked-out real email's h is STABLE.
+                    // After two consecutive suppressed ticks with h
+                    // unchanged, apply one probe grow: a real email catches
+                    // up and the following tick resets the streak; a ratchet
+                    // moves h again and re-suppresses — a bounded crawl, the
+                    // same trade-off as the observer path's ~epsilon-per-
+                    // 600ms confirm, with EMAIL_IFRAME_MAX_HEIGHT the hard
+                    // stop.
+                    const stable = iframe._pollLastH !== undefined
+                        && Math.abs(h - iframe._pollLastH) < 1;
+                    iframe._pollStableTicks = stable ? (iframe._pollStableTicks || 0) + 1 : 0;
+                    iframe._pollLastH = h;
+                    if (iframe._pollStableTicks >= 2) {
+                        iframe._pollStableTicks = 0;
+                        grow();
+                    }
+                    return;
+                }
+                iframe._pollLastH = h;
                 grow();
             } else {
                 iframe._pollGrowStreak = 0;
+                iframe._pollStableTicks = 0;
+                iframe._pollLastH = h;
             }
         } catch (_) { /* allow-same-origin should always succeed */ }
     };
@@ -6223,6 +6250,12 @@ function sizeIframeToContent(iframe) {
             ro.observe(body);
             iframe._sizedDoc = doc;
             if (iframe._pollTimer) clearInterval(iframe._pollTimer);
+            // A new document starts with a clean streak — the belt-and-braces
+            // same-iframe document swap must not inherit the previous
+            // document's suppression state (roborev 462).
+            iframe._pollGrowStreak = 0;
+            iframe._pollStableTicks = 0;
+            iframe._pollLastH = undefined;
             iframe._pollTimer = setInterval(pollFn, EMAIL_IFRAME_POLL_MS);
         }
     } catch (_) { /* allow-same-origin should always succeed */ }
