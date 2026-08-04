@@ -8237,6 +8237,39 @@ white   = '#fdf6e3'
         );
     }
 
+    // w5ba round 3 — the ACTUAL stuck-at-a-top-inch mechanism (reproduced in
+    // Playwright Firefox against real inbox emails; 3 of 50 failed): the
+    // iframe load event waits for EVERY subresource, and marketing emails
+    // reference trackers/images that respond slowly or never (especially
+    // under Firefox-family content blocking, i.e. Zen). With sizing
+    // initialized only from the load listener, such an email received NO
+    // height write and sat at the UA-default ~150px — the literal "top inch"
+    // — until load fired ("full email in a flash") or forever ("stuck").
+    // renderHtmlBodyIframe must initialize sizing once the srcdoc document is
+    // PARSED (readyState polling on rAF ticks), with load kept only as an
+    // idempotent re-measure. Proven behaviorally in
+    // tests/email_iframe_test.cjs; pinned here.
+    #[test]
+    fn app_js_iframe_sizing_initializes_on_parse_not_load() {
+        let render = js_fn_body(APP_JS, "function renderHtmlBodyIframe");
+        assert!(
+            render.contains("initWhenParsed"),
+            "renderHtmlBodyIframe must poll for the parsed srcdoc document (initWhenParsed) — the load event can be delayed indefinitely by hanging trackers (w5ba round 3)"
+        );
+        assert!(
+            render.contains("doc.readyState !== 'loading'"),
+            "the parsed check must gate on readyState leaving 'loading' — that is the point where the DOM is measurable regardless of subresources (w5ba round 3)"
+        );
+        assert!(
+            render.contains("requestAnimationFrame(initWhenParsed)"),
+            "the readyState poll must re-arm on rAF ticks until the srcdoc document appears (async navigation) and stop with the iframe (w5ba round 3)"
+        );
+        assert!(
+            render.contains("if (!iframe.isConnected) return;"),
+            "the readyState poll must die when the iframe is replaced — it must not accumulate across navigations (w5ba round 3)"
+        );
+    }
+
     // w5ba: "when an email opens it should be cached and open instantly."
     // First open: hold the iframe invisible (.settling — visibility, not
     // display, so layout still runs and every measurement cue works) until

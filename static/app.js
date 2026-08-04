@@ -5822,18 +5822,15 @@ function renderHtmlBodyIframe(container, html, opts) {
         iframe._revealTimer = setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS);
     }
     iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
-    iframe.addEventListener('load', () => {
-        // Firefox-family browsers (Zen; kata w5ba) can fire an extra load
-        // event for the iframe's initial about:blank document before the
-        // srcdoc one. Sizing that blank document is useless, and (worse) it
-        // used to latch the one-shot ResizeObserver attach onto the blank
-        // body, leaving the real email body unobserved. wrapEmailHtml always
-        // injects <base>, so its absence identifies the blank document —
-        // skip it; the srcdoc navigation fires its own load next.
+    const onDocReady = () => {
+        // The initial about:blank document must not initialize anything —
+        // sizing it is useless, and it used to latch the one-shot
+        // ResizeObserver attach onto the blank body (kata w5ba). wrapEmailHtml
+        // always injects <base>, so its absence identifies the blank document.
         try {
             const doc = iframe.contentDocument;
             if (!doc || !doc.querySelector('base')) return;
-        } catch (_) { /* allow-same-origin should always succeed */ }
+        } catch (_) { return; /* allow-same-origin should always succeed */ }
         sizeIframeToContent(iframe);
         if (hold) {
             // Early reveal: fonts settled + one frame for the reflow measure.
@@ -5845,8 +5842,36 @@ function renderHtmlBodyIframe(container, html, opts) {
         } else {
             reveal();
         }
-    });
+    };
+    // The load event still re-measures (all initialization is per-document
+    // idempotent), but it must NOT be the only trigger — see initWhenParsed.
+    iframe.addEventListener('load', onDocReady);
     container.appendChild(iframe);
+    // w5ba round 3 (the actual stuck-at-a-top-inch mechanism, reproduced in
+    // Playwright Firefox): an iframe's load event waits for EVERY subresource,
+    // and marketing emails routinely reference trackers/images that respond
+    // slowly or never — especially under Firefox-family content blocking
+    // (Zen). With sizing initialized only from the load listener, such an
+    // email got NO height write at all and sat at the UA default ~150px — the
+    // literal "top inch" — until load fired ("then the full email in a
+    // flash") or forever ("stuck"). Initialize as soon as the srcdoc document
+    // is PARSED instead: poll readyState from creation on rAF ticks (srcdoc
+    // navigation is async, so the real document appears a tick or two after
+    // append) and run onDocReady once the wrapper document has left
+    // 'loading'. The rAF loop dies with the iframe (isConnected) and
+    // onDocReady's <base> gate keeps it from initializing on about:blank.
+    const initWhenParsed = () => {
+        if (!iframe.isConnected) return; // replaced / navigated away — stop
+        let parsed = false;
+        try {
+            const doc = iframe.contentDocument;
+            parsed = !!(doc && doc.body && doc.readyState !== 'loading'
+                && doc.querySelector('base'));
+        } catch (_) { /* allow-same-origin should always succeed */ }
+        if (parsed) onDocReady();
+        else requestAnimationFrame(initWhenParsed);
+    };
+    requestAnimationFrame(initWhenParsed);
 }
 
 // Size a sandboxed (allow-same-origin, no-scripts) iframe to its content's

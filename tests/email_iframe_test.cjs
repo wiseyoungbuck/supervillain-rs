@@ -112,13 +112,16 @@ function makeMockIframe({ partialHeight, fullHeight, imgs, bodyBorderBox }) {
 // Ids are 1-based indices into a never-shrinking queue so clearTimeout can
 // REALLY drop the queued callback — the roborev-459 regression test asserts
 // the cancellation layer behaviorally, not just via the contains() backstop.
-// Intervals live in their own id space (offset 1e6) so timeout and interval
-// ids can't collide; tickIntervals() runs every live interval callback once.
+// rAFs live in their own queue (matching real browser semantics) so
+// pending() counts only timeouts — the readyState poll (w5ba round 3) arms a
+// benign rAF at render that must not read as a leaked timer. Intervals live
+// in their own id space (offset 1e6); tickIntervals() runs each live one once.
 function fakeTimers() {
     const queue = [];
+    const rafs = [];
     const intervals = [];
     return {
-        requestAnimationFrame: (fn) => { queue.push(fn); return queue.length; },
+        requestAnimationFrame: (fn) => { rafs.push(fn); return rafs.length; },
         setTimeout: (fn) => { queue.push(fn); return queue.length; },
         clearTimeout: (id) => { if (id) queue[id - 1] = null; },
         setInterval: (fn) => { intervals.push(fn); return 1_000_000 + intervals.length; },
@@ -128,11 +131,20 @@ function fakeTimers() {
         pending: () => queue.filter(Boolean).length,
         flush: () => {
             let i = 0;
-            while (i < queue.length) {
-                const fn = queue[i];
-                queue[i] = null;
-                i++;
-                if (fn) fn();
+            let j = 0;
+            while (i < queue.length || j < rafs.length) {
+                while (j < rafs.length) {
+                    const fn = rafs[j];
+                    rafs[j] = null;
+                    j++;
+                    if (fn) fn();
+                }
+                if (i < queue.length) {
+                    const fn = queue[i];
+                    queue[i] = null;
+                    i++;
+                    if (fn) fn();
+                }
             }
         },
     };
@@ -790,6 +802,43 @@ test('roborev 457: a stale reveal must not clobber the next email\'s scroll posi
         container.scrollTop,
         7,
         'a replaced iframe\'s reveal must not write the container scrollTop (roborev 457)',
+    );
+});
+
+// w5ba round 3 — the ACTUAL stuck-at-a-top-inch mechanism, reproduced in
+// Playwright Firefox against real inbox emails: the iframe load event waits
+// for EVERY subresource, and marketing emails reference trackers that respond
+// slowly or never (especially under Firefox-family content blocking). With
+// sizing initialized only from the load listener, such an email got no height
+// write at all and sat at the UA-default ~150px forever. Sizing must
+// initialize once the srcdoc document is PARSED, load or no load.
+test('w5ba: sizing initializes once the document is parsed, even if load never fires', () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const iframeEl = makeIframeEl();
+    // The srcdoc document is parsed (readyState interactive) but load will
+    // never fire — a tracker pixel is hanging.
+    iframeEl.isConnected = true;
+    iframeEl.contentDocument = {
+        readyState: 'interactive',
+        body: {},
+        querySelector: (sel) => (sel === 'base' ? {} : null),
+        fonts: { ready: new Promise(() => {}) },
+    };
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>hi</p>', {});
+    assert.equal(sized.length, 0, 'nothing runs synchronously at render');
+    timers.flush(); // the creation-time rAF readyState poll
+    assert.equal(
+        sized.length,
+        1,
+        'the sizing machinery must initialize from the parsed document without a load event (w5ba round 3)',
     );
 });
 
