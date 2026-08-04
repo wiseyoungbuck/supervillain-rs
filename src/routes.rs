@@ -6969,10 +6969,29 @@ white   = '#fdf6e3'
         );
         // ... and "every write" must stay true (roborev 459): the ONLY direct
         // `emailCache[...] = ...` assignment allowed is the one inside
-        // cacheEmail itself. Inserts that bypass it escape the bound.
+        // cacheEmail itself. Inserts that bypass it escape the bound. The
+        // filter parses past the bracket close rather than substring-matching
+        // "] = " (roborev 460): no-space (`emailCache[k]=v`) and compound
+        // (`??=`/`||=`/`&&=`) assignments are caught, while comparisons
+        // (`==`, `=>`) and reads sharing a line with an unrelated assignment
+        // are not false positives. Multi-line splits remain out of scope, as
+        // is usual for the repo's string invariants.
         let direct_writes: Vec<&str> = APP_JS
             .lines()
-            .filter(|l| l.contains("emailCache[") && l.contains("] = "))
+            .filter(|l| {
+                let Some(start) = l.find("emailCache[") else {
+                    return false;
+                };
+                let after = &l[start + "emailCache[".len()..];
+                let Some(close) = after.find(']') else {
+                    return false;
+                };
+                let rest = after[close + 1..].trim_start();
+                (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"))
+                    || rest.starts_with("??=")
+                    || rest.starts_with("||=")
+                    || rest.starts_with("&&=")
+            })
             .map(str::trim)
             .collect();
         assert!(
