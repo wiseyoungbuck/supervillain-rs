@@ -235,6 +235,239 @@ pub fn is_light_theme(theme_dir: &std::path::Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Readability repair
+// ---------------------------------------------------------------------------
+//
+// Terminal palettes routinely reuse slots: Everforest sets color0 == color8
+// and selection-background == foreground. Any static slot→variable mapping
+// (ours in generate_theme_css, or the Omarchy supervillain.css.tpl template)
+// then produces text painted in the exact color of the surface under it —
+// e.g. --fg-dim (From:/To: labels) == --bg-secondary (email header), or
+// --selection == --fg (selected rows). Since no mapping can be correct for
+// every palette, repair happens at serve time: check the variable pairs that
+// style.css actually layers, and re-derive any failing text color by blending
+// the theme's own fg toward its bg (keeping the repaired color on-theme).
+
+/// WCAG relative luminance of an sRGB color.
+fn luminance(rgb: [u8; 3]) -> f64 {
+    let lin = |c: u8| {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+}
+
+/// WCAG contrast ratio between two colors (>= 1.0).
+fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Linear blend: `t = 0` returns `a`, `t = 1` returns `b`.
+fn mix(a: [u8; 3], b: [u8; 3], t: f64) -> [u8; 3] {
+    let ch = |x: u8, y: u8| (x as f64 * (1.0 - t) + y as f64 * t).round() as u8;
+    [ch(a[0], b[0]), ch(a[1], b[1]), ch(a[2], b[2])]
+}
+
+/// Parse `#rrggbb` into RGB components.
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let h = s.strip_prefix('#')?;
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ])
+}
+
+fn to_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+// Minimum contrast ratios per role. --fg-dim is deliberately subtle, so its
+// floor is well below the WCAG 4.5 body-text bar — just high enough to stay
+// legible on every surface it's painted over.
+const MIN_FG: f64 = 4.5;
+const MIN_MUTED: f64 = 3.0;
+const MIN_DIM: f64 = 2.4;
+const MIN_ON_SELECTION: f64 = 2.5;
+const MIN_ACCENT: f64 = 2.5;
+
+/// Repair unreadable variable combinations in place. Returns the names of the
+/// variables that were changed (empty when the theme was already readable).
+///
+/// The pairs checked mirror how static/style.css layers the variables:
+/// - --fg on --bg (body text)
+/// - --selection is a background under --fg / --fg-muted / --fg-dim / --accent
+///   text (selected email rows, active mailbox)
+/// - --fg-muted on --bg / --bg-secondary / --bg-tertiary (subjects, meta)
+/// - --fg-dim on --bg / --bg-secondary / --bg-tertiary (labels, previews, dates)
+/// - --accent on --bg / --bg-secondary (active items, links, counts)
+fn repair_readability(colors: &mut std::collections::HashMap<String, [u8; 3]>) -> Vec<String> {
+    let mut changed = Vec::new();
+    let (Some(&bg), Some(&fg0)) = (colors.get("bg"), colors.get("fg")) else {
+        return changed;
+    };
+
+    // --fg is the anchor every repair blends from; fix it first. A theme whose
+    // fg fails against its own bg is fundamentally broken — snap to the pole.
+    let mut fg = fg0;
+    if contrast(fg, bg) < MIN_FG {
+        fg = if luminance(bg) < 0.5 {
+            [0xff, 0xff, 0xff]
+        } else {
+            [0x00, 0x00, 0x00]
+        };
+        colors.insert("fg".into(), fg);
+        changed.push("fg".into());
+    }
+
+    let bg2 = colors.get("bg-secondary").copied().unwrap_or(bg);
+    let bg3 = colors.get("bg-tertiary").copied().unwrap_or(bg);
+    let accent = colors.get("accent").copied();
+
+    // --selection: a background tint. When it collides with the text drawn
+    // over it (Everforest ships selection-background == foreground), rebuild
+    // it as a subtle fg-over-bg tint instead.
+    let mut selection = colors.get("selection").copied();
+    if let Some(sel) = selection {
+        let readable = |s: [u8; 3]| {
+            contrast(s, fg) >= MIN_ON_SELECTION && accent.is_none_or(|a| contrast(s, a) >= 2.0)
+        };
+        if !readable(sel) {
+            let repaired = [0.18, 0.26, 0.34, 0.12]
+                .iter()
+                .map(|&t| mix(bg, fg, t))
+                .find(|&c| readable(c))
+                .unwrap_or_else(|| mix(bg, fg, 0.18));
+            colors.insert("selection".into(), repaired);
+            changed.push("selection".into());
+            selection = Some(repaired);
+        }
+    }
+
+    // Dimmed text roles: if any surface fails, re-derive from fg blended
+    // toward bg — most-dimmed candidate first so the repaired color keeps its
+    // intended visual weight. Falls back to plain fg (readable by rule 1).
+    let mut repair_text = |name: &str, dim_steps: &[f64], surfaces: &[([u8; 3], f64)]| {
+        let Some(&cur) = colors.get(name) else { return };
+        let ok = |c: [u8; 3]| surfaces.iter().all(|&(s, min)| contrast(c, s) >= min);
+        if ok(cur) {
+            return;
+        }
+        let repaired = dim_steps
+            .iter()
+            .map(|&t| mix(fg, bg, t))
+            .find(|&c| ok(c))
+            .unwrap_or(fg);
+        colors.insert(name.into(), repaired);
+        changed.push(name.into());
+    };
+
+    let sel_surface = selection.map(|s| (s, 2.0));
+    let mut muted_surfaces = vec![(bg, MIN_MUTED), (bg2, MIN_MUTED), (bg3, MIN_MUTED)];
+    if let Some(s) = selection {
+        muted_surfaces.push((s, MIN_ON_SELECTION));
+    }
+    repair_text("fg-muted", &[0.30, 0.20, 0.10, 0.0], &muted_surfaces);
+
+    let mut dim_surfaces = vec![(bg, MIN_DIM), (bg2, MIN_DIM), (bg3, MIN_DIM)];
+    if let Some(s) = sel_surface {
+        dim_surfaces.push(s);
+    }
+    repair_text("fg-dim", &[0.55, 0.45, 0.30, 0.15, 0.0], &dim_surfaces);
+
+    // --accent: text on bg/bg-secondary and on --selection. Blend toward fg
+    // (not bg) so a repaired accent stays a highlight, not a dim.
+    if let Some(acc) = accent {
+        let mut surfaces = vec![(bg, MIN_ACCENT), (bg2, MIN_ACCENT)];
+        if let Some(s) = selection {
+            surfaces.push((s, 2.0));
+        }
+        let ok = |c: [u8; 3]| surfaces.iter().all(|&(s, min)| contrast(c, s) >= min);
+        if !ok(acc) {
+            let repaired = [0.25, 0.5, 0.75, 1.0]
+                .iter()
+                .map(|&t| mix(acc, fg, t))
+                .find(|&c| ok(c))
+                .unwrap_or(fg);
+            colors.insert("accent".into(), repaired);
+            changed.push("accent".into());
+        }
+    }
+
+    changed
+}
+
+/// Rewrite the `:root` variable block of a theme stylesheet so every text
+/// color stays readable on the surfaces style.css paints it over. CSS outside
+/// the `:root` block, unknown variables, and non-hex values pass through
+/// untouched; a stylesheet with no parseable `:root` (or one that is already
+/// readable) is returned unchanged.
+///
+/// Applied to BOTH theme sources (a theme-shipped supervillain.css and our
+/// generated fallback) at serve time, because both inherit the same
+/// palette-slot collisions from the terminal color scheme they mirror.
+pub fn sanitize_theme_css(css: &str) -> String {
+    let Some(root_pos) = css.find(":root") else {
+        return css.to_string();
+    };
+    let Some(open) = css[root_pos..].find('{').map(|i| root_pos + i) else {
+        return css.to_string();
+    };
+    let Some(close) = css[open..].find('}').map(|i| open + i) else {
+        return css.to_string();
+    };
+    let block = &css[open + 1..close];
+
+    let mut colors = std::collections::HashMap::new();
+    for line in block.lines() {
+        if let Some(rest) = line.trim().strip_prefix("--")
+            && let Some((name, value)) = rest.split_once(':')
+            && let Some(rgb) = parse_hex_rgb(value.trim().trim_end_matches(';').trim())
+        {
+            colors.insert(name.trim().to_string(), rgb);
+        }
+    }
+
+    let changed = repair_readability(&mut colors);
+    if changed.is_empty() {
+        return css.to_string();
+    }
+
+    let new_block: Vec<String> = block
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.trim().strip_prefix("--")
+                && let Some((name, _)) = rest.split_once(':')
+            {
+                let name = name.trim();
+                if changed.iter().any(|c| c == name) {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    return format!("{indent}--{name}: {};", to_hex(colors[name]));
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    let trailing = if block.ends_with('\n') { "\n" } else { "" };
+    format!(
+        "{}{}{}{}",
+        &css[..open + 1],
+        new_block.join("\n"),
+        trailing,
+        &css[close..]
+    )
+}
+
+// ---------------------------------------------------------------------------
 // CSS generation
 // ---------------------------------------------------------------------------
 
@@ -732,5 +965,216 @@ white   =   '#cccccc'
 
         std::fs::write(dir.path().join("light.mode"), "# light theme").unwrap();
         assert!(is_light_theme(dir.path()));
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_theme_css / repair_readability
+    // -----------------------------------------------------------------------
+
+    // Everforest: color0 == color8 == #475258 (so --fg-dim lands on surfaces
+    // of the exact same color) and selection-background == foreground (so
+    // selected rows paint fg-colored text on an fg-colored background). The
+    // real-world black-on-black report.
+    const GHOSTTY_EVERFOREST: &str = "\
+background = #2d353b
+foreground = #d3c6aa
+selection-background = #d3c6aa
+selection-foreground = #2d353b
+
+palette = 0=#475258
+palette = 1=#e67e80
+palette = 2=#a7c080
+palette = 3=#dbbc7f
+palette = 4=#7fbbb3
+palette = 5=#d699b6
+palette = 6=#83c092
+palette = 7=#d3c6aa
+palette = 8=#475258
+palette = 9=#e67e80
+palette = 10=#a7c080
+palette = 11=#dbbc7f
+palette = 12=#7fbbb3
+palette = 13=#d699b6
+palette = 14=#83c092
+palette = 15=#d3c6aa
+";
+
+    // The supervillain.css Omarchy's template pipeline generates for
+    // Everforest (verbatim from ~/.config/omarchy/current/theme/).
+    const EVERFOREST_TEMPLATE_CSS: &str = "\
+/* Omarchy Theme for Supervillain */
+
+:root {
+    --bg: #2d353b;
+    --bg-secondary: #475258;
+    --bg-tertiary: #475258;
+    --fg: #d3c6aa;
+    --fg-muted: #d3c6aa;
+    --fg-dim: #475258;
+    --accent: #7fbbb3;
+    --accent-dim: #7fbbb3;
+    --success: #a7c080;
+    --warning: #dbbc7f;
+    --danger: #e67e80;
+    --selection: #d3c6aa;
+    --border: #475258;
+}
+
+/* Help and modal overlays */
+#help-overlay {
+    background: rgba(45,53,59, 0.9);
+}
+
+#split-modal {
+    background: rgba(45,53,59, 0.9);
+}
+";
+
+    /// Extract `--name: #hex;` from a css string.
+    fn css_var(css: &str, name: &str) -> [u8; 3] {
+        let needle = format!("--{name}:");
+        let start = css.find(&needle).unwrap() + needle.len();
+        let end = css[start..].find(';').unwrap() + start;
+        parse_hex_rgb(css[start..end].trim()).unwrap()
+    }
+
+    #[test]
+    fn sanitize_everforest_template_css_repairs_collisions() {
+        let out = sanitize_theme_css(EVERFOREST_TEMPLATE_CSS);
+        let bg = css_var(&out, "bg");
+        let bg2 = css_var(&out, "bg-secondary");
+        let bg3 = css_var(&out, "bg-tertiary");
+        let fg = css_var(&out, "fg");
+        let dim = css_var(&out, "fg-dim");
+        let sel = css_var(&out, "selection");
+
+        // Anchors and surfaces stay on-theme
+        assert_eq!(bg, [0x2d, 0x35, 0x3b]);
+        assert_eq!(fg, [0xd3, 0xc6, 0xaa]);
+        assert_eq!(bg2, [0x47, 0x52, 0x58]);
+
+        // From:/To: labels: --fg-dim was the identical hex as the email
+        // header background it sits on. Must now clear the dim floor on
+        // every surface.
+        for surface in [bg, bg2, bg3] {
+            assert!(
+                contrast(dim, surface) >= MIN_DIM,
+                "fg-dim {} unreadable on {}",
+                to_hex(dim),
+                to_hex(surface)
+            );
+        }
+
+        // Selected rows: --selection was == --fg. Text over it must read.
+        assert!(contrast(sel, fg) >= MIN_ON_SELECTION);
+        assert!(contrast(sel, css_var(&out, "accent")) >= 2.0);
+        assert!(contrast(sel, css_var(&out, "fg-muted")) >= MIN_ON_SELECTION);
+    }
+
+    #[test]
+    fn sanitize_preserves_untouched_rules_and_vars() {
+        let out = sanitize_theme_css(EVERFOREST_TEMPLATE_CSS);
+        // Non-:root rules pass through verbatim
+        assert!(out.contains("background: rgba(45,53,59, 0.9);"));
+        // Vars outside the readability contract are untouched
+        assert!(out.contains("--danger: #e67e80;"));
+        assert!(out.contains("--warning: #dbbc7f;"));
+        assert!(out.contains("--border: #475258;"));
+    }
+
+    #[test]
+    fn sanitize_generated_css_repairs_everforest() {
+        // Path 2 (no supervillain.css): generate_theme_css maps --fg-dim and
+        // --bg-tertiary from the same palette slot, so hover surfaces always
+        // matched dim text exactly. Sanitize must repair its output too.
+        let colors = parse_ghostty_colors(GHOSTTY_EVERFOREST).unwrap();
+        let out = sanitize_theme_css(&generate_theme_css(&colors, false));
+        let dim = css_var(&out, "fg-dim");
+        assert!(contrast(dim, css_var(&out, "bg-tertiary")) >= MIN_DIM);
+        assert!(contrast(dim, css_var(&out, "bg-secondary")) >= MIN_DIM);
+        assert!(contrast(css_var(&out, "selection"), css_var(&out, "fg")) >= MIN_ON_SELECTION);
+    }
+
+    #[test]
+    fn sanitize_leaves_readable_theme_unchanged() {
+        let css = "\
+:root {
+    --bg: #000000;
+    --bg-secondary: #101010;
+    --bg-tertiary: #202020;
+    --fg: #e0e0e0;
+    --fg-muted: #b0b0b0;
+    --fg-dim: #808080;
+    --accent: #00c0c0;
+    --selection: #303030;
+}
+";
+        assert_eq!(sanitize_theme_css(css), css);
+    }
+
+    #[test]
+    fn sanitize_light_theme_with_dark_secondary_surface() {
+        // Solarized-light shape: light bg, dark bg-secondary, and a
+        // near-background --fg-muted. Repaired muted text must read on both.
+        let css = "\
+:root {
+    --bg: #fdf6e3;
+    --bg-secondary: #073642;
+    --bg-tertiary: #002b36;
+    --fg: #586e75;
+    --fg-muted: #eee8d5;
+    --fg-dim: #002b36;
+    --accent: #2aa198;
+    --selection: #002b36;
+}
+";
+        let out = sanitize_theme_css(css);
+        let muted = css_var(&out, "fg-muted");
+        let dim = css_var(&out, "fg-dim");
+        for (surface, min) in [
+            (css_var(&out, "bg"), MIN_MUTED),
+            (css_var(&out, "bg-secondary"), MIN_MUTED),
+        ] {
+            assert!(contrast(muted, surface) >= min);
+        }
+        for surface in [
+            css_var(&out, "bg"),
+            css_var(&out, "bg-secondary"),
+            css_var(&out, "bg-tertiary"),
+        ] {
+            assert!(contrast(dim, surface) >= MIN_DIM);
+        }
+        assert!(contrast(css_var(&out, "selection"), css_var(&out, "fg")) >= MIN_ON_SELECTION);
+    }
+
+    #[test]
+    fn sanitize_passes_through_css_without_root_block() {
+        assert_eq!(sanitize_theme_css(""), "");
+        assert_eq!(
+            sanitize_theme_css("body { color: red; }"),
+            "body { color: red; }"
+        );
+        // :root present but no parseable bg/fg → untouched
+        let partial = ":root { --accent: #123456; }";
+        assert_eq!(sanitize_theme_css(partial), partial);
+    }
+
+    #[test]
+    fn sanitize_preserves_light_mode_marker() {
+        let colors = parse_ghostty_colors(GHOSTTY_EVERFOREST).unwrap();
+        let out = sanitize_theme_css(&generate_theme_css(&colors, true));
+        assert!(out.contains("--light-mode"));
+    }
+
+    #[test]
+    fn sanitize_snaps_fg_to_pole_when_fg_matches_bg() {
+        let css = "\
+:root {
+    --bg: #2d353b;
+    --fg: #2d353b;
+}
+";
+        let out = sanitize_theme_css(css);
+        assert_eq!(css_var(&out, "fg"), [0xff, 0xff, 0xff]);
     }
 }
