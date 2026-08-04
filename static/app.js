@@ -77,8 +77,19 @@ const state = {
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
 };
 
-// Simple cache: email id -> full email object with body
+// Simple cache: email id -> full email object with body. Bounded FIFO
+// (roborev 457): visible-list prefetch warms up to 20 bodies per list render,
+// so a long-lived tab crossing many mailboxes/splits would otherwise grow
+// this without limit. All writes go through cacheEmail(), which trims the
+// oldest entries past EMAIL_CACHE_MAX. Reads and in-place mutations (e.g.
+// the cache-hit isUnread flip) keep touching emailCache[key] directly.
 const emailCache = {};
+const EMAIL_CACHE_MAX = 300;
+function cacheEmail(key, email) {
+    emailCache[key] = email;
+    const keys = Object.keys(emailCache);
+    for (let i = 0; i < keys.length - EMAIL_CACHE_MAX; i++) delete emailCache[keys[i]];
+}
 // Scroll position cache: email id -> scrollTop
 const scrollPositions = {};
 // Settled iframe height cache: email id -> last height sizeIframeToContent
@@ -90,7 +101,8 @@ const scrollPositions = {};
 // corrects drift.
 const iframeHeightCache = {};
 
-// Rolling email cache
+// Email list page size (list fetches only — the body cache above has its own
+// EMAIL_CACHE_MAX bound).
 const CACHE_LIMIT = 150;
 
 // Deadline guard consumed by the window focus listener: set when the
@@ -1555,7 +1567,7 @@ async function loadEmailDetail(emailId) {
 
     try {
         const email = await api('GET', `/emails/${emailId}`);
-        emailCache[cacheKey(emailId)] = email;
+        cacheEmail(cacheKey(emailId), email);
         // The GET above auto-marks the email read server-side, but the
         // response body reflects the pre-mark state — the server fetches
         // the email, then marks it read as a side effect, without mutating
@@ -1627,7 +1639,11 @@ function prefetchAdjacentEmails() {
         if (target && !emailCache[cacheKey(target.emailId)]) {
             const key = cacheKey(target.emailId);
             api('GET', `/emails/${target.emailId}?mark_read=false`)
-                .then(email => { emailCache[key] = email; })
+                // Assign only if still absent (roborev 457): a real open
+                // landing during the fetch stores the email with isUnread
+                // already flipped; overwriting it with this response's
+                // pre-mark state would misfire mark-read on the next reopen.
+                .then(email => { if (!emailCache[key]) cacheEmail(key, email); })
                 .catch(() => {}); // Swallow — prefetch is best-effort
         }
     }
@@ -1658,7 +1674,12 @@ function prefetchVisibleEmails() {
             const t = targets[next++];
             if (emailCache[t.key]) continue; // opened for real while queued
             try {
-                emailCache[t.key] = await api('GET', `/emails/${t.id}?mark_read=false`);
+                const email = await api('GET', `/emails/${t.id}?mark_read=false`);
+                // Assign only if still absent (roborev 457): a real open
+                // landing mid-fetch stores the email with isUnread flipped;
+                // this response's pre-mark state must not overwrite it, or
+                // the next cache-hit reopen misfires mark-read.
+                if (!emailCache[t.key]) cacheEmail(t.key, email);
             } catch (_) { /* Swallow — prefetch is best-effort */ }
         }
     };
@@ -5174,6 +5195,10 @@ function renderHtmlBodyIframe(container, html, opts) {
     // images can't pin the previous email's DOM in memory across navigations
     // (mirrors the _ro.disconnect() above; kata ceph remaining gap).
     if (oldIframe && oldIframe._imgLoadAc) oldIframe._imgLoadAc.abort();
+    // Cancel the prior iframe's pending reveal cap so it can't fire against
+    // this render's scroll position (roborev 457; the contains() guard in
+    // reveal is the backstop for paths that don't come through here).
+    if (oldIframe && oldIframe._revealTimer) clearTimeout(oldIframe._revealTimer);
     container.replaceChildren();
     const iframe = document.createElement('iframe');
     iframe.setAttribute(
@@ -5201,7 +5226,12 @@ function renderHtmlBodyIframe(container, html, opts) {
     // invisible.
     const hold = !autosize && !(knownHeight > 0);
     const reveal = () => {
-        if (iframe._revealed) return;
+        // Stale-reveal guard (roborev 457): the cap timer and the fonts.ready
+        // continuation can fire AFTER this iframe was replaced by a later
+        // render (keyboard-fast navigation within the 300ms hold window). The
+        // container then shows a different email — writing scrollTop would
+        // yank ITS position to this email's saved offset.
+        if (iframe._revealed || !container.contains(iframe)) return;
         iframe._revealed = true;
         iframe.classList.remove('settling');
         // Restore the saved scroll position now that the iframe is sized and
@@ -5211,7 +5241,7 @@ function renderHtmlBodyIframe(container, html, opts) {
     };
     if (hold) {
         iframe.classList.add('settling');
-        setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS);
+        iframe._revealTimer = setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS);
     }
     iframe.setAttribute('srcdoc', wrapEmailHtml(linkifyHtml(html)));
     iframe.addEventListener('load', () => {

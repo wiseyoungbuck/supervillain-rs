@@ -284,14 +284,14 @@ function extractRenderHtmlBodyIframe(src) {
 
 // Load the real renderHtmlBodyIframe with faked collaborators. wrapEmailHtml/
 // linkifyHtml become identity — the srcdoc string is not under test here.
-function loadRenderHtmlBodyIframe({ document, setTimeout, requestAnimationFrame, sizeIframeToContent }) {
+function loadRenderHtmlBodyIframe({ document, setTimeout, clearTimeout, requestAnimationFrame, sizeIframeToContent }) {
     const code = extractRenderHtmlBodyIframe(APP_JS);
     // eslint-disable-next-line no-new-func
     return new Function(
-        'document', 'setTimeout', 'requestAnimationFrame', 'sizeIframeToContent',
+        'document', 'setTimeout', 'clearTimeout', 'requestAnimationFrame', 'sizeIframeToContent',
         'wrapEmailHtml', 'linkifyHtml', 'EMAIL_IFRAME_REVEAL_CAP_MS',
         code + '\nreturn renderHtmlBodyIframe;',
-    )(document, setTimeout, requestAnimationFrame, sizeIframeToContent, (h) => h, (h) => h, 300);
+    )(document, setTimeout, clearTimeout, requestAnimationFrame, sizeIframeToContent, (h) => h, (h) => h, 300);
 }
 
 function makeIframeEl() {
@@ -312,7 +312,14 @@ function makeIframeEl() {
 }
 
 function makeContainer() {
-    return { scrollTop: -1, querySelector: () => null, replaceChildren() {}, appendChild() {} };
+    const children = new Set();
+    return {
+        scrollTop: -1,
+        querySelector: () => [...children][0] || null,
+        replaceChildren() { children.clear(); },
+        appendChild(el) { children.add(el); },
+        contains: (el) => children.has(el),
+    };
 }
 
 const realDoc = (fontsReady) => ({
@@ -388,6 +395,44 @@ test('w5ba: a load for a document without the wrapper <base> (Firefox about:blan
     iframeEl.contentDocument = realDoc(new Promise(() => {}));
     iframeEl.fire('load');
     assert.equal(sized.length, 1, 'the srcdoc load must run the sizing machinery');
+});
+
+// roborev 457 (Medium): a first-open iframe's reveal (cap timer or late
+// fonts.ready continuation) must NOT fire against the shared container after
+// a later render replaced the iframe — it would yank the NEW email's scroll
+// position to the OLD email's saved offset.
+test('roborev 457: a stale reveal must not clobber the next email\'s scroll position', async () => {
+    const timers = fakeTimers();
+    const els = [makeIframeEl(), makeIframeEl()];
+    let n = 0;
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => els[n++] },
+        ...timers,
+        sizeIframeToContent: () => {},
+    });
+
+    // Email A: first open, held, saved scrollTop 42. Its fonts.ready resolves
+    // LATE (after navigation) — arm the continuation now.
+    render(container, '<p>A</p>', { scrollTop: 42 });
+    els[0].contentDocument = realDoc(Promise.resolve());
+    els[0].fire('load');
+
+    // User navigates to email B before A's hold window closes. B is a
+    // known-height reopen whose position restores to 7 on load.
+    render(container, '<p>B</p>', { scrollTop: 7, knownHeight: 900 });
+    els[1].contentDocument = realDoc(new Promise(() => {}));
+    els[1].fire('load');
+    assert.equal(container.scrollTop, 7);
+
+    // A's stale cues fire now: the fonts.ready continuation and the cap timer.
+    await new Promise((r) => setImmediate(r));
+    timers.flush();
+    assert.equal(
+        container.scrollTop,
+        7,
+        'a replaced iframe\'s reveal must not write the container scrollTop (roborev 457)',
+    );
 });
 
 test('w5ba: reopen with a known height pre-sizes the iframe and paints immediately (no hold)', () => {

@@ -6894,6 +6894,19 @@ white   = '#fdf6e3'
             render.contains("setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS)"),
             "renderHtmlBodyIframe must arm the reveal cap at creation — a slow font fetch or never-firing load must not strand the iframe invisible (w5ba)"
         );
+        // Stale-reveal guard (roborev 457): the cap timer / late fonts.ready
+        // continuation must not write the container's scrollTop after this
+        // iframe was replaced — that would yank the NEXT email's position.
+        // Both layers: the contains() guard in reveal, and the prior iframe's
+        // timer cancelled on teardown.
+        assert!(
+            render.contains("container.contains(iframe)"),
+            "reveal must early-return when its iframe is no longer in the container — a stale reveal must not clobber the next email's scroll position (roborev 457)"
+        );
+        assert!(
+            render.contains("_revealTimer") && render.contains("clearTimeout("),
+            "renderHtmlBodyIframe must cancel the prior iframe's pending reveal cap timer on teardown (roborev 457)"
+        );
         assert!(
             render.contains("knownHeight > 0") && render.contains("knownHeight + 'px'"),
             "renderHtmlBodyIframe must pre-size the iframe from opts.knownHeight so a reopen paints full-height immediately with no hold (w5ba)"
@@ -6932,6 +6945,27 @@ white   = '#fdf6e3'
         assert!(
             block.contains("prefetchVisibleGen"),
             "prefetchVisibleEmails must guard its worker loop with a generation counter so an account/mailbox switch drops stale in-flight loops (w5ba)"
+        );
+        // Assign-if-absent after the await (roborev 457): a real open landing
+        // mid-fetch stores the email with isUnread flipped; the prefetch
+        // response's pre-mark state must not overwrite it, or the next
+        // cache-hit reopen misfires mark-read (the roborev 303 misfire again).
+        assert!(
+            block.contains("if (!emailCache[t.key]) cacheEmail(t.key, email)"),
+            "prefetchVisibleEmails must only cache its response when the entry is still absent — a real open mid-fetch must win (roborev 457)"
+        );
+        let adjacent = js_fn_body(APP_JS, "function prefetchAdjacentEmails");
+        assert!(
+            adjacent.contains("if (!emailCache[key]) cacheEmail(key, email)"),
+            "prefetchAdjacentEmails must only cache its response when the entry is still absent — a real open mid-fetch must win (roborev 457)"
+        );
+        // Bounded cache (roborev 457): warming 20 bodies per list render made
+        // the previously-unbounded emailCache grow materially; every write
+        // funnels through cacheEmail, which trims past EMAIL_CACHE_MAX.
+        assert!(
+            APP_JS.contains("EMAIL_CACHE_MAX")
+                && js_fn_body(APP_JS, "function cacheEmail").contains("delete emailCache"),
+            "emailCache writes must go through cacheEmail, which trims the oldest entries past EMAIL_CACHE_MAX (roborev 457)"
         );
         let load = js_fn_body(APP_JS, "async function loadEmails");
         assert!(
