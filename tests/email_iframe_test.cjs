@@ -47,7 +47,7 @@ function extractSizeIframeToContent(src) {
 // Load the real function with faked browser globals injected as PARAMETERS
 // (not globalThis) so Node's own timers / test runner are untouched. The
 // returned function closes over the consts and these injected globals.
-function loadSizeIframeToContent({ requestAnimationFrame, setTimeout, clearTimeout, ResizeObserver }) {
+function loadSizeIframeToContent({ requestAnimationFrame, setTimeout, clearTimeout, setInterval, clearInterval, ResizeObserver }) {
     const code = extractSizeIframeToContent(APP_JS);
     // eslint-disable-next-line no-new-func
     return new Function(
@@ -55,8 +55,10 @@ function loadSizeIframeToContent({ requestAnimationFrame, setTimeout, clearTimeo
         'requestAnimationFrame',
         'setTimeout',
         'clearTimeout',
+        'setInterval',
+        'clearInterval',
         code + '\nreturn sizeIframeToContent;',
-    )(ResizeObserver, requestAnimationFrame, setTimeout, clearTimeout);
+    )(ResizeObserver, requestAnimationFrame, setTimeout, clearTimeout, setInterval, clearInterval);
 }
 
 function curH(iframe) {
@@ -84,7 +86,7 @@ function makeImg() {
 //               fires normally. Used by the control test.
 function makeMockIframe({ partialHeight, fullHeight, imgs, bodyBorderBox }) {
     const state = { imageLoaded: false };
-    const iframe = { style: { height: '0px' } };
+    const iframe = { style: { height: '0px' }, isConnected: true };
     const cur = () => curH(iframe);
     const contentHeight = () => (state.imageLoaded ? fullHeight : partialHeight);
     const bodyRect = () => (bodyBorderBox === 'pinned' ? cur() : contentHeight());
@@ -110,12 +112,19 @@ function makeMockIframe({ partialHeight, fullHeight, imgs, bodyBorderBox }) {
 // Ids are 1-based indices into a never-shrinking queue so clearTimeout can
 // REALLY drop the queued callback — the roborev-459 regression test asserts
 // the cancellation layer behaviorally, not just via the contains() backstop.
+// Intervals live in their own id space (offset 1e6) so timeout and interval
+// ids can't collide; tickIntervals() runs every live interval callback once.
 function fakeTimers() {
     const queue = [];
+    const intervals = [];
     return {
         requestAnimationFrame: (fn) => { queue.push(fn); return queue.length; },
         setTimeout: (fn) => { queue.push(fn); return queue.length; },
         clearTimeout: (id) => { if (id) queue[id - 1] = null; },
+        setInterval: (fn) => { intervals.push(fn); return 1_000_000 + intervals.length; },
+        clearInterval: (id) => { if (id >= 1_000_001) intervals[id - 1_000_001] = null; },
+        tickIntervals: () => { for (const fn of [...intervals]) if (fn) fn(); },
+        liveIntervals: () => intervals.filter(Boolean).length,
         pending: () => queue.filter(Boolean).length,
         flush: () => {
             let i = 0;
@@ -219,7 +228,7 @@ test('w5ba: a second call with a new document re-attaches the ResizeObserver to 
         };
     };
 
-    const iframe = { style: { height: '0px' } };
+    const iframe = { style: { height: '0px' }, isConnected: true };
     const hA = { value: 50 };
     iframe.contentDocument = mkDoc(hA); // the about:blank-era document
     sizeIframeToContent(iframe);
@@ -282,6 +291,100 @@ test('w5ba: height writes report through iframe._onHeight for the reopen height 
     );
 });
 
+// w5ba round 2 (on-device repro): some emails still stick at the top inch —
+// the cross-document ResizeObserver may never deliver in Firefox-family
+// browsers, and table/CSS-driven late layout has no image events to hook.
+// The safety-net poll must rescue ANY late content growth, through the
+// grow path, gated by the ratchet epsilon.
+test('w5ba: the safety-net poll rescues a stuck-partial iframe when every other cue is dead', () => {
+    const timers = fakeTimers();
+    const roInstances = [];
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver(roInstances),
+    });
+
+    // No images (no load/error cues), pinned body (RO never fires).
+    const { iframe, state } = makeMockIframe({
+        partialHeight: 120,
+        fullHeight: 1200,
+        imgs: [],
+        bodyBorderBox: 'pinned',
+    });
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    assert.equal(curH(iframe), 120);
+
+    // Late layout (a big table, CSS) grows the content. No cue fires: RO is
+    // pinned-blind, there are no images, fonts never resolve.
+    state.imageLoaded = true;
+    for (const ro of roInstances) ro.tick();
+    assert.equal(curH(iframe), 120, 'no other cue may rescue this scenario (harness sanity)');
+
+    timers.tickIntervals(); // the poll
+    timers.flush();
+    assert.equal(
+        curH(iframe),
+        1200,
+        'the safety-net poll must grow a stuck-partial iframe when RO/image/font cues are all dead (w5ba)',
+    );
+});
+
+test('w5ba: the poll ignores sub-epsilon growth so viewport-relative sender CSS cannot self-feed', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const { iframe, state } = makeMockIframe({
+        partialHeight: 120,
+        fullHeight: 150, // +30px — under EMAIL_IFRAME_RATCHET_EPSILON (64)
+        imgs: [],
+        bodyBorderBox: 'pinned',
+    });
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    state.imageLoaded = true;
+    timers.tickIntervals();
+    timers.flush();
+    assert.equal(
+        curH(iframe),
+        120,
+        'sub-epsilon growth must not trigger the poll — the min-height:100vh ratchet tracks our own writes by less than epsilon (w5ba)',
+    );
+});
+
+test('w5ba: the poll self-clears once its iframe leaves the DOM', () => {
+    const timers = fakeTimers();
+    const sizeIframeToContent = loadSizeIframeToContent({
+        ...timers,
+        ResizeObserver: mockResizeObserver([]),
+    });
+
+    const { iframe, state } = makeMockIframe({
+        partialHeight: 120,
+        fullHeight: 1200,
+        imgs: [],
+        bodyBorderBox: 'pinned',
+    });
+
+    sizeIframeToContent(iframe);
+    timers.flush();
+    assert.equal(timers.liveIntervals(), 1, 'sizing arms exactly one poll');
+
+    // Plain-text render / view switch detaches the iframe without coming
+    // through renderHtmlBodyIframe's teardown.
+    iframe.isConnected = false;
+    state.imageLoaded = true;
+    timers.tickIntervals();
+    timers.flush();
+    assert.equal(curH(iframe), 120, 'a detached iframe must not keep being sized');
+    assert.equal(timers.liveIntervals(), 0, 'the poll must clearInterval itself on detach (w5ba)');
+});
+
 // ---------------------------------------------------------------------------
 // renderHtmlBodyIframe: first-open hold-then-reveal + reopen fast path (w5ba)
 // ---------------------------------------------------------------------------
@@ -296,14 +399,14 @@ function extractRenderHtmlBodyIframe(src) {
 
 // Load the real renderHtmlBodyIframe with faked collaborators. wrapEmailHtml/
 // linkifyHtml become identity — the srcdoc string is not under test here.
-function loadRenderHtmlBodyIframe({ document, setTimeout, clearTimeout, requestAnimationFrame, sizeIframeToContent }) {
+function loadRenderHtmlBodyIframe({ document, setTimeout, clearTimeout, clearInterval, requestAnimationFrame, sizeIframeToContent }) {
     const code = extractRenderHtmlBodyIframe(APP_JS);
     // eslint-disable-next-line no-new-func
     return new Function(
-        'document', 'setTimeout', 'clearTimeout', 'requestAnimationFrame', 'sizeIframeToContent',
+        'document', 'setTimeout', 'clearTimeout', 'clearInterval', 'requestAnimationFrame', 'sizeIframeToContent',
         'wrapEmailHtml', 'linkifyHtml', 'EMAIL_IFRAME_REVEAL_CAP_MS',
         code + '\nreturn renderHtmlBodyIframe;',
-    )(document, setTimeout, clearTimeout, requestAnimationFrame, sizeIframeToContent, (h) => h, (h) => h, 300);
+    )(document, setTimeout, clearTimeout, clearInterval, requestAnimationFrame, sizeIframeToContent, (h) => h, (h) => h, 300);
 }
 
 function makeIframeEl() {

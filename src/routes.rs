@@ -8154,6 +8154,47 @@ white   = '#fdf6e3'
         );
     }
 
+    // w5ba round 2 (on-device repro in Zen): some emails still stuck at the
+    // top inch after the double-load fix. Two residual causes, each pinned
+    // here and proven behaviorally in tests/email_iframe_test.cjs:
+    // (a) loading="lazy" images below the fold of a partially-sized iframe
+    //     never intersect the viewport, never load, never fire the load event
+    //     the sizing machinery re-measures on — chicken-and-egg stuck state.
+    //     linkifyHtml strips the attribute so every image fetches eagerly.
+    // (b) any cue can be defeated (cross-document ResizeObserver delivery in
+    //     Firefox-family browsers, table/CSS late layout with no image
+    //     events) — a low-cadence safety-net poll re-measures through the
+    //     grow path, gated by the ratchet epsilon so viewport-relative
+    //     sender CSS can't self-feed, and self-clears once the iframe leaves
+    //     the DOM.
+    #[test]
+    fn app_js_iframe_sizing_has_safety_net_poll_and_eager_images() {
+        let linkify = js_fn_body(APP_JS, "function linkifyHtml");
+        assert!(
+            linkify.contains("removeAttribute('loading')"),
+            "linkifyHtml must strip loading=lazy from images — a below-the-fold lazy image in a partially-sized iframe never loads and the iframe never grows (w5ba)"
+        );
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        assert!(
+            block.contains("setInterval(pollFn, EMAIL_IFRAME_POLL_MS)"),
+            "sizeIframeToContent must arm the safety-net poll — every event-driven cue can be defeated (dead cross-document RO, table/CSS late layout) (w5ba)"
+        );
+        assert!(
+            block.contains("h - cur >= EMAIL_IFRAME_RATCHET_EPSILON"),
+            "the poll must gate on the ratchet epsilon so viewport-relative sender CSS (min-height:100vh) can't self-feed at poll cadence (w5ba)"
+        );
+        assert!(
+            block.contains("if (!iframe.isConnected)")
+                && block.contains("clearInterval(iframe._pollTimer)"),
+            "the poll must self-clear once its iframe leaves the DOM — plain-text renders and view switches don't come through renderHtmlBodyIframe's teardown (w5ba)"
+        );
+        let render = js_fn_body(APP_JS, "function renderHtmlBodyIframe");
+        assert!(
+            render.contains("clearInterval(oldIframe._pollTimer)"),
+            "renderHtmlBodyIframe must stop the prior iframe's poll on re-render (w5ba)"
+        );
+    }
+
     // w5ba: "when an email opens it should be cached and open instantly."
     // First open: hold the iframe invisible (.settling — visibility, not
     // display, so layout still runs and every measurement cue works) until

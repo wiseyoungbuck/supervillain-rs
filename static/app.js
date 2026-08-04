@@ -5774,6 +5774,9 @@ function renderHtmlBodyIframe(container, html, opts) {
     // this render's scroll position (roborev 457; the contains() guard in
     // reveal is the backstop for paths that don't come through here).
     if (oldIframe && oldIframe._revealTimer) clearTimeout(oldIframe._revealTimer);
+    // Stop the prior iframe's safety-net poll (its isConnected self-clear is
+    // the backstop for teardown paths that don't come through here).
+    if (oldIframe && oldIframe._pollTimer) clearInterval(oldIframe._pollTimer);
     container.replaceChildren();
     const iframe = document.createElement('iframe');
     iframe.setAttribute(
@@ -5893,6 +5896,9 @@ const EMAIL_IFRAME_RATCHET_EPSILON = 64; // ~wrapper padding; smaller grows are 
 // long enough for parse + first layout + the typical font swap, short enough
 // that a slow font fetch never reads as a hung open.
 const EMAIL_IFRAME_REVEAL_CAP_MS = 300;
+// Safety-net poll cadence (kata w5ba): low enough to be free, fast enough
+// that a stuck-partial email visibly heals within a beat.
+const EMAIL_IFRAME_POLL_MS = 500;
 
 function sizeIframeToContent(iframe) {
     // `canShrink` distinguishes the load burst (only-grow — a stale small read
@@ -6162,6 +6168,35 @@ function sizeIframeToContent(iframe) {
     // path in Zen (kata w5ba). renderHtmlBodyIframe now skips the blank-doc
     // load outright; this per-document re-attach is the belt-and-braces layer
     // so a second call for a NEW document always rewires the observer.
+    // Safety-net poll (kata w5ba): every cue above can be defeated — the
+    // cross-document ResizeObserver may never deliver in Firefox-family
+    // browsers (Zen), image events don't exist for table/CSS-driven late
+    // layout, fonts.ready is one-shot. Poll the content height at a low
+    // cadence and re-measure through the grow path when it exceeds the
+    // current height by at least the ratchet epsilon. The epsilon gate keeps
+    // the viewport-relative sender-CSS ratchet (min-height:100vh — content
+    // tracks our own writes by ~wrapper padding, well under 64px) from
+    // self-feeding at poll cadence, while a real stuck-partial delta
+    // (hundreds of px) always fires. Self-clears when the iframe leaves the
+    // DOM (plain-text renders and view switches replace the pane's children
+    // without coming through renderHtmlBodyIframe's teardown).
+    const pollFn = () => {
+        try {
+            if (!iframe.isConnected) {
+                clearInterval(iframe._pollTimer);
+                return;
+            }
+            const doc = iframe.contentDocument;
+            const body = doc && doc.body;
+            if (!body) return;
+            const h = Math.min(
+                Math.max(body.scrollHeight, doc.documentElement.scrollHeight),
+                EMAIL_IFRAME_MAX_HEIGHT
+            );
+            const cur = parseFloat(iframe.style.height) || 0;
+            if (h - cur >= EMAIL_IFRAME_RATCHET_EPSILON) grow();
+        } catch (_) { /* allow-same-origin should always succeed */ }
+    };
     try {
         const doc = iframe.contentDocument;
         const body = doc && doc.body;
@@ -6172,6 +6207,8 @@ function sizeIframeToContent(iframe) {
             iframe._ro = ro;
             ro.observe(body);
             iframe._sizedDoc = doc;
+            if (iframe._pollTimer) clearInterval(iframe._pollTimer);
+            iframe._pollTimer = setInterval(pollFn, EMAIL_IFRAME_POLL_MS);
         }
     } catch (_) { /* allow-same-origin should always succeed */ }
     // ceph remaining gap: a late-loading image (no explicit dimensions) grows
@@ -6206,8 +6243,14 @@ function sizeIframeToContent(iframe) {
 
 // Walk text nodes outside <a> and wrap bare https?:// URLs in <a>. Purely
 // cosmetic — the iframe sandbox is the security boundary, not this function.
+// Also strips loading="lazy" from images (kata w5ba): the email iframe starts
+// small and grows to its content, so a below-the-fold lazy image never
+// intersects the viewport, never loads, never fires the load event the sizing
+// machinery re-measures on — and the iframe stays clipped at the top inch
+// forever (chicken-and-egg). Every image must fetch eagerly.
 function linkifyHtml(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('img[loading]').forEach(img => img.removeAttribute('loading'));
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
     const textNodes = [];
     while (walker.nextNode()) textNodes.push(walker.currentNode);
