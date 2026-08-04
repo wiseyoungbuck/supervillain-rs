@@ -129,25 +129,29 @@ function fakeTimers() {
         tickIntervals: () => { for (const fn of [...intervals]) if (fn) fn(); },
         liveIntervals: () => intervals.filter(Boolean).length,
         pending: () => queue.filter(Boolean).length,
+        // One frame: runs only the rAFs queued at entry — a self-re-arming
+        // rAF (initWhenParsed) queues into the NEXT frame instead of hanging
+        // the drain loop (roborev 466).
+        tickRafs,
         flush: () => {
+            tickRafs();
             let i = 0;
-            let j = 0;
-            while (i < queue.length || j < rafs.length) {
-                while (j < rafs.length) {
-                    const fn = rafs[j];
-                    rafs[j] = null;
-                    j++;
-                    if (fn) fn();
-                }
-                if (i < queue.length) {
-                    const fn = queue[i];
-                    queue[i] = null;
-                    i++;
-                    if (fn) fn();
-                }
+            while (i < queue.length) {
+                const fn = queue[i];
+                queue[i] = null;
+                i++;
+                if (fn) fn();
             }
         },
     };
+    function tickRafs() {
+        const end = rafs.length;
+        for (let j = 0; j < end; j++) {
+            const fn = rafs[j];
+            rafs[j] = null;
+            if (fn) fn();
+        }
+    }
 }
 
 // A ResizeObserver that fires the callback only for observed targets whose
@@ -664,6 +668,7 @@ function makeIframeEl() {
     const listeners = {};
     return {
         style: {},
+        isConnected: true,
         classList: {
             add: (c) => classes.add(c),
             remove: (c) => classes.delete(c),
@@ -839,6 +844,78 @@ test('w5ba: sizing initializes once the document is parsed, even if load never f
         sized.length,
         1,
         'the sizing machinery must initialize from the parsed document without a load event (w5ba round 3)',
+    );
+});
+
+// roborev 466: the poll's core behavior is RE-ARMING — it must keep ticking
+// while the document is still parsing and initialize exactly when readyState
+// leaves 'loading'.
+test('roborev 466: the readyState poll re-arms across frames until the document is parsed', () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const iframeEl = makeIframeEl();
+    const doc = {
+        readyState: 'loading',
+        body: {},
+        querySelector: (sel) => (sel === 'base' ? {} : null),
+        fonts: { ready: new Promise(() => {}) },
+    };
+    iframeEl.contentDocument = doc;
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>hi</p>', {});
+    timers.tickRafs();
+    timers.tickRafs();
+    assert.equal(sized.length, 0, 'still parsing — the poll must wait, re-armed');
+    doc.readyState = 'interactive';
+    timers.tickRafs();
+    assert.equal(sized.length, 1, 'the frame after parsing completes must initialize (roborev 466)');
+    timers.tickRafs();
+    assert.equal(sized.length, 1, 'the poll is one-shot — no re-initialization on later frames');
+});
+
+// roborev 466: "load stays as an idempotent re-measure" — after the parse
+// poll initialized, a subsequent load on the same document re-runs sizing
+// (a re-measure) without disturbing reveal state.
+test('roborev 466: a load event after parse-time initialization re-measures idempotently', async () => {
+    const timers = fakeTimers();
+    const sized = [];
+    const iframeEl = makeIframeEl();
+    iframeEl.contentDocument = {
+        readyState: 'interactive',
+        body: {},
+        querySelector: (sel) => (sel === 'base' ? {} : null),
+        fonts: { ready: Promise.resolve() },
+    };
+    const container = makeContainer();
+    const render = loadRenderHtmlBodyIframe({
+        document: { createElement: () => iframeEl },
+        ...timers,
+        sizeIframeToContent: (f) => sized.push(f),
+    });
+
+    render(container, '<p>hi</p>', { scrollTop: 42 });
+    timers.tickRafs(); // parse poll initializes
+    assert.equal(sized.length, 1);
+    await new Promise((r) => setImmediate(r)); // fonts.ready continuation
+    timers.tickRafs(); // the rAF reveal
+    assert.ok(!iframeEl.classList.contains('settling'), 'revealed after fonts settled');
+    assert.equal(container.scrollTop, 42);
+
+    container.scrollTop = 137; // user scrolled since reveal
+    iframeEl.fire('load'); // the slow tracker finally settled
+    await new Promise((r) => setImmediate(r));
+    timers.flush();
+    assert.equal(sized.length, 2, 'load must re-run the (idempotent) sizing machinery');
+    assert.equal(
+        container.scrollTop,
+        137,
+        'the load-time pass must not re-fire reveal or clobber the scroll position (roborev 466)',
     );
 });
 

@@ -8265,8 +8265,8 @@ white   = '#fdf6e3'
             "the readyState poll must re-arm on rAF ticks until the srcdoc document appears (async navigation) and stop with the iframe (w5ba round 3)"
         );
         assert!(
-            render.contains("if (!iframe.isConnected) return;"),
-            "the readyState poll must die when the iframe is replaced — it must not accumulate across navigations (w5ba round 3)"
+            render.contains("if (!container.contains(iframe)) return;"),
+            "the readyState poll must die when the iframe is replaced (same predicate as reveal; container.contains survives a briefly-detached container) — it must not accumulate across navigations (w5ba round 3, roborev 466)"
         );
     }
 

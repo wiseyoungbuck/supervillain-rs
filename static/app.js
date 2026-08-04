@@ -5860,8 +5860,12 @@ function renderHtmlBodyIframe(container, html, opts) {
     // append) and run onDocReady once the wrapper document has left
     // 'loading'. The rAF loop dies with the iframe (isConnected) and
     // onDocReady's <base> gate keeps it from initializing on about:blank.
+    // Staleness predicate matches reveal's (roborev 466): contains() means
+    // "this iframe was replaced", and keeps the poll alive even if the
+    // container itself is briefly detached (isConnected is transitive and
+    // would silently revert that render to load-only initialization).
     const initWhenParsed = () => {
-        if (!iframe.isConnected) return; // replaced / navigated away — stop
+        if (!container.contains(iframe)) return; // replaced / navigated away — stop
         let parsed = false;
         try {
             const doc = iframe.contentDocument;
