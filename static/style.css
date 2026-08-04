@@ -823,6 +823,14 @@ body {
     background: #fff;
 }
 
+/* First-open hold (kata w5ba/ceph): the iframe stays invisible while its
+   content lays out — visibility (not display) so layout still runs and
+   sizeIframeToContent can measure — then renderHtmlBodyIframe reveals it
+   full-height. Kills the "top inch first, rest later" flash. */
+.email-iframe.settling {
+    visibility: hidden;
+}
+
 /* Compose view */
 #compose-view {
     padding: 20px;

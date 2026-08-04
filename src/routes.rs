@@ -8120,6 +8120,164 @@ white   = '#fdf6e3'
         );
     }
 
+    // w5ba: the ceph fixes were live yet the symptom persisted in Zen (a
+    // Firefox derivative). Firefox-family browsers can fire an extra iframe
+    // load for the initial about:blank document before the srcdoc one; the
+    // one-shot `_sized` boolean latched the ResizeObserver onto the blank
+    // body, so the real email body was never observed. Two layers, both
+    // pinned here and proven behaviorally in tests/email_iframe_test.cjs:
+    // renderHtmlBodyIframe skips blank-document loads (wrapEmailHtml always
+    // injects <base>; its absence identifies the blank doc), and the observer
+    // attach is tracked per document so a second call for a new document
+    // always rewires it.
+    #[test]
+    fn app_js_iframe_sizing_survives_firefox_double_load() {
+        let render = js_fn_body(APP_JS, "function renderHtmlBodyIframe");
+        assert!(
+            render.contains("querySelector('base')"),
+            "renderHtmlBodyIframe's load handler must identify the wrapper document via querySelector('base') and skip the Firefox about:blank load (w5ba)"
+        );
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        assert!(
+            block.contains("_sizedDoc !== doc"),
+            "sizeIframeToContent must track the observed DOCUMENT (_sizedDoc), not a one-shot per-iframe boolean — a Firefox about:blank load must not strand the ResizeObserver on a dead body (w5ba)"
+        );
+        assert!(
+            !block.contains("iframe._sized =") && !block.contains("!iframe._sized"),
+            "the one-shot per-iframe _sized boolean must stay gone — it is what latched the observer onto the about:blank body in Firefox-family browsers (w5ba)"
+        );
+    }
+
+    // w5ba: "when an email opens it should be cached and open instantly."
+    // First open: hold the iframe invisible (.settling — visibility, not
+    // display, so layout still runs and every measurement cue works) until
+    // layout settles, then reveal full-height — no top-inch flash. The cap is
+    // armed at creation so the iframe can never be stranded invisible.
+    // Reopen: pre-size the iframe from the cached settled height and paint
+    // immediately. Behavior proven in tests/email_iframe_test.cjs; these pin
+    // the code shapes.
+    #[test]
+    fn app_js_first_open_holds_then_reveals_and_reopen_presizes() {
+        let render = js_fn_body(APP_JS, "function renderHtmlBodyIframe");
+        assert!(
+            render.contains("classList.add('settling')"),
+            "renderHtmlBodyIframe must hold a first-open iframe hidden via the .settling class until layout settles (w5ba)"
+        );
+        assert!(
+            render.contains("setTimeout(reveal, EMAIL_IFRAME_REVEAL_CAP_MS)"),
+            "renderHtmlBodyIframe must arm the reveal cap at creation — a slow font fetch or never-firing load must not strand the iframe invisible (w5ba)"
+        );
+        // Stale-reveal guard (roborev 457): the cap timer / late fonts.ready
+        // continuation must not write the container's scrollTop after this
+        // iframe was replaced — that would yank the NEXT email's position.
+        // Both layers: the contains() guard in reveal, and the prior iframe's
+        // timer cancelled on teardown.
+        assert!(
+            render.contains("container.contains(iframe)"),
+            "reveal must early-return when its iframe is no longer in the container — a stale reveal must not clobber the next email's scroll position (roborev 457)"
+        );
+        assert!(
+            render.contains("_revealTimer") && render.contains("clearTimeout("),
+            "renderHtmlBodyIframe must cancel the prior iframe's pending reveal cap timer on teardown (roborev 457)"
+        );
+        assert!(
+            render.contains("knownHeight > 0") && render.contains("knownHeight + 'px'"),
+            "renderHtmlBodyIframe must pre-size the iframe from opts.knownHeight so a reopen paints full-height immediately with no hold (w5ba)"
+        );
+        assert!(
+            STYLE_CSS.contains(".email-iframe.settling"),
+            "style.css must define .email-iframe.settling (visibility-based hold) for the first-open hold-then-reveal (w5ba)"
+        );
+        // The height cache that feeds knownHeight: every height write in
+        // sizeIframeToContent reports through _onHeight, and renderEmailDetail
+        // wires both ends to iframeHeightCache under the account-scoped key.
+        let block = js_fn_body(APP_JS, "function sizeIframeToContent");
+        assert!(
+            block.contains("iframe._onHeight(h)"),
+            "sizeIframeToContent must report height writes through iframe._onHeight so the reopen cache tracks the settled height (w5ba)"
+        );
+        assert!(
+            APP_JS.contains("knownHeight: iframeHeightCache[key]")
+                && APP_JS.contains("iframeHeightCache[key] = h"),
+            "renderEmailDetail must feed knownHeight from iframeHeightCache and keep it updated via onHeight (w5ba)"
+        );
+    }
+
+    // w5ba: warm the body cache for the rows on screen so the FIRST open of
+    // any visible email is instant. mark_read=false is load-bearing: a bare
+    // GET auto-marks read server-side, and background warm-up must never
+    // silently consume unread state (roborev 302, fix 2 — same contract as
+    // prefetchAdjacentEmails).
+    #[test]
+    fn app_js_prefetches_visible_list_bodies_without_marking_read() {
+        let block = js_fn_body(APP_JS, "function prefetchVisibleEmails");
+        assert!(
+            block.contains("mark_read=false"),
+            "prefetchVisibleEmails must fetch with mark_read=false — background warm-up must never consume unread state (w5ba)"
+        );
+        assert!(
+            block.contains("prefetchVisibleGen"),
+            "prefetchVisibleEmails must guard its worker loop with a generation counter so an account/mailbox switch drops stale in-flight loops (w5ba)"
+        );
+        // Assign-if-absent after the await (roborev 457): a real open landing
+        // mid-fetch stores the email with isUnread flipped; the prefetch
+        // response's pre-mark state must not overwrite it, or the next
+        // cache-hit reopen misfires mark-read (the roborev 303 misfire again).
+        assert!(
+            block.contains("if (!emailCache[t.key]) cacheEmail(t.key, email)"),
+            "prefetchVisibleEmails must only cache its response when the entry is still absent — a real open mid-fetch must win (roborev 457)"
+        );
+        let adjacent = js_fn_body(APP_JS, "function prefetchAdjacentEmails");
+        assert!(
+            adjacent.contains("if (!emailCache[key]) cacheEmail(key, email)"),
+            "prefetchAdjacentEmails must only cache its response when the entry is still absent — a real open mid-fetch must win (roborev 457)"
+        );
+        // Bounded cache (roborev 457): warming 20 bodies per list render made
+        // the previously-unbounded emailCache grow materially; every write
+        // funnels through cacheEmail, which trims past EMAIL_CACHE_MAX.
+        assert!(
+            APP_JS.contains("EMAIL_CACHE_MAX")
+                && js_fn_body(APP_JS, "function cacheEmail").contains("delete emailCache"),
+            "emailCache writes must go through cacheEmail, which trims the oldest entries past EMAIL_CACHE_MAX (roborev 457)"
+        );
+        // ... and "every write" must stay true (roborev 459): the ONLY direct
+        // `emailCache[...] = ...` assignment allowed is the one inside
+        // cacheEmail itself. Inserts that bypass it escape the bound. The
+        // filter parses past the bracket close rather than substring-matching
+        // "] = " (roborev 460): no-space (`emailCache[k]=v`) and compound
+        // (`??=`/`||=`/`&&=`) assignments are caught, while comparisons
+        // (`==`, `=>`) and reads sharing a line with an unrelated assignment
+        // are not false positives. Multi-line splits remain out of scope, as
+        // is usual for the repo's string invariants.
+        let direct_writes: Vec<&str> = APP_JS
+            .lines()
+            .filter(|l| {
+                let Some(start) = l.find("emailCache[") else {
+                    return false;
+                };
+                let after = &l[start + "emailCache[".len()..];
+                let Some(close) = after.find(']') else {
+                    return false;
+                };
+                let rest = after[close + 1..].trim_start();
+                (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"))
+                    || rest.starts_with("??=")
+                    || rest.starts_with("||=")
+                    || rest.starts_with("&&=")
+            })
+            .map(str::trim)
+            .collect();
+        assert!(
+            direct_writes == vec!["emailCache[key] = email;"],
+            "the only direct emailCache assignment must be inside cacheEmail — inserts bypassing it escape the EMAIL_CACHE_MAX bound (roborev 459); found: {direct_writes:?}"
+        );
+        let load = js_fn_body(APP_JS, "async function loadEmails");
+        assert!(
+            load.contains("prefetchVisibleEmails()"),
+            "loadEmails must warm the visible rows' bodies after rendering the list (w5ba)"
+        );
+    }
+
     #[test]
     fn mobile_app_js_renders_email_body_in_sandboxed_iframe() {
         assert!(
@@ -9128,11 +9286,12 @@ white   = '#fdf6e3'
         // After successful RSVP, the email cache should be updated — keyed on
         // the email/account captured BEFORE the await, so a mid-flight
         // account/email switch can't cache the result under the wrong key
-        // (roborev 449).
+        // (roborev 449) — and through cacheEmail, since direct assignments
+        // bypass the EMAIL_CACHE_MAX bound (roborev 459).
         let rsvp_fn = js_fn_body(APP_JS, "async function rsvpToEvent(");
         assert!(
-            rsvp_fn.contains("emailCache[cacheKey(rsvpEmail.id, rsvpAccount)] = rsvpEmail"),
-            "should update emailCache after RSVP (account-scoped key pinned to the pre-await account)"
+            rsvp_fn.contains("cacheEmail(cacheKey(rsvpEmail.id, rsvpAccount), rsvpEmail)"),
+            "should update emailCache (through cacheEmail) after RSVP (account-scoped key pinned to the pre-await account)"
         );
         assert!(
             rsvp_fn.contains(
