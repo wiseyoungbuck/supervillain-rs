@@ -5286,14 +5286,18 @@ mod tests {
         // optimistic-removal flow deletes its id both when the mutation
         // POST settles (server cache invalidated — later responses no
         // longer carry the row) and when a failure reverts the removal.
-        // performUndo restores a settled removal, so it releases too.
-        // Per-function pins (not a global count) so a release can't
-        // migrate out of one path unnoticed (roborev 471 #2).
+        // performUndo restores a settled removal, so it releases on
+        // restore — and its FAILURE revert re-removes via
+        // removeEmailsFromList, which re-registers the id; that removal is
+        // a sync to server truth with no mutation in flight, so it must
+        // release again immediately (roborev 472 #1). Per-function pins
+        // (not a global count) so a release can't migrate out of one path
+        // unnoticed (roborev 471 #2).
         for (decl, expected) in [
             ("async function emailAction(", 2),
             ("async function remindEmail(", 2),
             ("async function unsubscribeAndArchiveAll(", 2),
-            ("async function performUndo(", 1),
+            ("async function performUndo(", 2),
         ] {
             let body = js_fn_body(APP_JS, decl);
             assert_eq!(

@@ -5663,9 +5663,15 @@ async function performUndo() {
         }
         loadSplitCounts(); // resync with server truth
     } catch (err) {
-        // Revert: remove the email we optimistically re-inserted
+        // Revert: remove the email we optimistically re-inserted. This
+        // removal syncs BACK to server truth (the move failed, so the
+        // email stayed archived) — it is not an optimistic removal with a
+        // mutation in flight, so the suppression removeEmailsFromList just
+        // registered must be released immediately or the id stays hidden
+        // from every list load for the rest of the session (roborev 472).
         if (item.emailData) {
             removeEmailFromList(item.emailId);
+            refillSuppressedIds.delete(item.emailId);
         }
         showStatus('Undo failed', 'error');
     }
