@@ -5279,10 +5279,11 @@ mod tests {
             "removeEmailsFromList must register removed ids before the refill fires"
         );
         assert!(
-            removal.contains("splitListCache[key].filter(keepFn)"),
+            removal.contains("!removedIds.has(e.id)"),
             "removeEmailsFromList must purge removed rows from every cached \
-             context — the suppression set only covers the in-flight window \
-             (roborev 474)"
+             context BY ID — the suppression set only covers the in-flight \
+             window (roborev 474), and purging by keepFn would let a \
+             sender-shaped predicate over-match other contexts (roborev 475)"
         );
     }
 

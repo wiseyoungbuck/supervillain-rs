@@ -4470,8 +4470,12 @@ function removeEmailFromList(emailId) {
 }
 
 function removeEmailsFromList(keepFn, expectedRemoved) {
+    const removedIds = new Set();
     for (const e of state.emails) {
-        if (!keepFn(e)) refillSuppressedIds.add(e.id);
+        if (!keepFn(e)) {
+            removedIds.add(e.id);
+            refillSuppressedIds.add(e.id);
+        }
     }
     state.emails = state.emails.filter(keepFn);
     adjustSplitCounts(-expectedRemoved);
@@ -4480,11 +4484,16 @@ function removeEmailsFromList(keepFn, expectedRemoved) {
     // The suppression set only covers the in-flight window (ids leave it
     // on settle), so a sibling tab's stale entry still carrying the row
     // would re-flash it from the eager warm-cache repaint the moment the
-    // mutation settles (roborev 474). Purging keeps every client cache
-    // consistent with the optimistic state regardless of when the tab
-    // switch happens; a failure revert self-heals on that tab's next fetch.
+    // mutation settles (roborev 474). Purge by the removed IDS, not
+    // keepFn: unsubscribeSender's predicate is sender-shaped and would
+    // over-match — stripping that sender's untouched rows from other
+    // accounts' caches and from Archive/search contexts where they
+    // legitimately live (roborev 475). A failure revert self-heals on the
+    // sibling tab's next fetch. Sibling badge COUNTS are deliberately not
+    // adjusted here — adjustSplitCounts covers only the current split,
+    // and loadSplitCounts resyncs all badges from the server on settle.
     for (const key of Object.keys(splitListCache)) {
-        splitListCache[key] = splitListCache[key].filter(keepFn);
+        splitListCache[key] = splitListCache[key].filter(e => !removedIds.has(e.id));
     }
     // threadGroups is append-only — the removed ids just drop out of the live
     // present set visibleRows() recomputes. Clamp selection against the VISIBLE

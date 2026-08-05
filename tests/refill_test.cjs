@@ -209,6 +209,31 @@ test('jg51: removal purges the row from every cached context', () => {
     );
 });
 
+test('jg51: sender-based removal purges only the removed ids, not the sender globally', () => {
+    // unsubscribeSender passes a sender-shaped keepFn. The purge must
+    // apply the removed IDS, not that predicate: a different-id email
+    // from the same sender cached under another context (another
+    // account's list, the Archive tab) legitimately lives there and must
+    // survive (roborev 475).
+    const h = makeHarness(async () => []);
+    const spamRow = (id) => ({ id, subject: 'sale', from: [{ email: 'spam@x.com' }] });
+    h.state.emails = [row('e1'), spamRow('e2')];
+    h.splitListCache['other-acct:archive'] = [spamRow('e7'), row('e8')];
+
+    h.removeEmailsFromList(e => e.from?.[0]?.email !== 'spam@x.com', 1);
+
+    assert.deepEqual(
+        h.state.emails.map(e => e.id),
+        ['e1'],
+        'the current list drops the sender'
+    );
+    assert.deepEqual(
+        h.splitListCache['other-acct:archive'].map(e => e.id),
+        ['e7', 'e8'],
+        'a different-id email from the same sender in another context must survive'
+    );
+});
+
 test('jg51: eager repaint from a warm splitListCache filters suppressed rows', () => {
     // removeEmailsFromList invalidates only the current context's cache
     // entry, so a sibling tab's cached list can still carry the row whose
