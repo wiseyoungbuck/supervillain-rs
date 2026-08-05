@@ -35,6 +35,29 @@ const BODY_CACHE_MAX: usize = 2000;
 const CALENDAR_STATUS_TTL: Duration = Duration::from_secs(15);
 const CALENDAR_STATUS_CACHE_MAX: usize = 64;
 
+/// How long cached split counts are served before being recomputed. The
+/// recompute reads the cached inbox list, so this TTL cannot observe new
+/// mail by itself — it bounds how long the counts may lag behind that
+/// list. The list refreshes on the warmer cadence (which normally also
+/// rewrites the counts directly) or a route miss; without a TTL, counts
+/// computed against an older list would be served until an explicit
+/// invalidate even after the slot underneath them changed — e.g. when
+/// the warmer's counts write was version-discarded mid-pass, its counts
+/// task failed, or a route miss refilled the slot. Recomputing is a
+/// cheap local walk of the cached list (kata jg51), so a short window
+/// keeps badges consistent with the list at negligible cost.
+pub(crate) const SPLIT_COUNTS_TTL: Duration = Duration::from_secs(60);
+
+/// Cached per-mailbox split counts plus when they were computed, so
+/// [`PrefetchCache::get_split_counts`] can expire them after
+/// [`SPLIT_COUNTS_TTL`] instead of serving stale badges until the next
+/// explicit invalidate.
+struct SplitCountsEntry {
+    mailbox_id: String,
+    counts: HashMap<String, u32>,
+    computed_at: Instant,
+}
+
 /// Lookup key for the cached inbox email list. Two cache hits must share
 /// the same mailbox, limit, and sort order; otherwise the cached payload
 /// doesn't match what the caller would have fetched.
@@ -92,7 +115,7 @@ struct AccountEntry {
     mailboxes: Option<Vec<Mailbox>>,
     identities: Option<Vec<Identity>>,
     inbox_lists: HashMap<InboxKey, InboxList>,
-    split_counts: Option<(String, HashMap<String, u32>)>,
+    split_counts: Option<SplitCountsEntry>,
     body_cache: HashMap<String, Email>,
     /// Per-UID current calendar copies for invite chips. Not persisted; the
     /// short TTL only coalesces repeated live list polls.
@@ -273,7 +296,11 @@ impl PrefetchCache {
         let entry = self.entry(account).await;
         let guard = entry.lock().await;
         match &guard.split_counts {
-            Some((m, c)) if m == mailbox_id => Some(c.clone()),
+            Some(sc)
+                if sc.mailbox_id == mailbox_id && sc.computed_at.elapsed() < SPLIT_COUNTS_TTL =>
+            {
+                Some(sc.counts.clone())
+            }
             _ => None,
         }
     }
@@ -285,7 +312,24 @@ impl PrefetchCache {
         counts: HashMap<String, u32>,
     ) {
         let entry = self.entry(account).await;
-        entry.lock().await.split_counts = Some((mailbox_id, counts));
+        entry.lock().await.split_counts = Some(SplitCountsEntry {
+            mailbox_id,
+            counts,
+            computed_at: Instant::now(),
+        });
+    }
+
+    /// Rewind the split-counts entry's `computed_at` so TTL expiry can be
+    /// tested without a real 60 s sleep.
+    #[cfg(test)]
+    pub(crate) async fn backdate_split_counts(&self, account: &str, age: Duration) {
+        let entry = self.entry(account).await;
+        if let Some(sc) = entry.lock().await.split_counts.as_mut() {
+            sc.computed_at = sc
+                .computed_at
+                .checked_sub(age)
+                .expect("system uptime too short to backdate split counts in test");
+        }
     }
 
     /// Clears the account-level payload caches plus short-lived calendar
@@ -448,7 +492,11 @@ impl PrefetchCache {
         if e.version != expected_version {
             return false;
         }
-        e.split_counts = Some((mailbox_id, counts));
+        e.split_counts = Some(SplitCountsEntry {
+            mailbox_id,
+            counts,
+            computed_at: Instant::now(),
+        });
         true
     }
 
@@ -667,7 +715,10 @@ impl PrefetchCache {
                         .iter()
                         .map(|(k, l)| (k.clone(), l.emails.clone()))
                         .collect(),
-                    split_counts: e.split_counts.clone(),
+                    split_counts: e
+                        .split_counts
+                        .as_ref()
+                        .map(|sc| (sc.mailbox_id.clone(), sc.counts.clone())),
                     body_cache: bodies
                         .into_iter()
                         .take(SNAPSHOT_BODY_CAP)
@@ -735,7 +786,17 @@ impl PrefetchCache {
                         )
                     })
                     .collect(),
-                split_counts: snap.split_counts,
+                // Restored counts get a fresh TTL window: recomputing them
+                // from the (equally restored) inbox list would produce the
+                // same numbers, and the warmer's first pass overwrites them
+                // with live data anyway.
+                split_counts: snap
+                    .split_counts
+                    .map(|(mailbox_id, counts)| SplitCountsEntry {
+                        mailbox_id,
+                        counts,
+                        computed_at: Instant::now(),
+                    }),
                 body_cache: snap.body_cache,
                 calendar_status: HashMap::new(),
                 body_order,
@@ -1163,7 +1224,12 @@ async fn fetch_identities(
     crate::provider::get_identities(&mut session).await
 }
 
-async fn fetch_inbox(
+/// Fetch one mailbox's list exactly the way the warmer does — the shared
+/// "what goes in an `InboxKey` slot" fetch. `pub(crate)` because
+/// `routes::compute_split_counts` uses it as the miss path of
+/// `inbox_list_or_fetch` (kata jg51), so a counts-triggered fill is
+/// byte-identical to a warmer fill and `list_emails` can serve it.
+pub(crate) async fn fetch_inbox(
     state: &crate::types::AppState,
     account_id: &str,
     mailbox_id: &str,
@@ -1210,7 +1276,7 @@ async fn fetch_split_counts(
     // calls — drift between warmer and route would mean the cached
     // value disagrees with what the route would have produced on a
     // miss, which then flips visibly to the user every invalidate.
-    crate::routes::compute_split_counts(state, Some(account_id), mailbox_id, &config, None).await
+    crate::routes::compute_split_counts(state, Some(account_id), mailbox_id, &config, false).await
 }
 
 async fn session_for(
@@ -1592,6 +1658,52 @@ mod tests {
             .unwrap();
         assert_eq!(got.get("split-a"), Some(&3));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn split_counts_ttl_expires_stale_entries() {
+        // kata jg51: nothing invalidates the split-counts entry when the
+        // inbox list slot underneath it changes (warmer refresh whose
+        // counts write was discarded, route-miss refill), so without a
+        // TTL the badges could lag that list until an explicit
+        // invalidate. An entry older than SPLIT_COUNTS_TTL must read as
+        // a miss so the next request recomputes from the current list.
+        let cache = PrefetchCache::new();
+        let mut counts = HashMap::new();
+        counts.insert("split-a".to_string(), 3u32);
+        cache
+            .set_split_counts("acc-1", "inbox".into(), counts.clone())
+            .await;
+        assert_eq!(
+            cache.get_split_counts("acc-1", "inbox").await,
+            Some(counts),
+            "a fresh entry must be served"
+        );
+
+        cache
+            .backdate_split_counts("acc-1", SPLIT_COUNTS_TTL + Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            cache.get_split_counts("acc-1", "inbox").await,
+            None,
+            "an entry older than SPLIT_COUNTS_TTL must expire, not serve stale forever"
+        );
+
+        // And the or_fetch path must refresh: the closure runs and its
+        // result replaces the expired entry with a fresh TTL window.
+        let mut fresh = HashMap::new();
+        fresh.insert("split-a".to_string(), 5u32);
+        let refetched = fresh.clone();
+        let got = cache
+            .split_counts_or_fetch("acc-1", "inbox", move || async move { Ok(refetched) })
+            .await
+            .unwrap();
+        assert_eq!(got, fresh);
+        assert_eq!(
+            cache.get_split_counts("acc-1", "inbox").await,
+            Some(fresh),
+            "the refreshed entry must be served again"
+        );
     }
 
     #[tokio::test]

@@ -130,6 +130,19 @@ const CACHE_LIMIT = 150;
 let suppressFocusThemeRefreshUntil = 0;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
+// Ids removed from the list optimistically (archive/trash/remind/unsub)
+// whose server mutation hasn't settled yet. Until the mutation's POST
+// resolves, the server still answers list requests from its
+// pre-invalidate cached window — which contains the removed row — so
+// both the refill fired by removeEmailsFromList (roborev 470 #1) and a
+// loadEmails wholesale replace (roborev 471 #1) must filter against this
+// set or they resurrect the email the user just archived. Ids leave the
+// set when their mutation settles (the server cache is invalidated by
+// then) or when a revert/undo restores the row. A response fetched
+// pre-invalidate that lands after its mutation settled can still slip
+// through — that residual window is provider-latency-sized and
+// pre-existing; the whole-round-trip window is what this closes.
+const refillSuppressedIds = new Set();
 
 // Per-split email list cache for instant split switching
 // Key: "accountId:mailboxId:splitId:search" -> email array
@@ -1333,10 +1346,12 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     }
     try {
         await api('POST', `/emails/${emailId}/remind`, { wake_at: wakeAt, mode });
+        refillSuppressedIds.delete(emailId);
         loadReminders({ skipNotify: true });
         loadSplitCounts();
     } catch (err) {
         state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             extendThreadGroups([removedEmail]);
@@ -1582,6 +1597,12 @@ async function loadEmails() {
     // arrives. Only show the "Loading" placeholder on a true cold miss
     // (no cached entry and no in-memory emails).
     if (splitListCache[context]) {
+        // The eager repaint must filter suppressed rows too:
+        // removeEmailsFromList invalidates only the CURRENT context's
+        // cache entry, so while a mutation is in flight a sibling
+        // context's cached list can still carry the row being archived —
+        // switching tabs mid-round-trip would flash it back (roborev 473).
+        const cached = splitListCache[context].filter(e => !refillSuppressedIds.has(e.id));
         // Skip the eager repaint only when the pane already shows exactly
         // this context's list with exactly this payload. During stale-
         // snapshot revalidation every poll tick re-enters loadEmails, and
@@ -1589,8 +1610,8 @@ async function loadEmails() {
         // the fetch even started (roborev 307 #1). See lastRenderedContext
         // for why payload equality alone isn't sufficient.
         if (lastRenderedContext !== context
-            || !emailListsEqual(state.emails, splitListCache[context])) {
-            state.emails = [...splitListCache[context]];
+            || !emailListsEqual(state.emails, cached)) {
+            state.emails = cached;
             state.selectedIndex = 0;
             rebuildThreadGroups();
             renderEmailList();
@@ -1608,17 +1629,24 @@ async function loadEmails() {
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
-        splitListCache[context] = [...emails];
+        // Drop rows whose optimistic removal hasn't settled yet: during
+        // the mutation's provider round-trip the server still answers from
+        // its pre-invalidate cached window, so a wholesale replace would
+        // resurrect the just-archived row (roborev 471 #1). Ids leave the
+        // set when their mutation settles or reverts, so in steady state
+        // this filter keeps nothing.
+        const fresh = emails.filter(e => !refillSuppressedIds.has(e.id));
+        splitListCache[context] = [...fresh];
         // Render unless the pane already shows this context's list with an
         // identical payload. lastRenderedContext is null while a Loading
         // placeholder is up, so a cold miss always renders — even an
         // identical-looking (e.g. empty) list carried over in state.emails.
-        if (lastRenderedContext !== context || !emailListsEqual(state.emails, emails)) {
-            state.emails = emails;
+        if (lastRenderedContext !== context || !emailListsEqual(state.emails, fresh)) {
+            state.emails = fresh;
             state.selectedIndex = 0;
             rebuildThreadGroups();
             renderEmailList();
-            harvestContacts(emails, state.currentAccount?.id);
+            harvestContacts(fresh, state.currentAccount?.id);
         }
         // Warm bodies for the on-screen rows (even when the repaint was
         // skipped — a poll tick may have surfaced new uncached emails, and
@@ -1652,7 +1680,8 @@ async function maybeRefillEmails() {
         if (splitCacheKey() !== context) return;
 
         const existingIds = new Set(state.emails.map(e => e.id));
-        const newEmails = fresh.filter(e => !existingIds.has(e.id));
+        const newEmails = fresh.filter(
+            e => !existingIds.has(e.id) && !refillSuppressedIds.has(e.id));
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
             extendThreadGroups(newEmails);
@@ -2072,10 +2101,15 @@ async function emailAction(type, emailId) {
 
     try {
         await api('POST', `/emails/${emailId}/${type}`);
+        // Settled: the server cache is invalidated, so list responses no
+        // longer carry this row and the suppression must not outlive the
+        // race it guards (a later legitimate reappearance stays visible).
+        refillSuppressedIds.delete(emailId);
         loadSplitCounts(); // resync with server truth
     } catch (err) {
         // Revert: re-insert the email and remove the stale undo entry
         state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             invalidateSplitListCache();
@@ -4406,12 +4440,14 @@ async function unsubscribeAndArchiveAll() {
     try {
         const result = await api('POST', `/emails/${id}/unsubscribe-and-archive-all`);
 
+        for (const e of removedEmails) refillSuppressedIds.delete(e.id);
         showStatus(`Archived ${result.archived} emails from ${result.sender}.`, 'success');
         loadSplitCounts(); // resync with server truth
         maybeRefillEmails();
     } catch (err) {
         // Revert: re-insert the removed emails
         if (removedEmails.length > 0) {
+            for (const e of removedEmails) refillSuppressedIds.delete(e.id);
             state.emails = state.emails.concat(removedEmails);
             // Re-sort respecting the active sort order (kata review
             // follow-up) — a hardcoded descending re-sort here would scramble
@@ -4434,9 +4470,31 @@ function removeEmailFromList(emailId) {
 }
 
 function removeEmailsFromList(keepFn, expectedRemoved) {
+    const removedIds = new Set();
+    for (const e of state.emails) {
+        if (!keepFn(e)) {
+            removedIds.add(e.id);
+            refillSuppressedIds.add(e.id);
+        }
+    }
     state.emails = state.emails.filter(keepFn);
     adjustSplitCounts(-expectedRemoved);
     invalidateSplitListCache();
+    // Purge the removed rows from every OTHER context's cached list too.
+    // The suppression set only covers the in-flight window (ids leave it
+    // on settle), so a sibling tab's stale entry still carrying the row
+    // would re-flash it from the eager warm-cache repaint the moment the
+    // mutation settles (roborev 474). Purge by the removed IDS, not
+    // keepFn: unsubscribeSender's predicate is sender-shaped and would
+    // over-match — stripping that sender's untouched rows from other
+    // accounts' caches and from Archive/search contexts where they
+    // legitimately live (roborev 475). A failure revert self-heals on the
+    // sibling tab's next fetch. Sibling badge COUNTS are deliberately not
+    // adjusted here — adjustSplitCounts covers only the current split,
+    // and loadSplitCounts resyncs all badges from the server on settle.
+    for (const key of Object.keys(splitListCache)) {
+        splitListCache[key] = splitListCache[key].filter(e => !removedIds.has(e.id));
+    }
     // threadGroups is append-only — the removed ids just drop out of the live
     // present set visibleRows() recomputes. Clamp selection against the VISIBLE
     // row count (kata 64z6), which may differ from state.emails.length once a
@@ -5605,6 +5663,7 @@ async function performUndo() {
     // selection must land on the re-inserted email's VISIBLE row, which under
     // grouping is not that flat index (kata 64z6).
     if (item.emailData) {
+        refillSuppressedIds.delete(item.emailId);
         const idx = Math.min(item.insertIndex, state.emails.length);
         state.emails.splice(idx, 0, item.emailData);
         // Guarantee the id is registered even in the edge case where its thread
@@ -5629,9 +5688,15 @@ async function performUndo() {
         }
         loadSplitCounts(); // resync with server truth
     } catch (err) {
-        // Revert: remove the email we optimistically re-inserted
+        // Revert: remove the email we optimistically re-inserted. This
+        // removal syncs BACK to server truth (the move failed, so the
+        // email stayed archived) — it is not an optimistic removal with a
+        // mutation in flight, so the suppression removeEmailsFromList just
+        // registered must be released immediately or the id stays hidden
+        // from every list load for the rest of the session (roborev 472).
         if (item.emailData) {
             removeEmailFromList(item.emailId);
+            refillSuppressedIds.delete(item.emailId);
         }
         showStatus('Undo failed', 'error');
     }

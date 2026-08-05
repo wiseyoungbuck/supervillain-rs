@@ -34,6 +34,7 @@ function makeHarness(fetchImpl) {
     const removeEmailFromList = (id) => {
         state.emails = state.emails.filter((email) => email.id !== id);
     };
+    const refillSuppressedIds = new Set();
     const code = [
         extractFunction('async function remindEmail('),
         'return remindEmail;',
@@ -43,12 +44,12 @@ function makeHarness(fetchImpl) {
         'state', 'api', 'pushUndo', 'removeEmailFromList', 'showStatus',
         'loadReminders', 'loadSplitCounts', 'adjustSplitCounts',
         'extendThreadGroups', 'invalidateSplitListCache', 'renderEmailList',
-        'setMode', 'showView', 'maybeRefillEmails',
+        'setMode', 'showView', 'maybeRefillEmails', 'refillSuppressedIds',
         code,
     )(
         state, api, pushUndo, removeEmailFromList, () => {},
         () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
-        () => {}, () => {},
+        () => {}, () => {}, () => {}, refillSuppressedIds,
     );
     return { state, calls, remindEmail };
 }
