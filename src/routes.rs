@@ -5281,21 +5281,46 @@ mod tests {
     }
 
     #[test]
-    fn app_js_refill_suppression_released_when_rows_are_restored() {
-        // The suppression must not outlive the removal: every revert/undo
-        // path that re-inserts a row deletes its id (emailAction revert,
-        // remindEmail revert, unsubscribe revert, performUndo), and a full
-        // loadEmails replaces the list with server truth and clears the
-        // set wholesale — otherwise a legitimately-returned id would be
-        // suppressed from refills forever.
-        assert!(
-            APP_JS.matches("refillSuppressedIds.delete").count() >= 4,
-            "every restore path must release its refill suppression"
-        );
+    fn app_js_refill_suppression_released_when_mutations_settle_or_revert() {
+        // The suppression must not outlive the race it guards: each
+        // optimistic-removal flow deletes its id both when the mutation
+        // POST settles (server cache invalidated — later responses no
+        // longer carry the row) and when a failure reverts the removal.
+        // performUndo restores a settled removal, so it releases too.
+        // Per-function pins (not a global count) so a release can't
+        // migrate out of one path unnoticed (roborev 471 #2).
+        for (decl, expected) in [
+            ("async function emailAction(", 2),
+            ("async function remindEmail(", 2),
+            ("async function unsubscribeAndArchiveAll(", 2),
+            ("async function performUndo(", 1),
+        ] {
+            let body = js_fn_body(APP_JS, decl);
+            assert_eq!(
+                body.matches("refillSuppressedIds.delete").count(),
+                expected,
+                "{decl} must release refill suppression on settle and/or revert"
+            );
+        }
+    }
+
+    #[test]
+    fn app_js_load_emails_filters_optimistically_removed_ids() {
+        // roborev 471 #1: the refill isn't the only resurrection vector — a
+        // loadEmails (tab switch, stale-revalidation tick) during the
+        // mutation's round-trip is answered from the server's
+        // pre-invalidate cached window and wholesale-replaces the list, so
+        // it must filter the payload against the suppression set (and must
+        // NOT clear the set on an arbitrary response, which would disarm
+        // the guard inside the very window it exists for).
         let load = js_fn_body(APP_JS, "async function loadEmails(");
         assert!(
-            load.contains("refillSuppressedIds.clear()"),
-            "loadEmails must clear refill suppression when server truth lands"
+            load.contains("!refillSuppressedIds.has"),
+            "loadEmails must drop rows whose optimistic removal is still in flight"
+        );
+        assert!(
+            !load.contains("refillSuppressedIds.clear"),
+            "loadEmails must not wholesale-clear the suppression set"
         );
     }
 

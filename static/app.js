@@ -131,13 +131,17 @@ let suppressFocusThemeRefreshUntil = 0;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
 // Ids removed from the list optimistically (archive/trash/remind/unsub)
-// whose server mutation may not have settled yet. The refill fired by
-// removeEmailsFromList races that mutation, and split refills are served
-// from the server's cached window — which still contains the removed row
-// until the mutation invalidates it — so an unfiltered refill would
-// re-append the email the user just archived (roborev 470 #1). Ids leave
-// the set when a revert/undo restores them, or wholesale when loadEmails
-// replaces the list with server truth.
+// whose server mutation hasn't settled yet. Until the mutation's POST
+// resolves, the server still answers list requests from its
+// pre-invalidate cached window — which contains the removed row — so
+// both the refill fired by removeEmailsFromList (roborev 470 #1) and a
+// loadEmails wholesale replace (roborev 471 #1) must filter against this
+// set or they resurrect the email the user just archived. Ids leave the
+// set when their mutation settles (the server cache is invalidated by
+// then) or when a revert/undo restores the row. A response fetched
+// pre-invalidate that lands after its mutation settled can still slip
+// through — that residual window is provider-latency-sized and
+// pre-existing; the whole-round-trip window is what this closes.
 const refillSuppressedIds = new Set();
 
 // Per-split email list cache for instant split switching
@@ -1342,6 +1346,7 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     }
     try {
         await api('POST', `/emails/${emailId}/remind`, { wake_at: wakeAt, mode });
+        refillSuppressedIds.delete(emailId);
         loadReminders({ skipNotify: true });
         loadSplitCounts();
     } catch (err) {
@@ -1618,21 +1623,24 @@ async function loadEmails() {
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
-        // Server truth replaces the list wholesale; refill suppression for
-        // earlier optimistic removals no longer applies (and must not leak
-        // into suppressing a legitimately-returned id forever).
-        refillSuppressedIds.clear();
-        splitListCache[context] = [...emails];
+        // Drop rows whose optimistic removal hasn't settled yet: during
+        // the mutation's provider round-trip the server still answers from
+        // its pre-invalidate cached window, so a wholesale replace would
+        // resurrect the just-archived row (roborev 471 #1). Ids leave the
+        // set when their mutation settles or reverts, so in steady state
+        // this filter keeps nothing.
+        const fresh = emails.filter(e => !refillSuppressedIds.has(e.id));
+        splitListCache[context] = [...fresh];
         // Render unless the pane already shows this context's list with an
         // identical payload. lastRenderedContext is null while a Loading
         // placeholder is up, so a cold miss always renders — even an
         // identical-looking (e.g. empty) list carried over in state.emails.
-        if (lastRenderedContext !== context || !emailListsEqual(state.emails, emails)) {
-            state.emails = emails;
+        if (lastRenderedContext !== context || !emailListsEqual(state.emails, fresh)) {
+            state.emails = fresh;
             state.selectedIndex = 0;
             rebuildThreadGroups();
             renderEmailList();
-            harvestContacts(emails, state.currentAccount?.id);
+            harvestContacts(fresh, state.currentAccount?.id);
         }
         // Warm bodies for the on-screen rows (even when the repaint was
         // skipped — a poll tick may have surfaced new uncached emails, and
@@ -2087,6 +2095,10 @@ async function emailAction(type, emailId) {
 
     try {
         await api('POST', `/emails/${emailId}/${type}`);
+        // Settled: the server cache is invalidated, so list responses no
+        // longer carry this row and the suppression must not outlive the
+        // race it guards (a later legitimate reappearance stays visible).
+        refillSuppressedIds.delete(emailId);
         loadSplitCounts(); // resync with server truth
     } catch (err) {
         // Revert: re-insert the email and remove the stale undo entry
@@ -4422,6 +4434,7 @@ async function unsubscribeAndArchiveAll() {
     try {
         const result = await api('POST', `/emails/${id}/unsubscribe-and-archive-all`);
 
+        for (const e of removedEmails) refillSuppressedIds.delete(e.id);
         showStatus(`Archived ${result.archived} emails from ${result.sender}.`, 'success');
         loadSplitCounts(); // resync with server truth
         maybeRefillEmails();
