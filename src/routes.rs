@@ -5278,6 +5278,12 @@ mod tests {
             removal.contains("refillSuppressedIds.add"),
             "removeEmailsFromList must register removed ids before the refill fires"
         );
+        assert!(
+            removal.contains("splitListCache[key].filter(keepFn)"),
+            "removeEmailsFromList must purge removed rows from every cached \
+             context — the suppression set only covers the in-flight window \
+             (roborev 474)"
+        );
     }
 
     #[test]

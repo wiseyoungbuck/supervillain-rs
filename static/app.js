@@ -4476,6 +4476,16 @@ function removeEmailsFromList(keepFn, expectedRemoved) {
     state.emails = state.emails.filter(keepFn);
     adjustSplitCounts(-expectedRemoved);
     invalidateSplitListCache();
+    // Purge the removed rows from every OTHER context's cached list too.
+    // The suppression set only covers the in-flight window (ids leave it
+    // on settle), so a sibling tab's stale entry still carrying the row
+    // would re-flash it from the eager warm-cache repaint the moment the
+    // mutation settles (roborev 474). Purging keeps every client cache
+    // consistent with the optimistic state regardless of when the tab
+    // switch happens; a failure revert self-heals on that tab's next fetch.
+    for (const key of Object.keys(splitListCache)) {
+        splitListCache[key] = splitListCache[key].filter(keepFn);
+    }
     // threadGroups is append-only — the removed ids just drop out of the live
     // present set visibleRows() recomputes. Clamp selection against the VISIBLE
     // row count (kata 64z6), which may differ from state.emails.length once a

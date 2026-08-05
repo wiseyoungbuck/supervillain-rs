@@ -50,7 +50,7 @@ function makeHarness(fetchImpl) {
         noop, noop, noop, noop, noop, () => state.emails,
         noop,
     );
-    return { state, refillSuppressedIds, ...fns };
+    return { state, refillSuppressedIds, splitListCache, ...fns };
 }
 
 // Harness for the loadEmails wholesale-replace vector (roborev 471 #1):
@@ -124,11 +124,11 @@ function makeUndoHarness(fetchImpl) {
         'visibleRowIndexForEmailId', 'extendThreadGroups',
         'invalidateSplitListCache', 'renderEmailList', 'adjustSplitCounts',
         'loadReminders', 'loadSplitCounts', 'maybeRefillEmails',
-        'visibleRows',
+        'visibleRows', 'splitListCache',
         code,
     )(
         state, api, refillSuppressedIds, els, noop, () => 0, noop,
-        noop, noop, noop, noop, noop, noop, () => state.emails,
+        noop, noop, noop, noop, noop, noop, () => state.emails, {},
     );
     return { state, refillSuppressedIds, performUndo: fns.performUndo };
 }
@@ -188,6 +188,24 @@ test('jg51: loadEmails drops suppressed rows from the list AND the split cache',
         h.splitListCache['ctx'].map(e => e.id),
         ['e1'],
         'the pre-invalidate window must not be written into splitListCache either'
+    );
+});
+
+test('jg51: removal purges the row from every cached context', () => {
+    // The suppression set only covers the in-flight window (settle deletes
+    // the id), so a sibling tab's stale cache entry still carrying the row
+    // would re-flash it right after the mutation settles (roborev 474).
+    // The removal itself must purge all cached contexts.
+    const h = makeHarness(async () => []);
+    h.state.emails = [row('e1'), row('e2')];
+    h.splitListCache['sibling'] = [row('e2'), row('e9')];
+
+    h.removeEmailsFromList(e => e.id !== 'e2', 1);
+
+    assert.deepEqual(
+        h.splitListCache['sibling'].map(e => e.id),
+        ['e9'],
+        'a stale sibling entry must not keep the removed row past settle'
     );
 });
 
