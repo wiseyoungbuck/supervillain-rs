@@ -35,12 +35,17 @@ const BODY_CACHE_MAX: usize = 2000;
 const CALENDAR_STATUS_TTL: Duration = Duration::from_secs(15);
 const CALENDAR_STATUS_CACHE_MAX: usize = 64;
 
-/// How long cached split counts are served before being recomputed. Mail
-/// arriving server-side never fires an `invalidate` (only user mutations
-/// and splits CRUD do), so without a TTL the tab badges stale silently
-/// until an unrelated action. Recomputing is cheap — counts derive from
-/// the cached inbox list (kata jg51) — so a short window matching the
-/// frontend's poll cadence keeps badges honest at negligible cost.
+/// How long cached split counts are served before being recomputed. The
+/// recompute reads the cached inbox list, so this TTL cannot observe new
+/// mail by itself — it bounds how long the counts may lag behind that
+/// list. The list refreshes on the warmer cadence (which normally also
+/// rewrites the counts directly) or a route miss; without a TTL, counts
+/// computed against an older list would be served until an explicit
+/// invalidate even after the slot underneath them changed — e.g. when
+/// the warmer's counts write was version-discarded mid-pass, its counts
+/// task failed, or a route miss refilled the slot. Recomputing is a
+/// cheap local walk of the cached list (kata jg51), so a short window
+/// keeps badges consistent with the list at negligible cost.
 pub(crate) const SPLIT_COUNTS_TTL: Duration = Duration::from_secs(60);
 
 /// Cached per-mailbox split counts plus when they were computed, so
@@ -1656,11 +1661,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_counts_cache_has_ttl_self_heals_on_new_mail() {
-        // kata jg51: mail arriving server-side never invalidates the
-        // split-counts entry, so without a TTL the badges stale silently
-        // forever. An entry older than SPLIT_COUNTS_TTL must read as a
-        // miss so the next request recomputes it.
+    async fn split_counts_ttl_expires_stale_entries() {
+        // kata jg51: nothing invalidates the split-counts entry when the
+        // inbox list slot underneath it changes (warmer refresh whose
+        // counts write was discarded, route-miss refill), so without a
+        // TTL the badges could lag that list until an explicit
+        // invalidate. An entry older than SPLIT_COUNTS_TTL must read as
+        // a miss so the next request recomputes from the current list.
         let cache = PrefetchCache::new();
         let mut counts = HashMap::new();
         counts.insert("split-a".to_string(), 3u32);

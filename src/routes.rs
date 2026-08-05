@@ -752,11 +752,20 @@ async fn list_mailboxes(
 /// list every other default-shape request shares, so a split-tab click is
 /// a pure cache hit — `split_id` never joins the key and never causes a
 /// separate fetch.
+///
+/// Split requests are cacheable even with `offset > 0`: the frontend's
+/// refill loop (`maybeRefillEmails`) passes the number of rows the tab
+/// already shows — an index into the *filtered* list — which
+/// `list_emails` applies after filtering the cached window. Routing that
+/// through the live path instead would re-issue a full provider fetch on
+/// every archive in an under-filled split tab, and a provider-side
+/// offset indexes the unfiltered mailbox anyway (it would mostly return
+/// the same window again).
 fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
     params.mailbox_id.is_some()
         && params.search.is_none()
         && params.starred != Some(true)
-        && offset == 0
+        && (offset == 0 || params.split_id.is_some())
         && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT
         && sort == EmailSort::default()
 }
@@ -1116,28 +1125,18 @@ async fn list_emails(
             limit,
             sort,
         };
+        // The miss path fills the slot with `prefetch::fetch_inbox` — the
+        // same fetch the warmer uses, and always the offset-0 window:
+        // `is_cacheable` only admits `offset > 0` for split requests, whose
+        // offset indexes the *filtered* list below, never this fetch.
+        // (`query_ref` is guaranteed None here — no search, no starred.)
         state
             .prefetch
             .inbox_list_or_fetch(&account_id, key, || async {
-                let session_lock = resolve_session(&state, Some(&account_id)).await?;
-                let email_ids = {
-                    let session = session_lock.read().await;
-                    provider::query_emails(
-                        &session,
-                        params.mailbox_id.as_deref(),
-                        limit,
-                        offset,
-                        query_ref,
-                        sort,
-                    )
-                    .await?
-                };
-                provider::get_emails_chunked(
-                    &session_lock,
-                    &email_ids,
-                    false,
-                    None,
-                    provider::GET_EMAILS_CHUNK,
+                crate::prefetch::fetch_inbox(
+                    &state,
+                    &account_id,
+                    params.mailbox_id.as_deref().unwrap(),
                 )
                 .await
             })
@@ -1216,6 +1215,15 @@ async fn list_emails(
     // config loaded above the fetch — no second load/scope pass.
     if let (Some(split_id), Some(config)) = (params.split_id.as_deref(), split_config.as_ref()) {
         emails = splits::filter_by_split(emails, split_id, config);
+        if is_cacheable && offset > 0 {
+            // Refill requests pass the rows the tab already shows as
+            // `offset` — an index into the filtered list. Slice locally so
+            // a refill is a free cache read; a provider-side offset would
+            // index the unfiltered mailbox and mostly return the same
+            // window again. (The live path — search + split — keeps the
+            // pre-existing provider-side offset semantics.)
+            emails.drain(..offset.min(emails.len()));
+        }
         emails.truncate(limit);
     }
 
@@ -2509,7 +2517,13 @@ async fn split_counts(
 /// (kata jg51).
 ///
 /// `starred_only` restricts counting to flagged mail (the sidebar Starred
-/// toggle) — filtered locally over the same cached window.
+/// toggle). That variant does NOT read the cached window: the starred
+/// *list* path queries the provider for flagged mail mailbox-wide
+/// (flagged mail is typically old and sparse, so it rarely overlaps the
+/// newest-`DEFAULT_INBOX_LIMIT` window), and the badges must sample the
+/// same population or they contradict the tab contents. It's one
+/// `DEFAULT_INBOX_LIMIT`-row query — not the old 10× fan-out — and it's
+/// already the cache-bypassing, per-session-ephemeral arm of the route.
 pub(crate) async fn compute_split_counts(
     state: &AppState,
     account: Option<&str>,
@@ -2518,19 +2532,52 @@ pub(crate) async fn compute_split_counts(
     starred_only: bool,
 ) -> Result<HashMap<String, u32>, Error> {
     let account_id = resolve_account_id(state, account).await?;
-    let key = crate::prefetch::InboxKey {
-        mailbox_id: mailbox_id.to_string(),
-        limit: DEFAULT_INBOX_LIMIT,
-        // Counts are order-independent, and only the default-sort slot is
-        // ever cached/warmed — see `InboxKey`'s doc comment.
-        sort: EmailSort::default(),
+    let emails = if starred_only {
+        let session_lock = resolve_session(state, Some(&account_id)).await?;
+        let query = crate::types::ParsedQuery {
+            is_flagged: Some(true),
+            ..Default::default()
+        };
+        let email_ids = {
+            let session = session_lock.read().await;
+            provider::query_emails(
+                &session,
+                Some(mailbox_id),
+                DEFAULT_INBOX_LIMIT,
+                0,
+                Some(&query),
+                EmailSort::default(),
+            )
+            .await?
+        };
+        // Headers only — `matches_split` never needs bodies. `keywords`
+        // rides along so the local flagged filter below still holds even
+        // if a provider ignores the query-side filter.
+        let minimal_props: &[&str] = &["id", "keywords", "from", "to", "cc", "subject"];
+        provider::get_emails_chunked(
+            &session_lock,
+            &email_ids,
+            false,
+            Some(minimal_props),
+            provider::GET_EMAILS_CHUNK,
+        )
+        .await?
+    } else {
+        let key = crate::prefetch::InboxKey {
+            mailbox_id: mailbox_id.to_string(),
+            limit: DEFAULT_INBOX_LIMIT,
+            // Counts are order-independent, and only the default-sort slot
+            // is ever cached/warmed — see `InboxKey`'s doc comment.
+            sort: EmailSort::default(),
+        };
+        state
+            .prefetch
+            .inbox_list_or_fetch(&account_id, key, || async {
+                crate::prefetch::fetch_inbox(state, &account_id, mailbox_id).await
+            })
+            .await?
+            .0
     };
-    let (emails, _stale) = state
-        .prefetch
-        .inbox_list_or_fetch(&account_id, key, || async {
-            crate::prefetch::fetch_inbox(state, &account_id, mailbox_id).await
-        })
-        .await?;
 
     let mut counts = HashMap::new();
     for split in &config.splits {
@@ -4789,12 +4836,16 @@ mod tests {
     /// A state whose single Fastmail session points at a loopback recorder:
     /// any provider round-trip the code under test issues lands in
     /// `recorded`, so `recorded.is_empty()` is the "zero fan-out" pin.
-    async fn jg51_recorder_state() -> (
+    /// The recorder answers every request with `canned` — pass a JMAP body
+    /// for tests that exercise a live-fetch path, or empty for pure
+    /// cache-hit tests where no request may be issued at all.
+    async fn jg51_recorder_state(
+        canned: Vec<u8>,
+    ) -> (
         AppState,
         std::sync::Arc<std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>>,
     ) {
-        let (base, recorded) =
-            crate::jmap::caldav_recorder::spawn(StatusCode::OK, Vec::new()).await;
+        let (base, recorded) = crate::jmap::caldav_recorder::spawn(StatusCode::OK, canned).await;
         let mut sess = crate::jmap::JmapSession::new("me@example.com", "test-token", None);
         sess.api_url = Some(format!("{base}/jmap"));
         sess.account_id = Some("acc1".into());
@@ -4811,9 +4862,56 @@ mod tests {
         (state, recorded)
     }
 
+    /// A canned JMAP body serving BOTH `Email/query` and `Email/get` from
+    /// one response: both parsers read `methodResponses[0][1]` and each
+    /// looks only for its own key (`ids` vs `list`), so a single object
+    /// carrying both satisfies whichever call arrives. `from`/`flagged`
+    /// pairs become one email each, ids `c1..cN`.
+    fn jg51_canned_jmap(emails: &[(&str, bool)]) -> Vec<u8> {
+        let list: Vec<serde_json::Value> = emails
+            .iter()
+            .enumerate()
+            .map(|(i, (from, flagged))| {
+                let mut keywords = serde_json::Map::new();
+                if *flagged {
+                    keywords.insert("$flagged".into(), serde_json::json!(true));
+                }
+                serde_json::json!({
+                    "id": format!("c{}", i + 1),
+                    "keywords": keywords,
+                    "subject": format!("Subject {}", i + 1),
+                    "from": [{"name": null, "email": from}],
+                    "to": [{"name": null, "email": "me@example.com"}],
+                })
+            })
+            .collect();
+        let ids: Vec<String> = (1..=emails.len()).map(|i| format!("c{i}")).collect();
+        serde_json::json!({
+            "methodResponses": [["Combined", {"ids": ids, "list": list}, "0"]]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The JMAP method names posted to the recorder, in order — each
+    /// recorded request body is a `methodCalls` envelope.
+    fn jg51_recorded_methods(
+        recorded: &std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>,
+    ) -> Vec<String> {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["methodCalls"][0][0].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn split_counts_uses_cached_inbox_list_no_fanout() {
-        let (state, recorded) = jg51_recorder_state().await;
+        let (state, recorded) = jg51_recorder_state(Vec::new()).await;
         let emails = vec![
             jg51_email("e1", "a@aristoi.ai", false),
             jg51_email("e2", "x@example.com", false),
@@ -4846,7 +4944,7 @@ mod tests {
 
     #[tokio::test]
     async fn split_tab_list_uses_cached_inbox_list_no_fanout() {
-        let (mut state, recorded) = jg51_recorder_state().await;
+        let (mut state, recorded) = jg51_recorder_state(Vec::new()).await;
         let temp = tempfile::tempdir().unwrap();
         let splits_path = temp.path().join("splits.json");
         splits::save_splits(&jg51_splits_config(), &splits_path).unwrap();
@@ -4901,9 +4999,10 @@ mod tests {
     #[tokio::test]
     async fn split_counts_accuracy_within_cached_window() {
         // Pinning test: the cached-list refactor must not change what gets
-        // counted within the window — per-split match counts, and the
-        // starred variant restricted to flagged mail.
-        let (state, recorded) = jg51_recorder_state().await;
+        // counted within the window — per-split match counts over the
+        // cached list. (The starred variant deliberately bypasses the
+        // cache — see starred_split_counts_match_starred_split_list.)
+        let (state, recorded) = jg51_recorder_state(Vec::new()).await;
         let mut config = jg51_splits_config();
         config.splits.push(SplitInbox {
             id: "foo".into(),
@@ -4935,19 +5034,209 @@ mod tests {
             .unwrap();
         assert_eq!(counts.get("aristoi"), Some(&3));
         assert_eq!(counts.get("foo"), Some(&2));
-
-        let starred = compute_split_counts(&state, Some("acct"), "mb-inbox", &config, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            starred.get("aristoi"),
-            Some(&1),
-            "starred counts must only count flagged matches"
-        );
-        assert_eq!(starred.get("foo"), Some(&2));
         assert!(
             recorded.lock().unwrap().is_empty(),
-            "both count variants must derive from the cached window with zero provider requests"
+            "counts must derive from the cached window with zero provider requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_counts_cold_cache_fetches_one_window_and_warms_shared_slot() {
+        // The miss path: a cold-cache counts request must issue exactly one
+        // Email/query + one Email/get for one DEFAULT_INBOX_LIMIT window
+        // (not per-split, not the old 10× fan-out), and the fetched list
+        // must land in the shared InboxKey slot so list_emails (and the
+        // next counts request) hit the cache.
+        let canned = jg51_canned_jmap(&[
+            ("a@aristoi.ai", false),
+            ("x@example.com", false),
+            ("b@aristoi.ai", false),
+        ]);
+        let (state, recorded) = jg51_recorder_state(canned).await;
+
+        let counts = compute_split_counts(
+            &state,
+            Some("acct"),
+            "mb-inbox",
+            &jg51_splits_config(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counts.get("aristoi"), Some(&2));
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"],
+            "a cold-cache count must cost exactly one query + one get"
+        );
+        let cached = state
+            .prefetch
+            .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+            .await
+            .expect("the miss fetch must warm the shared inbox slot");
+        assert_eq!(
+            cached.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["c1", "c2", "c3"]
+        );
+
+        // Second request: pure cache hit, no new provider traffic.
+        let again = compute_split_counts(
+            &state,
+            Some("acct"),
+            "mb-inbox",
+            &jg51_splits_config(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.get("aristoi"), Some(&2));
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            2,
+            "a warm-cache recount must issue zero additional requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn starred_split_counts_match_starred_split_list() {
+        // roborev 469 #1: the starred badge and the starred tab must sample
+        // the same population. The starred list queries the provider for
+        // flagged mail mailbox-wide (flagged mail is typically old and
+        // outside the newest-150 window), so starred counts must issue the
+        // same flagged query — counting flagged mail within the cached
+        // unfiltered window instead would show 0 badges over non-empty tabs.
+        let canned = jg51_canned_jmap(&[
+            ("a@aristoi.ai", true),
+            ("x@example.com", true),
+            ("b@aristoi.ai", true),
+        ]);
+        let (mut state, recorded) = jg51_recorder_state(canned).await;
+        let temp = tempfile::tempdir().unwrap();
+        let splits_path = temp.path().join("splits.json");
+        splits::save_splits(&jg51_splits_config(), &splits_path).unwrap();
+        state.splits_config_path = splits_path;
+
+        // A cached unfiltered window with NO flagged aristoi mail: if counts
+        // wrongly derived from it, the badge would read 0 while the tab
+        // shows 2.
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("e1", "y@example.com", false)],
+            )
+            .await;
+
+        let state = Arc::new(state);
+        let starred = compute_split_counts(
+            &state,
+            Some("acct"),
+            "mb-inbox",
+            &jg51_splits_config(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let count_query_body = String::from_utf8(recorded.lock().unwrap()[0].body.clone()).unwrap();
+        assert!(
+            count_query_body.contains("$flagged"),
+            "starred counts must issue the same provider-side flagged query \
+             the starred list uses"
+        );
+
+        let request = Request::builder()
+            .uri("/api/emails?mailbox_id=mb-inbox&split_id=aristoi&starred=true")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            starred.get("aristoi").copied(),
+            Some(rows.len() as u32),
+            "the starred badge must equal the starred tab's row count for \
+             the same provider data"
+        );
+        assert_eq!(starred.get("aristoi"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn split_tab_refill_offset_slices_cached_filtered_list() {
+        // roborev 469 #2: the frontend refill loop (maybeRefillEmails)
+        // passes the rows the tab already shows as `offset` — an index into
+        // the *filtered* list. A split request with offset > 0 must slice
+        // the filtered cached window locally (zero provider requests), not
+        // fall to the live path where a provider-side offset indexes the
+        // unfiltered mailbox and re-fans-out on every archive.
+        let (mut state, recorded) = jg51_recorder_state(Vec::new()).await;
+        let temp = tempfile::tempdir().unwrap();
+        let splits_path = temp.path().join("splits.json");
+        splits::save_splits(&jg51_splits_config(), &splits_path).unwrap();
+        state.splits_config_path = splits_path;
+
+        let emails = vec![
+            jg51_email("e1", "a@aristoi.ai", false),
+            jg51_email("e2", "x@example.com", false),
+            jg51_email("e3", "b@aristoi.ai", false),
+            jg51_email("e4", "c@aristoi.ai", false),
+        ];
+        state
+            .prefetch
+            .set_inbox_list("acct", jg51_inbox_key("mb-inbox"), emails.clone())
+            .await;
+        for e in &emails {
+            state
+                .prefetch
+                .set_body("acct", e.id.clone(), e.clone())
+                .await;
+        }
+
+        let state = Arc::new(state);
+        // The tab already shows 1 filtered row → refill asks for the rest.
+        let request = Request::builder()
+            .uri("/api/emails?mailbox_id=mb-inbox&split_id=aristoi&offset=1")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["e3", "e4"],
+            "offset must index the filtered list, skipping rows the tab already shows"
+        );
+
+        // Offset at/past the end of the filtered matches: empty, still local.
+        let request = Request::builder()
+            .uri("/api/emails?mailbox_id=mb-inbox&split_id=aristoi&offset=3")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            rows.is_empty(),
+            "an exhausted split refill must return no rows"
+        );
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "split refills must be served from the cached window with zero \
+             provider requests — a live re-fetch on every archive is the bug"
         );
     }
 
