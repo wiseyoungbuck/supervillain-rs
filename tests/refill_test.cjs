@@ -57,7 +57,7 @@ function makeHarness(fetchImpl) {
 // during a mutation's round-trip the server answers from its
 // pre-invalidate cached window, so the payload must be filtered against
 // the suppression set before it reaches state.emails or splitListCache.
-function makeLoadHarness(payload) {
+function makeLoadHarness(payload, seedCache) {
     const state = {
         emails: [],
         currentMailbox: { id: 'mb-inbox', role: 'inbox' },
@@ -65,9 +65,13 @@ function makeLoadHarness(payload) {
         selectedIndex: 0,
     };
     const refillSuppressedIds = new Set();
-    const splitListCache = {};
+    const splitListCache = seedCache || {};
     const noop = () => {};
-    const apiWithMeta = async () => ({ data: payload, headers: { get: () => null } });
+    // payload === null models a fetch that never settles, isolating the
+    // synchronous eager-repaint path.
+    const apiWithMeta = payload === null
+        ? () => new Promise(() => {})
+        : async () => ({ data: payload, headers: { get: () => null } });
     const els = { emailList: { innerHTML: '' } };
     const code = [
         'let loadEmailsController = null;',
@@ -184,6 +188,24 @@ test('jg51: loadEmails drops suppressed rows from the list AND the split cache',
         h.splitListCache['ctx'].map(e => e.id),
         ['e1'],
         'the pre-invalidate window must not be written into splitListCache either'
+    );
+});
+
+test('jg51: eager repaint from a warm splitListCache filters suppressed rows', () => {
+    // removeEmailsFromList invalidates only the current context's cache
+    // entry, so a sibling tab's cached list can still carry the row whose
+    // archive is in flight; switching to that tab mid-round-trip must not
+    // flash it back (roborev 473). The fetch never settles here — only the
+    // synchronous eager repaint runs.
+    const h = makeLoadHarness(null, { ctx: [row('e1'), row('e2')] });
+    h.refillSuppressedIds.add('e2');
+
+    h.loadEmails();
+
+    assert.deepEqual(
+        h.state.emails.map(e => e.id),
+        ['e1'],
+        'the warm-cache repaint must not resurrect the row being archived'
     );
 });
 

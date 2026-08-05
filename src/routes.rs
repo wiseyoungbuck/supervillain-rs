@@ -5318,9 +5318,11 @@ mod tests {
         // NOT clear the set on an arbitrary response, which would disarm
         // the guard inside the very window it exists for).
         let load = js_fn_body(APP_JS, "async function loadEmails(");
-        assert!(
-            load.contains("!refillSuppressedIds.has"),
-            "loadEmails must drop rows whose optimistic removal is still in flight"
+        assert_eq!(
+            load.matches("!refillSuppressedIds.has").count(),
+            2,
+            "loadEmails must drop suppressed rows on BOTH paths — the eager \
+             splitListCache repaint (roborev 473) and the fetch response"
         );
         assert!(
             !load.contains("refillSuppressedIds.clear"),

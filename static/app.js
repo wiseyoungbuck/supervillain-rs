@@ -1597,6 +1597,12 @@ async function loadEmails() {
     // arrives. Only show the "Loading" placeholder on a true cold miss
     // (no cached entry and no in-memory emails).
     if (splitListCache[context]) {
+        // The eager repaint must filter suppressed rows too:
+        // removeEmailsFromList invalidates only the CURRENT context's
+        // cache entry, so while a mutation is in flight a sibling
+        // context's cached list can still carry the row being archived —
+        // switching tabs mid-round-trip would flash it back (roborev 473).
+        const cached = splitListCache[context].filter(e => !refillSuppressedIds.has(e.id));
         // Skip the eager repaint only when the pane already shows exactly
         // this context's list with exactly this payload. During stale-
         // snapshot revalidation every poll tick re-enters loadEmails, and
@@ -1604,8 +1610,8 @@ async function loadEmails() {
         // the fetch even started (roborev 307 #1). See lastRenderedContext
         // for why payload equality alone isn't sufficient.
         if (lastRenderedContext !== context
-            || !emailListsEqual(state.emails, splitListCache[context])) {
-            state.emails = [...splitListCache[context]];
+            || !emailListsEqual(state.emails, cached)) {
+            state.emails = cached;
             state.selectedIndex = 0;
             rebuildThreadGroups();
             renderEmailList();
