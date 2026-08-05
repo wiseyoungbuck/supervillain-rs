@@ -130,6 +130,15 @@ const CACHE_LIMIT = 150;
 let suppressFocusThemeRefreshUntil = 0;
 const REFILL_THRESHOLD = 100;
 let refillInFlight = false;
+// Ids removed from the list optimistically (archive/trash/remind/unsub)
+// whose server mutation may not have settled yet. The refill fired by
+// removeEmailsFromList races that mutation, and split refills are served
+// from the server's cached window — which still contains the removed row
+// until the mutation invalidates it — so an unfiltered refill would
+// re-append the email the user just archived (roborev 470 #1). Ids leave
+// the set when a revert/undo restores them, or wholesale when loadEmails
+// replaces the list with server truth.
+const refillSuppressedIds = new Set();
 
 // Per-split email list cache for instant split switching
 // Key: "accountId:mailboxId:splitId:search" -> email array
@@ -1337,6 +1346,7 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
         loadSplitCounts();
     } catch (err) {
         state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             extendThreadGroups([removedEmail]);
@@ -1608,6 +1618,10 @@ async function loadEmails() {
         // Stale response guard: discard if context changed during fetch
         if (splitCacheKey() !== context) return;
 
+        // Server truth replaces the list wholesale; refill suppression for
+        // earlier optimistic removals no longer applies (and must not leak
+        // into suppressing a legitimately-returned id forever).
+        refillSuppressedIds.clear();
         splitListCache[context] = [...emails];
         // Render unless the pane already shows this context's list with an
         // identical payload. lastRenderedContext is null while a Loading
@@ -1652,7 +1666,8 @@ async function maybeRefillEmails() {
         if (splitCacheKey() !== context) return;
 
         const existingIds = new Set(state.emails.map(e => e.id));
-        const newEmails = fresh.filter(e => !existingIds.has(e.id));
+        const newEmails = fresh.filter(
+            e => !existingIds.has(e.id) && !refillSuppressedIds.has(e.id));
         if (newEmails.length > 0) {
             state.emails = state.emails.concat(newEmails);
             extendThreadGroups(newEmails);
@@ -2076,6 +2091,7 @@ async function emailAction(type, emailId) {
     } catch (err) {
         // Revert: re-insert the email and remove the stale undo entry
         state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
         if (removedEmail) {
             state.emails.splice(removedIndex, 0, removedEmail);
             invalidateSplitListCache();
@@ -4412,6 +4428,7 @@ async function unsubscribeAndArchiveAll() {
     } catch (err) {
         // Revert: re-insert the removed emails
         if (removedEmails.length > 0) {
+            for (const e of removedEmails) refillSuppressedIds.delete(e.id);
             state.emails = state.emails.concat(removedEmails);
             // Re-sort respecting the active sort order (kata review
             // follow-up) — a hardcoded descending re-sort here would scramble
@@ -4434,6 +4451,9 @@ function removeEmailFromList(emailId) {
 }
 
 function removeEmailsFromList(keepFn, expectedRemoved) {
+    for (const e of state.emails) {
+        if (!keepFn(e)) refillSuppressedIds.add(e.id);
+    }
     state.emails = state.emails.filter(keepFn);
     adjustSplitCounts(-expectedRemoved);
     invalidateSplitListCache();
@@ -5605,6 +5625,7 @@ async function performUndo() {
     // selection must land on the re-inserted email's VISIBLE row, which under
     // grouping is not that flat index (kata 64z6).
     if (item.emailData) {
+        refillSuppressedIds.delete(item.emailId);
         const idx = Math.min(item.insertIndex, state.emails.length);
         state.emails.splice(idx, 0, item.emailData);
         // Guarantee the id is registered even in the edge case where its thread

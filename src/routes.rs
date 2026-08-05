@@ -761,6 +761,16 @@ async fn list_mailboxes(
 /// every archive in an under-filled split tab, and a provider-side
 /// offset indexes the unfiltered mailbox anyway (it would mostly return
 /// the same window again).
+///
+/// "Cacheable" here means a free local read *while the slot is warm*.
+/// Mutations (archive/trash/move) call `prefetch.invalidate`, which
+/// clears the slot, so a refill arriving after the mutation settles pays
+/// one `fetch_inbox` window re-fetch on the miss (usually the
+/// post-mutation `loadSplitCounts` resync has re-warmed it first). A
+/// refill arriving *before* the mutation settles reads the pre-mutation
+/// window — the frontend filters those rows against its
+/// optimistically-removed ids (`refillSuppressedIds`) so a just-archived
+/// email can't be re-appended by its own refill (roborev 470 #1).
 fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
     params.mailbox_id.is_some()
         && params.search.is_none()
@@ -2524,6 +2534,15 @@ async fn split_counts(
 /// same population or they contradict the tab contents. It's one
 /// `DEFAULT_INBOX_LIMIT`-row query — not the old 10× fan-out — and it's
 /// already the cache-bypassing, per-session-ephemeral arm of the route.
+///
+/// Known residual (roborev 470 #2, accepted): this query always uses the
+/// default sort, while the starred list carries the user's active sort
+/// (and mobile requests `limit=200`). With a non-default sort AND more
+/// than `DEFAULT_INBOX_LIMIT` flagged messages in the mailbox, the badge
+/// samples the newest 150 flagged while the tab shows the oldest 150 —
+/// the populations can diverge at that scale. Not worth threading a sort
+/// param through the counts route for; revisit only if someone actually
+/// flags >150 messages and sorts oldest-first.
 pub(crate) async fn compute_split_counts(
     state: &AppState,
     account: Option<&str>,
@@ -5237,6 +5256,46 @@ mod tests {
             recorded.lock().unwrap().is_empty(),
             "split refills must be served from the cached window with zero \
              provider requests — a live re-fetch on every archive is the bug"
+        );
+    }
+
+    #[test]
+    fn app_js_refill_filters_optimistically_removed_ids() {
+        // roborev 470 #1: removeEmailsFromList fires maybeRefillEmails
+        // before the mutation POST settles, and the cached split refill
+        // deterministically reads the pre-mutation window — which still
+        // contains the removed row. The refill must filter against the
+        // optimistically-removed id set or it re-appends the email the
+        // user just archived. Source-shape pins, updated in lockstep with
+        // maybeRefillEmails / removeEmailsFromList.
+        let refill = js_fn_body(APP_JS, "async function maybeRefillEmails(");
+        assert!(
+            refill.contains("refillSuppressedIds.has"),
+            "maybeRefillEmails must drop rows whose removal is still in flight"
+        );
+        let removal = js_fn_body(APP_JS, "function removeEmailsFromList(");
+        assert!(
+            removal.contains("refillSuppressedIds.add"),
+            "removeEmailsFromList must register removed ids before the refill fires"
+        );
+    }
+
+    #[test]
+    fn app_js_refill_suppression_released_when_rows_are_restored() {
+        // The suppression must not outlive the removal: every revert/undo
+        // path that re-inserts a row deletes its id (emailAction revert,
+        // remindEmail revert, unsubscribe revert, performUndo), and a full
+        // loadEmails replaces the list with server truth and clears the
+        // set wholesale — otherwise a legitimately-returned id would be
+        // suppressed from refills forever.
+        assert!(
+            APP_JS.matches("refillSuppressedIds.delete").count() >= 4,
+            "every restore path must release its refill suppression"
+        );
+        let load = js_fn_body(APP_JS, "async function loadEmails(");
+        assert!(
+            load.contains("refillSuppressedIds.clear()"),
+            "loadEmails must clear refill suppression when server truth lands"
         );
     }
 
