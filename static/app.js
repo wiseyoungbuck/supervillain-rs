@@ -5822,6 +5822,15 @@ function copyEmailIframeSelection() {
     const parentSel = window.getSelection();
     if (parentSel && !parentSel.isCollapsed && String(parentSel)) return false;
     for (const iframe of document.querySelectorAll('iframe.email-iframe')) {
+        // Hidden iframes outlive their views: showView only toggles CSS
+        // classes, and a document's selection survives display:none. Without
+        // this guard a stale invisible selection (detail body after q-back-
+        // to-list, or behind an open reply) would clobber the clipboard or
+        // shadow the visible compose-quote selection sitting later in
+        // document order (roborev 478). offsetParent is null whenever any
+        // ancestor is display:none — exactly the "not currently rendered"
+        // test needed here.
+        if (!iframe.offsetParent) continue;
         let text = '';
         try {
             const sel = iframe.contentWindow && iframe.contentWindow.getSelection();

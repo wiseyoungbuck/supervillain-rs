@@ -59,8 +59,13 @@ function mockSelection(text, collapsed) {
     return { isCollapsed: collapsed, toString: () => text };
 }
 
-function mockIframe(sel) {
-    return { contentWindow: { getSelection: () => sel } };
+function mockIframe(sel, { hidden = false } = {}) {
+    // offsetParent is null for elements inside a display:none subtree —
+    // the copier uses it to skip iframes whose views are not on screen.
+    return {
+        offsetParent: hidden ? null : {},
+        contentWindow: { getSelection: () => sel },
+    };
 }
 
 function mockEnv({ parentSel = null, iframes = [], clipboard } = {}) {
@@ -141,8 +146,38 @@ test('no iframes at all means nothing to copy', () => {
     assert.strictEqual(copyEmailIframeSelection(), false);
 });
 
+test('a hidden iframe\'s stale selection is never copied (q-back-to-list case)', () => {
+    // Selections survive display:none — leaving detail view hides the iframe
+    // but keeps its document and selection alive. Ctrl+C in the list with
+    // nothing visibly selected must stay a native no-op, not clobber the
+    // clipboard with stale invisible text (roborev 478).
+    const env = mockEnv({
+        parentSel: null,
+        iframes: [mockIframe(mockSelection('stale detail text', false), { hidden: true })],
+    });
+    const { copyEmailIframeSelection } = loadCopyFns(env);
+    assert.strictEqual(copyEmailIframeSelection(), false);
+    assert.deepStrictEqual(env.writes, []);
+});
+
+test('a hidden stale iframe does not shadow a visible selection later in DOM order', () => {
+    // Reply flow: the hidden detail-body iframe comes first in document
+    // order and still holds its old selection; the visible compose-quote
+    // iframe's selection must win (roborev 478).
+    const env = mockEnv({
+        parentSel: null,
+        iframes: [
+            mockIframe(mockSelection('stale detail text', false), { hidden: true }),
+            mockIframe(mockSelection('quote text the user selected', false)),
+        ],
+    });
+    const { copyEmailIframeSelection } = loadCopyFns(env);
+    assert.strictEqual(copyEmailIframeSelection(), true);
+    assert.deepStrictEqual(env.writes, ['quote text the user selected']);
+});
+
 test('a throwing iframe (detached mid-teardown) is skipped, later ones still copy', () => {
-    const hostile = { get contentWindow() { throw new Error('detached'); } };
+    const hostile = { offsetParent: {}, get contentWindow() { throw new Error('detached'); } };
     const env = mockEnv({
         parentSel: null,
         iframes: [hostile, mockIframe(mockSelection('still here', false))],
