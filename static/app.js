@@ -325,13 +325,16 @@ function init() {
     });
     document.addEventListener('keydown', handleKeyDown);
     // The sandboxed email-body iframe (renderHtmlBodyIframe) swallows
-    // keyboard focus when clicked: it's cross-origin by design (no
-    // allow-same-origin), so once it holds focus every shortcut — Escape
+    // keyboard focus when clicked: its document runs no scripts (sandbox
+    // omits allow-scripts), so once it holds focus every shortcut — Escape
     // back to the list, j/k, all of it — silently dies, with no way back
     // but the mouse. Focus moving into any iframe fires window blur;
     // bounce it straight back. Mouse text-selection inside the email
-    // doesn't need keyboard focus, so reading and selecting still work
-    // (copying that selection needs the right-click menu).
+    // doesn't need keyboard focus, so reading and selecting still work.
+    // Copying that selection is handled by handleKeyDown's Ctrl/Cmd+C
+    // branch (copyEmailIframeSelection): with focus parked out here,
+    // native copy would act on the parent's empty selection and silently
+    // put nothing on the clipboard (kata 26gb).
     window.addEventListener('blur', () => {
         setTimeout(() => {
             const el = document.activeElement;
@@ -3937,6 +3940,25 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Ctrl/Cmd+C: native copy can't see a selection living inside the
+    // sandboxed email-body iframe — the focus bounce (init's window-blur
+    // handler) parks keyboard focus in the parent document, whose own
+    // selection is empty, so the chord silently copied nothing (kata 26gb).
+    // The iframe is same-origin-readable, so read its selection here and
+    // write the clipboard ourselves. Editable targets are excluded: their
+    // in-field selection is invisible to window.getSelection(), which would
+    // misread as "nothing selected in the parent" and hijack a normal copy.
+    // Falling through without preventDefault keeps native copy alive for
+    // parent-document selections (plain-text bodies, headers, list rows).
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'c') {
+        const t = e.target;
+        const editable = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+        if (!editable && copyEmailIframeSelection()) {
+            e.preventDefault();
+        }
+        return;
+    }
+
     // Normal mode keys
     if (state.mode === 'normal') {
         handleNormalModeKey(e);
@@ -4029,6 +4051,14 @@ function handleSettingsNormalKey(e) {
 
 function handleNormalModeKey(e) {
     const key = e.key;
+
+    // Ctrl/Cmd/Alt chords belong to the browser (copy, reload, find,
+    // devtools) — the vim bindings below are bare-key only, mirroring the
+    // compose and settings normal-mode guards (roborev 312 #3). Without
+    // this, Ctrl+C opened compose and Ctrl+R started a reply instead of
+    // copying/reloading (kata 26gb). Shift stays allowed: G/U/R/?/# and
+    // Shift+Space are real bindings.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
 
     // Handle g-prefix chords (gg = top, gs = settings)
     if (state.pendingG) {
@@ -5775,6 +5805,59 @@ function providerIcon(provider) {
 // Use escapeAttr inside attribute strings like data-foo="${...}".
 function escapeAttr(text) {
     return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Ctrl/Cmd+C support for HTML email bodies (kata 26gb). The window-blur
+// focus bounce (init) keeps keyboard focus OUT of the sandboxed email-body
+// iframe so global shortcuts stay alive — which means native copy acts on
+// the parent document's empty selection and puts nothing on the clipboard.
+// The iframe is same-origin-readable (allow-same-origin, no allow-scripts),
+// so the parent can read the selection itself. Plain text deliberately:
+// the iframe HTML is attacker-controlled and must not ride the clipboard
+// as text/html into whatever app the user pastes into.
+// Returns true when an iframe selection was found and a clipboard write was
+// initiated; false when there is nothing for it to do (a real selection in
+// the parent document — native copy owns that — or no selection anywhere).
+function copyEmailIframeSelection() {
+    const parentSel = window.getSelection();
+    if (parentSel && !parentSel.isCollapsed && String(parentSel)) return false;
+    for (const iframe of document.querySelectorAll('iframe.email-iframe')) {
+        let text = '';
+        try {
+            const sel = iframe.contentWindow && iframe.contentWindow.getSelection();
+            if (sel && !sel.isCollapsed) text = String(sel);
+        } catch (_) {
+            continue; // detached mid-teardown; nothing to copy from this one
+        }
+        if (!text) continue;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            // A rejection (permission quirk, non-secure context) falls back
+            // to the legacy textarea path while the gesture is still warm.
+            navigator.clipboard.writeText(text).catch(() => execCommandCopyFallback(text));
+        } else {
+            execCommandCopyFallback(text);
+        }
+        return true;
+    }
+    return false;
+}
+
+// Legacy clipboard write: select-and-execCommand on a throwaway textarea in
+// the parent document. Only reached when navigator.clipboard is missing or
+// its write rejects.
+function execCommandCopyFallback(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    const prev = document.activeElement;
+    ta.select();
+    try { document.execCommand('copy'); } catch (_) { /* best effort */ }
+    ta.remove();
+    // Hand focus back so the selection/focus state the user saw is restored.
+    if (prev && typeof prev.focus === 'function') prev.focus();
 }
 
 // Render attacker-controlled email HTML in a sandboxed iframe. The sandbox
