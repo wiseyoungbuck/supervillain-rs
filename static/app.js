@@ -1587,6 +1587,10 @@ function retireRefreshStatus() {
 }
 
 async function loadEmails({ refresh = false } = {}) {
+    // Any new load intent invalidates an in-flight refill — including the
+    // early-return paths below (roborev 505: switching into Reminders left
+    // the refill request live on the wire).
+    refillController?.abort();
     if (!state.currentMailbox) {
         if (refresh) retireRefreshStatus();
         return;
@@ -1615,10 +1619,6 @@ async function loadEmails({ refresh = false } = {}) {
             retireRefreshStatus();
         }
     }
-    // A fresh list load owns the window; an in-flight refill for the old
-    // window must not race it (roborev 114 — the context check only guards
-    // the response, not the wasted request).
-    refillController?.abort();
     loadEmailsController = new AbortController();
     loadEmailsController.refresh = refresh;
     loadEmailsController.context = requestedContext;

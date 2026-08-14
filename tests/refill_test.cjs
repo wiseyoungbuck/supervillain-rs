@@ -31,6 +31,7 @@ function makeHarness(fetchImpl) {
     const api = async (method, url) => fetchImpl(method, url);
     const code = [
         'let refillInFlight = false;',
+        'let refillController = null;',
         'const REFILL_THRESHOLD = 100;',
         extractFunction('async function maybeRefillEmails('),
         extractFunction('function removeEmailsFromList('),
@@ -75,6 +76,7 @@ function makeLoadHarness(payload, seedCache) {
     const els = { emailList: { innerHTML: '' } };
     const code = [
         'let loadEmailsController = null;',
+        'let refillController = null;',
         'let lastRenderedContext = null;',
         extractFunction('async function loadEmails('),
         'return { loadEmails };',
