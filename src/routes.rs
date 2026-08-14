@@ -4983,6 +4983,12 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>>,
     ) {
         let (base, recorded) = crate::jmap::caldav_recorder::spawn(status, canned).await;
+        (jg51_state_for_recorder(&base).await, recorded)
+    }
+
+    /// The session/state wiring shared by the gated and ungated recorder
+    /// helpers: one Fastmail session for account "acct" pointed at `base`.
+    async fn jg51_state_for_recorder(base: &str) -> AppState {
         let mut sess = crate::jmap::JmapSession::new("me@example.com", "test-token", None);
         sess.api_url = Some(format!("{base}/jmap"));
         sess.account_id = Some("acc1".into());
@@ -4996,7 +5002,7 @@ mod tests {
                 )),
             );
         }
-        (state, recorded)
+        state
     }
 
     /// [`jg51_recorder_state`] on a gated recorder: responses block until
@@ -5011,20 +5017,7 @@ mod tests {
     ) {
         let (base, recorded, gate) =
             crate::jmap::caldav_recorder::spawn_gated(StatusCode::OK, canned).await;
-        let mut sess = crate::jmap::JmapSession::new("me@example.com", "test-token", None);
-        sess.api_url = Some(format!("{base}/jmap"));
-        sess.account_id = Some("acc1".into());
-        let state = test_state(&["acct"], "acct");
-        {
-            let mut reg = state.accounts.write().await;
-            reg.sessions.insert(
-                "acct".into(),
-                Arc::new(tokio::sync::RwLock::new(
-                    provider::ProviderSession::Fastmail(Box::new(sess)),
-                )),
-            );
-        }
-        (state, recorded, gate)
+        (jg51_state_for_recorder(&base).await, recorded, gate)
     }
 
     /// A canned JMAP body serving BOTH `Email/query` and `Email/get` from
@@ -5202,10 +5195,16 @@ mod tests {
         };
 
         // The recorded Email/query proves the route has snapshotted the
-        // version and is awaiting the gated provider response.
-        while recorded.lock().unwrap().is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // version and is awaiting the gated provider response. Bounded so a
+        // regression that never reaches the provider fails loudly instead of
+        // hanging the suite.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while recorded.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("route never issued the gated Email/query");
         // A sibling invalidation bumps the account version without clearing
         // the seeded list slot — the exact race the else branch exists for.
         state
