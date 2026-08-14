@@ -4999,6 +4999,34 @@ mod tests {
         (state, recorded)
     }
 
+    /// [`jg51_recorder_state`] on a gated recorder: responses block until
+    /// the test releases permits, so a mutation can deterministically land
+    /// while the route's provider fetch is in flight.
+    async fn jg51_gated_recorder_state(
+        canned: Vec<u8>,
+    ) -> (
+        AppState,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    ) {
+        let (base, recorded, gate) =
+            crate::jmap::caldav_recorder::spawn_gated(StatusCode::OK, canned).await;
+        let mut sess = crate::jmap::JmapSession::new("me@example.com", "test-token", None);
+        sess.api_url = Some(format!("{base}/jmap"));
+        sess.account_id = Some("acc1".into());
+        let state = test_state(&["acct"], "acct");
+        {
+            let mut reg = state.accounts.write().await;
+            reg.sessions.insert(
+                "acct".into(),
+                Arc::new(tokio::sync::RwLock::new(
+                    provider::ProviderSession::Fastmail(Box::new(sess)),
+                )),
+            );
+        }
+        (state, recorded, gate)
+    }
+
     /// A canned JMAP body serving BOTH `Email/query` and `Email/get` from
     /// one response: both parsers read `methodResponses[0][1]` and each
     /// looks only for its own key (`ids` vs `list`), so a single object
@@ -5138,6 +5166,77 @@ mod tests {
         let response = router(state).oneshot(normal).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(jg51_recorded_methods(&recorded).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_losing_version_race_evicts_rather_than_recaching() {
+        let (state, recorded, gate) =
+            jg51_gated_recorder_state(jg51_canned_jmap(&[("new@example.com", false)])).await;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("old", "old@example.com", false)],
+            )
+            .await;
+        // Pre-seed the fresh body so the fire-and-forget body warm issues no
+        // request of its own (it would hang on the gate and skew `recorded`).
+        state
+            .prefetch
+            .set_body(
+                "acct",
+                "c1".into(),
+                jg51_email("c1", "new@example.com", false),
+            )
+            .await;
+
+        let refresh = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let request_task = {
+            let state = state.clone();
+            tokio::spawn(async move { router(state).oneshot(refresh).await.unwrap() })
+        };
+
+        // The recorded Email/query proves the route has snapshotted the
+        // version and is awaiting the gated provider response.
+        while recorded.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // A sibling invalidation bumps the account version without clearing
+        // the seeded list slot — the exact race the else branch exists for.
+        state
+            .prefetch
+            .invalidate_split_counts_for_mailbox("acct", "mb-inbox")
+            .await;
+        gate.add_permits(usize::MAX >> 4);
+
+        let response = request_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            rows[0]["id"], "c1",
+            "the live response must still serve provider truth to this request"
+        );
+        assert!(
+            state
+                .prefetch
+                .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+                .await
+                .is_none(),
+            "a refresh that loses the version race must evict the old window, \
+             not leave it (or the pre-mutation fetch) available to the next read"
+        );
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"]
+        );
     }
 
     #[tokio::test]

@@ -2982,12 +2982,35 @@ pub(crate) mod caldav_recorder {
         status: axum::http::StatusCode,
         body: Vec<u8>,
     ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let (base, recorded, gate) = spawn_gated(status, body).await;
+        // Ungated: every request may respond immediately.
+        gate.add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        (base, recorded)
+    }
+
+    /// Like [`spawn`], but each response consumes one permit from the
+    /// returned semaphore (created with zero permits) *after* the request
+    /// has been recorded. A test can therefore observe a request's arrival
+    /// in `recorded`, interleave state mutations while the caller is still
+    /// awaiting the provider, then `add_permits` to release the response —
+    /// making in-flight races deterministic.
+    pub async fn spawn_gated(
+        status: axum::http::StatusCode,
+        body: Vec<u8>,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<RecordedRequest>>>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
         let recorded: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let recorded_for_handler = recorded.clone();
         let body_for_handler = body.clone();
+        let gate_for_handler = gate.clone();
         let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let recorded = recorded_for_handler.clone();
             let body = body_for_handler.clone();
+            let gate = gate_for_handler.clone();
             async move {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
@@ -3012,13 +3035,14 @@ pub(crate) mod caldav_recorder {
                     content_type,
                     body: req_body,
                 });
+                gate.acquire().await.unwrap().forget();
                 (status, axum::body::Bytes::from(body))
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), recorded)
+        (format!("http://{addr}"), recorded, gate)
     }
 
     /// Convenience: the `Basic <base64(username:app_password)>` header the

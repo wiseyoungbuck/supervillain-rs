@@ -167,6 +167,13 @@ impl AccountEntry {
 
 /// Clear one mailbox's derived count and bump the shared version so an
 /// in-flight count computation cannot write its old result after refresh.
+///
+/// The version counter is account-wide and guards every `try_set_*` write
+/// (inbox lists, bodies, identities), so this bump also cancels any
+/// in-flight version-guarded warmer writes for the whole account — provider
+/// work already paid for is discarded and refetched on the next read. That
+/// collateral is an accepted tradeoff while explicit refreshes are rare; if
+/// they become frequent, split the counter into per-projection versions.
 fn clear_split_counts_for_mailbox(entry: &mut AccountEntry, mailbox_id: &str) {
     if entry
         .split_counts
