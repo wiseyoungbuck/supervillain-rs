@@ -1,5 +1,13 @@
 # P0 close-out plan — 8e3w / x7df / hp8w / yane
 
+> **STATUS: COMPLETED — historical document (roborev 367/370).** The
+> `hp8w`/`yane` fixes shipped in `c8e126a`/`b305f2b` (merged at `dda2633`,
+> 2026-07-27); the `ceph`/`fpjj` work referenced as "dirty working tree"
+> (including §6's stash instructions) has long since landed. `8e3w`/`x7df`
+> remain operational-only (tailnet serve + device verification, tracked in
+> kata). Nothing below is a live instruction; ground-truth claims and line
+> numbers reflect `main` @ `3c617f0` and have drifted.
+
 A design plan in the spirit of Carmack, Muratori, and Blow: find the root
 cause, make the smallest change that is actually correct, delete rather than
 add, write the test that pins the real behavior, and be honest about what is
@@ -31,8 +39,8 @@ comment fix._
 `api.js` extraction + rewire); `af815a2` is a separate 4-line unread-contrast
 fix *found* during x7df verification, not part of the rewire — don't credit it
 to the pivot. | **Verification, not code.** Phone-over-tailnet latency + 15-min device dogfood (Fastmail↔Gmail switch), blocked on `8e3w`'s tailnet enablement. |
-| **hp8w** | bug/security | **NOT shipped — 3 live bugs** in `static/app.js`. | Land 3 one-line root-cause fixes + tests. |
-| **yane** | bug/security | **NOT shipped — 1 live bug** in `static/app.js`. | Land 1 one-line root-cause fix + test. |
+| **hp8w** | bug/security | ~~NOT shipped~~ **Shipped** in `c8e126a` (merged `dda2633`, 2026-07-27). | None. |
+| **yane** | bug/security | ~~NOT shipped~~ **Shipped** in `b305f2b` (merged `dda2633`, 2026-07-27). | None. |
 
 **Reframing.** "Fix all four" is really: **land 4 one-line fixes (2 tickets) +
 their tests, then run 1 command + 1 device pass to close the other 2.** Two of

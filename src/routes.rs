@@ -12357,8 +12357,8 @@ white   = '#fdf6e3'
     #[test]
     fn palette_get_commands_reads_state_view() {
         // The context pass is a switch on state.view inside getCommands —
-        // today the function builds a flat literal and never references
-        // state.view, so this fails until the pass is added (sefy RED).
+        // before sefy the function built a flat literal and never referenced
+        // state.view; this pins the pass so it can't regress.
         let body = js_fn_body(APP_JS, "function getCommands(");
         assert!(
             body.contains("state.view"),
@@ -12372,7 +12372,7 @@ white   = '#fdf6e3'
         // Close Draft, no Attach — the only actions you want while drafting.
         // The compose branch of commandsForView must yield a Send command
         // (action 'send') and a Close Draft command (action 'close-draft'),
-        // neither of which exists today (sefy RED). Assert against the compose
+        // neither of which the pre-sefy flat list had. Assert against the compose
         // branch slice (not the whole body) so a future refactor that moves
         // Send into the detail branch can't keep this green (roborev 375).
         // The action id is 'close-draft' (not 'discard-draft') because the
@@ -12395,8 +12395,8 @@ white   = '#fdf6e3'
     fn palette_detail_view_ranks_reply_above_compose() {
         // On detail, Reply is what you want first; Compose is a global action
         // that belongs below it. The detail branch must order a Reply-family
-        // command before the Compose command — today there is no view branch
-        // at all, so the flat list's accidental order is unpinned (sefy RED).
+        // command before the Compose command — the pre-sefy flat list had no
+        // view branches, so its accidental order was unpinned.
         let body = js_fn_body(APP_JS, "function commandsForView(");
         let detail = case_branch(body, "detail");
         let reply_idx = detail
@@ -12414,8 +12414,8 @@ white   = '#fdf6e3'
     #[test]
     fn palette_list_view_omits_reply_when_no_selection() {
         // Reply is a detail-view action (you reply to an open email). The list
-        // branch must never offer it — today Reply sits in the flat global
-        // list and shows on every screen, list included (sefy RED).
+        // branch must never offer it — the pre-sefy flat global list showed
+        // Reply on every screen, list included.
         let body = js_fn_body(APP_JS, "function commandsForView(");
         let list = case_branch(body, "list");
         assert!(
@@ -12429,8 +12429,8 @@ white   = '#fdf6e3'
         // The y/n/m keybindings only RSVP when state.currentEmail?.calendarEvent
         // (keydown handler ~:3492). The palette must mirror that gate or it
         // will offer Accept/Decline/Tentative that then no-op — a promise
-        // broken, worse than today's flat list. The detail branch's RSVP
-        // commands must live inside a calendarEvent guard (sefy RED).
+        // broken, worse than the old flat list. The detail branch's RSVP
+        // commands must live inside a calendarEvent guard.
         let body = js_fn_body(APP_JS, "function commandsForView(");
         let detail = case_branch(body, "detail");
         assert!(
@@ -12440,8 +12440,11 @@ white   = '#fdf6e3'
         let gate_idx = detail
             .find("state.currentEmail?.calendarEvent")
             .expect("calendarEvent gate must exist (sefy)");
+        // Match the command literal, not the bare substring "rsvp" — a
+        // comment or unrelated helper mentioning RSVP before the gate must
+        // not satisfy (or break) this ordering assertion (roborev 370).
         let rsvp_idx = detail
-            .find("rsvp")
+            .find("action: 'rsvp-")
             .expect("detail branch must define RSVP commands behind the gate (sefy)");
         assert!(
             rsvp_idx > gate_idx,
