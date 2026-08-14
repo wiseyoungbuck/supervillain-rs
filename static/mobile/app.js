@@ -469,7 +469,11 @@ async function loadMailboxes(acct, signal, preferredRole = 'inbox') {
 // whichever split tab is active, same as the server does when both params
 // are present (src/routes.rs list_emails applies the search query to the
 // fetch, then split-filters the results).
-function emailListPath(offset) {
+function emailListPath(offset, { refresh = false } = {}) {
+    // Mobile's PAGE_SIZE is 50, while the server's warm inbox slot is the
+    // 150-row desktop shape. The live refresh therefore cannot replace
+    // that slot directly; the server uses this flag to drop the stale
+    // 150-row list and derived split counts after a successful fetch.
     let path = '/emails?limit=' + PAGE_SIZE;
     if (state.currentMailbox) path += '&mailbox_id=' + encodeURIComponent(state.currentMailbox.id);
     if (offset > 0) path += '&offset=' + offset;
@@ -477,6 +481,7 @@ function emailListPath(offset) {
         path += '&split_id=' + encodeURIComponent(state.currentSplit);
     }
     if (state.searchQuery) path += '&search=' + encodeURIComponent(state.searchQuery);
+    if (refresh) path += '&refresh=true';
     return path;
 }
 
@@ -497,7 +502,7 @@ function abortListLoad() {
 // shell chrome, not screen-scoped, so a reconnect refresh mid-detail or
 // mid-compose would otherwise flash 'Loading...' beneath the active screen
 // (see handleOnline, the only silent caller).
-async function loadEmails({ silent = false } = {}) {
+async function loadEmails({ silent = false, refresh = false } = {}) {
     // No account selected yet (e.g. no accounts configured) — nothing to
     // load. Without this guard the call below throws 'state.api is not a
     // function', and the resulting toast wipes the 'No accounts configured'
@@ -518,7 +523,7 @@ async function loadEmails({ silent = false } = {}) {
     const acct = state.currentAccount.id;
     const signal = state.loadAbort?.signal;
     try {
-        const emails = await state.api('GET', emailListPath(0), null, signal);
+        const emails = await state.api('GET', emailListPath(0, { refresh }), null, signal);
         if (signal?.aborted || state.currentAccount?.id !== acct) return;
         state.emails = emails;
         // The freshness stamp persistState relies on — set only where rows
@@ -530,6 +535,7 @@ async function loadEmails({ silent = false } = {}) {
         // after every successful load so a kill that skips visibilitychange
         // still leaves a fresh list to restore. Idempotent and cheap.
         persistState();
+        if (refresh && state.currentMailbox?.role === 'inbox') loadSplitCounts();
         if (!silent) showStatus('');
     } catch (err) {
         if (err.name === 'AbortError') return;
@@ -2626,7 +2632,7 @@ const pullToRefreshRecognizer = {
             indicator.style.height = '40px';
             indicator.textContent = 'Refreshing...';
             abortListLoad();
-            loadEmails();
+            loadEmails({ refresh: true });
         } else {
             finishPullRefresh();
         }
@@ -2812,6 +2818,8 @@ function handleOnline() {
     // LIST screen: #status-bar is shell chrome, not screen-scoped, so a
     // non-silent refresh would flash 'Loading...' beneath detail/compose.
     abortListLoad();
+    // Mobile's 50-row path is already provider-live; don't evict the shared
+    // desktop prefetch slot during an automatic reconnect.
     loadEmails({ silent: state.screen !== Screen.LIST });
 }
 
@@ -3023,6 +3031,8 @@ function restoreFromSnapshot({ offline = false } = {}) {
                 state.currentSplit = 'all';
                 renderSplitTabs();
             }
+            // The mobile snapshot refresh is already live at PAGE_SIZE=50;
+            // keep it from evicting the shared desktop prefetch slot.
             return loadEmails({ silent: true });
         })
         .then(() => {

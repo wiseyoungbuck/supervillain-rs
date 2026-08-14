@@ -487,6 +487,11 @@ struct ListEmailsParams {
     search: Option<String>,
     account: Option<String>,
     starred: Option<bool>,
+    /// A user-requested refresh bypasses the in-process prefetch snapshot.
+    /// Ordinary mailbox switches retain the instant cached paint, while an
+    /// explicit Refresh asks the provider for current mail.
+    #[serde(default)]
+    refresh: Option<bool>,
     /// List sort order. Absent means "use the default" (newest-first,
     /// today's behavior); an unrecognized value is rejected at
     /// deserialization (400), never silently coerced to the default —
@@ -731,53 +736,43 @@ async fn list_mailboxes(
     Ok(Json(serde_json::json!(mailboxes)))
 }
 
-/// Whether a `list_emails` request is eligible for the prefetch cache.
-///
-/// Default-inbox shape (mailbox_id set, no search, no starred, default
-/// offset/limit, **and default sort**) goes through the prefetch cache.
-/// Anything else always fetches live — no cache read, no cache write:
-///
-/// - mailbox/search/starred/offset/limit: cache key would explode,
-///   and the data is per-query anyway.
-/// - sort: the background warmer only ever re-warms the `DateDesc` slot
-///   (see `prefetch::warm_all_mailboxes`), and there's no TTL on cache
-///   entries. If a non-default sort were cacheable, a user sitting in
-///   "Oldest first" would read from a slot the warmer never refreshes and
-///   would never see new mail until some unrelated local mutation
-///   invalidated the whole account's cache (roborev 291). Simplest fix:
-///   non-default sorts just aren't cacheable, full stop.
-///
-/// `split_id` deliberately does NOT gate cacheability (kata jg51): split
-/// filtering is applied *after* the cache read, over the same unfiltered
-/// list every other default-shape request shares, so a split-tab click is
-/// a pure cache hit — `split_id` never joins the key and never causes a
-/// separate fetch.
-///
-/// Split requests are cacheable even with `offset > 0`: the frontend's
-/// refill loop (`maybeRefillEmails`) passes the number of rows the tab
-/// already shows — an index into the *filtered* list — which
-/// `list_emails` applies after filtering the cached window. Routing that
-/// through the live path instead would re-issue a full provider fetch on
-/// every archive in an under-filled split tab, and a provider-side
-/// offset indexes the unfiltered mailbox anyway (it would mostly return
-/// the same window again).
-///
-/// "Cacheable" here means a free local read *while the slot is warm*.
-/// Mutations (archive/trash/move) call `prefetch.invalidate`, which
-/// clears the slot, so a refill arriving after the mutation settles pays
-/// one `fetch_inbox` window re-fetch on the miss (usually the
-/// post-mutation `loadSplitCounts` resync has re-warmed it first). A
-/// refill arriving *before* the mutation settles reads the pre-mutation
-/// window — the frontend filters those rows against its
-/// optimistically-removed ids (`refillSuppressedIds`) so a just-archived
-/// email can't be re-appended by its own refill (roborev 470 #1).
-fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
+/// Common default-inbox shape shared by the cache gate and explicit-refresh
+/// projection invalidation. Offset and split refill semantics belong to
+/// [`list_is_cacheable`], not this predicate.
+fn is_plain_mailbox_query(params: &ListEmailsParams, sort: EmailSort) -> bool {
     params.mailbox_id.is_some()
         && params.search.is_none()
         && params.starred != Some(true)
-        && (offset == 0 || params.split_id.is_some())
-        && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT
         && sort == EmailSort::default()
+}
+
+fn is_default_inbox_shape(params: &ListEmailsParams, sort: EmailSort) -> bool {
+    is_plain_mailbox_query(params, sort)
+        && params.limit.unwrap_or(DEFAULT_INBOX_LIMIT) == DEFAULT_INBOX_LIMIT
+}
+
+/// Whether a `list_emails` request is eligible for the prefetch cache.
+///
+/// Default-inbox shape (mailbox_id set, no search, no starred, default
+/// limit, and default sort) goes through the prefetch cache. A split request
+/// may also use a nonzero offset: the frontend's refill loop passes an index
+/// into the filtered list, which this route applies after reading the shared
+/// unfiltered window. A provider-side offset would index the unfiltered
+/// mailbox and mostly return the same window again.
+///
+/// `split_id` deliberately does NOT join the cache key (kata jg51): split
+/// filtering happens after the cache read. Mutations clear the slot, and the
+/// frontend suppresses optimistically removed ids during the settling window
+/// (roborev 470 #1).
+fn list_is_cacheable(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
+    is_default_inbox_shape(params, sort) && (offset == 0 || params.split_id.is_some())
+}
+
+/// Whether a list request may read the warm prefetch slot. An explicit user
+/// refresh always asks the provider for current mail, even when the request
+/// otherwise has the default-inbox shape.
+fn should_use_prefetch_cache(params: &ListEmailsParams, offset: usize, sort: EmailSort) -> bool {
+    params.refresh != Some(true) && list_is_cacheable(params, offset, sort)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1117,8 +1112,41 @@ async fn list_emails(
     // it, not a reason to fan out on every tab click.
 
     // See `list_is_cacheable`'s doc comment for the full rationale,
-    // including why non-default sorts are excluded (roborev 291).
-    let is_cacheable = list_is_cacheable(&params, offset, sort);
+    // including why non-default sorts are excluded (roborev 291). An explicit
+    // refresh is the one deliberate exception to the cache hit path: the
+    // user is asking for provider truth, not another read of the warm slot.
+    let force_refresh = params.refresh == Some(true);
+    let is_cacheable = should_use_prefetch_cache(&params, offset, sort);
+    let split_refill_shape =
+        params.split_id.is_some() && offset > 0 && is_default_inbox_shape(&params, sort);
+    // Refresh invalidation also applies to non-default sorts: their list
+    // response is live already, but the matching cached list/count projections
+    // must still be retired before the frontend follows up for badges.
+    let refreshes_mailbox_view = force_refresh
+        && offset == 0
+        && params.mailbox_id.is_some()
+        && params.search.is_none()
+        && params.starred != Some(true);
+    // A refresh of the default, offset-zero list also replaces the shared
+    // cache entry. Split tabs filter this same unfiltered window below, so
+    // refreshing a split still makes the next All/split request fresh. The
+    // version snapshot prevents a slow refresh from resurrecting rows after a
+    // concurrent user mutation invalidated the account.
+    let refresh_cache_key = if force_refresh && offset == 0 && list_is_cacheable(&params, 0, sort) {
+        Some(crate::prefetch::InboxKey {
+            mailbox_id: params.mailbox_id.clone().unwrap(),
+            limit,
+            sort,
+        })
+    } else {
+        None
+    };
+    let refresh_populates_cache = refresh_cache_key.is_some();
+    let refresh_cache_version = if refresh_cache_key.is_some() {
+        Some(state.prefetch.version(&account_id).await)
+    } else {
+        None
+    };
 
     // Both live paths below release the session read guard between the id
     // query and each get_emails chunk (provider::get_emails_chunked) so a
@@ -1159,7 +1187,11 @@ async fn list_emails(
                 &session,
                 params.mailbox_id.as_deref(),
                 limit,
-                offset,
+                if force_refresh && split_refill_shape {
+                    0
+                } else {
+                    offset
+                },
                 query_ref,
                 sort,
             )
@@ -1173,6 +1205,47 @@ async fn list_emails(
             provider::GET_EMAILS_CHUNK,
         )
         .await?;
+        if refreshes_mailbox_view && !refresh_populates_cache {
+            // Mobile requests 50 rows, so there is no shared cache slot to
+            // replace. Clear the old default-size slot only after the live
+            // fetch succeeds; a transient reconnect failure must preserve the
+            // instant fallback snapshot.
+            state
+                .prefetch
+                .invalidate_inbox_list(&account_id, params.mailbox_id.as_deref().unwrap())
+                .await;
+        }
+        if let (Some(key), Some(version)) = (refresh_cache_key, refresh_cache_version) {
+            // If a user mutation invalidated the account while the provider
+            // request was in flight, discard this result rather than putting
+            // the pre-mutation window back into the shared cache. The live
+            // response is still valid for this request.
+            let cache_updated = state
+                .prefetch
+                .try_set_inbox_list(&account_id, version, key, live.clone())
+                .await;
+            if cache_updated {
+                // A concurrent count request may have read the old list
+                // before this post-refresh version bump and written its
+                // result late. Invalidate after the list lands so the
+                // frontend's follow-up count request cannot reuse it.
+                state
+                    .prefetch
+                    .invalidate_split_counts_for_mailbox(
+                        &account_id,
+                        params.mailbox_id.as_deref().unwrap(),
+                    )
+                    .await;
+            } else {
+                // A sibling invalidation can win the version race without
+                // clearing this mailbox's list slot. Do not leave that old
+                // window available for the next ordinary cache read.
+                state
+                    .prefetch
+                    .invalidate_inbox_list(&account_id, params.mailbox_id.as_deref().unwrap())
+                    .await;
+            }
+        }
         (live, false)
     };
 
@@ -1181,13 +1254,14 @@ async fn list_emails(
     // arrived since the last periodic warm pass (the inbox list revalidates
     // stale against the provider and returns newer ids than the warmer
     // filled — without this, opening #1 right after a reload hit the slow
-    // provider path). Gated on `is_cacheable` so only the default-sort
-    // (DateDesc) path warms — that's the only slot the periodic warmer
-    // keeps warm, so warming a non-default-sort list would be wasted. The
-    // `warm_bodies_for_list` helper skips ids already in `body_cache`, so
-    // repeated list views (stale-revalidation poll ticks) are no-ops.
-    // Spawned, never awaited: the list response must not block on warming.
-    if is_cacheable {
+    // provider path). Gated on the default-sort (DateDesc) path: ordinary
+    // cache hits and explicit refreshes that populated the shared slot both
+    // warm bodies, while a non-default-sort live request has no shared slot
+    // for the periodic warmer to maintain. The `warm_bodies_for_list` helper
+    // skips ids already in `body_cache`, so repeated list views (including
+    // stale-revalidation poll ticks) are no-ops. Spawned, never awaited: the
+    // list response must not block on warming.
+    if is_cacheable || refresh_populates_cache {
         let warm_ids: Vec<String> = emails
             .iter()
             .take(crate::prefetch::BODY_PREFETCH_PER_MAILBOX)
@@ -1225,7 +1299,7 @@ async fn list_emails(
     // config loaded above the fetch — no second load/scope pass.
     if let (Some(split_id), Some(config)) = (params.split_id.as_deref(), split_config.as_ref()) {
         emails = splits::filter_by_split(emails, split_id, config);
-        if is_cacheable && offset > 0 {
+        if offset > 0 && (is_cacheable || (force_refresh && split_refill_shape)) {
             // Refill requests pass the rows the tab already shows as
             // `offset` — an index into the filtered list. Slice locally so
             // a refill is a free cache read; a provider-side offset would
@@ -3548,7 +3622,7 @@ mod tests {
 
         // Primary list-load path.
         let start = APP_JS
-            .find("async function loadEmails()")
+            .find("async function loadEmails(")
             .expect("loadEmails must exist");
         let rest = &APP_JS[start..];
         let end = rest
@@ -3711,7 +3785,7 @@ mod tests {
 
         // Full list replace path harvests via rebuild.
         let start = APP_JS
-            .find("async function loadEmails()")
+            .find("async function loadEmails(")
             .expect("loadEmails must exist");
         let rest = &APP_JS[start..];
         let end = rest
@@ -4666,6 +4740,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_emails_params_refresh_true_parses() {
+        let uri: axum::http::Uri = "/api/emails?mailbox_id=inbox&refresh=true".parse().unwrap();
+        let Query(params) =
+            Query::<ListEmailsParams>::try_from_uri(&uri).expect("refresh=true must deserialize");
+        assert_eq!(params.refresh, Some(true));
+    }
+
     // =========================================================================
     // limit/offset clamping (kata f7mm #2) — an unbounded client-supplied
     // `limit`/`offset` must be bounded before reaching the provider query.
@@ -4725,6 +4807,7 @@ mod tests {
             search: None,
             account: None,
             starred: None,
+            refresh: None,
             sort,
         }
     }
@@ -4736,6 +4819,31 @@ mod tests {
             list_is_cacheable(&params, 0, EmailSort::DateDesc),
             "default-inbox shape with default sort must remain cacheable"
         );
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_default_prefetch_cache() {
+        let mut params = cacheable_shape_params(None);
+        assert!(
+            should_use_prefetch_cache(&params, 0, EmailSort::DateDesc),
+            "ordinary default inbox reads should retain the warm-cache path"
+        );
+
+        params.refresh = Some(true);
+        assert!(
+            !should_use_prefetch_cache(&params, 0, EmailSort::DateDesc),
+            "an explicit refresh must reach the provider instead of rereading the cache"
+        );
+    }
+
+    #[test]
+    fn refresh_does_not_change_non_default_cache_rules() {
+        let mut params = cacheable_shape_params(Some(EmailSort::DateAsc));
+        params.refresh = Some(true);
+        assert!(!should_use_prefetch_cache(&params, 0, EmailSort::DateAsc));
+
+        params.refresh = None;
+        assert!(!should_use_prefetch_cache(&params, 0, EmailSort::DateAsc));
     }
 
     #[test]
@@ -4864,7 +4972,17 @@ mod tests {
         AppState,
         std::sync::Arc<std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>>,
     ) {
-        let (base, recorded) = crate::jmap::caldav_recorder::spawn(StatusCode::OK, canned).await;
+        jg51_recorder_state_with_status(StatusCode::OK, canned).await
+    }
+
+    async fn jg51_recorder_state_with_status(
+        status: StatusCode,
+        canned: Vec<u8>,
+    ) -> (
+        AppState,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::jmap::caldav_recorder::RecordedRequest>>>,
+    ) {
+        let (base, recorded) = crate::jmap::caldav_recorder::spawn(status, canned).await;
         let mut sess = crate::jmap::JmapSession::new("me@example.com", "test-token", None);
         sess.api_url = Some(format!("{base}/jmap"));
         sess.account_id = Some("acc1".into());
@@ -4958,6 +5076,309 @@ mod tests {
             "split counts on a warm inbox cache must issue zero provider \
              requests, not an Email/get fan-out: {:?}",
             recorded.lock().unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_refresh_bypasses_and_replaces_cached_inbox_list() {
+        let (state, recorded) =
+            jg51_recorder_state(jg51_canned_jmap(&[("new@example.com", false)])).await;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("old", "old@example.com", false)],
+            )
+            .await;
+        // The explicit refresh also warms the newest bodies asynchronously;
+        // pre-seed the provider's fresh id so this test's request-count
+        // assertion is deterministic and only observes list refresh traffic.
+        state
+            .prefetch
+            .set_body(
+                "acct",
+                "c1".into(),
+                jg51_email("c1", "new@example.com", false),
+            )
+            .await;
+
+        let refresh = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let response = router(state.clone()).oneshot(refresh).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rows[0]["id"], "c1");
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"],
+            "refresh=true must bypass the cached old window and query the provider"
+        );
+
+        let cached = state
+            .prefetch
+            .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+            .await
+            .expect("explicit refresh must replace the shared cache slot");
+        assert_eq!(cached[0].id, "c1");
+
+        // The subsequent normal route is a pure cache hit, including its
+        // fire-and-forget body warm, so this assertion isolates list-cache
+        // reuse rather than a background body fetch.
+        let normal = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(normal).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(jg51_recorded_methods(&recorded).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mobile_sized_refresh_clears_old_list_and_count_projections() {
+        let (state, recorded) =
+            jg51_recorder_state(jg51_canned_jmap(&[("new@example.com", false)])).await;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("old", "old@example.com", false)],
+            )
+            .await;
+        state
+            .prefetch
+            .set_split_counts(
+                "acct",
+                "mb-inbox".into(),
+                HashMap::from([("aristoi".to_string(), 99)]),
+            )
+            .await;
+
+        let request = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&limit=50&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .prefetch
+                .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+                .await
+                .is_none(),
+            "a 50-row mobile refresh must not leave the old 150-row list slot"
+        );
+        assert_eq!(
+            state.prefetch.get_split_counts("acct", "mb-inbox").await,
+            None
+        );
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_mobile_refresh_preserves_fallback_projections() {
+        let (state, recorded) =
+            jg51_recorder_state_with_status(StatusCode::INTERNAL_SERVER_ERROR, Vec::new()).await;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("old", "old@example.com", false)],
+            )
+            .await;
+        state
+            .prefetch
+            .set_split_counts(
+                "acct",
+                "mb-inbox".into(),
+                HashMap::from([("aristoi".to_string(), 99)]),
+            )
+            .await;
+
+        let request = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&limit=50&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            state
+                .prefetch
+                .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+                .await
+                .unwrap()[0]
+                .id,
+            "old"
+        );
+        assert_eq!(
+            state.prefetch.get_split_counts("acct", "mb-inbox").await,
+            Some(HashMap::from([("aristoi".to_string(), 99)]))
+        );
+        assert_eq!(jg51_recorded_methods(&recorded), vec!["Email/query"]);
+    }
+
+    #[tokio::test]
+    async fn refreshing_another_mailbox_preserves_inbox_projections() {
+        let (state, recorded) =
+            jg51_recorder_state(jg51_canned_jmap(&[("archive@example.com", false)])).await;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("inbox", "inbox@example.com", false)],
+            )
+            .await;
+        state
+            .prefetch
+            .set_split_counts(
+                "acct",
+                "mb-inbox".into(),
+                HashMap::from([("aristoi".to_string(), 7)]),
+            )
+            .await;
+
+        let request = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-archive&limit=50&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .prefetch
+                .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+                .await
+                .unwrap()[0]
+                .id,
+            "inbox"
+        );
+        assert_eq!(
+            state.prefetch.get_split_counts("acct", "mb-inbox").await,
+            Some(HashMap::from([("aristoi".to_string(), 7)]))
+        );
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"]
+        );
+    }
+
+    #[tokio::test]
+    async fn split_refresh_replaces_shared_cache_with_unfiltered_window() {
+        let (mut state, recorded) = jg51_recorder_state(jg51_canned_jmap(&[
+            ("a@aristoi.ai", false),
+            ("x@example.com", false),
+            ("b@aristoi.ai", false),
+        ]))
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let splits_path = temp.path().join("splits.json");
+        splits::save_splits(&jg51_splits_config(), &splits_path).unwrap();
+        state.splits_config_path = splits_path;
+        state
+            .prefetch
+            .set_inbox_list(
+                "acct",
+                jg51_inbox_key("mb-inbox"),
+                vec![jg51_email("old", "old@example.com", false)],
+            )
+            .await;
+        state
+            .prefetch
+            .set_split_counts(
+                "acct",
+                "mb-inbox".into(),
+                HashMap::from([("aristoi".to_string(), 99)]),
+            )
+            .await;
+        // Keep the body warm-up out of the provider-request assertion.
+        for id in ["c1", "c2", "c3"] {
+            state
+                .prefetch
+                .set_body("acct", id.into(), jg51_email(id, "x@example.com", false))
+                .await;
+        }
+
+        let request = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&split_id=aristoi&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let state = Arc::new(state);
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let response_ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+        assert_eq!(response_ids, vec!["c1", "c3"]);
+
+        let cached = state
+            .prefetch
+            .get_inbox_list("acct", &jg51_inbox_key("mb-inbox"))
+            .await
+            .expect("split refresh must populate the shared cache slot");
+        let cached_ids: Vec<&str> = cached.iter().map(|email| email.id.as_str()).collect();
+        assert_eq!(cached_ids, vec!["c1", "c2", "c3"]);
+        assert_eq!(
+            state.prefetch.get_split_counts("acct", "mb-inbox").await,
+            None,
+            "refreshing the list must invalidate its derived split counts"
+        );
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"]
+        );
+    }
+
+    #[tokio::test]
+    async fn split_refresh_refill_uses_filtered_offset_semantics() {
+        let (mut state, recorded) = jg51_recorder_state(jg51_canned_jmap(&[
+            ("a@aristoi.ai", false),
+            ("x@example.com", false),
+            ("b@aristoi.ai", false),
+        ]))
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let splits_path = temp.path().join("splits.json");
+        splits::save_splits(&jg51_splits_config(), &splits_path).unwrap();
+        state.splits_config_path = splits_path;
+        for id in ["c1", "c2", "c3"] {
+            state
+                .prefetch
+                .set_body("acct", id.into(), jg51_email(id, "x@example.com", false))
+                .await;
+        }
+
+        let request = Request::builder()
+            .uri("/api/emails?account=acct&mailbox_id=mb-inbox&split_id=aristoi&offset=1&refresh=true")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(Arc::new(state)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["c3"]);
+        assert_eq!(
+            jg51_recorded_methods(&recorded),
+            vec!["Email/query", "Email/get"]
         );
     }
 
@@ -11786,7 +12207,7 @@ white   = '#fdf6e3'
             .find("abortListLoad()")
             .expect("pull-to-refresh must abort an in-flight list load");
         let reload = block
-            .find("loadEmails()")
+            .find("loadEmails({ refresh: true })")
             .expect("pull-to-refresh must reload emails");
         assert!(
             abort < reload,

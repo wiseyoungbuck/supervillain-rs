@@ -165,6 +165,19 @@ impl AccountEntry {
     }
 }
 
+/// Clear one mailbox's derived count and bump the shared version so an
+/// in-flight count computation cannot write its old result after refresh.
+fn clear_split_counts_for_mailbox(entry: &mut AccountEntry, mailbox_id: &str) {
+    if entry
+        .split_counts
+        .as_ref()
+        .is_some_and(|counts| counts.mailbox_id == mailbox_id)
+    {
+        entry.split_counts = None;
+    }
+    entry.version = entry.version.wrapping_add(1);
+}
+
 pub struct PrefetchCache {
     inner: RwLock<HashMap<String, Arc<Mutex<AccountEntry>>>>,
 }
@@ -392,6 +405,31 @@ impl PrefetchCache {
         let mut e = entry.lock().await;
         e.split_counts = None;
         e.version = e.version.wrapping_add(1);
+    }
+
+    /// Clear list and derived count snapshots for one mailbox after a
+    /// successful explicit refresh. Unlike [`invalidate`], this preserves
+    /// cached mailboxes, identities, and bodies. Clearing the old default-size
+    /// list is important for mobile: its 50-row live refresh cannot replace
+    /// the server's 150-row shared slot, but a following split-count request
+    /// must not recompute against that old slot.
+    pub async fn invalidate_inbox_list(&self, account: &str, mailbox_id: &str) {
+        let entry = self.entry(account).await;
+        let mut e = entry.lock().await;
+        e.inbox_lists.retain(|key, _| key.mailbox_id != mailbox_id);
+        clear_split_counts_for_mailbox(&mut e, mailbox_id);
+    }
+
+    /// Clear split counts only when they belong to `mailbox_id`. The account
+    /// version is bumped even when the slot is currently empty: a count
+    /// computation may have observed the old list while its result was still
+    /// in flight, before the slot existed to be cleared. The bump makes its
+    /// version-guarded write fail without disturbing another mailbox's count
+    /// value.
+    pub async fn invalidate_split_counts_for_mailbox(&self, account: &str, mailbox_id: &str) {
+        let entry = self.entry(account).await;
+        let mut e = entry.lock().await;
+        clear_split_counts_for_mailbox(&mut e, mailbox_id);
     }
 
     /// Current version of this account's entry. Used by the warmer to
@@ -645,9 +683,20 @@ impl PrefetchCache {
         if let Some(c) = self.get_split_counts(account, mailbox_id).await {
             return Ok(c);
         }
+        // The provider/local computation may overlap an explicit list
+        // refresh. Snapshot the version before fetching and discard the
+        // result if that refresh invalidates the account in the meantime;
+        // otherwise an old count could be written after the refresh's own
+        // invalidation and remain visible for the TTL.
+        let expected_version = self.version(account).await;
         let live = fetch().await?;
-        self.set_split_counts(account, mailbox_id.to_string(), live.clone())
-            .await;
+        self.try_set_split_counts(
+            account,
+            expected_version,
+            mailbox_id.to_string(),
+            live.clone(),
+        )
+        .await;
         Ok(live)
     }
 }
@@ -1633,6 +1682,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_refresh_replaces_cached_inbox_for_following_normal_reads() {
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateDesc,
+        };
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("old")])
+            .await;
+
+        // This models the route's force-refresh path after it has fetched the
+        // provider. A subsequent ordinary list read must observe the new
+        // window, not the old warm snapshot.
+        let version = cache.version("acc-1").await;
+        assert!(
+            cache
+                .try_set_inbox_list("acc-1", version, key.clone(), vec![email("new")])
+                .await
+        );
+
+        let (got, stale) = cache
+            .inbox_list_or_fetch("acc-1", key, || async {
+                panic!("a normal read after refresh must hit the updated cache")
+            })
+            .await
+            .unwrap();
+        assert_eq!(got[0].id, "new");
+        assert!(!stale);
+    }
+
+    #[tokio::test]
+    async fn slow_refresh_cannot_restore_a_window_invalidated_by_mutation() {
+        let cache = PrefetchCache::new();
+        let key = InboxKey {
+            mailbox_id: "inbox".into(),
+            limit: 150,
+            sort: EmailSort::DateDesc,
+        };
+        cache
+            .set_inbox_list("acc-1", key.clone(), vec![email("old")])
+            .await;
+        let version = cache.version("acc-1").await;
+
+        cache.invalidate("acc-1").await;
+        assert!(
+            !cache
+                .try_set_inbox_list("acc-1", version, key.clone(), vec![email("stale")])
+                .await
+        );
+
+        let (got, stale) = cache
+            .inbox_list_or_fetch("acc-1", key, || async { Ok(vec![email("live")]) })
+            .await
+            .unwrap();
+        assert_eq!(got[0].id, "live");
+        assert!(!stale);
+    }
+
+    #[tokio::test]
     async fn split_counts_or_fetch_hit_and_miss() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let cache = PrefetchCache::new();
@@ -1658,6 +1767,37 @@ mod tests {
             .unwrap();
         assert_eq!(got.get("split-a"), Some(&3));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn split_counts_fetch_does_not_write_after_refresh_invalidation() {
+        let cache = Arc::new(PrefetchCache::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let worker_cache = cache.clone();
+        let worker = tokio::spawn(async move {
+            worker_cache
+                .split_counts_or_fetch("acc-1", "inbox", move || async move {
+                    started_tx.send(()).unwrap();
+                    continue_rx.await.unwrap();
+                    Ok(HashMap::from([("split-a".to_string(), 3)]))
+                })
+                .await
+                .unwrap();
+        });
+
+        started_rx.await.unwrap();
+        cache
+            .invalidate_split_counts_for_mailbox("acc-1", "inbox")
+            .await;
+        continue_tx.send(()).unwrap();
+        worker.await.unwrap();
+
+        assert_eq!(
+            cache.get_split_counts("acc-1", "inbox").await,
+            None,
+            "a pre-refresh count result must not repopulate the invalidated slot"
+        );
     }
 
     #[tokio::test]

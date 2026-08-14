@@ -1515,7 +1515,7 @@ async function loadMailboxes() {
     }
 }
 
-function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
+function buildEmailListUrl(mailboxId, { offset = 0, refresh = false } = {}) {
     let url = `/emails?mailbox_id=${mailboxId}&limit=${CACHE_LIMIT}`;
     if (offset > 0) url += `&offset=${offset}`;
     if (state.currentMailbox?.role === 'inbox' && state.currentSplit && state.currentSplit !== 'all' && state.splits.length > 0) {
@@ -1523,6 +1523,7 @@ function buildEmailListUrl(mailboxId, { offset = 0 } = {}) {
     }
     if (state.starredOnly) url += `&starred=true`;
     url += `&sort=${state.sortOrder}`;
+    if (refresh) url += '&refresh=true';
     const search = getSearchQuery();
     if (search) url += `&search=${encodeURIComponent(search)}`;
     return url;
@@ -1578,21 +1579,48 @@ function emailListsEqual(a, b) {
 // (two empty mailboxes; a split holding every message vs. 'all'), and
 // skipping then would strand whatever the pane last showed (roborev 308 #1).
 let lastRenderedContext = null;
+const REFRESHING_STATUS = 'Refreshing...';
 
-async function loadEmails() {
-    if (!state.currentMailbox) return;
+function retireRefreshStatus() {
+    if (els.statusMessage?.textContent === REFRESHING_STATUS) showStatus('');
+}
+
+async function loadEmails({ refresh = false } = {}) {
+    if (!state.currentMailbox) {
+        if (refresh) retireRefreshStatus();
+        return;
+    }
     if (state.currentMailbox.role === 'reminders') {
         await loadReminders({ full: true });
         renderReminderList();
+        if (refresh) retireRefreshStatus();
         return;
     }
 
-    // Cancel any in-flight email fetch
-    if (loadEmailsController) loadEmailsController.abort();
+    // Snapshot context before aborting a possible predecessor so refresh
+    // intent is inherited only by a successor for the same mailbox/split.
+    const requestedContext = splitCacheKey();
+
+    // Cancel any in-flight email fetch. If an ordinary successor replaces a
+    // same-context refresh, it inherits the provider-fresh request; a
+    // different context simply retires the abandoned refresh status.
+    if (loadEmailsController) {
+        const wasRefresh = loadEmailsController.refresh === true;
+        const sameContext = loadEmailsController.context === requestedContext;
+        loadEmailsController.abort();
+        if (wasRefresh && !refresh && sameContext) {
+            refresh = true;
+        } else if (wasRefresh && !refresh) {
+            retireRefreshStatus();
+        }
+    }
     loadEmailsController = new AbortController();
+    loadEmailsController.refresh = refresh;
+    loadEmailsController.context = requestedContext;
+    const requestController = loadEmailsController;
 
     // Snapshot context at request time for stale detection
-    const context = splitCacheKey();
+    const context = requestedContext;
 
     // Superhuman-style: render the cached list immediately so the
     // mailbox/split/account switch feels instant. The network refresh
@@ -1625,12 +1653,17 @@ async function loadEmails() {
     }
 
     try {
-        const url = buildEmailListUrl(state.currentMailbox.id);
+        const url = buildEmailListUrl(state.currentMailbox.id, { refresh });
         const { data: emails, headers } =
-            await apiWithMeta('GET', url, null, loadEmailsController.signal);
+            await apiWithMeta('GET', url, null, requestController.signal);
 
-        // Stale response guard: discard if context changed during fetch
-        if (splitCacheKey() !== context) return;
+        // Stale response guard: discard if context changed during fetch.
+        // Also retire the status owned by this abandoned refresh; a newer
+        // context will manage its own status independently.
+        if (splitCacheKey() !== context) {
+            if (refresh && loadEmailsController === requestController) retireRefreshStatus();
+            return;
+        }
 
         // Drop rows whose optimistic removal hasn't settled yet: during
         // the mutation's provider round-trip the server still answers from
@@ -1661,10 +1694,20 @@ async function loadEmails() {
         } else {
             staleRevalidateAttempts.clear();
         }
-    } catch (err) {
-        if (err.name !== 'AbortError') {
-            showStatus('Failed to load emails: ' + err.message, 'error');
+        if (refresh) {
+            if (state.currentMailbox?.role === 'inbox') loadSplitCounts();
+            retireRefreshStatus();
         }
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            // A newer refresh owns the status if it replaced this
+            // controller; ordinary successors retire it at abort time.
+            if (refresh && loadEmailsController === requestController) retireRefreshStatus();
+            return;
+        }
+        showStatus('Failed to load emails: ' + err.message, 'error');
+    } finally {
+        if (loadEmailsController === requestController) loadEmailsController = null;
     }
 }
 
@@ -4192,8 +4235,7 @@ function handleNormalModeKey(e) {
             els.helpOverlay.classList.remove('hidden');
             break;
         case 'R':
-            loadEmails();
-            showStatus('Refreshing...', 'info');
+            refreshEmailList();
             break;
 
         // Split tab cycling
@@ -5339,6 +5381,11 @@ function getCommands() {
     return commandsForView(state.view);
 }
 
+function refreshEmailList() {
+    showStatus(REFRESHING_STATUS, 'info');
+    loadEmails({ refresh: true });
+}
+
 function executeCommand(action) {
     switch (action) {
         case 'archive': actionSelected('archive'); break;
@@ -5363,7 +5410,7 @@ function executeCommand(action) {
         case 'search': openSearch(); break;
         case 'toggle-unread': toggleUnreadSelected(); break;
         case 'toggle-flag': toggleFlagSelected(); break;
-        case 'refresh': loadEmails(); break;
+        case 'refresh': refreshEmailList(); break;
         case 'inbox': {
             const inbox = state.mailboxes.find(m => m.role === 'inbox');
             if (inbox) selectMailbox(inbox);
