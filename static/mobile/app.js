@@ -1356,9 +1356,12 @@ function handleDetailAction(type) {
 
     if (next) {
         navigateTo(Screen.DETAIL, { emailId: next.id });
-    } else {
+    } else if (index !== -1) {
         history.back();
     }
+    // index === -1: the email is already gone from the list (double-tap, or
+    // actioned elsewhere) — a second history.back() would pop past the list
+    // screen (roborev 287).
 }
 
 // ============================================================================
@@ -2637,6 +2640,11 @@ const pullToRefreshRecognizer = {
             finishPullRefresh();
         }
     },
+    // An interrupted touch (notification shade, incoming call) must snap the
+    // indicator back without refreshing (roborev 287).
+    cancel() {
+        finishPullRefresh();
+    },
 };
 
 // Row-swipe recognizer: horizontal drag on a `.email-row` — right reveals
@@ -2685,6 +2693,22 @@ const rowSwipeRecognizer = {
         }
         return true;
     },
+    // Spring the row back and release it; shared by end() and cancel().
+    reset() {
+        const row = this.row;
+        if (!row) return;
+        row.classList.remove('swiping');
+        row.style.transform = '';
+        const bg = row.parentElement.querySelector('.swipe-bg');
+        if (bg) bg.classList.remove('swipe-reveal-archive', 'swipe-reveal-trash');
+        this.row = null;
+    },
+    // An interrupted touch must never archive/trash — reset only
+    // (roborev 287: without this a cancelled swipe left the row stuck
+    // mid-translate with `.swiping` still applied).
+    cancel() {
+        this.reset();
+    },
     end() {
         const row = this.row;
         if (!row) return;
@@ -2693,11 +2717,7 @@ const rowSwipeRecognizer = {
         const triggered = Math.abs(dx) > SWIPE_TRIGGER_MIN_PX
             || Math.abs(dx) > this.width * SWIPE_TRIGGER_RATIO;
 
-        row.classList.remove('swiping');
-        row.style.transform = '';
-        const bg = row.parentElement.querySelector('.swipe-bg');
-        if (bg) bg.classList.remove('swipe-reveal-archive', 'swipe-reveal-trash');
-        this.row = null;
+        this.reset();
 
         if (!triggered || !id) return;
         if (dx > 0) archiveEmail(id);
@@ -2720,6 +2740,7 @@ const gestureController = {
         this.listWrap.addEventListener('touchstart', (e) => this.onStart(e), { passive: true });
         this.listWrap.addEventListener('touchmove', (e) => this.onMove(e), { passive: false });
         this.listWrap.addEventListener('touchend', () => this.onEnd());
+        this.listWrap.addEventListener('touchcancel', () => this.onCancel());
     },
 
     ctx(touch) {
@@ -2767,6 +2788,15 @@ const gestureController = {
 
     onEnd() {
         if (this.active) this.active.end();
+        this.active = null;
+        this.candidates = [];
+    },
+
+    // The browser took the touch away (notification shade, incoming call,
+    // system gesture): reset the active recognizer's visuals without letting
+    // it trigger its action (roborev 287).
+    onCancel() {
+        if (this.active) this.active.cancel();
         this.active = null;
         this.candidates = [];
     },

@@ -78,7 +78,8 @@ function loadDesktopLoader({ initial, fresh, onRequest = null }) {
     ].join('\n');
     // eslint-disable-next-line no-new-func
     const loadEmails = new Function(
-        'state', 'splitListCache', 'loadEmailsController', 'AbortController',
+        'state', 'splitListCache', 'loadEmailsController', 'refillController',
+        'AbortController',
         'splitCacheKey', 'buildEmailListUrl', 'apiWithMeta',
         'refillSuppressedIds', 'els', 'lastRenderedContext',
         'rebuildThreadGroups', 'renderEmailList', 'harvestContacts',
@@ -88,6 +89,7 @@ function loadDesktopLoader({ initial, fresh, onRequest = null }) {
     )(
         state,
         splitListCache,
+        null,
         null,
         AbortController,
         context,

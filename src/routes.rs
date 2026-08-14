@@ -94,7 +94,6 @@ const FAVICON_32: &[u8] = include_bytes!("../static/favicon-32.png");
 const ICON_180: &[u8] = include_bytes!("../static/icon-180.png");
 const ICON_192: &[u8] = include_bytes!("../static/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../static/icon-512.png");
-const SUPERVILLAIN_JPG: &[u8] = include_bytes!("../static/supervillain.jpg");
 const PROVIDER_GMAIL_SVG: &[u8] = include_bytes!("../static/provider-icons/gmail.svg");
 const PROVIDER_OUTLOOK_SVG: &[u8] =
     include_bytes!("../static/provider-icons/microsoft-outlook.svg");
@@ -219,7 +218,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/icon-180.png", get(icon_180))
         .route("/icon-192.png", get(icon_192))
         .route("/icon-512.png", get(icon_512))
-        .route("/supervillain.jpg", get(supervillain_jpg))
         .route("/provider-icons/gmail.svg", get(provider_gmail_svg))
         .route(
             "/provider-icons/microsoft-outlook.svg",
@@ -452,10 +450,6 @@ async fn icon_192() -> impl IntoResponse {
 
 async fn icon_512() -> impl IntoResponse {
     (binary_asset_headers("image/png"), ICON_512)
-}
-
-async fn supervillain_jpg() -> impl IntoResponse {
-    (binary_asset_headers("image/jpeg"), SUPERVILLAIN_JPG)
 }
 
 fn provider_svg(svg: &'static [u8]) -> impl IntoResponse {
@@ -3205,7 +3199,6 @@ mod tests {
             (icon_180().await.into_response(), "image/png"),
             (icon_192().await.into_response(), "image/png"),
             (icon_512().await.into_response(), "image/png"),
-            (supervillain_jpg().await.into_response(), "image/jpeg"),
             (provider_gmail_svg().await.into_response(), "image/svg+xml"),
             (
                 provider_outlook_svg().await.into_response(),
@@ -6569,26 +6562,6 @@ mod tests {
     #[tokio::test]
     async fn icon_512_serves_png() {
         assert_png_icon(icon_512().await.into_response(), "512").await;
-    }
-
-    #[tokio::test]
-    async fn supervillain_jpg_serves_jpeg() {
-        let resp = supervillain_jpg().await.into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(ct, "image/jpeg");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            body.starts_with(&[0xFF, 0xD8, 0xFF]),
-            "supervillain.jpg should have JPEG magic bytes"
-        );
     }
 
     async fn assert_svg_icon(resp: axum::response::Response, label: &str) {
@@ -10602,9 +10575,37 @@ white   = '#fdf6e3'
 
     #[test]
     fn app_js_show_account_errors_escapes_html() {
+        // Per-field assertions, scoped to the function body: a whole-file
+        // `contains("escapeHtml(")` would stay green if any one field lost
+        // its escaping while another kept it (roborev 169).
+        let block = js_fn_body(APP_JS, "function showAccountErrors(");
         assert!(
-            APP_JS.contains("escapeHtml("),
-            "showAccountErrors should use escapeHtml for XSS prevention"
+            block.contains("escapeHtml(e.account)"),
+            "showAccountErrors must escapeHtml the account id in text context"
+        );
+        assert!(
+            block.contains("escapeAttr(e.account)"),
+            "showAccountErrors must escapeAttr the account id in the data-account-id attribute"
+        );
+        assert!(
+            block.contains("escapeHtml(e.error)"),
+            "showAccountErrors must escapeHtml the provider error text"
+        );
+    }
+
+    #[test]
+    fn app_js_refill_is_abortable_and_aborted_by_new_list_loads() {
+        // roborev 114: maybeRefillEmails used to fetch with no signal, so a
+        // context switch could only discard (not cancel) an in-flight refill.
+        let refill = js_fn_body(APP_JS, "async function maybeRefillEmails(");
+        assert!(
+            refill.contains("refillController.signal"),
+            "maybeRefillEmails must pass its controller's signal to api()"
+        );
+        let load = js_fn_body(APP_JS, "async function loadEmails(");
+        assert!(
+            load.contains("refillController?.abort()"),
+            "loadEmails must abort an in-flight refill before starting a new list load"
         );
     }
 
@@ -12310,6 +12311,34 @@ white   = '#fdf6e3'
         assert!(
             abort < reload,
             "pull-to-refresh must abort the previous list load before starting its reload"
+        );
+    }
+
+    #[test]
+    fn mobile_gesture_controller_resets_on_touchcancel_without_acting() {
+        // roborev 287: an interrupted touch (notification shade, incoming
+        // call) fires touchcancel, not touchend. Without a cancel path the
+        // row stayed stuck mid-swipe; with the wrong one (routing to end())
+        // the interruption could archive/trash.
+        assert!(
+            MOBILE_APP_JS.contains("addEventListener('touchcancel'"),
+            "gestureController must listen for touchcancel"
+        );
+        assert!(
+            MOBILE_APP_JS.contains("this.active.cancel()"),
+            "onCancel must route to the recognizer's cancel(), which resets visuals without triggering the action"
+        );
+    }
+
+    #[test]
+    fn mobile_detail_action_fallback_guards_history_back() {
+        // roborev 287: when the email is already gone from state.emails
+        // (double-tap, actioned elsewhere), an unconditional history.back()
+        // pops past the list screen.
+        let block = js_fn_body(MOBILE_APP_JS, "function handleDetailAction(");
+        assert!(
+            block.contains("else if (index !== -1)"),
+            "handleDetailAction's back-to-list fallback must be gated on the email still being in the list"
         );
     }
 

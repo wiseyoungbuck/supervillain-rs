@@ -148,6 +148,7 @@ const refillSuppressedIds = new Set();
 // Key: "accountId:mailboxId:splitId:search" -> email array
 const splitListCache = {};
 let loadEmailsController = null;
+let refillController = null;
 
 // Contact autocomplete harvesting (kata e64s, task B6). All module-level and
 // session-only (reset on page reload), mirroring emailCache/splitListCache.
@@ -1614,6 +1615,10 @@ async function loadEmails({ refresh = false } = {}) {
             retireRefreshStatus();
         }
     }
+    // A fresh list load owns the window; an in-flight refill for the old
+    // window must not race it (roborev 114 — the context check only guards
+    // the response, not the wasted request).
+    refillController?.abort();
     loadEmailsController = new AbortController();
     loadEmailsController.refresh = refresh;
     loadEmailsController.context = requestedContext;
@@ -1718,9 +1723,10 @@ async function maybeRefillEmails() {
     const context = splitCacheKey();
 
     refillInFlight = true;
+    refillController = new AbortController();
     try {
         const url = buildEmailListUrl(state.currentMailbox.id, { offset: state.emails.length });
-        const fresh = await api('GET', url);
+        const fresh = await api('GET', url, null, refillController.signal);
 
         // Discard results if context changed during fetch (mailbox, split, or search)
         if (splitCacheKey() !== context) return;
@@ -1737,9 +1743,10 @@ async function maybeRefillEmails() {
             prefetchVisibleEmails();
         }
     } catch (err) {
-        console.warn('Refill failed:', err);
+        if (err.name !== 'AbortError') console.warn('Refill failed:', err);
     } finally {
         refillInFlight = false;
+        refillController = null;
     }
 }
 
