@@ -4734,10 +4734,14 @@ mod tests {
     //
     // Before zs8n, send_email silently dropped EmailSubmission.calendar_ics,
     // so /api/calendar/invite?account=gmail produced a bare text/plain
-    // message with no text/calendar part (verified live: recipient raw MIME
-    // had no text/calendar, no METHOD:REQUEST). These pin that an invite now
-    // reaches messages.send as a raw RFC822 carrying
-    // text/calendar; method=REQUEST — the iMIP shape Google's own invites use.
+    // message with no text/calendar part. The first fix sent inline
+    // text/calendar (multipart/alternative), but live probes showed Gmail's
+    // outbound pipeline strips that shape from messages.send raw regardless
+    // of CTE. These pin the working shape: a raw RFC822 multipart/mixed
+    // carrying the ICS as an application/ics attachment — which Gmail
+    // rewrites on the wire into its canonical invite MIME (alternative +
+    // text/calendar; method=REQUEST + ics attachment) with our ICS bytes
+    // preserved. Inline text/calendar is asserted ABSENT.
 
     fn invite_ics() -> String {
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\

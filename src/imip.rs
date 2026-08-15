@@ -1,14 +1,20 @@
 //! iMIP (RFC 6047 / RFC 2447) MIME envelope for calendar invites.
 //!
-//! Shared by `gmail.rs` and `outlook.rs` so invites from Gmail and Outlook
-//! accounts go out with the exact same on-the-wire MIME shape —
-//! `multipart/alternative` carrying `text/plain` and
-//! `text/calendar; method=<METHOD>` (base64 CTE), wrapped in
-//! `multipart/mixed` when there are attachments. This mirrors Google
-//! Calendar's own invite shape (kata zs8n): before this module both
-//! providers' `send_email` silently dropped `EmailSubmission.calendar_ics`,
-//! so `/api/calendar/invite?account=gmail|outlook` produced a bare
-//! `text/plain` message with no processable `text/calendar` part.
+//! Shared by `gmail.rs` and `outlook.rs` (kata zs8n): before this module
+//! both providers' `send_email` silently dropped
+//! `EmailSubmission.calendar_ics`, so `/api/calendar/invite?account=
+//! gmail|outlook` produced a bare `text/plain` message with no processable
+//! `text/calendar` part. The two providers need DIFFERENT shapes:
+//!
+//! - **Outlook** ([`build_imip_mime`]): inline iMIP — `multipart/
+//!   alternative` carrying `text/plain` and `text/calendar;
+//!   method=<METHOD>` (base64 CTE), wrapped in `multipart/mixed` when
+//!   there are attachments.
+//! - **Gmail** ([`build_ics_attachment_mime`]): the ICS as an
+//!   `application/ics` ATTACHMENT — live probes (2026-08-15) showed
+//!   Gmail's outbound pipeline strips hand-rolled inline `text/calendar`
+//!   parts from `messages.send` raw and regenerates its canonical invite
+//!   MIME only when the ICS rides as an attachment.
 //!
 //! Only `jmap.rs` implemented `calendar_ics` (via `build_draft_email` for
 //! REQUEST and `build_itip_reply_mime` for REPLY); those paths are
@@ -349,10 +355,10 @@ pub(crate) type ImipAttachment = (String, String, Vec<u8>);
 ///
 /// Pure — no I/O, no clock dependence beyond `Utc::now()` for `Date:` (which
 /// the pinning tests assert by presence, not by value). Returns raw bytes
-/// ready for the provider's send path:
-///   - Gmail: base64url-encode → `messages.send` `raw` field.
-///   - Outlook: base64 (standard) → Graph `sendMail` with
-///     `Content-Type: text/plain` (the MIME-mode request shape).
+/// for Outlook's send path: base64 (standard) → Graph `sendMail` with
+/// `Content-Type: text/plain` (the MIME-mode request shape). Gmail does NOT
+/// use this builder — its pipeline strips inline `text/calendar`; see
+/// [`build_ics_attachment_mime`].
 ///
 /// Shape (mirrors Google Calendar's own invites):
 /// ```text
@@ -390,32 +396,8 @@ pub(crate) fn build_imip_mime(
     attachments: &[ImipAttachment],
 ) -> Vec<u8> {
     let method = extract_ics_method(calendar_ics);
-    let from = format_mailbox(from_display_name, from_addr);
-    let to_line = format_recipient_list(to);
-
-    // Header block.
     let mut out = String::with_capacity(2048);
-    out.push_str(&format!("From: {from}\r\n"));
-    out.push_str(&format!("To: {to_line}\r\n"));
-    if !cc.is_empty() {
-        out.push_str(&format!("Cc: {}\r\n", format_recipient_list(cc)));
-    }
-    if let Some(bcc) = bcc
-        && !bcc.is_empty()
-    {
-        // Bcc: header drives envelope delivery for raw-MIME sends (Gmail
-        // `messages.send`, Graph MIME-mode sendMail derive recipients from
-        // the headers); the sending MTA strips it before delivery to To/Cc.
-        out.push_str(&format!("Bcc: {}\r\n", format_recipient_list(bcc)));
-    }
-    out.push_str(&format!("Subject: {}\r\n", encode_subject(subject)));
-    out.push_str(&format!(
-        "Message-ID: <{}@{}>\r\n",
-        uuid::Uuid::new_v4(),
-        message_id_domain(from_addr)
-    ));
-    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
-    out.push_str("MIME-Version: 1.0\r\n");
+    push_rfc5322_headers(&mut out, from_addr, from_display_name, to, cc, bcc, subject);
 
     // Body: build the alternative subtree once, then either emit it bare or
     // nest it under multipart/mixed with the attachments.
@@ -436,29 +418,61 @@ pub(crate) fn build_imip_mime(
         ));
         out.push_str(&alt);
         for (name, mime, bytes) in attachments {
-            out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
-            let mime = sanitize_attachment_mime_type(mime);
-            push_attachment_parameter_header(
-                &mut out,
-                &format!("Content-Type: {mime}"),
-                "name",
-                name,
-            );
-            out.push_str("Content-Transfer-Encoding: base64\r\n");
-            push_attachment_parameter_header(
-                &mut out,
-                "Content-Disposition: attachment",
-                "filename",
-                name,
-            );
-            out.push_str("\r\n");
-            out.push_str(&base64_mime_lines(bytes));
-            out.push_str("\r\n");
+            push_attachment_part(&mut out, name, mime, bytes);
         }
         out.push_str(&format!("--{MIXED_BOUNDARY}--\r\n"));
     }
 
     out.into_bytes()
+}
+
+/// Emit the shared RFC 5322 header block (From/To/Cc/Bcc/Subject/
+/// Message-ID/Date/MIME-Version) — one copy so the header-injection and
+/// encoding guards pinned on [`build_imip_mime`] cover both builders.
+fn push_rfc5322_headers(
+    out: &mut String,
+    from_addr: &str,
+    from_display_name: Option<&str>,
+    to: &[String],
+    cc: &[String],
+    bcc: Option<&[String]>,
+    subject: &str,
+) {
+    let from = format_mailbox(from_display_name, from_addr);
+    out.push_str(&format!("From: {from}\r\n"));
+    out.push_str(&format!("To: {}\r\n", format_recipient_list(to)));
+    if !cc.is_empty() {
+        out.push_str(&format!("Cc: {}\r\n", format_recipient_list(cc)));
+    }
+    if let Some(bcc) = bcc
+        && !bcc.is_empty()
+    {
+        // Bcc: header drives envelope delivery for raw-MIME sends (Gmail
+        // `messages.send`, Graph MIME-mode sendMail derive recipients from
+        // the headers); the sending MTA strips it before delivery to To/Cc.
+        out.push_str(&format!("Bcc: {}\r\n", format_recipient_list(bcc)));
+    }
+    out.push_str(&format!("Subject: {}\r\n", encode_subject(subject)));
+    out.push_str(&format!(
+        "Message-ID: <{}@{}>\r\n",
+        uuid::Uuid::new_v4(),
+        message_id_domain(from_addr)
+    ));
+    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
+    out.push_str("MIME-Version: 1.0\r\n");
+}
+
+/// Emit one attachment part under `MIXED_BOUNDARY` (opening delimiter,
+/// sanitized Content-Type + RFC 2231-safe name/filename, base64 body).
+fn push_attachment_part(out: &mut String, name: &str, mime: &str, bytes: &[u8]) {
+    out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
+    let mime = sanitize_attachment_mime_type(mime);
+    push_attachment_parameter_header(out, &format!("Content-Type: {mime}"), "name", name);
+    out.push_str("Content-Transfer-Encoding: base64\r\n");
+    push_attachment_parameter_header(out, "Content-Disposition: attachment", "filename", name);
+    out.push_str("\r\n");
+    out.push_str(&base64_mime_lines(bytes));
+    out.push_str("\r\n");
 }
 
 /// Build an invite message that carries the ICS as an `application/ics`
@@ -495,28 +509,8 @@ pub(crate) fn build_ics_attachment_mime(
     calendar_ics: &str,
     attachments: &[ImipAttachment],
 ) -> Vec<u8> {
-    let from = format_mailbox(from_display_name, from_addr);
-    let to_line = format_recipient_list(to);
-
     let mut out = String::with_capacity(2048);
-    out.push_str(&format!("From: {from}\r\n"));
-    out.push_str(&format!("To: {to_line}\r\n"));
-    if !cc.is_empty() {
-        out.push_str(&format!("Cc: {}\r\n", format_recipient_list(cc)));
-    }
-    if let Some(bcc) = bcc
-        && !bcc.is_empty()
-    {
-        out.push_str(&format!("Bcc: {}\r\n", format_recipient_list(bcc)));
-    }
-    out.push_str(&format!("Subject: {}\r\n", encode_subject(subject)));
-    out.push_str(&format!(
-        "Message-ID: <{}@{}>\r\n",
-        uuid::Uuid::new_v4(),
-        message_id_domain(from_addr)
-    ));
-    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
-    out.push_str("MIME-Version: 1.0\r\n");
+    push_rfc5322_headers(&mut out, from_addr, from_display_name, to, cc, bcc, subject);
     out.push_str(&format!(
         "Content-Type: multipart/mixed; boundary=\"{MIXED_BOUNDARY}\"\r\n\r\n"
     ));
@@ -527,25 +521,14 @@ pub(crate) fn build_ics_attachment_mime(
     out.push_str(&base64_mime_lines(text_body.as_bytes()));
     out.push_str("\r\n");
 
-    let ics_att: ImipAttachment = (
-        "invite.ics".into(),
-        "application/ics".into(),
-        calendar_ics.as_bytes().to_vec(),
+    push_attachment_part(
+        &mut out,
+        "invite.ics",
+        "application/ics",
+        calendar_ics.as_bytes(),
     );
-    for (name, mime, bytes) in std::iter::once(&ics_att).chain(attachments) {
-        out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
-        let mime = sanitize_attachment_mime_type(mime);
-        push_attachment_parameter_header(&mut out, &format!("Content-Type: {mime}"), "name", name);
-        out.push_str("Content-Transfer-Encoding: base64\r\n");
-        push_attachment_parameter_header(
-            &mut out,
-            "Content-Disposition: attachment",
-            "filename",
-            name,
-        );
-        out.push_str("\r\n");
-        out.push_str(&base64_mime_lines(bytes));
-        out.push_str("\r\n");
+    for (name, mime, bytes) in attachments {
+        push_attachment_part(&mut out, name, mime, bytes);
     }
     out.push_str(&format!("--{MIXED_BOUNDARY}--\r\n"));
 
