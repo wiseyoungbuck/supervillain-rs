@@ -2400,20 +2400,22 @@ pub async fn send_email(
 ) -> Result<Option<String>, Error> {
     let display_name = pick_identity_display_name(session, from_addr, identity_id_override).await;
 
-    // iMIP invite path (kata zs8n): `calendar_ics` needs a
-    // `text/calendar; method=<METHOD>` MIME part with base64 CTE that
-    // `build_rfc822` (mail_builder) can't express precisely — mail_builder
-    // auto-encodes text/* parts as 7bit/quoted-printable, not base64, and
-    // has no clean channel for the `method` Content-Type parameter. Build
-    // the iMIP envelope directly (multipart/alternative > text/plain +
-    // text/calendar; method=REQUEST, wrapped in multipart/mixed when there
-    // are attachments) and send it as the raw RFC822. Mirrors Google
-    // Calendar's own invite shape. Invites are new messages
-    // (`send_invite_handler` sets in_reply_to=None), so threading headers
-    // don't apply on this branch.
+    // iMIP invite path (kata zs8n): send the ICS as an `application/ics`
+    // ATTACHMENT, not an inline `text/calendar` part. Live probes
+    // (2026-08-15, gmail → Fastmail with raw-MIME verification at the
+    // recipient) showed Gmail's outbound pipeline strips hand-rolled inline
+    // text/calendar parts from `messages.send` raw — any CTE, with or
+    // without `method=` — flattening the delivered message to bare
+    // text/plain before DKIM-signing. The attachment shape instead makes
+    // Gmail regenerate its canonical invite MIME (alternative +
+    // text/calendar; method=REQUEST + ics attachment) with our ICS bytes
+    // (UID/ORGANIZER/ATTENDEE) preserved verbatim. See
+    // `imip::build_ics_attachment_mime` for the full empirical record.
+    // Invites are new messages (`send_invite_handler` sets
+    // in_reply_to=None), so threading headers don't apply on this branch.
     if let Some(ics) = sub.calendar_ics.as_ref() {
         let resolved_atts = resolve_invite_attachments(session, sub).await?;
-        let mime = crate::imip::build_imip_mime(
+        let mime = crate::imip::build_ics_attachment_mime(
             from_addr,
             display_name.as_deref(),
             &sub.to,
@@ -4772,7 +4774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_email_with_calendar_ics_emits_text_calendar_part() {
+    async fn send_email_with_calendar_ics_attaches_ics_for_gmail_rewrite() {
         let (base, recorded) = spawn_calendar_recorder(vec![
             (
                 ("GET", "/settings/sendAs"),
@@ -4800,26 +4802,40 @@ mod tests {
             .find(|r| r.method == "POST" && r.path == "/messages/send")
             .expect("messages.send POST recorded");
         let s = decode_send_raw(send_req);
+        // Empirical (kata zs8n, 2026-08-15 live probes): Gmail's outbound
+        // pipeline strips hand-rolled inline text/calendar parts from
+        // messages.send raw (any CTE, with or without method=), flattening
+        // the message to bare text/plain before DKIM-signing. An
+        // application/ics ATTACHMENT instead triggers Gmail to regenerate
+        // its own canonical invite MIME (alternative + text/calendar;
+        // method=REQUEST + ics attachment) with the ICS bytes preserved
+        // verbatim — so the attachment shape is the only one that delivers
+        // a processable invite.
+        assert!(s.contains("multipart/mixed"), "mixed wrapper missing: {s}");
         assert!(
-            s.contains("text/calendar; method=REQUEST"),
-            "calendar part missing: {s}"
+            s.contains("application/ics; name=invite.ics"),
+            "invite.ics attachment part missing: {s}"
         );
         assert!(
-            s.contains("multipart/alternative"),
-            "alternative wrapper missing: {s}"
+            s.contains("Content-Disposition: attachment; filename=invite.ics"),
+            "invite.ics must be a named attachment: {s}"
         );
-        // The ICS is base64-encoded in the calendar part, so assert its
-        // base64 form is present (first 76-char line == first 57 ICS bytes).
+        assert!(
+            !s.contains("text/calendar"),
+            "inline text/calendar must not be emitted for Gmail — its pipeline strips it: {s}"
+        );
+        // The ICS is base64-encoded in the attachment, so assert its base64
+        // form is present (first 76-char line == first 57 ICS bytes).
         use base64::Engine;
         let ics_b64 = base64::engine::general_purpose::STANDARD.encode(invite_ics().as_bytes());
         let first_chunk = &ics_b64[..ics_b64.len().min(76)];
         assert!(
             s.contains(first_chunk),
-            "ICS base64 body missing from calendar part: {s}"
+            "ICS base64 body missing from attachment part: {s}"
         );
         assert!(
             s.contains("Content-Transfer-Encoding: base64"),
-            "calendar part must use base64 CTE: {s}"
+            "ics attachment must use base64 CTE: {s}"
         );
     }
 
@@ -4858,12 +4874,12 @@ mod tests {
         let s = decode_send_raw(send_req);
         assert!(s.contains("multipart/mixed"), "mixed wrapper missing: {s}");
         assert!(
-            s.contains("multipart/alternative"),
-            "alternative nested inside mixed missing: {s}"
+            s.contains("Content-Type: text/plain"),
+            "text body part missing: {s}"
         );
         assert!(
-            s.contains("text/calendar; method=REQUEST"),
-            "calendar part missing: {s}"
+            s.contains("application/ics; name=invite.ics"),
+            "invite.ics attachment missing alongside user attachment: {s}"
         );
         assert!(s.contains("report.pdf"), "attachment missing: {s}");
     }

@@ -461,6 +461,97 @@ pub(crate) fn build_imip_mime(
     out.into_bytes()
 }
 
+/// Build an invite message that carries the ICS as an `application/ics`
+/// ATTACHMENT instead of an inline `text/calendar` alternative part.
+///
+/// Why this exists (kata zs8n, live probes 2026-08-15): Gmail's outbound
+/// pipeline strips hand-rolled inline `text/calendar` parts from
+/// `messages.send` raw sends — any CTE (base64 or 7bit), with or without
+/// the `method=` Content-Type parameter — flattening the delivered message
+/// to bare `text/plain` before DKIM-signing (verified by matching
+/// Message-IDs: the Sent copy keeps the part, the delivered copy does not).
+/// An `application/ics` attachment, by contrast, makes Gmail *regenerate*
+/// its canonical invite MIME on the wire (multipart/alternative with
+/// `text/calendar; method=REQUEST` + the ics attachment) with the ICS
+/// bytes preserved verbatim — so this shape is the only one that delivers
+/// a processable invite from the Gmail API.
+///
+/// Shape:
+/// ```text
+/// multipart/mixed
+///   ├── text/plain; charset=utf-8   (base64)
+///   ├── invite.ics                  (application/ics, base64, attachment)
+///   └── <user attachment>…          (base64, attachment)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_ics_attachment_mime(
+    from_addr: &str,
+    from_display_name: Option<&str>,
+    to: &[String],
+    cc: &[String],
+    bcc: Option<&[String]>,
+    subject: &str,
+    text_body: &str,
+    calendar_ics: &str,
+    attachments: &[ImipAttachment],
+) -> Vec<u8> {
+    let from = format_mailbox(from_display_name, from_addr);
+    let to_line = format_recipient_list(to);
+
+    let mut out = String::with_capacity(2048);
+    out.push_str(&format!("From: {from}\r\n"));
+    out.push_str(&format!("To: {to_line}\r\n"));
+    if !cc.is_empty() {
+        out.push_str(&format!("Cc: {}\r\n", format_recipient_list(cc)));
+    }
+    if let Some(bcc) = bcc
+        && !bcc.is_empty()
+    {
+        out.push_str(&format!("Bcc: {}\r\n", format_recipient_list(bcc)));
+    }
+    out.push_str(&format!("Subject: {}\r\n", encode_subject(subject)));
+    out.push_str(&format!(
+        "Message-ID: <{}@{}>\r\n",
+        uuid::Uuid::new_v4(),
+        message_id_domain(from_addr)
+    ));
+    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
+    out.push_str("MIME-Version: 1.0\r\n");
+    out.push_str(&format!(
+        "Content-Type: multipart/mixed; boundary=\"{MIXED_BOUNDARY}\"\r\n\r\n"
+    ));
+
+    out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
+    out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+    out.push_str(&base64_mime_lines(text_body.as_bytes()));
+    out.push_str("\r\n");
+
+    let ics_att: ImipAttachment = (
+        "invite.ics".into(),
+        "application/ics".into(),
+        calendar_ics.as_bytes().to_vec(),
+    );
+    for (name, mime, bytes) in std::iter::once(&ics_att).chain(attachments) {
+        out.push_str(&format!("--{MIXED_BOUNDARY}\r\n"));
+        let mime = sanitize_attachment_mime_type(mime);
+        push_attachment_parameter_header(&mut out, &format!("Content-Type: {mime}"), "name", name);
+        out.push_str("Content-Transfer-Encoding: base64\r\n");
+        push_attachment_parameter_header(
+            &mut out,
+            "Content-Disposition: attachment",
+            "filename",
+            name,
+        );
+        out.push_str("\r\n");
+        out.push_str(&base64_mime_lines(bytes));
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!("--{MIXED_BOUNDARY}--\r\n"));
+
+    out.into_bytes()
+}
+
 /// Build the `multipart/alternative` subtree (without the wrapping
 /// `Content-Type` header — the caller emits that so it can scope the
 /// boundary to the right container). Includes the closing `--boundary--`.
@@ -485,6 +576,62 @@ fn build_alternative_body(text_body: &str, calendar_ics: &str, method: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- build_ics_attachment_mime (Gmail shape) ----
+
+    #[test]
+    fn ics_attachment_mime_is_mixed_with_ics_attachment_and_no_inline_calendar() {
+        let raw = build_ics_attachment_mime(
+            "boss@example.com",
+            None,
+            &["guest@example.com".into()],
+            &[],
+            None,
+            "Standup",
+            "See you there",
+            sample_ics(),
+            &[],
+        );
+        let s = decode_mime_body(&raw);
+        assert!(s.contains("Content-Type: multipart/mixed; boundary=\"supervillain-imip-mixed\""));
+        assert!(s.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(s.contains("Content-Type: application/ics; name=invite.ics"));
+        assert!(s.contains("Content-Disposition: attachment; filename=invite.ics"));
+        assert!(
+            !s.contains("text/calendar"),
+            "Gmail strips inline text/calendar — this builder must never emit one: {s}"
+        );
+        use base64::Engine;
+        let ics_b64 = base64::engine::general_purpose::STANDARD.encode(sample_ics().as_bytes());
+        assert!(
+            s.contains(&ics_b64[..76]),
+            "ICS bytes must ride in the attachment verbatim (base64): {s}"
+        );
+    }
+
+    #[test]
+    fn ics_attachment_mime_puts_invite_ics_before_user_attachments() {
+        let raw = build_ics_attachment_mime(
+            "boss@example.com",
+            Some("The Boss"),
+            &["guest@example.com".into()],
+            &["observer@example.com".into()],
+            None,
+            "Standup",
+            "body",
+            sample_ics(),
+            &[pdf_attachment()],
+        );
+        let s = decode_mime_body(&raw);
+        assert!(s.contains("Cc: observer@example.com"));
+        let ics_idx = s.find("name=invite.ics").expect("invite.ics present");
+        let pdf_idx = s.find("report.pdf").expect("user attachment present");
+        assert!(
+            ics_idx < pdf_idx,
+            "invite.ics leads the attachment list so Gmail's rewrite sees it first"
+        );
+        assert!(s.ends_with("--supervillain-imip-mixed--\r\n"));
+    }
 
     fn sample_ics() -> &'static str {
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n\
