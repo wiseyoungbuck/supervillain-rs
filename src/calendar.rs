@@ -813,6 +813,37 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
         .join("\n")
 }
 
+/// Stamp `SCHEDULE-AGENT=CLIENT` (RFC 6638 §7.1) on every ORGANIZER property
+/// so the CalDAV server does NOT run its own organizer scheduling for this
+/// object. Without it, PUTting an attendee copy with an updated PARTSTAT
+/// makes Fastmail fire a server-generated iTIP REPLY on top of the one the
+/// RSVP flow already emails — the organizer gets two responses per click
+/// (kata 8gn5 live verification). Idempotent: an ORGANIZER that already
+/// carries any SCHEDULE-AGENT param is left untouched.
+pub fn set_schedule_agent_client(raw_ics: &str) -> String {
+    let raw_ics = unfold_lines(raw_ics);
+    raw_ics
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.trim_end_matches('\r');
+            let is_organizer =
+                trimmed.starts_with("ORGANIZER;") || trimmed.starts_with("ORGANIZER:");
+            if is_organizer && !trimmed.to_ascii_uppercase().contains("SCHEDULE-AGENT=") {
+                let rest = &trimmed["ORGANIZER".len()..];
+                let updated = format!("ORGANIZER;SCHEDULE-AGENT=CLIENT{rest}");
+                if line.ends_with('\r') {
+                    format!("{updated}\r")
+                } else {
+                    updated
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // =============================================================================
 // RSVP Generation
 // =============================================================================
@@ -1838,6 +1869,44 @@ END:VCALENDAR";
     }
 
     // --- update_partstat tests ---
+
+    // ---- set_schedule_agent_client (kata 8gn5) ----
+
+    #[test]
+    fn schedule_agent_client_added_to_bare_organizer() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nORGANIZER:mailto:boss@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let out = set_schedule_agent_client(ics);
+        assert!(
+            out.contains("ORGANIZER;SCHEDULE-AGENT=CLIENT:mailto:boss@example.com\r"),
+            "param must be inserted before the value: {out}"
+        );
+    }
+
+    #[test]
+    fn schedule_agent_client_preserves_existing_params() {
+        let ics = "BEGIN:VCALENDAR\nORGANIZER;CN=The Boss:mailto:boss@example.com\nEND:VCALENDAR\n";
+        let out = set_schedule_agent_client(ics);
+        assert!(
+            out.contains("ORGANIZER;SCHEDULE-AGENT=CLIENT;CN=The Boss:mailto:boss@example.com"),
+            "existing params must survive after the inserted one: {out}"
+        );
+    }
+
+    #[test]
+    fn schedule_agent_client_is_idempotent_and_respects_existing_agent() {
+        // An explicit SCHEDULE-AGENT (ours or the server's) must not be
+        // duplicated or overridden.
+        let ics = "ORGANIZER;SCHEDULE-AGENT=SERVER:mailto:boss@example.com\n";
+        assert_eq!(set_schedule_agent_client(ics), ics);
+        let ours = "ORGANIZER;SCHEDULE-AGENT=CLIENT:mailto:boss@example.com\n";
+        assert_eq!(set_schedule_agent_client(ours), ours);
+    }
+
+    #[test]
+    fn schedule_agent_client_ignores_non_organizer_lines() {
+        let ics = "ATTENDEE;PARTSTAT=ACCEPTED:mailto:a@example.com\nORGANIZER-X:not-a-real-prop\n";
+        assert_eq!(set_schedule_agent_client(ics), ics);
+    }
 
     #[test]
     fn update_partstat_changes_matching_attendee() {

@@ -613,7 +613,26 @@ pub async fn rsvp(
                 jmap::remove_from_calendar(s, &event.uid).await?;
             } else {
                 let updated_ics = calendar::update_partstat(ics_data, attendee_email, status);
+                // SCHEDULE-AGENT=CLIENT: this flow already emailed the iTIP
+                // REPLY above; without the param Fastmail's server-side
+                // scheduling fires its own REPLY on the PARTSTAT write, so
+                // the organizer gets two responses per click (kata 8gn5,
+                // verified live).
+                let updated_ics = calendar::set_schedule_agent_client(&updated_ics);
                 jmap::add_to_calendar(s, &updated_ics, &event.uid, false).await?;
+            }
+            // Consume the scheduling-Inbox invitation (RFC 6638) — left
+            // behind, Fastmail/Morgen keep rendering the invite as pending
+            // regardless of the RSVP, the kata 8gn5 "Maybe/Decline don't
+            // update my calendar" symptom. Best-effort by design: the reply
+            // email and calendar write above already succeeded, and failing
+            // the whole RSVP here would invite retries that re-send replies
+            // (same duplicate-reply hazard as the m5yp comment above).
+            if let Err(e) = jmap::clear_scheduling_inbox(s, &event.uid).await {
+                tracing::warn!(
+                    "RSVP succeeded but clearing the scheduling inbox for {} failed: {e}",
+                    event.uid
+                );
             }
         }
         ProviderSession::Outlook(s) => {
@@ -928,6 +947,41 @@ mod tests {
             .and_then(|rest| rest.split("ProviderSession::Gmail(s) => {").next())
             .expect("Outlook arm of rsvp dispatch must exist")
             .to_string()
+    }
+
+    fn rsvp_fastmail_arm_src() -> String {
+        let src = include_str!("provider.rs");
+        let handler_src = src.split("mod tests").next().unwrap_or(src);
+        handler_src
+            .split("pub async fn rsvp(")
+            .nth(1)
+            .expect("rsvp fn must exist")
+            .split("ProviderSession::Fastmail(s) => {")
+            .nth(1)
+            .and_then(|rest| rest.split("ProviderSession::Outlook(s) => {").next())
+            .expect("Fastmail arm of rsvp dispatch must exist")
+            .to_string()
+    }
+
+    #[test]
+    fn rsvp_fastmail_arm_suppresses_server_scheduling_and_clears_inbox() {
+        // kata 8gn5 (live-verified): without SCHEDULE-AGENT=CLIENT the
+        // PARTSTAT PUT makes Fastmail email its own REPLY on top of ours,
+        // and without the inbox clear the scheduling-Inbox invitation keeps
+        // rendering as pending regardless of the RSVP.
+        let arm = rsvp_fastmail_arm_src();
+        assert!(
+            arm.contains("calendar::set_schedule_agent_client("),
+            "the PARTSTAT write must carry SCHEDULE-AGENT=CLIENT so the server doesn't double-reply"
+        );
+        assert!(
+            arm.contains("jmap::clear_scheduling_inbox(s, &event.uid)"),
+            "every RSVP must consume the scheduling-Inbox invitation for the event's UID"
+        );
+        assert!(
+            !arm.contains("clear_scheduling_inbox(s, &event.uid).await?"),
+            "inbox clearing is best-effort — propagating its error would invite RSVP retries that re-send replies"
+        );
     }
 
     #[test]

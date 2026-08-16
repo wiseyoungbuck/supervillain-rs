@@ -151,7 +151,7 @@ pub struct JmapSession {
     /// init permit, no poisoning), so a transient discovery failure retries
     /// on the next call while a permanent one (no writable calendar) keeps
     /// surfacing. The four `&self` CalDAV functions populate it without `&mut`.
-    pub caldav_collection_url: std::sync::Arc<tokio::sync::OnceCell<String>>,
+    pub caldav_collection_url: std::sync::Arc<tokio::sync::OnceCell<DiscoveredCalendars>>,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
     pub upload_url: Option<String>,
@@ -2415,6 +2415,8 @@ static CALENDAR_ELEM_RE: LazyLock<Regex> = LazyLock::new(|| {
 static SCHEDULE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?schedule-(?:inbox|outbox)\b").expect("static regex")
 });
+static SCHEDULE_INBOX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?schedule-inbox\b").expect("static regex"));
 static DISPLAYNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?s)<(?:[A-Za-z0-9_.-]+:)?displayname\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?displayname\s*>",
@@ -2481,7 +2483,18 @@ struct CalCollectionInfo {
     displayname: Option<String>,
     is_calendar: bool,
     is_schedule: bool,
+    is_schedule_inbox: bool,
     writable: bool,
+}
+
+/// Discovery result cached per session: the default writable calendar plus
+/// (when the server advertises one) the RFC 6638 schedule-inbox collection —
+/// the queue that holds incoming iTIP invitations until a client consumes
+/// them. Both URLs are absolute with no trailing slash.
+#[derive(Clone, Debug)]
+pub struct DiscoveredCalendars {
+    pub default_collection: String,
+    pub schedule_inbox: Option<String>,
 }
 
 /// Step 3 parse: enumerate the `<D:response>` blocks in the home PROPFIND and
@@ -2502,6 +2515,7 @@ fn parse_calendar_collections(xml: &str) -> Vec<CalCollectionInfo> {
                 .unwrap_or_default();
             let is_calendar = CALENDAR_ELEM_RE.is_match(&rt);
             let is_schedule = SCHEDULE_RE.is_match(&rt);
+            let is_schedule_inbox = SCHEDULE_INBOX_RE.is_match(&rt);
             let displayname = DISPLAYNAME_RE
                 .captures(block)
                 .map(|c| element_text(&c[1]))
@@ -2516,6 +2530,7 @@ fn parse_calendar_collections(xml: &str) -> Vec<CalCollectionInfo> {
                 displayname,
                 is_calendar,
                 is_schedule,
+                is_schedule_inbox,
                 writable,
             })
         })
@@ -2632,7 +2647,7 @@ async fn discover_calendar_collection(
     client: &reqwest::Client,
     caldav_base: &str,
     auth: &str,
-) -> Result<String, Error> {
+) -> Result<DiscoveredCalendars, Error> {
     // Step 1: PROPFIND the calendars root for current-user-principal. We hit
     // `{caldav_base}/dav/calendars` directly rather than RFC 6764's
     // `/.well-known/caldav` because the well-known 301-redirects to exactly
@@ -2670,7 +2685,16 @@ async fn discover_calendar_collection(
     // `/{uid}.ics` with a single slash — Cyrus lists collection hrefs with a
     // trailing `/`; keeping it would yield `…/COLLID//uid.ics`.
     let href = default.href.trim_end_matches('/');
-    Ok(absolute_url(caldav_base, href))
+    // The schedule-inbox (RFC 6638) is optional: its absence just means
+    // there's no invitation queue to consume after an RSVP.
+    let schedule_inbox = collections
+        .iter()
+        .find(|c| c.is_schedule_inbox)
+        .map(|c| absolute_url(caldav_base, c.href.trim_end_matches('/')));
+    Ok(DiscoveredCalendars {
+        default_collection: absolute_url(caldav_base, href),
+        schedule_inbox,
+    })
 }
 
 /// Resolve the session's default calendar collection URL, discovering it once
@@ -2686,12 +2710,12 @@ async fn discover_calendar_collection(
 /// keeps surfacing honestly each time. `auth` is the `require_caldav_auth`
 /// header; discovery is only reached when the app password is configured (the
 /// m5yp guard runs first in each caller).
-async fn resolve_calendar_collection_parts(
+async fn resolve_discovered_calendars(
     client: &reqwest::Client,
     caldav_base: &str,
-    collection_url: &tokio::sync::OnceCell<String>,
+    collection_url: &tokio::sync::OnceCell<DiscoveredCalendars>,
     auth: &str,
-) -> Result<String, Error> {
+) -> Result<DiscoveredCalendars, Error> {
     // `get_or_try_init` runs discovery only if the cell is empty; concurrent
     // callers await the one in-flight init. `.clone()` releases the shared
     // borrow before the caller builds its per-call URL.
@@ -2699,6 +2723,19 @@ async fn resolve_calendar_collection_parts(
         .get_or_try_init(|| discover_calendar_collection(client, caldav_base, auth))
         .await?
         .clone())
+}
+
+async fn resolve_calendar_collection_parts(
+    client: &reqwest::Client,
+    caldav_base: &str,
+    collection_url: &tokio::sync::OnceCell<DiscoveredCalendars>,
+    auth: &str,
+) -> Result<String, Error> {
+    Ok(
+        resolve_discovered_calendars(client, caldav_base, collection_url, auth)
+            .await?
+            .default_collection,
+    )
 }
 
 async fn resolve_calendar_collection(s: &JmapSession, auth: &str) -> Result<String, Error> {
@@ -2714,7 +2751,7 @@ pub(crate) struct CalendarEventReader {
     client: reqwest::Client,
     auth_header: String,
     caldav_base: String,
-    collection_url: std::sync::Arc<tokio::sync::OnceCell<String>>,
+    collection_url: std::sync::Arc<tokio::sync::OnceCell<DiscoveredCalendars>>,
 }
 
 pub(crate) fn calendar_event_reader(s: &JmapSession) -> Result<CalendarEventReader, Error> {
@@ -2834,6 +2871,11 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
         .client
         .delete(&caldav_url)
         .header("Authorization", auth)
+        // RFC 6638 §8.1: suppress the server-generated iTIP DECLINE that
+        // deleting an attendee copy would otherwise trigger — the RSVP flow
+        // emails its own REPLY, so the server's would double-notify the
+        // organizer (kata 8gn5 live verification).
+        .header("Schedule-Reply", "F")
         .send()
         .await?;
 
@@ -2850,6 +2892,100 @@ pub async fn remove_from_calendar(s: &JmapSession, uid: &str) -> Result<bool, Er
     }
 
     Ok(true)
+}
+
+/// Minimal XML text-node escape for values interpolated into a CalDAV REPORT
+/// body (the UID filter). `&`, `<`, `>` are the only characters that can
+/// change the document structure in text content.
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Consume the RFC 6638 scheduling-Inbox objects for `uid` after an RSVP.
+///
+/// Fastmail queues each incoming iTIP invitation as an object in the
+/// schedule-inbox collection; calendar clients (Fastmail web, Morgen) render
+/// those as "pending invitation" prompts. Responding via supervillain never
+/// touched that queue, so the invitation kept showing as unanswered no
+/// matter what the user clicked — the kata 8gn5 "Maybe/Decline don't update
+/// my calendar" symptom (verified live: after RSVP the calendar copy's
+/// PARTSTAT was correct while the Inbox copy sat at NEEDS-ACTION forever).
+///
+/// Flow: calendar-query REPORT the inbox for objects with this UID, then
+/// DELETE each hit (`Schedule-Reply: F` — consuming a notification must not
+/// itself emit iTIP). Returns the number of objects removed; `Ok(0)` when
+/// the server advertises no schedule-inbox or the queue has no such object.
+pub async fn clear_scheduling_inbox(s: &JmapSession, uid: &str) -> Result<usize, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
+    let discovered =
+        resolve_discovered_calendars(&s.client, &s.caldav_base, &s.caldav_collection_url, auth)
+            .await?;
+    let Some(inbox) = discovered.schedule_inbox else {
+        return Ok(0);
+    };
+
+    let query = format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:prop-filter name="UID"><C:text-match collation="i;octet">{}</C:text-match></C:prop-filter>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>"#,
+        xml_escape_text(uid)
+    );
+    let resp = s
+        .client
+        .request(
+            reqwest::Method::from_bytes(b"REPORT").expect("REPORT is a valid method"),
+            &inbox,
+        )
+        .header("Authorization", auth)
+        .header("Depth", "1")
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(query)
+        .send()
+        .await?;
+    let status = resp.status();
+    // 404: no inbox collection after all (or it vanished) — nothing queued.
+    if status.as_u16() == 404 {
+        return Ok(0);
+    }
+    if status.as_u16() != 207 {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("REPORT", &inbox, status, &body));
+    }
+    let xml = resp.text().await?;
+    let hrefs: Vec<String> = RESPONSE_RE
+        .find_iter(&xml)
+        .filter_map(|m| HREF_RE.captures(m.as_str()).map(|c| element_text(&c[1])))
+        .filter(|h| h.ends_with(".ics"))
+        .collect();
+
+    let mut removed = 0;
+    for href in hrefs {
+        let url = absolute_url(&s.caldav_base, &href);
+        let resp = s
+            .client
+            .delete(&url)
+            .header("Authorization", auth)
+            .header("Schedule-Reply", "F")
+            .send()
+            .await?;
+        let status = resp.status();
+        // 404 = another client consumed it first; the queue entry is gone
+        // either way.
+        if status.is_success() || status.as_u16() == 404 {
+            removed += 1;
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(caldav_failure("DELETE", &url, status, &body));
+        }
+    }
+    Ok(removed)
 }
 
 /// Read a stored event's attendee PARTSTAT for `attendee_email` from CalDAV.
@@ -2974,7 +3110,31 @@ pub(crate) mod caldav_recorder {
         pub path: String,
         pub authorization: Option<String>,
         pub content_type: Option<String>,
+        /// Every request header as `(lowercased-name, value)` — for asserting
+        /// protocol headers beyond auth/content-type (e.g. `Schedule-Reply`).
+        pub headers: Vec<(String, String)>,
         pub body: Vec<u8>,
+    }
+
+    impl RecordedRequest {
+        /// First value of `name` (case-insensitive), if the request sent it.
+        pub fn header(&self, name: &str) -> Option<&str> {
+            let name = name.to_ascii_lowercase();
+            self.headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    fn collect_headers(map: &axum::http::HeaderMap) -> Vec<(String, String)> {
+        map.iter()
+            .filter_map(|(n, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (n.as_str().to_ascii_lowercase(), v.to_string()))
+            })
+            .collect()
     }
 
     /// Spawn the recorder. Returns `(base_url, recorded_buffer)`.
@@ -3024,6 +3184,7 @@ pub(crate) mod caldav_recorder {
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let headers = collect_headers(req.headers());
                 let req_body = axum::body::to_bytes(req.into_body(), usize::MAX)
                     .await
                     .unwrap_or_default()
@@ -3033,6 +3194,7 @@ pub(crate) mod caldav_recorder {
                     path,
                     authorization,
                     content_type,
+                    headers,
                     body: req_body,
                 });
                 gate.acquire().await.unwrap().forget();
@@ -3088,6 +3250,7 @@ pub(crate) mod caldav_recorder {
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
+                let headers = collect_headers(req.headers());
                 let req_body = axum::body::to_bytes(req.into_body(), usize::MAX)
                     .await
                     .unwrap_or_default()
@@ -3097,6 +3260,7 @@ pub(crate) mod caldav_recorder {
                     path: path.clone(),
                     authorization,
                     content_type,
+                    headers,
                     body: req_body,
                 });
                 let (status, body) = responder(&method, &path);
@@ -6679,6 +6843,134 @@ END:VCALENDAR";
     }
 
     #[tokio::test]
+    async fn caldav_delete_suppresses_server_schedule_reply() {
+        // RFC 6638 §8.1: deleting an attendee copy without Schedule-Reply: F
+        // makes the server fire its own iTIP DECLINE on top of the REPLY the
+        // RSVP flow emails — the organizer gets two responses (kata 8gn5).
+        let (base, recorded) = spawn_discovery(
+            "/dav/principals/user/user@fastmail.com/",
+            &default_coll_path("user@fastmail.com"),
+            axum::http::StatusCode::NO_CONTENT,
+            Vec::new(),
+        )
+        .await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+
+        remove_from_calendar(&sess, "uid-8gn5")
+            .await
+            .expect("delete should succeed");
+        let rec = recorded.lock().unwrap();
+        let del = recorded_by_method(&rec, "DELETE");
+        assert_eq!(del.len(), 1, "exactly one DELETE expected: {rec:?}");
+        assert_eq!(
+            del[0].header("schedule-reply"),
+            Some("F"),
+            "DELETE must carry Schedule-Reply: F so the server does not emit its own decline"
+        );
+    }
+
+    /// A 207 multistatus body for the Inbox REPORT: one queued invitation
+    /// object (the collection itself has no `.ics` suffix and is skipped by
+    /// the href filter).
+    fn inbox_report_multistatus(inbox_object_href: &str) -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+ <D:response>
+  <D:href>{inbox_object_href}</D:href>
+  <D:propstat><D:prop><D:getetag>"etag-1"</D:getetag></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+</D:multistatus>"#
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn caldav_rsvp_clears_scheduling_inbox_invitation() {
+        // The schedule-inbox queues each incoming invitation; clients render
+        // those as "pending invite" prompts. An RSVP must consume the queue
+        // entry (REPORT by UID, then DELETE each hit) or the invitation keeps
+        // showing as unanswered — the kata 8gn5 symptom. Discovery must find
+        // the inbox from the home listing's schedule-inbox resourcetype.
+        let user = "user@fastmail.com";
+        let inbox_obj = format!("/dav/calendars/user/{user}/Inbox/queued-entry.ics");
+        let (base, recorded) = spawn_discovery(
+            &format!("/dav/principals/user/{user}/"),
+            &default_coll_path(user),
+            axum::http::StatusCode::MULTI_STATUS,
+            inbox_report_multistatus(&inbox_obj),
+        )
+        .await;
+        let mut sess = JmapSession::new(user, "fmu1-test-token", Some("test-app-pass"));
+        sess.caldav_base = base;
+
+        let removed = clear_scheduling_inbox(&sess, "uid-8gn5&<odd>")
+            .await
+            .expect("inbox clear should succeed");
+        assert_eq!(removed, 1, "the one queued invitation must be consumed");
+
+        let rec = recorded.lock().unwrap();
+        let reports = recorded_by_method(&rec, "REPORT");
+        assert_eq!(reports.len(), 1, "exactly one REPORT expected: {rec:?}");
+        assert!(
+            reports[0]
+                .path
+                .ends_with(&format!("/dav/calendars/user/{user}/Inbox")),
+            "REPORT must address the DISCOVERED schedule-inbox: {}",
+            reports[0].path
+        );
+        assert_eq!(reports[0].header("depth"), Some("1"));
+        let body = std::str::from_utf8(&reports[0].body).unwrap_or("");
+        assert!(
+            body.contains("uid-8gn5&amp;&lt;odd&gt;"),
+            "REPORT must filter by the XML-escaped UID: {body}"
+        );
+        let dels = recorded_by_method(&rec, "DELETE");
+        assert_eq!(dels.len(), 1, "exactly one DELETE expected: {rec:?}");
+        assert_eq!(
+            dels[0].path, inbox_obj,
+            "DELETE must address the queued object href from the REPORT"
+        );
+        assert_eq!(
+            dels[0].header("schedule-reply"),
+            Some("F"),
+            "consuming a notification must not itself emit iTIP"
+        );
+    }
+
+    #[tokio::test]
+    async fn caldav_inbox_clear_is_noop_when_server_has_no_schedule_inbox() {
+        let (base, recorded) = caldav_recorder::spawn(axum::http::StatusCode::OK, Vec::new()).await;
+        let mut sess = JmapSession::new(
+            "user@fastmail.com",
+            "fmu1-test-token",
+            Some("test-app-pass"),
+        );
+        sess.caldav_base = base;
+        sess.caldav_collection_url
+            .set(DiscoveredCalendars {
+                default_collection: "http://unused/coll".into(),
+                schedule_inbox: None,
+            })
+            .expect("prefill discovery cache");
+
+        let removed = clear_scheduling_inbox(&sess, "uid-any")
+            .await
+            .expect("no inbox advertised must be a clean no-op");
+        assert_eq!(removed, 0);
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "no HTTP may be issued when the server advertises no schedule-inbox"
+        );
+    }
+
+    #[tokio::test]
     async fn caldav_get_and_delete_use_same_basic_auth() {
         // Sibling calls can't regress to the Bearer api-token, and must both
         // address the discovered (cached) collection — never /Default/.
@@ -7027,6 +7319,7 @@ END:VCALENDAR";
             displayname: Some(displayname.into()),
             is_calendar,
             is_schedule: false,
+            is_schedule_inbox: false,
             writable,
         }
     }
@@ -7111,6 +7404,7 @@ END:VCALENDAR";
                 displayname: Some("Inbox".into()),
                 is_calendar: false,
                 is_schedule: true,
+                is_schedule_inbox: true,
                 writable: true,
             },
             CalCollectionInfo {
@@ -7118,6 +7412,7 @@ END:VCALENDAR";
                 displayname: Some("Outbox".into()),
                 is_calendar: false,
                 is_schedule: true,
+                is_schedule_inbox: false,
                 writable: true,
             },
         ];
