@@ -2911,25 +2911,66 @@ fn xml_escape_text(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Reverse of [`xml_escape_text`] plus the two standard XML entities a
-/// server may emit in `calendar-data` text nodes. `&amp;` last so decoded
-/// ampersands can't cascade into a second decode.
+static NUMERIC_ENTITY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"&#(x[0-9A-Fa-f]+|[0-9]+);").expect("static regex"));
+
+/// Reverse of [`xml_escape_text`] plus the standard named entities and
+/// numeric character references a server may emit in `calendar-data` text
+/// nodes — notably `&#13;`: conforming XML emitters must encode CR that
+/// way to survive parser newline normalization, so a CRLF-lined ICS can
+/// arrive with every line suffixed by one (roborev 510). `&amp;` decodes
+/// last so escaped ampersands can't cascade into a second decode (an
+/// escaped `&amp;#13;` contains no `&#…;` span, so the numeric pass can't
+/// touch it either).
 fn xml_unescape_text(s: &str) -> String {
-    s.replace("&lt;", "<")
+    let s = s
+        .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+        .replace("&apos;", "'");
+    let s = NUMERIC_ENTITY_RE.replace_all(&s, |c: &regex::Captures| {
+        let t = &c[1];
+        let n = match t.strip_prefix('x') {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => t.parse::<u32>().ok(),
+        };
+        n.and_then(char::from_u32)
+            .map(String::from)
+            .unwrap_or_else(|| c[0].to_string())
+    });
+    s.replace("&amp;", "&")
 }
 
-/// Extract the VEVENT UID from raw ICS text (folded lines unfolded first).
+/// Extract the VEVENT UID from raw ICS text. Tolerates the legal shapes a
+/// third-party organizer may emit (roborev 510): folded lines continued by
+/// space OR HTAB (RFC 5545 §3.1), a lowercase property name, and property
+/// parameters (`UID;X-…=…:value`).
 fn ics_uid(ics: &str) -> Option<String> {
-    let unfolded = ics.replace("\r\n ", "").replace("\n ", "");
-    unfolded
-        .lines()
-        .map(|l| l.trim_end_matches('\r'))
-        .find_map(|l| l.strip_prefix("UID:"))
-        .map(|v| v.to_string())
+    let unfolded = ics
+        .replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .replace("\n ", "")
+        .replace("\n\t", "");
+    for line in unfolded.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line
+            .get(..3)
+            .filter(|p| p.eq_ignore_ascii_case("UID"))
+            .map(|_| &line[3..])
+        else {
+            continue;
+        };
+        match rest.as_bytes().first() {
+            Some(b':') => return Some(rest[1..].to_string()),
+            Some(b';') => {
+                if let Some(idx) = rest.find(':') {
+                    return Some(rest[idx + 1..].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Consume the RFC 6638 scheduling-Inbox objects for `uid` after an RSVP.
@@ -3001,8 +3042,19 @@ pub async fn clear_scheduling_inbox(s: &JmapSession, uid: &str) -> Result<usize,
         .filter_map(|m| {
             let block = m.as_str();
             let href = element_text(&HREF_RE.captures(block)?[1]);
+            // No calendar-data = the collection's own row; skip silently.
             let data = xml_unescape_text(&element_text(&CALENDAR_DATA_RE.captures(block)?[1]));
-            (ics_uid(&data).as_deref() == Some(uid)).then_some(href)
+            match ics_uid(&data) {
+                Some(hit_uid) if hit_uid == uid => Some(href),
+                other => {
+                    // Visible breadcrumb: a systematic false negative here
+                    // silently resurrects the stuck-pending symptom.
+                    tracing::debug!(
+                        "scheduling-inbox hit {href} skipped: UID {other:?} != {uid:?}"
+                    );
+                    None
+                }
+            }
         })
         .collect();
 
@@ -7007,6 +7059,35 @@ END:VCALENDAR";
             Some("F"),
             "consuming a notification must not itself emit iTIP"
         );
+    }
+
+    #[test]
+    fn ics_uid_handles_third_party_encoding_variants() {
+        // Plain, parameterized+lowercase, HTAB folding, and a CR left by a
+        // decoded &#13; must all resolve; a UID-prefixed other property
+        // must not (roborev 510).
+        assert_eq!(
+            ics_uid("BEGIN:VEVENT\r\nUID:plain\r\nEND:VEVENT\r\n").as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            ics_uid("uid;X-SEQ=1:param-and-case\n").as_deref(),
+            Some("param-and-case")
+        );
+        assert_eq!(ics_uid("UID:fol\r\n\tded\r\n").as_deref(), Some("folded"));
+        assert_eq!(ics_uid("UID:cr-suffixed\r").as_deref(), Some("cr-suffixed"));
+        assert_eq!(ics_uid("UIDX:not-a-uid\n"), None);
+    }
+
+    #[test]
+    fn xml_unescape_decodes_numeric_character_references() {
+        // Conforming emitters encode CR in text content as &#13;; a decoded
+        // one must land as a real CR so ics_uid's trim strips it. Escaped
+        // ampersand sequences must NOT double-decode.
+        assert_eq!(xml_unescape_text("UID:x&#13;"), "UID:x\r");
+        assert_eq!(xml_unescape_text("a&#x41;b"), "aAb");
+        assert_eq!(xml_unescape_text("&amp;#13;"), "&#13;");
+        assert_eq!(xml_unescape_text("bad&#zz;ref"), "bad&#zz;ref");
     }
 
     #[tokio::test]
