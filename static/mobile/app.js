@@ -3305,8 +3305,9 @@ function restoreFromSnapshot({ offline = false } = {}) {
     // Cached bodies (kata 2chc) — the difference between "the list is there but
     // every message is blank" and actually reading mail on a plane. Seeded
     // oldest-first through cacheEmail so the restored cache carries the live
-    // cache's eviction order, and so an over-limit blob (it can't be — the
-    // snapshot caps at 20, the cache at 50 — would still evict correctly).
+    // cache's eviction order — and so even an over-limit blob (impossible
+    // today: the snapshot caps at 20, the cache at 50) would evict correctly
+    // rather than overflow.
     if (Array.isArray(snapshot.bodies)) {
         for (const cached of snapshot.bodies) {
             if (cached && typeof cached.id === 'string') cacheEmail(cached);

@@ -229,12 +229,13 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extract(MOBILE, 'async function sendComposedEmail('),
         extract(MOBILE, 'async function renderScreenDetail('),
         extract(MOBILE, 'async function init('),
+        extract(MOBILE, 'function handleOffline('),
         extract(MOBILE, 'function handleOnline('),
         extract(MOBILE, 'const pullToRefreshRecognizer = {'),
         extractListener("document.getElementById('detail-attachments').addEventListener('click'"),
         extractListener("document.getElementById('bottom-nav').addEventListener('click'"),
         `return { persistState, restoreFromSnapshot, snapshotBodies, pullToRefreshRecognizer,
-                  handleOnline, selectAccount, performUndo, rsvpToEvent,
+                  handleOffline, handleOnline, selectAccount, performUndo, rsvpToEvent,
                   serializeSnapshot, setOfflineMode, offlineBlocked, cacheEmail,
                   emailAction, submitSearch, clearSearch, sendComposedEmail,
                   renderScreenDetail, init,
@@ -551,6 +552,28 @@ test('offline mode raises the cached-mail banner and disables server-touching co
         assert.ok(h.OFFLINE_DISABLED_CONTROLS.includes(id),
             `${id} touches the server and must be disabled offline`);
     }
+});
+
+test('a connectivity drop in a live session shows the STALE banner, not CACHED', () => {
+    // roborev 527: the two-message split is the point of the banner — a live
+    // session that loses connectivity has aging data ("data may be stale"),
+    // not a read-only cached session, and telling it archive taps won't work
+    // would be false. Pins the offlineMode ternary in setOfflineBanner.
+    const h = makeHarness();
+    h.handleOffline();
+
+    const banner = h.document.getElementById('offline-banner');
+    assert.ok(banner.classList.contains('visible'));
+    assert.strictEqual(banner.textContent, h.OFFLINE_BANNER_STALE,
+        'a merely-stale live session must not claim to be showing cached mail');
+});
+
+test('a degraded session keeps the CACHED banner text through handleOffline', () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.handleOffline();
+
+    assert.strictEqual(h.document.getElementById('offline-banner').textContent,
+        h.OFFLINE_BANNER_CACHED);
 });
 
 test('leaving offline mode clears the banner and re-enables the controls', () => {
