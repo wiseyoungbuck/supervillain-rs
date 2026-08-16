@@ -53,6 +53,20 @@ function extractFunction(src, declaration) {
     return src.slice(start, close + 2);
 }
 
+// Pull a single-statement `const NAME = ...;` out of the bundle and eval it.
+// Data collaborators come from the shipped source for the same reason the
+// functions do: a restated copy in the test keeps passing after the real one
+// is reworded, which is the drift this suite exists to catch.
+function extractConst(src, name) {
+    const decl = `const ${name} = `;
+    const start = src.indexOf(decl);
+    assert.notStrictEqual(start, -1, `${name} must exist`);
+    const end = src.indexOf(';\n', start);
+    assert.notStrictEqual(end, -1, `${name} must terminate`);
+    // eslint-disable-next-line no-new-func
+    return new Function(`${src.slice(start, end + 1)}\nreturn ${name};`)();
+}
+
 // Extract one or more declarations and hand back the last one named, with any
 // collaborators injected as parameters rather than globals (the
 // email_iframe_test.cjs convention — Node's own globals stay untouched).
@@ -419,7 +433,7 @@ function loadRenderCalendarCard(timeRange = 'Mon, Jan 5, 9:00 AM') {
         ['function escapeHtml(', 'function renderCalendarCard('],
         'renderCalendarCard',
         {
-            RSVP_LABELS: { ACCEPTED: 'Accepted', TENTATIVE: 'Maybe', DECLINED: 'Declined' },
+            RSVP_LABELS: extractConst(MOBILE, 'RSVP_LABELS'),
             formatEventTimeRange: () => timeRange,
         },
     );
