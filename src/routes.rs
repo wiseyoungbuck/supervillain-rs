@@ -12261,8 +12261,11 @@ white   = '#fdf6e3'
     // Only functions that are byte-identical TODAY belong here. The mobile
     // copies that legitimately diverge (escapeHtml, linkifyHtml, segmentUrls,
     // renderAttachments, renderCalendarCard, toggleUnread, ...) get behavioral
-    // fixture coverage in tests/mobile_port_test.cjs instead, which is the
-    // only thing that can protect a function with no twin to compare against.
+    // fixture coverage in tests/mobile_port_test.cjs, which is the only thing
+    // that can protect a function with no twin to compare against. The two
+    // sets overlap rather than partition: escapeAttr, formatFileSize and
+    // getFileIcon are pinned here AND covered there, because a byte pin
+    // catches drift without documenting what either copy actually does.
     #[test]
     fn mobile_verbatim_desktop_ports_stay_byte_identical() {
         for decl in [

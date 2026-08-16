@@ -19,10 +19,18 @@
 //
 // Every test extracts the REAL function from the shipped bundle and evals it
 // against fixtures (the tests/email_refresh_test.cjs and invite_chip_test.cjs
-// idiom); nothing here re-implements renderer logic. Functions that are
-// verbatim ports are additionally pinned byte-for-byte in routes.rs, so the
-// two bundles cannot drift silently; the ones covered here are the divergent
-// copies, which a pin cannot protect.
+// idiom); nothing here re-implements renderer logic.
+//
+// Most of what is covered here are the copies that diverge from desktop, which
+// have no twin to be compared against and so can only be protected
+// behaviorally. Three — escapeAttr, formatFileSize, getFileIcon — are instead
+// verbatim ports, and are covered here as well as pinned byte-for-byte by
+// routes.rs' mobile_verbatim_desktop_ports_stay_byte_identical. That overlap is
+// deliberate: the pin catches the two copies drifting apart but says nothing
+// about what either one does, and these three encode contracts (quote
+// escaping, unit thresholds, extension precedence) worth stating outright. So
+// coverage here does not imply divergence, and pinning does not imply a
+// function should be left out of this file.
 //
 // linkifyHtml and htmlToPlainText are absent by necessity: both go through
 // DOMParser, which Node does not provide, and faking it would test the fake.
