@@ -327,7 +327,10 @@ function attachmentUrl(emailId, att) {
 // is later opened keeps the promotion.
 function cacheEmail(email, { opened = false } = {}) {
     const keys = Object.keys(state.emailCache);
-    if (keys.length >= BODY_CACHE_LIMIT) {
+    // No eviction for a re-insert (roborev 526): replacing an existing key
+    // doesn't grow the cache, so evicting would shrink it by one unrelated
+    // body for no capacity gain.
+    if (!(email.id in state.emailCache) && keys.length >= BODY_CACHE_LIMIT) {
         // Evict the oldest PREFETCHED body first (roborev 522): snapshotBodies
         // can only rank what survives eviction, and an opened-blind FIFO let
         // 3-per-open speculative neighbours push today's actually-read mail

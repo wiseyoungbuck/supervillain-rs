@@ -211,6 +211,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         'let initInFlight = false;',
         'let reconnectedDuringBoot = false;',
         'let bootIncomplete = false;',
+        'let undoToastEntry = null;',
         extract(MOBILE, 'function cacheEmail('),
         extract(MOBILE, 'function snapshotBodies('),
         extract(MOBILE, 'function serializeSnapshot('),
@@ -220,6 +221,9 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extract(MOBILE, 'function setOfflineMode('),
         extract(MOBILE, 'function offlineBlocked('),
         extract(MOBILE, 'async function emailAction('),
+        extract(MOBILE, 'function selectAccount('),
+        extract(MOBILE, 'async function performUndo('),
+        extract(MOBILE, 'async function rsvpToEvent('),
         extract(MOBILE, 'function submitSearch('),
         extract(MOBILE, 'function clearSearch('),
         extract(MOBILE, 'async function sendComposedEmail('),
@@ -228,8 +232,9 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extract(MOBILE, 'function handleOnline('),
         extract(MOBILE, 'const pullToRefreshRecognizer = {'),
         extractListener("document.getElementById('detail-attachments').addEventListener('click'"),
+        extractListener("document.getElementById('bottom-nav').addEventListener('click'"),
         `return { persistState, restoreFromSnapshot, snapshotBodies, pullToRefreshRecognizer,
-                  handleOnline,
+                  handleOnline, selectAccount, performUndo, rsvpToEvent,
                   serializeSnapshot, setOfflineMode, offlineBlocked, cacheEmail,
                   emailAction, submitSearch, clearSearch, sendComposedEmail,
                   renderScreenDetail, init,
@@ -251,6 +256,8 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         'renderEmailDetailPartial', 'renderDetailActionBar',
         'setComposeSending', 'doSendComposedEmail', 'cancelAutosave',
         'finishPullRefresh', 'downloadAllAttachments',
+        'hideAccountPicker', 'updateCalendarCard', 'selectMailbox',
+        'setScreen', 'closeSearchBar', 'history',
         code,
     )(
         state, document, localStorage, { onLine: true },
@@ -289,6 +296,12 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         log('cancelAutosave'),
         log('finishPullRefresh'),
         log('downloadAllAttachments'),
+        log('hideAccountPicker'),
+        log('updateCalendarCard'),
+        log('selectMailbox'),
+        log('setScreen'),
+        log('closeSearchBar'),
+        { replaceState() {} },
     );
 
     const snapshot = () => JSON.parse(localStorage.getItem('supervillain_mobile_state_v1'));
@@ -412,6 +425,20 @@ test('prefetched bodies fill the snapshot slots opened mail leaves free', () => 
     }
     assert.ok(ids.includes('pre29'), 'the newest prefetched bodies fill the remainder');
     assert.ok(!ids.includes('pre0'), 'the oldest prefetched bodies are dropped first');
+});
+
+test('re-caching an already-cached id at capacity evicts nothing', () => {
+    // roborev 526: a re-insert replaces its own key — it does not grow the
+    // cache — so running the eviction branch would shrink the cache by one
+    // unrelated body for no capacity gain.
+    const h = makeHarness();
+    for (let i = 0; i < 50; i++) h.cacheEmail(body('e' + i));
+
+    h.cacheEmail(body('e10'));
+
+    assert.strictEqual(Object.keys(h.state.emailCache).length, 50,
+        'replacing an existing key must not shrink the cache');
+    assert.ok(h.state.emailCache.e0, 'no victim may be evicted for a re-insert');
 });
 
 test('opening a prefetched message promotes it to opened for snapshot purposes', async () => {
@@ -576,6 +603,66 @@ test('send is refused offline — no lock taken, no draft posted', async () => {
     assert.ok(!h.names().includes('doSendComposedEmail'));
     assert.ok(!h.names().includes('setComposeSending'));
     assert.strictEqual(h.state.sending, false);
+});
+
+test('RSVP is refused offline — cached-body buttons have no disabled styling', async () => {
+    // roborev 526: the RSVP buttons render from a cached body, so they are
+    // reachable and live-looking in a degraded session — the handler guard is
+    // the only enforcement, and this pins it.
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.currentEmailId = 'e1';
+    h.cacheEmail({ ...body('e1'), calendarEvent: { user_rsvp_status: 'needs-action' } });
+    h.state.api = async (m, p) => { h.calls.push({ name: 'api', args: [m, p] }); return {}; };
+
+    await h.rsvpToEvent('accepted');
+
+    assert.ok(!h.names().includes('api'), 'no RSVP POST may be attempted offline');
+    assert.strictEqual(h.state.emailCache.e1.calendarEvent.user_rsvp_status, 'needs-action',
+        'the optimistic flip must not happen for a refused RSVP');
+    assert.ok(h.names().includes('showToast'), 'the refusal must be visible');
+});
+
+test('undo is refused offline — the undo record survives for later', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    const entry = { action: 'archive', email: email('e1'), index: 0, mailboxId: 'mb-inbox', settled: null };
+    h.state.undoStack.push(entry);
+    h.state.api = async (m, p) => { h.calls.push({ name: 'api', args: [m, p] }); };
+
+    await h.performUndo();
+
+    assert.ok(!h.names().includes('api'), 'no move-back may be attempted offline');
+    assert.strictEqual(h.state.undoStack.length, 1,
+        'the entry must not be popped — it is the only record of what to undo');
+    assert.ok(h.names().includes('showToast'), 'the refusal must be visible');
+});
+
+test('account switching is refused offline and the picker is dismissed', () => {
+    // The picker renders from the CACHED accounts list, so it opens and its
+    // rows look live in a degraded session.
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+
+    h.selectAccount({ id: 'acct-2', email: 'other@example.com' });
+
+    assert.strictEqual(h.state.currentAccount.id, 'acct-1',
+        'the switch must not happen offline — its whole body is a reload cascade');
+    assert.ok(!h.names().includes('loadMailboxes'));
+    assert.ok(h.names().includes('hideAccountPicker'),
+        'the modal must not stay up over the refusal toast');
+    assert.ok(h.names().includes('showToast'));
+});
+
+test('bottom-nav mailbox switching is refused offline with a visible toast', () => {
+    // A degraded session never fetched /mailboxes, so without the guard the
+    // tap would silently no-op — the toast is the only honest answer.
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    const handler = h.document.getElementById('bottom-nav').listeners.click;
+    assert.ok(handler, 'the bottom-nav click handler must be registered');
+
+    handler({ target: { closest: () => ({ dataset: { role: 'archive' } }) } });
+
+    assert.ok(!h.names().includes('selectMailbox'));
+    assert.ok(h.names().includes('showToast'), 'the refusal must be visible');
 });
 
 test('actions are allowed again once offline mode clears', async () => {
