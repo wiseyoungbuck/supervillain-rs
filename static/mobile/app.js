@@ -328,7 +328,13 @@ function attachmentUrl(emailId, att) {
 function cacheEmail(email, { opened = false } = {}) {
     const keys = Object.keys(state.emailCache);
     if (keys.length >= BODY_CACHE_LIMIT) {
-        delete state.emailCache[keys[0]];
+        // Evict the oldest PREFETCHED body first (roborev 522): snapshotBodies
+        // can only rank what survives eviction, and an opened-blind FIFO let
+        // 3-per-open speculative neighbours push today's actually-read mail
+        // out of the cache before the snapshot was ever taken. Plain FIFO
+        // only once every entry is opened.
+        const victim = keys.find(k => !state.emailCache[k].openedByUser) || keys[0];
+        delete state.emailCache[victim];
     }
     email.openedByUser = opened
         || !!email.openedByUser
@@ -3015,8 +3021,16 @@ function handleOnline() {
     // 'Cannot reach server' boot, which previously stayed stuck until a
     // manual reload. A degraded session (kata 2chc) needs the same full boot
     // even though it HAS an accounts list — that list came out of the snapshot,
-    // not the server, and mailboxes/splits/identities are still unfetched.
-    if (state.offlineMode || !state.accounts.length) {
+    // not the server, and mailboxes/splits/identities are still unfetched. So
+    // does the pre-fetch paint's revalidation window (roborev 522): the paint
+    // seeds state.accounts from the snapshot before offlineMode is decided,
+    // and currentMailbox is still null — a bare mailbox-less refresh can't
+    // recover that state either.
+    if (initInFlight || state.offlineMode || !state.accounts.length || !state.currentMailbox) {
+        // A boot already in flight will swallow the init() below via its
+        // reentrancy guard — remember the connectivity signal so its finally
+        // block can honor it (roborev 522).
+        if (initInFlight) reconnectedDuringBoot = true;
         init();
         return;
     }
@@ -3358,6 +3372,11 @@ function restoreFromSnapshot({ offline = false } = {}) {
 // selectAccount against each other, so a second call while one is still
 // pending is a no-op rather than a re-entrant boot.
 let initInFlight = false;
+// An online event that landed while a boot was in flight (roborev 522): the
+// reentrancy guard swallows the re-run, but the signal must not be lost —
+// the boot's own fetch may have started before the radio came back and be
+// about to fail into a degraded session no future online event will fix.
+let reconnectedDuringBoot = false;
 
 async function init() {
     if (initInFlight) return;
@@ -3473,6 +3492,14 @@ async function init() {
         }
     } finally {
         initInFlight = false;
+        // Honor a reconnect the reentrancy guard swallowed — but only when
+        // this boot still ended degraded (its fetch raced the radio and
+        // lost); a boot that succeeded already has live data. One retry per
+        // swallowed event: the flag clears before the re-run (roborev 522).
+        if (reconnectedDuringBoot) {
+            reconnectedDuringBoot = false;
+            if (state.offlineMode) init();
+        }
     }
 }
 

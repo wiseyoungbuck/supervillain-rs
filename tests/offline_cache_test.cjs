@@ -189,10 +189,13 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         calls.push({ name: 'api', args: [method, path] });
         return null;
     };
+    // accountsResult may be a function to script per-attempt results (e.g. a
+    // fetch that fails once, then succeeds after reconnect).
     const loadAccounts = async () => {
         calls.push({ name: 'loadAccounts', args: [] });
-        if (accountsResult instanceof Error) throw accountsResult;
-        state.accounts = accountsResult || [];
+        const result = typeof accountsResult === 'function' ? accountsResult() : accountsResult;
+        if (result instanceof Error) throw result;
+        state.accounts = result || [];
     };
 
     const code = [
@@ -206,6 +209,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extractConst('OFFLINE_BANNER_CACHED'),
         extractConstArray('OFFLINE_DISABLED_CONTROLS'),
         'let initInFlight = false;',
+        'let reconnectedDuringBoot = false;',
         extract(MOBILE, 'function cacheEmail('),
         extract(MOBILE, 'function snapshotBodies('),
         extract(MOBILE, 'function serializeSnapshot('),
@@ -864,6 +868,71 @@ test('a fully-online persist never parses the previous snapshot blob', () => {
     assert.deepStrictEqual(h.localStorage.reads, [],
         'no localStorage read may happen when state supplies every carried field');
     assert.deepStrictEqual(h.snapshot().accounts.map(a => a.id), ['acct-1']);
+});
+
+test('prefetches past the cache limit never evict opened mail from the cache itself', () => {
+    // roborev 522: snapshotBodies ranks opened over prefetched, but it can
+    // only rank what survives cache eviction — an opened-blind FIFO at
+    // BODY_CACHE_LIMIT (50) lets 3-per-open speculative neighbours push
+    // today's actually-read mail out before the snapshot is ever taken.
+    // 20 opens with 3 prefetched neighbours each = 80 inserts through 50 slots.
+    const h = makeHarness();
+    h.state.accounts = [{ id: 'acct-1' }];
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    for (let i = 0; i < 20; i++) {
+        h.cacheEmail(body('open' + i), { opened: true });
+        for (let j = 0; j < 3; j++) h.cacheEmail(body(`pre${i}_${j}`));
+    }
+
+    h.persistState();
+
+    const ids = h.snapshot().bodies.map(b => b.id);
+    assert.strictEqual(ids.length, 20);
+    assert.ok(ids.every(id => id.startsWith('open')),
+        `all 20 opened messages must survive to the snapshot, got ${ids.join(',')}`);
+});
+
+test('handleOnline mid-revalidation reroutes to the full boot, not a bare list refresh', () => {
+    // roborev 522: the pre-fetch paint seeds state.accounts from the snapshot
+    // while offlineMode is still false and currentMailbox is still null. An
+    // online event in that window must not take the bare-refresh path — a
+    // mailbox-less loadEmails cannot recover a half-initialized session.
+    const h = makeHarness({ accountsResult: [{ id: 'acct-1', email: 'me@example.com' }] });
+    h.state.accounts = [{ id: 'acct-1', email: 'me@example.com' }];
+    h.state.currentAccount = h.state.accounts[0];
+    h.state.currentMailbox = null;
+
+    h.handleOnline();
+
+    assert.ok(h.names().includes('loadAccounts'),
+        'a session with no mailbox must re-run the boot');
+    assert.ok(!h.names().includes('loadEmails'),
+        'a bare mailbox-less refresh cannot recover the session');
+});
+
+test('an online event swallowed by an in-flight boot still escapes the degraded session', async () => {
+    // roborev 522: init's reentrancy guard eats a reconnect that lands
+    // mid-boot. If that boot's fetch (started before the radio came back)
+    // then fails and commits to the degraded session, no further online event
+    // ever fires — the signal must be remembered and honored with a retry.
+    let attempt = 0;
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: () => (++attempt === 1
+            ? new ApiError('Network error: failed to fetch')
+            : [{ id: 'acct-1', email: 'me@example.com' }]),
+    });
+
+    const boot = h.init();       // fetch will fail — started before the radio
+    h.handleOnline();            // reconnect mid-boot, swallowed by the guard
+    await boot;
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.strictEqual(h.state.offlineMode, false,
+        'the reconnect signal must survive the reentrancy guard');
+    assert.strictEqual(attempt, 2, 'the boot must have been retried once');
 });
 
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {
