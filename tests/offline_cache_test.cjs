@@ -935,6 +935,30 @@ test('an online event swallowed by an in-flight boot still escapes the degraded 
     assert.strictEqual(attempt, 2, 'the boot must have been retried once');
 });
 
+test('a swallowed reconnect also rescues the snapshot-less boot', async () => {
+    // roborev 523: same race as the degraded-boot rescue, but with no usable
+    // snapshot — the boot ends at 'Cannot reach server' with offlineMode
+    // still false, and a retry gated on offlineMode alone discards the
+    // remembered signal. The device is already online, so no future online
+    // event will ever fire; without the retry the session is stuck.
+    let attempt = 0;
+    const h = makeHarness({
+        accountsResult: () => (++attempt === 1
+            ? new ApiError('Network error: failed to fetch')
+            : [{ id: 'acct-1', email: 'me@example.com', isDefault: true }]),
+    });
+
+    const boot = h.init();       // fetch will fail — started before the radio
+    h.handleOnline();            // reconnect mid-boot, swallowed by the guard
+    await boot;
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.strictEqual(attempt, 2,
+        'the snapshot-less boot must be retried too — it cannot self-recover');
+    assert.deepStrictEqual(h.state.accounts.map(a => a.id), ['acct-1']);
+});
+
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {
     const h = makeHarness({
         storage: { [KEY]: savedBlob() },

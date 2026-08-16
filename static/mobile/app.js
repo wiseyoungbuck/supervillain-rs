@@ -3493,12 +3493,17 @@ async function init() {
     } finally {
         initInFlight = false;
         // Honor a reconnect the reentrancy guard swallowed — but only when
-        // this boot still ended degraded (its fetch raced the radio and
-        // lost); a boot that succeeded already has live data. One retry per
+        // this boot ended somewhere it can't self-recover from: a degraded
+        // session, or the snapshot-less 'Cannot reach server' dead end
+        // (accounts never loaded, roborev 523) — the device is already
+        // online, so no future online event will fire for either. A boot
+        // that succeeded already has live data. Deliberately NOT gated on
+        // currentMailbox, which is transiently null after a successful
+        // online restore while its cascade is still in flight. One retry per
         // swallowed event: the flag clears before the re-run (roborev 522).
         if (reconnectedDuringBoot) {
             reconnectedDuringBoot = false;
-            if (state.offlineMode) init();
+            if (state.offlineMode || !state.accounts.length) init();
         }
     }
 }
