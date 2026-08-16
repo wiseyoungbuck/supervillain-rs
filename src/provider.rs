@@ -1070,6 +1070,15 @@ END:VCALENDAR</C:calendar-data></D:prop>
         );
         assert_eq!(dels[0].path, inbox_obj);
         assert_eq!(dels[0].header("schedule-reply"), Some("F"));
+        // Ordering is part of the contract: the invitation is consumed only
+        // AFTER the PARTSTAT write succeeds, so a failed calendar write
+        // can't destroy the queued invite (roborev 513).
+        let pos = |m: &str| rec.iter().position(|r| r.method == m).unwrap();
+        assert!(
+            pos("PUT") < pos("REPORT") && pos("REPORT") < pos("DELETE"),
+            "wire order must be PUT then REPORT then DELETE: {:?}",
+            rec.iter().map(|r| r.method.as_str()).collect::<Vec<_>>()
+        );
     }
 
     fn rsvp_fastmail_arm_src() -> String {
