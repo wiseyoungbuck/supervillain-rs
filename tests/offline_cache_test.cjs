@@ -210,6 +210,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extractConstArray('OFFLINE_DISABLED_CONTROLS'),
         'let initInFlight = false;',
         'let reconnectedDuringBoot = false;',
+        'let bootIncomplete = false;',
         extract(MOBILE, 'function cacheEmail('),
         extract(MOBILE, 'function snapshotBodies('),
         extract(MOBILE, 'function serializeSnapshot('),
@@ -980,6 +981,79 @@ test('a swallowed reconnect also rescues the snapshot-less boot', async () => {
     assert.strictEqual(attempt, 2,
         'the snapshot-less boot must be retried too — it cannot self-recover');
     assert.deepStrictEqual(h.state.accounts.map(a => a.id), ['acct-1']);
+});
+
+test('reconnect after an auth-failed painted boot re-runs the full boot', async () => {
+    // roborev 525: the ApiAuthError-with-paint exit leaves accounts and
+    // currentAccount seeded from the snapshot, offlineMode false, and no
+    // mailbox cascade — the one incomplete terminal state the
+    // offlineMode/accounts/currentAccount predicates all miss. After the
+    // user re-authorizes, recovery signals must reboot, not bare-refresh a
+    // session whose bottom nav has no mailboxes to switch to.
+    let attempt = 0;
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: () => (++attempt === 1
+            ? new ApiAuthError('session expired', 401)
+            : [{ id: 'acct-1', email: 'me@example.com' }]),
+    });
+    await h.init();          // paint sticks, auth failure — no degraded session
+    h.calls.length = 0;
+
+    h.handleOnline();
+
+    assert.ok(h.names().includes('loadAccounts'),
+        'the half-initialized auth aftermath must re-run the boot');
+    assert.ok(!h.names().includes('loadEmails'),
+        'a bare refresh cannot restore the missing mailbox cascade');
+    await new Promise(resolve => setImmediate(resolve));
+});
+
+test('pull-to-refresh after an auth-failed painted boot also reboots', async () => {
+    let attempt = 0;
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: () => (++attempt === 1
+            ? new ApiAuthError('session expired', 401)
+            : [{ id: 'acct-1', email: 'me@example.com' }]),
+    });
+    await h.init();
+    h.calls.length = 0;
+    h.document.getElementById('pull-indicator').style.height = '100px';
+
+    h.pullToRefreshRecognizer.end();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.ok(h.names().includes('loadAccounts'),
+        'the manual escape must work for the auth aftermath too');
+    assert.ok(h.names().includes('finishPullRefresh'));
+});
+
+test('a quota throw degrades to a bodiless snapshot instead of none', () => {
+    // roborev 525: bodies are the declared sacrificial payload, but a
+    // setItem that throws despite the serialization cap dropped the WHOLE
+    // snapshot — list rows and accounts included — exactly the fields an
+    // offline cold start cannot boot without.
+    const h = makeHarness();
+    h.state.accounts = [{ id: 'acct-1', email: 'me@example.com' }];
+    h.state.currentAccount = h.state.accounts[0];
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    h.state.emails = [email('e1')];
+    h.cacheEmail(body('e1', 5000), { opened: true });
+    const realSet = h.localStorage.setItem.bind(h.localStorage);
+    h.localStorage.setItem = (k, v) => {
+        if (v.length > 3000) throw new Error('QuotaExceededError');
+        realSet(k, v);
+    };
+
+    h.persistState();
+
+    const snap = h.snapshot();
+    assert.ok(snap, 'the snapshot must survive a quota throw');
+    assert.deepStrictEqual(snap.bodies, [], 'bodies are shed on quota');
+    assert.deepStrictEqual(snap.emails.map(e => e.id), ['e1'],
+        'the list rows a cold start needs must still be written');
+    assert.deepStrictEqual(snap.accounts.map(a => a.id), ['acct-1']);
 });
 
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {

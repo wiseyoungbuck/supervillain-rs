@@ -2743,7 +2743,7 @@ const pullToRefreshRecognizer = {
             // cached paint for live state. This is the only manual escape from
             // a server-down session, where no 'online' event ever fires to
             // trigger handleOnline.
-            if (state.offlineMode) {
+            if (state.offlineMode || bootIncomplete) {
                 init().finally(finishPullRefresh);
                 return;
             }
@@ -3030,7 +3030,8 @@ function handleOnline() {
     // The currentAccount check covers the rejected-paint aftermath, where
     // accounts exist but nothing is selected — a bare refresh has no API to
     // refresh through.
-    if (initInFlight || state.offlineMode || !state.accounts.length || !state.currentAccount) {
+    if (initInFlight || state.offlineMode || bootIncomplete
+        || !state.accounts.length || !state.currentAccount) {
         // A boot already in flight will swallow the init() below via its
         // reentrancy guard — remember the connectivity signal so its finally
         // block can honor it (roborev 522).
@@ -3182,32 +3183,45 @@ function persistState() {
     const accounts = state.accounts.length
         ? state.accounts
         : (Array.isArray(loadPrev()?.accounts) ? loadPrev().accounts : []);
+    const snapshot = {
+        accountId: state.currentAccount.id,
+        // Lets the degraded offline restore label the account button
+        // without an account list to look the id up in.
+        accountEmail: state.currentAccount.email || null,
+        accounts,
+        mailboxRole,
+        mailboxId,
+        splitId: state.currentSplit,
+        searchQuery: state.searchQuery,
+        emails: state.emails.slice(0, PAGE_SIZE),
+        bodies: snapshotBodies(),
+        listScrollTop,
+        // The rows' actual fetch time, not "now" — re-persisting the same
+        // rows (e.g. a degraded offline session's background snapshot
+        // cycle) must not re-stamp them fresh and defeat restoreFromSnapshot's
+        // 24h gate. Falls back to now before any fetch has happened this
+        // session (first-run boot), matching prior behavior.
+        savedAt: state.emailsFetchedAt ?? Date.now(),
+    };
     try {
-        localStorage.setItem(MOBILE_STATE_KEY, serializeSnapshot({
-            accountId: state.currentAccount.id,
-            // Lets the degraded offline restore label the account button
-            // without an account list to look the id up in.
-            accountEmail: state.currentAccount.email || null,
-            accounts,
-            mailboxRole,
-            mailboxId,
-            splitId: state.currentSplit,
-            searchQuery: state.searchQuery,
-            emails: state.emails.slice(0, PAGE_SIZE),
-            bodies: snapshotBodies(),
-            listScrollTop,
-            // The rows' actual fetch time, not "now" — re-persisting the same
-            // rows (e.g. a degraded offline session's background snapshot
-            // cycle) must not re-stamp them fresh and defeat restoreFromSnapshot's
-            // 24h gate. Falls back to now before any fetch has happened this
-            // session (first-run boot), matching prior behavior.
-            savedAt: state.emailsFetchedAt ?? Date.now(),
-        }));
-    } catch (err) {
-        // Quota exceeded or a private-mode storage denial — a warm snapshot is
-        // a best-effort optimization, never a user-facing failure. Log only;
-        // the bottom toast is reserved for user-affecting failures.
-        console.warn('State snapshot failed:', err);
+        localStorage.setItem(MOBILE_STATE_KEY, serializeSnapshot(snapshot));
+    } catch (_err) {
+        // setItem can throw even under the serialization cap: the ~5 MB quota
+        // is shared origin-wide, and a browser that accounts it in UTF-16
+        // BYTES sees a 2 M-char blob as ~4 MB. Bodies are the sacrificial
+        // payload (see serializeSnapshot) — retry without them before giving
+        // up, so a body-inflated write degrades to the pre-2chc ~25 KB
+        // snapshot rather than leaving no snapshot at all (roborev 525).
+        try {
+            localStorage.setItem(
+                MOBILE_STATE_KEY, serializeSnapshot({ ...snapshot, bodies: [] }));
+        } catch (err) {
+            // Still failing (private-mode denial, quota exhausted by other
+            // data) — a warm snapshot is a best-effort optimization, never a
+            // user-facing failure. Log only; the bottom toast is reserved for
+            // user-affecting failures.
+            console.warn('State snapshot failed:', err);
+        }
     }
 }
 
@@ -3381,6 +3395,14 @@ let initInFlight = false;
 // the boot's own fetch may have started before the radio came back and be
 // about to fail into a degraded session no future online event will fix.
 let reconnectedDuringBoot = false;
+// True between a boot that exited without live accounts and the next boot
+// that gets them (roborev 525). offlineMode covers the degraded exit, but the
+// painted-boot-hits-ApiAuthError exit leaves accounts and currentAccount
+// seeded from the snapshot with offlineMode false — a terminal state the
+// recovery predicates can't otherwise tell from a healthy session, so a
+// reconnect or pull after re-authorizing would bare-refresh a session that
+// never fetched mailboxes.
+let bootIncomplete = false;
 
 async function init() {
     if (initInFlight) return;
@@ -3418,6 +3440,9 @@ async function init() {
             // the early return so both the degraded-restore and the error
             // paths dismiss it. (No-op when the paint above already did it.)
             hideBootSplash();
+            // Whatever branch below runs, this boot has no live session —
+            // arm the recovery predicates (roborev 525).
+            bootIncomplete = true;
             // Now the failure is confirmed — but only a CONNECTIVITY failure
             // degrades. ApiAuthError (api.js taxonomy) means the session needs
             // re-authorization in desktop Settings; dressing that as 'Offline'
@@ -3452,6 +3477,7 @@ async function init() {
 
         // Live accounts in hand: whatever degraded session was on screen is
         // over (kata 2chc) — banner down, actions re-enabled.
+        bootIncomplete = false;
         setOfflineMode(false);
 
         // Resume from a snapshot when one is valid (kata mhck, task A13): renders
