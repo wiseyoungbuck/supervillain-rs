@@ -108,11 +108,13 @@ function makeDocument() {
 
 function makeStorage(initial = {}) {
     const data = { ...initial };
+    const reads = [];
     return {
-        getItem: (k) => (k in data ? data[k] : null),
+        getItem(k) { reads.push(k); return (k in data ? data[k] : null); },
         setItem(k, v) { data[k] = String(v); },
         removeItem(k) { delete data[k]; },
         raw: data,
+        reads,
     };
 }
 
@@ -818,6 +820,50 @@ test('attachment download-all still fires online', () => {
     assert.ok(h.names().includes('downloadAllAttachments'),
         'the offline guard must not eat online download-all taps');
     assert.strictEqual(prevented, false);
+});
+
+test('an auth failure during a degraded-session reboot drops offline mode', async () => {
+    // roborev 521: a degraded session whose handleOnline/pull-to-refresh
+    // reboot discovers the session expired must not keep wearing the offline
+    // dress — 'showing cached mail' plus disabled controls over an 'Account
+    // needs re-authorization' status is the exact mixed signal the ApiAuthError
+    // carve-out exists to prevent, and the cold-boot path already leaves
+    // controls enabled.
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: new ApiAuthError('session expired', 401),
+        stateOverrides: { offlineMode: true },
+    });
+    h.setOfflineMode(true);
+
+    await h.init();
+
+    assert.strictEqual(h.state.offlineMode, false,
+        'auth means re-authorize, not airplane mode — even on the reboot path');
+    assert.strictEqual(
+        h.document.getElementById('offline-banner').classList.contains('visible'), false);
+    for (const id of h.OFFLINE_DISABLED_CONTROLS) {
+        assert.strictEqual(h.document.getElementById(id).disabled, false,
+            `${id} must be re-enabled once the failure is known to be auth, not network`);
+    }
+});
+
+test('a fully-online persist never parses the previous snapshot blob', () => {
+    // roborev 521: persistState runs on visibilitychange/pagehide inside iOS's
+    // pre-suspend budget, and the previous blob can now be ~2 MB of bodies. A
+    // session that can supply the mailbox and the accounts list itself must
+    // not spend that budget parsing a carry-forward source it will not use.
+    const h = makeHarness({ storage: { [KEY]: savedBlob() } });
+    h.state.accounts = [{ id: 'acct-1', email: 'me@example.com' }];
+    h.state.currentAccount = h.state.accounts[0];
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    h.localStorage.reads.length = 0;
+
+    h.persistState();
+
+    assert.deepStrictEqual(h.localStorage.reads, [],
+        'no localStorage read may happen when state supplies every carried field');
+    assert.deepStrictEqual(h.snapshot().accounts.map(a => a.id), ['acct-1']);
 });
 
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {

@@ -12124,8 +12124,11 @@ white   = '#fdf6e3'
         let rest = &MOBILE_APP_JS[start..];
         let end = rest.find("\n}").expect("persistState body must close");
         let region = &rest[..end];
+        // roborev 521 made the previous-blob read lazy (loadPrev) so the iOS
+        // pre-suspend persist never parses a multi-MB snapshot it won't use;
+        // the fallback itself is unchanged.
         assert!(
-            region.contains("prev.mailboxRole"),
+            region.contains("loadPrev().mailboxRole"),
             "a null currentMailbox must fall back to the previous snapshot's mailbox"
         );
     }

@@ -3129,11 +3129,22 @@ function persistState() {
         ? wrap.scrollTop
         : state.listScrollTop;
     // The previous blob is the carry-forward source for every field this
-    // session can't supply itself. Read once, used twice below.
-    let prev = null;
-    try {
-        prev = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null');
-    } catch (_e) { /* unreadable previous snapshot — carry nothing forward */ }
+    // session can't supply itself — but it can now be ~2 MB of bodies, and
+    // persistState runs on visibilitychange/pagehide inside iOS's tight
+    // pre-suspend budget. Parse it lazily and at most once: a normal online
+    // session (mailbox picked, accounts fetched) never needs it, so the
+    // budget stays reserved for the serialize+write below (roborev 521).
+    let prevMemo;
+    const loadPrev = () => {
+        if (prevMemo === undefined) {
+            try {
+                prevMemo = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null');
+            } catch (_e) {
+                prevMemo = null; // unreadable previous snapshot — carry nothing forward
+            }
+        }
+        return prevMemo;
+    };
     // The restore window (and a whole degraded offline session) runs with
     // currentMailbox still null — mailboxes haven't been fetched. Writing
     // mailboxRole: null then would lose the saved mailbox on the NEXT resume,
@@ -3141,9 +3152,9 @@ function persistState() {
     // a cross-account carry would pin a foreign mailbox id).
     let mailboxRole = state.currentMailbox?.role || null;
     let mailboxId = state.currentMailbox?.id || null;
-    if (!state.currentMailbox && prev?.accountId === state.currentAccount.id) {
-        mailboxRole = prev.mailboxRole || null;
-        mailboxId = prev.mailboxId || null;
+    if (!state.currentMailbox && loadPrev()?.accountId === state.currentAccount.id) {
+        mailboxRole = loadPrev().mailboxRole || null;
+        mailboxId = loadPrev().mailboxId || null;
     }
     // Same reasoning for the accounts list (kata 2chc): a session that never
     // got a /accounts response has an empty state.accounts, and writing that
@@ -3152,7 +3163,7 @@ function persistState() {
     // account-scoped.
     const accounts = state.accounts.length
         ? state.accounts
-        : (Array.isArray(prev?.accounts) ? prev.accounts : []);
+        : (Array.isArray(loadPrev()?.accounts) ? loadPrev().accounts : []);
     try {
         localStorage.setItem(MOBILE_STATE_KEY, serializeSnapshot({
             accountId: state.currentAccount.id,
@@ -3367,7 +3378,12 @@ async function init() {
         // good snapshot on disk. Offline mode is NOT entered here: the server
         // may well answer in a moment, and a banner that flashes 'Offline' on
         // every warm launch teaches the user to ignore it. Until the fetch
-        // actually fails, this is a stale-while-revalidate paint.
+        // actually fails, this is a stale-while-revalidate paint. Known
+        // tradeoff (roborev 521): the painted UI is interactive before the
+        // snapshot's account is validated, so a tap in that window acts on an
+        // account the fetch may be about to reject — each such request fails
+        // server-side with its own error toast, and the rejected-paint
+        // cleanup below resets the display, so the window self-corrects.
         const painted = restoreFromSnapshot({ offline: true });
         if (painted) hideBootSplash();
 
@@ -3392,6 +3408,16 @@ async function init() {
                 // init() on reconnect for the full boot.
                 setOfflineMode(true);
                 return;
+            }
+            // A degraded session can reach here too — handleOnline and the
+            // offline pull-to-refresh reboot through init(), and the reboot
+            // may discover the session EXPIRED rather than the network back.
+            // Keeping the cached-mail banner and dimmed controls over the
+            // re-authorize status would be the exact mixed signal the
+            // carve-out above exists to prevent, so drop the degraded state
+            // before showing it (roborev 521).
+            if (err instanceof ApiAuthError && state.offlineMode) {
+                setOfflineMode(false);
             }
             showError('Load accounts', err);
             showStatus(err instanceof ApiAuthError
