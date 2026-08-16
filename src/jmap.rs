@@ -2911,34 +2911,44 @@ fn xml_escape_text(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-static NUMERIC_ENTITY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"&#(x[0-9A-Fa-f]+|[0-9]+);").expect("static regex"));
+static XML_ENTITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"&(lt|gt|quot|apos|amp|#x[0-9A-Fa-f]+|#[0-9]+);").expect("static regex")
+});
 
 /// Reverse of [`xml_escape_text`] plus the standard named entities and
 /// numeric character references a server may emit in `calendar-data` text
 /// nodes — notably `&#13;`: conforming XML emitters must encode CR that
 /// way to survive parser newline normalization, so a CRLF-lined ICS can
-/// arrive with every line suffixed by one (roborev 510). `&amp;` decodes
-/// last so escaped ampersands can't cascade into a second decode (an
-/// escaped `&amp;#13;` contains no `&#…;` span, so the numeric pass can't
-/// touch it either).
+/// arrive with every line suffixed by one (roborev 510). Decoded in ONE
+/// left-to-right pass whose replacements are never rescanned, so no
+/// decode can cascade into another in either direction — sequential
+/// replace passes can't be ordered safely for both `&amp;#13;` and
+/// `&#38;amp;` (roborev 511). Malformed or out-of-range references are
+/// left as-is.
 fn xml_unescape_text(s: &str) -> String {
-    let s = s
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'");
-    let s = NUMERIC_ENTITY_RE.replace_all(&s, |c: &regex::Captures| {
-        let t = &c[1];
-        let n = match t.strip_prefix('x') {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => t.parse::<u32>().ok(),
-        };
-        n.and_then(char::from_u32)
-            .map(String::from)
-            .unwrap_or_else(|| c[0].to_string())
-    });
-    s.replace("&amp;", "&")
+    XML_ENTITY_RE
+        .replace_all(s, |c: &regex::Captures| {
+            let entity = &c[1];
+            let decoded = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                num => {
+                    let num = num.strip_prefix('#').expect("regex admits only #-refs");
+                    match num.strip_prefix('x') {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse::<u32>().ok(),
+                    }
+                    .and_then(char::from_u32)
+                }
+            };
+            decoded
+                .map(String::from)
+                .unwrap_or_else(|| c[0].to_string())
+        })
+        .into_owned()
 }
 
 /// Extract the VEVENT UID from raw ICS text. Tolerates the legal shapes a
@@ -2963,8 +2973,16 @@ fn ics_uid(ics: &str) -> Option<String> {
         match rest.as_bytes().first() {
             Some(b':') => return Some(rest[1..].to_string()),
             Some(b';') => {
-                if let Some(idx) = rest.find(':') {
-                    return Some(rest[idx + 1..].to_string());
+                // The value delimiter is the first colon OUTSIDE quoted
+                // parameter values — RFC 5545 §3.2 quoted-strings may
+                // contain colons (`UID;X-REF="urn:x":value`), roborev 511.
+                let mut in_quotes = false;
+                for (idx, ch) in rest.char_indices() {
+                    match ch {
+                        '"' => in_quotes = !in_quotes,
+                        ':' if !in_quotes => return Some(rest[idx + 1..].to_string()),
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -7076,6 +7094,11 @@ END:VCALENDAR";
         );
         assert_eq!(ics_uid("UID:fol\r\n\tded\r\n").as_deref(), Some("folded"));
         assert_eq!(ics_uid("UID:cr-suffixed\r").as_deref(), Some("cr-suffixed"));
+        assert_eq!(
+            ics_uid("UID;X-REF=\"urn:x\":real-uid\n").as_deref(),
+            Some("real-uid"),
+            "a quoted parameter value containing a colon must not truncate the value"
+        );
         assert_eq!(ics_uid("UIDX:not-a-uid\n"), None);
     }
 
@@ -7087,6 +7110,11 @@ END:VCALENDAR";
         assert_eq!(xml_unescape_text("UID:x&#13;"), "UID:x\r");
         assert_eq!(xml_unescape_text("a&#x41;b"), "aAb");
         assert_eq!(xml_unescape_text("&amp;#13;"), "&#13;");
+        assert_eq!(
+            xml_unescape_text("&#38;amp;"),
+            "&amp;",
+            "a numerically-encoded ampersand must not cascade into a named-entity decode"
+        );
         assert_eq!(xml_unescape_text("bad&#zz;ref"), "bad&#zz;ref");
     }
 
