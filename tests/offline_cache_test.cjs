@@ -205,7 +205,8 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extract(MOBILE, 'async function sendComposedEmail('),
         extract(MOBILE, 'async function renderScreenDetail('),
         extract(MOBILE, 'async function init('),
-        `return { persistState, restoreFromSnapshot, snapshotBodies,
+        extract(MOBILE, 'const pullToRefreshRecognizer = {'),
+        `return { persistState, restoreFromSnapshot, snapshotBodies, pullToRefreshRecognizer,
                   serializeSnapshot, setOfflineMode, offlineBlocked, cacheEmail,
                   emailAction, submitSearch, clearSearch, sendComposedEmail,
                   renderScreenDetail, init,
@@ -226,6 +227,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         'prefetchAdjacentEmails', 'renderEmailDetail',
         'renderEmailDetailPartial', 'renderDetailActionBar',
         'setComposeSending', 'doSendComposedEmail', 'cancelAutosave',
+        'finishPullRefresh',
         code,
     )(
         state, document, localStorage, { onLine: true },
@@ -262,6 +264,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         (sending) => { state.sending = sending; calls.push({ name: 'setComposeSending', args: [sending] }); },
         async () => { calls.push({ name: 'doSendComposedEmail', args: [] }); },
         log('cancelAutosave'),
+        log('finishPullRefresh'),
     );
 
     const snapshot = () => JSON.parse(localStorage.getItem('supervillain_mobile_state_v1'));
@@ -327,6 +330,58 @@ test('snapshot keeps only the most recent SNAPSHOT_BODY_LIMIT bodies, oldest evi
     assert.strictEqual(ids.length, limit);
     assert.strictEqual(ids[0], 'e5', 'the five oldest opens must be evicted, not the newest');
     assert.strictEqual(ids[ids.length - 1], 'e' + (limit + 4));
+});
+
+test('prefetched neighbours never crowd opened mail out of the snapshot', () => {
+    // roborev 517: prefetchAdjacentEmails caches up to 3 unread neighbours per
+    // open, so a purely recency-ordered tail would fill the 20 body slots with
+    // speculative fodder and evict the mail the user actually read today —
+    // which then reports "not opened while connected" offline.
+    const h = makeHarness();
+    h.state.accounts = [{ id: 'acct-1' }];
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    for (let i = 0; i < 20; i++) h.cacheEmail(body('open' + i), { opened: true });
+    for (let i = 0; i < 20; i++) h.cacheEmail(body('pre' + i));
+
+    h.persistState();
+
+    const ids = h.snapshot().bodies.map(b => b.id);
+    assert.strictEqual(ids.length, 20);
+    assert.ok(ids.every(id => id.startsWith('open')),
+        `opened mail must own every slot when it fills them, got ${ids.join(',')}`);
+});
+
+test('prefetched bodies fill the snapshot slots opened mail leaves free', () => {
+    const h = makeHarness();
+    h.state.accounts = [{ id: 'acct-1' }];
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    for (let i = 0; i < 5; i++) h.cacheEmail(body('open' + i), { opened: true });
+    for (let i = 0; i < 30; i++) h.cacheEmail(body('pre' + i));
+
+    h.persistState();
+
+    const ids = h.snapshot().bodies.map(b => b.id);
+    assert.strictEqual(ids.length, 20);
+    for (let i = 0; i < 5; i++) {
+        assert.ok(ids.includes('open' + i), `opened body open${i} must survive`);
+    }
+    assert.ok(ids.includes('pre29'), 'the newest prefetched bodies fill the remainder');
+    assert.ok(!ids.includes('pre0'), 'the oldest prefetched bodies are dropped first');
+});
+
+test('opening a prefetched message promotes it to opened for snapshot purposes', async () => {
+    const h = makeHarness();
+    h.state.emails = [email('e1')];
+    h.state.currentEmailId = 'e1';
+    h.state.api = async () => null;
+    h.cacheEmail(body('e1'));
+
+    await h.renderScreenDetail('e1');
+
+    assert.strictEqual(h.state.emailCache.e1.openedByUser, true,
+        'a prefetched body the user then opens must claim an opened slot');
 });
 
 test('serializeSnapshot drops bodies oldest-first until the blob fits the cap', () => {
@@ -581,6 +636,76 @@ test('an auth failure is NOT swallowed into the offline path', async () => {
     const reported = h.calls.find(c => c.name === 'showError');
     assert.ok(reported, 'the auth failure must still be reported');
     assert.ok(reported.args[1] instanceof ApiAuthError);
+});
+
+test('a paint the online restore rejects is cleared, not left on screen', async () => {
+    // roborev 517: the pre-fetch paint skips the connected-account check (there
+    // is no account list yet). When the fetch then succeeds and the snapshot's
+    // account is gone, the online restore rejects it — but the no-connected-
+    // account branch never resets the list, so foreign cached mail would sit
+    // there fully interactive under a 'No authorized accounts' status.
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: [{ id: 'other', email: 'other@example.com', authStatus: 'pending' }],
+    });
+
+    await h.init();
+
+    assert.deepStrictEqual(h.state.emails, [],
+        'cached mail for an account that is no longer connected must not stay on screen');
+    assert.strictEqual(h.state.currentAccount, null);
+    const statuses = h.calls.filter(c => c.name === 'showStatus').map(c => c.args[0]);
+    assert.ok(statuses.some(s => /No authorized accounts/.test(s)));
+});
+
+// ============================================================================
+// Pull-to-refresh: the manual escape from a degraded session
+// ============================================================================
+
+test('pull-to-refresh retries the whole boot in a degraded session', async () => {
+    // roborev 517: this is the ONLY manual recovery when the server is down but
+    // the device is online (no 'online' event ever fires), so it needs a pin —
+    // a refactor dropping the branch would leave a doomed loadEmails against a
+    // session with no mailbox and no splits.
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: [{ id: 'acct-1', email: 'me@example.com' }],
+        stateOverrides: { offlineMode: true },
+    });
+    h.document.getElementById('pull-indicator').style.height = '100px';
+
+    h.pullToRefreshRecognizer.end();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.ok(h.names().includes('loadAccounts'), 'the pull must re-run init()');
+    assert.strictEqual(h.state.offlineMode, false, 'a successful retry leaves the degraded session');
+    assert.ok(h.names().includes('finishPullRefresh'), 'the indicator must be reset');
+});
+
+test('a failed offline pull-to-refresh still resets the indicator', async () => {
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: new ApiError('Network error: failed to fetch'),
+        stateOverrides: { offlineMode: true },
+    });
+    h.document.getElementById('pull-indicator').style.height = '100px';
+
+    h.pullToRefreshRecognizer.end();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.ok(h.names().includes('finishPullRefresh'),
+        'a still-unreachable server must not leave the pull indicator stuck open');
+    assert.strictEqual(h.state.offlineMode, true, 'the degraded session survives a failed retry');
+});
+
+test('pull-to-refresh online still refreshes the list rather than rebooting', () => {
+    const h = makeHarness();
+    h.document.getElementById('pull-indicator').style.height = '100px';
+
+    h.pullToRefreshRecognizer.end();
+
+    assert.ok(h.names().includes('loadEmails'));
+    assert.ok(!h.names().includes('loadAccounts'), 'an online pull must not re-run the boot');
 });
 
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {

@@ -318,11 +318,21 @@ function attachmentUrl(emailId, att) {
 // Email body cache (LRU, max 50)
 // ============================================================================
 
-function cacheEmail(email) {
+// opened: the USER opened this message, as opposed to prefetchAdjacentEmails
+// warming it speculatively. The flag rides on the cached object (and so into
+// the snapshot, kata 2chc) because the snapshot's 20 body slots go to opened
+// mail first: prefetch adds up to 3 neighbours per open, so a purely
+// recency-ordered tail would fill every slot with mail the user never read and
+// evict what they actually did (roborev 517). Sticky — a prefetched body that
+// is later opened keeps the promotion.
+function cacheEmail(email, { opened = false } = {}) {
     const keys = Object.keys(state.emailCache);
     if (keys.length >= BODY_CACHE_LIMIT) {
         delete state.emailCache[keys[0]];
     }
+    email.openedByUser = opened
+        || !!email.openedByUser
+        || !!state.emailCache[email.id]?.openedByUser;
     state.emailCache[email.id] = email;
 }
 
@@ -1277,6 +1287,9 @@ async function renderScreenDetail(emailId) {
     const cacheHit = !!full;
     if (full) {
         delete state.emailCache[emailId];
+        // A hit may be a body prefetchAdjacentEmails warmed; opening it is what
+        // earns it a snapshot slot (kata 2chc, roborev 517).
+        full.openedByUser = true;
         state.emailCache[emailId] = full;
     }
     if (!full && state.offlineMode) {
@@ -1292,7 +1305,7 @@ async function renderScreenDetail(emailId) {
     if (!full) {
         try {
             full = await state.api('GET', '/emails/' + encodeURIComponent(emailId));
-            cacheEmail(full);
+            cacheEmail(full, { opened: true });
         } catch (err) {
             showError('Load email', err);
             document.getElementById('email-body').innerHTML =
@@ -2637,7 +2650,8 @@ async function startDraftCompose(emailId) {
     if (!draft || draft.textBody === undefined) {
         try {
             draft = await state.api('GET', '/emails/' + encodeURIComponent(emailId));
-            cacheEmail(draft);
+            // Fetched because the user opened this draft — an opened body.
+            cacheEmail(draft, { opened: true });
         } catch (err) {
             showError('Load draft', err);
             return;
@@ -3056,16 +3070,29 @@ function setupInfiniteScroll() {
 // pendingAttachments, compose fields, the send lock — restore always lands on
 // LIST, so no DETAIL/COMPOSE-scoped state exists to resurrect.
 
-// The bodies that ride along in the snapshot: the tail of the body cache,
-// oldest first. state.emailCache is FIFO-with-promotion (renderScreenDetail
-// re-inserts on a hit), so its tail IS "the last N messages opened" — no
-// second structure to keep in sync, and the same eviction order both here and
-// in cacheEmail. Oldest-first ordering matters twice: it's the order
-// serializeSnapshot sheds in, and the order restore re-inserts in, so the
-// restored cache evicts in the same sequence the live one would have.
+// The bodies that ride along in the snapshot, drawn from the body cache —
+// no second structure to keep in sync, and the same FIFO-with-promotion order
+// (renderScreenDetail re-inserts on a hit) that cacheEmail already evicts by.
+//
+// Opened mail claims the slots first and prefetched neighbours fill whatever is
+// left (roborev 517): prefetchAdjacentEmails caches up to 3 unread neighbours
+// per open, so ranking on recency alone would let speculative fodder evict the
+// mail the user actually read — which then reports "not available offline".
+//
+// The returned order is oldest-first WITH prefetched bodies ahead of opened
+// ones, and that ordering does double duty: serializeSnapshot sheds from the
+// front (so a too-large blob loses speculative bodies before read ones), and
+// restore re-inserts in the same order (so the restored cache's eviction order
+// matches what the live cache would have done next).
 function snapshotBodies() {
-    const keys = Object.keys(state.emailCache);
-    return keys.slice(-SNAPSHOT_BODY_LIMIT).map(id => state.emailCache[id]);
+    const cached = Object.keys(state.emailCache).map(id => state.emailCache[id]);
+    const opened = cached.filter(e => e.openedByUser).slice(-SNAPSHOT_BODY_LIMIT);
+    const room = SNAPSHOT_BODY_LIMIT - opened.length;
+    // slice(-0) returns the WHOLE array, so the no-room case is explicit.
+    const prefetched = room > 0
+        ? cached.filter(e => !e.openedByUser).slice(-room)
+        : [];
+    return prefetched.concat(opened);
 }
 
 // Serialize under the size cap, shedding bodies oldest-first until it fits.
@@ -3385,6 +3412,21 @@ async function init() {
         if (defaultAcc) {
             selectAccount(defaultAcc);
         } else {
+            // Nothing to select, and the pre-fetch paint above skipped the
+            // connected-account check by design (there was no list yet). If the
+            // online restore just rejected that snapshot — its account was
+            // disconnected since it was saved — the painted mail belongs to an
+            // account this app can no longer touch, and unlike selectAccount
+            // this branch never resets the list. Clear it rather than leave a
+            // fully interactive foreign inbox under the status line (roborev 517).
+            if (painted) {
+                state.currentAccount = null;
+                state.api = null;
+                state.emails = [];
+                state.emailCache = {};
+                state.emailsFetchedAt = null;
+                renderEmailList();
+            }
             renderAccountButton();
             showStatus(state.accounts.length
                 ? 'No authorized accounts — authorize in desktop Settings'
