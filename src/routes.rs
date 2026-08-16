@@ -12247,6 +12247,44 @@ white   = '#fdf6e3'
         );
     }
 
+    // kata r29v: the rest of the verbatim desktop→mobile ports.
+    //
+    // adjustSplitCounts is pinned above because a design claim rests on it;
+    // these helpers are pinned for the same reason at lower stakes. The 1v8z
+    // one-file guardrail means mobile duplicates rather than imports them, so
+    // a fix applied to one copy is invisible to the other — an extension
+    // added to getFileIcon, a unit added to formatFileSize, a rule changed in
+    // encodeFilenameHeader. Failing here is not "you broke something", it is
+    // "you changed one copy; change both, or move the function out of this
+    // list because the divergence is deliberate".
+    //
+    // Only functions that are byte-identical TODAY belong here. The mobile
+    // copies that legitimately diverge (escapeHtml, linkifyHtml, segmentUrls,
+    // renderAttachments, renderCalendarCard, toggleUnread, ...) get behavioral
+    // fixture coverage in tests/mobile_port_test.cjs instead, which is the
+    // only thing that can protect a function with no twin to compare against.
+    #[test]
+    fn mobile_verbatim_desktop_ports_stay_byte_identical() {
+        for decl in [
+            "function escapeAttr(",
+            "function htmlToPlainText(",
+            "function formatFileSize(",
+            "function getFileIcon(",
+            "function encodeFilenameHeader(",
+            "function draftsEnabled(",
+            "function composeSignaturePrefill(",
+        ] {
+            let desktop = js_fn_body(APP_JS, decl);
+            let mobile = js_fn_body(MOBILE_APP_JS, decl);
+            assert_eq!(
+                desktop, mobile,
+                "mobile's `{decl}` must stay byte-identical to desktop's — if you \
+                 change one, change both, or drop it from this list because you \
+                 meant to diverge"
+            );
+        }
+    }
+
     #[test]
     fn mobile_email_action_adjusts_split_counts_with_failure_symmetry() {
         // emailAction is the archive/trash path. Optimistic removal decrements
