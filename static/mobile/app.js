@@ -50,6 +50,10 @@ const state = {
                                // differs, so an untouched prefill never prompts to discard
     pendingAttachments: [],    // [{_id, name, mime_type, size, status: 'uploading'|'ready'|'error', blob_id, controller}]
     searchQuery: '',           // active search string, or '' when inactive; combines with currentSplit (kata p80m)
+    offlineMode: false,        // true while a DEGRADED session is on screen: the server was
+                               // unreachable at boot and everything visible came out of the
+                               // localStorage snapshot (kata 2chc). Gates every server-touching
+                               // action — offline is read-only, never queued.
     emailsFetchedAt: null,     // when state.emails was actually fetched (loadEmails success, or
                                // carried over from a restored snapshot's savedAt) — persistState's
                                // freshness stamp, kept separate from "last time we wrote to
@@ -69,6 +73,19 @@ const UNDO_STACK_LIMIT = 10;
 // key plus the max age past which a snapshot is too stale to resume from.
 const MOBILE_STATE_KEY = 'supervillain_mobile_state_v1';
 const STATE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+
+// Offline mail (kata 2chc): how much of the body cache rides along in the
+// snapshot, and the ceiling the serialized blob must stay under.
+//
+// 20 bodies is the ticket's number — enough that the messages a user actually
+// read today are readable on a plane, small enough that the blob stays well
+// clear of localStorage's ~5 MB quota. The cap is measured in JS string length
+// (UTF-16 code units), which is the unit Safari's quota accounting uses, and
+// is deliberately under half the quota: the snapshot shares that quota with
+// whatever else the origin stores, and a write that throws costs us the whole
+// snapshot, not just the bodies.
+const SNAPSHOT_BODY_LIMIT = 20;
+const SNAPSHOT_MAX_CHARS = 2 * 1024 * 1024; // ~2 MB of a ~5 MB quota
 
 // ============================================================================
 // Date formatting (reused from desktop app.js)
@@ -301,11 +318,30 @@ function attachmentUrl(emailId, att) {
 // Email body cache (LRU, max 50)
 // ============================================================================
 
-function cacheEmail(email) {
+// opened: the USER opened this message, as opposed to prefetchAdjacentEmails
+// warming it speculatively. The flag rides on the cached object (and so into
+// the snapshot, kata 2chc) because the snapshot's 20 body slots go to opened
+// mail first: prefetch adds up to 3 neighbours per open, so a purely
+// recency-ordered tail would fill every slot with mail the user never read and
+// evict what they actually did (roborev 517). Sticky — a prefetched body that
+// is later opened keeps the promotion.
+function cacheEmail(email, { opened = false } = {}) {
     const keys = Object.keys(state.emailCache);
-    if (keys.length >= BODY_CACHE_LIMIT) {
-        delete state.emailCache[keys[0]];
+    // No eviction for a re-insert (roborev 526): replacing an existing key
+    // doesn't grow the cache, so evicting would shrink it by one unrelated
+    // body for no capacity gain.
+    if (!(email.id in state.emailCache) && keys.length >= BODY_CACHE_LIMIT) {
+        // Evict the oldest PREFETCHED body first (roborev 522): snapshotBodies
+        // can only rank what survives eviction, and an opened-blind FIFO let
+        // 3-per-open speculative neighbours push today's actually-read mail
+        // out of the cache before the snapshot was ever taken. Plain FIFO
+        // only once every entry is opened.
+        const victim = keys.find(k => !state.emailCache[k].openedByUser) || keys[0];
+        delete state.emailCache[victim];
     }
+    email.openedByUser = opened
+        || !!email.openedByUser
+        || !!state.emailCache[email.id]?.openedByUser;
     state.emailCache[email.id] = email;
 }
 
@@ -348,6 +384,15 @@ function connectedAccounts() {
 }
 
 function selectAccount(account) {
+    // The picker is populated from the CACHED accounts list in a degraded
+    // session (kata 2chc), so it can be tapped with no server to switch
+    // against — and selectAccount's whole body is a reload cascade. Dismiss
+    // the picker on the way out: leaving that modal overlay up over the
+    // refusal toast would read as the tap having done nothing at all.
+    if (offlineBlocked('Switch account')) {
+        hideAccountPicker();
+        return;
+    }
     // Cancel any in-flight load from the account we're leaving — otherwise
     // a slow response can land after the switch and overwrite the new
     // account's list.
@@ -551,6 +596,10 @@ async function loadEmails({ silent = false, refresh = false } = {}) {
 }
 
 async function loadMoreEmails() {
+    // The snapshot page is all there is offline (kata 2chc). Silent, unlike
+    // offlineBlocked's toast: scrolling to the bottom isn't an action the user
+    // asked to have refused, and a toast per scroll would be noise.
+    if (state.offlineMode) return;
     if (state.loadingMore || state.loading) return;
     if (!state.emails.length || state.emails.length >= CACHE_LIMIT) return;
     state.loadingMore = true;
@@ -759,6 +808,11 @@ function closeSearchBar() {
 // since it's wired as `addEventListener('click', clearSearch)`, the MouseEvent
 // passed in has no `close` property, so the default of true applies there too.
 function clearSearch({ close = true } = {}) {
+    // Clearing an active search is a reload of the unfiltered list — a server
+    // round-trip like the search itself, so it's refused offline (kata 2chc).
+    // The restored snapshot IS the filtered list; dropping the filter locally
+    // would leave the bar empty over results that are still filtered.
+    if (state.searchQuery && offlineBlocked('Search')) return;
     document.getElementById('search-input').value = '';
     if (close) closeSearchBar();
     if (!state.searchQuery) return;
@@ -773,6 +827,10 @@ function clearSearch({ close = true } = {}) {
 }
 
 function submitSearch() {
+    // Search is server-side (src/search.rs) — there is no local index to query
+    // offline, and running it against the cached list would silently answer a
+    // different question than the one asked (kata 2chc).
+    if (offlineBlocked('Search')) return;
     const input = document.getElementById('search-input');
     const raw = input.value.trim();
     if (!raw) {
@@ -969,6 +1027,9 @@ function hideUndoToast(entry) {
 // Archive, tap Undo — would drop it into an unrelated list at a stale
 // index. Off the origin mailbox, only the server move-back happens.
 async function performUndo() {
+    // An undo is a server move-back. Offline it can't happen, and popping the
+    // entry first would destroy the only record of what to undo (kata 2chc).
+    if (offlineBlocked('Undo')) return;
     const entry = state.undoStack.pop();
     if (!entry) return;
 
@@ -1015,6 +1076,10 @@ async function performUndo() {
 }
 
 async function emailAction(type, emailId) {
+    // Offline is read-only (kata 2chc). Refuse BEFORE the optimistic splice:
+    // an optimistic removal with no request behind it would show the user a
+    // move that never happens and can never be reconciled.
+    if (offlineBlocked(type === 'archive' ? 'Archive' : 'Trash')) return;
     const index = state.emails.findIndex(e => e.id === emailId);
     if (index === -1) return;
     const email = state.emails[index];
@@ -1074,6 +1139,7 @@ function trashEmail(emailId) {
 }
 
 async function toggleUnread(emailId) {
+    if (offlineBlocked('Toggle read status')) return;
     const email = state.emails.find(e => e.id === emailId);
     const cached = state.emailCache[emailId];
     if (!email && !cached) return;
@@ -1104,6 +1170,7 @@ async function toggleUnread(emailId) {
 }
 
 async function toggleFlag(emailId) {
+    if (offlineBlocked('Toggle star')) return;
     const email = state.emails.find(e => e.id === emailId);
     const cached = state.emailCache[emailId];
     if (!email && !cached) return;
@@ -1229,12 +1296,25 @@ async function renderScreenDetail(emailId) {
     const cacheHit = !!full;
     if (full) {
         delete state.emailCache[emailId];
+        // A hit may be a body prefetchAdjacentEmails warmed; opening it is what
+        // earns it a snapshot slot (kata 2chc, roborev 517).
+        full.openedByUser = true;
         state.emailCache[emailId] = full;
+    }
+    if (!full && state.offlineMode) {
+        // Cached bodies are the entire offline dataset (kata 2chc): a message
+        // opened before the snapshot was written reads normally, one that
+        // wasn't has nowhere to come from. Say that, instead of firing a GET
+        // whose only possible outcome is a network-error toast over a
+        // permanently blank body pane.
+        document.getElementById('email-body').innerHTML =
+            '<div style="padding:16px;color:var(--text-muted)">Not available offline — this message was not opened while connected.</div>';
+        return;
     }
     if (!full) {
         try {
             full = await state.api('GET', '/emails/' + encodeURIComponent(emailId));
-            cacheEmail(full);
+            cacheEmail(full, { opened: true });
         } catch (err) {
             showError('Load email', err);
             document.getElementById('email-body').innerHTML =
@@ -1259,7 +1339,10 @@ async function renderScreenDetail(emailId) {
     // immediately, before the POST below even fires (roborev 302, fix 4) —
     // revert alongside showError on failure — otherwise a failed POST would
     // leave the row rendered read while the server still has it unread.
-    const needsMarkRead = cacheHit && full.isUnread;
+    // ...and never offline (kata 2chc): the POST can't reach the server, and
+    // flipping the flag locally would show a read message the server still has
+    // unread, silently reverted by the next refresh.
+    const needsMarkRead = cacheHit && full.isUnread && !state.offlineMode;
     if (needsMarkRead) {
         full.isUnread = false;
         if (listEmail) listEmail.isUnread = false;
@@ -1403,6 +1486,7 @@ function hideUnsubSheet() {
 }
 
 async function unsubscribeAndArchiveAll() {
+    if (offlineBlocked('Unsubscribe')) return;
     const target = unsubSheetTarget;
     hideUnsubSheet();
     if (!target) return;
@@ -1613,6 +1697,10 @@ function updateCalendarCard(emailId, event) {
 // Optimistic active-state flip → POST /rsvp → revert + showError on failure
 // (showError is the only failure sink on a phone without devtools).
 async function rsvpToEvent(status) {
+    // The RSVP buttons live inside the calendar card, which renders from a
+    // CACHED body — so unlike the detail action bar they're reachable in a
+    // degraded session and need their own guard (kata 2chc).
+    if (offlineBlocked('RSVP')) return;
     const emailId = state.currentEmailId;
     const email = state.emailCache[emailId];
     const event = email && email.calendarEvent;
@@ -1647,6 +1735,10 @@ async function rsvpToEvent(status) {
 }
 
 function prefetchAdjacentEmails(emailId) {
+    // Nothing to warm from offline (kata 2chc) — the cache is already whatever
+    // the snapshot carried, and three doomed GETs per open buy only console
+    // noise.
+    if (state.offlineMode) return;
     const idx = state.emails.findIndex(e => e.id === emailId);
     if (idx === -1) return;
     const toFetch = [];
@@ -1969,6 +2061,10 @@ function setComposeTitle(text) {
 
 // New blank message.
 function startCompose() {
+    // Compose autosaves to a server draft (kata wm57) and can only end in a
+    // send, so the whole surface is refused offline (kata 2chc) rather than
+    // opened onto a compose that can neither save nor send.
+    if (offlineBlocked('Compose')) return;
     // Bumped on every new draft (including reply/forward below) — see
     // sendComposedEmail's stale-completion guard.
     state.composeSession++;
@@ -1983,6 +2079,7 @@ function startCompose() {
 // in_reply_to = email.id. Reply-all additionally Cc's the original To
 // recipients (desktop's exact rule — email.to only, filtered of blanks).
 function startReply(replyAll) {
+    if (offlineBlocked(replyAll ? 'Reply all' : 'Reply')) return;
     const email = getComposeEmail();
     if (!email) return;
 
@@ -2023,6 +2120,7 @@ function startReply(replyAll) {
 // Desktop leaves To and Cc empty on a forward — the user picks recipients —
 // so this does too.
 function startForward() {
+    if (offlineBlocked('Forward')) return;
     const email = getComposeEmail();
     if (!email) return;
 
@@ -2113,6 +2211,10 @@ let sendingSession = null;
 // locks against double-send, reports failures via showError with the form
 // left intact for a retry.
 async function sendComposedEmail() {
+    // No offline send, and no outbox (kata 2chc): a queue that replays on
+    // reconnect is a sync engine with the hard parts deferred. Checked before
+    // the lock below so a refused send leaves nothing to unwind.
+    if (offlineBlocked('Send')) return;
     // Re-entry lock, taken BEFORE the first await: a check-only guard here
     // let two quick taps both slip past while the autosave settle below was
     // still pending, firing a duplicate POST. The wrapper owns the lock;
@@ -2550,11 +2652,15 @@ function deleteDraftById(id) {
 // autosave updates it and send deletes it. Plain text only — the reply/forward
 // quote context is not reconstructed (the body is whatever plain text was saved).
 async function startDraftCompose(emailId) {
+    // Opening a draft arms the autosave PUT cycle — a write, so it's refused
+    // offline like every other compose entry point (kata 2chc).
+    if (offlineBlocked('Open draft')) return;
     let draft = state.emailCache[emailId];
     if (!draft || draft.textBody === undefined) {
         try {
             draft = await state.api('GET', '/emails/' + encodeURIComponent(emailId));
-            cacheEmail(draft);
+            // Fetched because the user opened this draft — an opened body.
+            cacheEmail(draft, { opened: true });
         } catch (err) {
             showError('Load draft', err);
             return;
@@ -2634,6 +2740,16 @@ const pullToRefreshRecognizer = {
         if (h > 60) {
             indicator.style.height = '40px';
             indicator.textContent = 'Refreshing...';
+            // In a degraded session the list can't refresh — there's no
+            // mailbox, no split and no server (kata 2chc). Retry the whole boot
+            // instead: init() re-fetches accounts and, on success, swaps the
+            // cached paint for live state. This is the only manual escape from
+            // a server-down session, where no 'online' event ever fires to
+            // trigger handleOnline.
+            if (state.offlineMode || bootIncomplete) {
+                init().finally(finishPullRefresh);
+                return;
+            }
             abortListLoad();
             loadEmails({ refresh: true });
         } else {
@@ -2820,8 +2936,71 @@ function finishPullRefresh() {
 // an inline style — and remains visible across screen changes rather than
 // being torn down on navigation like a screen-scoped element would be.
 
+// Two honest messages, one banner (kata 2chc). A connectivity drop mid-session
+// leaves LIVE state in memory that is merely aging — "data may be stale". A
+// degraded session has no live state at all: everything on screen came out of
+// the snapshot and every server-touching action is disabled — "showing cached
+// mail". Saying the first when the second is true would imply an archive tap
+// would work.
+const OFFLINE_BANNER_STALE = 'Offline — data may be stale';
+const OFFLINE_BANNER_CACHED = 'Offline — showing cached mail';
+
+// Every control that can only complete against the server. Disabled — not
+// queued — for the duration of a degraded session: a queue is a sync engine
+// with the hard parts deferred, and this ticket explicitly refuses to build
+// one. The handler-side guards (offlineBlocked) are the real enforcement;
+// these make the refusal visible before the tap, since a phone user has no
+// other way to tell which taps are futile.
+const OFFLINE_DISABLED_CONTROLS = [
+    'compose-btn',
+    'search-btn',
+    'detail-archive-btn',
+    'detail-trash-btn',
+    'detail-read-btn',
+    'detail-star-btn',
+    'detail-more-btn',
+    'detail-reply-btn',
+    'detail-reply-all-btn',
+    'detail-forward-btn',
+    'compose-send-btn',
+];
+
 function setOfflineBanner(offline) {
-    document.getElementById('offline-banner').classList.toggle('visible', offline);
+    const el = document.getElementById('offline-banner');
+    if (!el) return;
+    el.textContent = state.offlineMode ? OFFLINE_BANNER_CACHED : OFFLINE_BANNER_STALE;
+    el.classList.toggle('visible', offline);
+}
+
+// Enter or leave the degraded session. Called by init() — on the boot path
+// that couldn't reach the server, and again (with false) the moment a later
+// boot's account fetch succeeds.
+function setOfflineMode(offline) {
+    state.offlineMode = offline;
+    // The banner stays up when the DEVICE is offline even after the mode
+    // clears: a reconnect that races ahead of the online event still has stale
+    // data on screen, which is exactly what the stale message is for.
+    setOfflineBanner(offline || !navigator.onLine);
+    for (const id of OFFLINE_DISABLED_CONTROLS) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = offline;
+    }
+    // An in-flight send owns the Send button's disabled state (setComposeSending)
+    // and must keep it — leaving offline mode must not unlock a send mid-flight.
+    if (!offline && state.sending) {
+        const send = document.getElementById('compose-send-btn');
+        if (send) send.disabled = true;
+    }
+}
+
+// The gate every server-touching action calls first. Returns true when the
+// action must NOT proceed, having already told the user why — a silent
+// no-op on a phone reads as a broken button. `action` is the same label the
+// action's own showError uses, so the two failure surfaces stay consistent.
+function offlineBlocked(action) {
+    if (!state.offlineMode) return false;
+    showToast(action + ': unavailable offline — cached mail is read-only');
+    return true;
 }
 
 function handleOffline() {
@@ -2829,7 +3008,13 @@ function handleOffline() {
 }
 
 function handleOnline() {
-    setOfflineBanner(false);
+    // In a degraded session the banner belongs to setOfflineMode: the online
+    // event only proves the device found a network, not that the server
+    // answers (captive portal, server-side outage), and init() below may take
+    // a full fetch timeout to find out. Clearing eagerly here would blank the
+    // 'showing cached mail' surface over still-dimmed controls for that whole
+    // window (roborev 520).
+    if (!state.offlineMode) setOfflineBanner(false);
     // A degraded offline boot (kata mhck — loadAccounts failed; the SW never
     // caches /api/*) has no account list, and therefore no mailboxes, splits,
     // or identities either. A bare list refresh against that half-initialized
@@ -2837,8 +3022,23 @@ function handleOnline() {
     // accounts again and restoreFromSnapshot picks up the same snapshot in
     // full online mode, refresh cascade armed. Also covers the snapshot-less
     // 'Cannot reach server' boot, which previously stayed stuck until a
-    // manual reload.
-    if (!state.accounts.length) {
+    // manual reload. A degraded session (kata 2chc) needs the same full boot
+    // even though it HAS an accounts list — that list came out of the snapshot,
+    // not the server, and mailboxes/splits/identities are still unfetched. So
+    // does the pre-fetch paint's revalidation window (roborev 522): the paint
+    // seeds state.accounts from the snapshot before offlineMode is decided —
+    // that window is exactly initInFlight, NOT a currentMailbox probe, which
+    // would also match the transient null during a normal account switch and
+    // reboot the old account's snapshot over the user's tap (roborev 524).
+    // The currentAccount check covers the rejected-paint aftermath, where
+    // accounts exist but nothing is selected — a bare refresh has no API to
+    // refresh through.
+    if (initInFlight || state.offlineMode || bootIncomplete
+        || !state.accounts.length || !state.currentAccount) {
+        // A boot already in flight will swallow the init() below via its
+        // reentrancy guard — remember the connectivity signal so its finally
+        // block can honor it (roborev 522).
+        if (initInFlight) reconnectedDuringBoot = true;
         init();
         return;
     }
@@ -2880,17 +3080,64 @@ function setupInfiniteScroll() {
 // itself, no refresh cascade — handleOnline re-runs the full boot on
 // reconnect. See restoreFromSnapshot's offline flag.
 //
-// localStorage, not IndexedDB: the snapshot is ~25KB (≤50 bodyless list rows)
-// — trivially under quota — and a synchronous write is exactly what the
+// localStorage, not IndexedDB: a synchronous write is exactly what the
 // visibilitychange/pagehide handlers need, since they must complete before iOS
-// suspends us. An async IndexedDB transaction could be cut off mid-flight.
+// suspends us — an async IndexedDB transaction could be cut off mid-flight —
+// and synchronous reads are what let restore paint before the first frame.
+// Offline mail (kata 2chc) grew the blob from ~25KB to at most a couple of MB
+// but did NOT change that calculus: serializeSnapshot keeps it under
+// SNAPSHOT_MAX_CHARS by shedding bodies, so the quota argument for IndexedDB
+// never gets to fire.
 //
-// Persisted (data only): accountId, mailboxRole (+id for exactness; restore
-// resolves by role so a provider-side id change still lands the right
-// mailbox), splitId, searchQuery, the ≤50 list rows (no bodies), listScrollTop,
-// savedAt. NEVER persisted: screen, currentEmailId, emailCache, undoStack,
+// Persisted (data only): accountId, the accounts list (kata 2chc — an offline
+// cold start can't GET /api/accounts, and without a cached copy it dead-ends
+// before rendering a single message), mailboxRole (+id for exactness; restore
+// resolves by role so a provider-side id change still lands the right mailbox),
+// splitId, searchQuery, the ≤50 list rows, the ≤20 most recently opened bodies,
+// listScrollTop, savedAt. NEVER persisted: screen, currentEmailId, undoStack,
 // pendingAttachments, compose fields, the send lock — restore always lands on
 // LIST, so no DETAIL/COMPOSE-scoped state exists to resurrect.
+
+// The bodies that ride along in the snapshot, drawn from the body cache —
+// no second structure to keep in sync, and the same FIFO-with-promotion order
+// (renderScreenDetail re-inserts on a hit) that cacheEmail already evicts by.
+//
+// Opened mail claims the slots first and prefetched neighbours fill whatever is
+// left (roborev 517): prefetchAdjacentEmails caches up to 3 unread neighbours
+// per open, so ranking on recency alone would let speculative fodder evict the
+// mail the user actually read — which then reports "not available offline".
+//
+// The returned order is oldest-first WITH prefetched bodies ahead of opened
+// ones, and that ordering does double duty: serializeSnapshot sheds from the
+// front (so a too-large blob loses speculative bodies before read ones), and
+// restore re-inserts in the same order (so the restored cache's eviction order
+// matches what the live cache would have done next).
+function snapshotBodies() {
+    const cached = Object.keys(state.emailCache).map(id => state.emailCache[id]);
+    const opened = cached.filter(e => e.openedByUser).slice(-SNAPSHOT_BODY_LIMIT);
+    const room = SNAPSHOT_BODY_LIMIT - opened.length;
+    // slice(-0) returns the WHOLE array, so the no-room case is explicit.
+    const prefetched = room > 0
+        ? cached.filter(e => !e.openedByUser).slice(-room)
+        : [];
+    return prefetched.concat(opened);
+}
+
+// Serialize under the size cap, shedding bodies oldest-first until it fits.
+// Bodies are the sacrificial payload: a cold start needs the list and the
+// accounts to boot at all, while a missing body degrades to one "not available
+// offline" message. Re-stringifying per drop is O(n²) in principle but n ≤ 20
+// and the loop only runs at all on an over-cap snapshot, so measuring sizes
+// incrementally would buy nothing but a second code path to get wrong.
+function serializeSnapshot(snapshot, maxChars = SNAPSHOT_MAX_CHARS) {
+    const bodies = Array.isArray(snapshot.bodies) ? snapshot.bodies.slice() : [];
+    let json = JSON.stringify({ ...snapshot, bodies });
+    while (bodies.length && json.length > maxChars) {
+        bodies.shift();
+        json = JSON.stringify({ ...snapshot, bodies });
+    }
+    return json;
+}
 
 function persistState() {
     // Nothing worth saving before an account is selected; such a snapshot
@@ -2903,6 +3150,23 @@ function persistState() {
     const listScrollTop = state.screen === Screen.LIST && wrap
         ? wrap.scrollTop
         : state.listScrollTop;
+    // The previous blob is the carry-forward source for every field this
+    // session can't supply itself — but it can now be ~2 MB of bodies, and
+    // persistState runs on visibilitychange/pagehide inside iOS's tight
+    // pre-suspend budget. Parse it lazily and at most once: a normal online
+    // session (mailbox picked, accounts fetched) never needs it, so the
+    // budget stays reserved for the serialize+write below (roborev 521).
+    let prevMemo;
+    const loadPrev = () => {
+        if (prevMemo === undefined) {
+            try {
+                prevMemo = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null');
+            } catch (_e) {
+                prevMemo = null; // unreadable previous snapshot — carry nothing forward
+            }
+        }
+        return prevMemo;
+    };
     // The restore window (and a whole degraded offline session) runs with
     // currentMailbox still null — mailboxes haven't been fetched. Writing
     // mailboxRole: null then would lose the saved mailbox on the NEXT resume,
@@ -2910,39 +3174,57 @@ function persistState() {
     // a cross-account carry would pin a foreign mailbox id).
     let mailboxRole = state.currentMailbox?.role || null;
     let mailboxId = state.currentMailbox?.id || null;
-    if (!state.currentMailbox) {
-        try {
-            const prev = JSON.parse(localStorage.getItem(MOBILE_STATE_KEY) || 'null');
-            if (prev?.accountId === state.currentAccount.id) {
-                mailboxRole = prev.mailboxRole || null;
-                mailboxId = prev.mailboxId || null;
-            }
-        } catch (_e) { /* unreadable previous snapshot — null is the honest value */ }
+    if (!state.currentMailbox && loadPrev()?.accountId === state.currentAccount.id) {
+        mailboxRole = loadPrev().mailboxRole || null;
+        mailboxId = loadPrev().mailboxId || null;
     }
+    // Same reasoning for the accounts list (kata 2chc): a session that never
+    // got a /accounts response has an empty state.accounts, and writing that
+    // empty array over a good cached list would disarm the very cold start
+    // this field exists for. No account-id gate — the list is global, not
+    // account-scoped.
+    const accounts = state.accounts.length
+        ? state.accounts
+        : (Array.isArray(loadPrev()?.accounts) ? loadPrev().accounts : []);
+    const snapshot = {
+        accountId: state.currentAccount.id,
+        // Lets the degraded offline restore label the account button
+        // without an account list to look the id up in.
+        accountEmail: state.currentAccount.email || null,
+        accounts,
+        mailboxRole,
+        mailboxId,
+        splitId: state.currentSplit,
+        searchQuery: state.searchQuery,
+        emails: state.emails.slice(0, PAGE_SIZE),
+        bodies: snapshotBodies(),
+        listScrollTop,
+        // The rows' actual fetch time, not "now" — re-persisting the same
+        // rows (e.g. a degraded offline session's background snapshot
+        // cycle) must not re-stamp them fresh and defeat restoreFromSnapshot's
+        // 24h gate. Falls back to now before any fetch has happened this
+        // session (first-run boot), matching prior behavior.
+        savedAt: state.emailsFetchedAt ?? Date.now(),
+    };
     try {
-        localStorage.setItem(MOBILE_STATE_KEY, JSON.stringify({
-            accountId: state.currentAccount.id,
-            // Lets the degraded offline restore label the account button
-            // without an account list to look the id up in.
-            accountEmail: state.currentAccount.email || null,
-            mailboxRole,
-            mailboxId,
-            splitId: state.currentSplit,
-            searchQuery: state.searchQuery,
-            emails: state.emails.slice(0, PAGE_SIZE),
-            listScrollTop,
-            // The rows' actual fetch time, not "now" — re-persisting the same
-            // rows (e.g. a degraded offline session's background snapshot
-            // cycle) must not re-stamp them fresh and defeat restoreFromSnapshot's
-            // 24h gate. Falls back to now before any fetch has happened this
-            // session (first-run boot), matching prior behavior.
-            savedAt: state.emailsFetchedAt ?? Date.now(),
-        }));
-    } catch (err) {
-        // Quota exceeded or a private-mode storage denial — a warm snapshot is
-        // a best-effort optimization, never a user-facing failure. Log only;
-        // the bottom toast is reserved for user-affecting failures.
-        console.warn('State snapshot failed:', err);
+        localStorage.setItem(MOBILE_STATE_KEY, serializeSnapshot(snapshot));
+    } catch (_err) {
+        // setItem can throw even under the serialization cap: the ~5 MB quota
+        // is shared origin-wide, and a browser that accounts it in UTF-16
+        // BYTES sees a 2 M-char blob as ~4 MB. Bodies are the sacrificial
+        // payload (see serializeSnapshot) — retry without them before giving
+        // up, so a body-inflated write degrades to the pre-2chc ~25 KB
+        // snapshot rather than leaving no snapshot at all (roborev 525).
+        try {
+            localStorage.setItem(
+                MOBILE_STATE_KEY, serializeSnapshot({ ...snapshot, bodies: [] }));
+        } catch (err) {
+            // Still failing (private-mode denial, quota exhausted by other
+            // data) — a warm snapshot is a best-effort optimization, never a
+            // user-facing failure. Log only; the bottom toast is reserved for
+            // user-affecting failures.
+            console.warn('State snapshot failed:', err);
+        }
     }
 }
 
@@ -2953,10 +3235,12 @@ function persistState() {
 // existed. Corrupt, stale, or foreign-account snapshots are removed and
 // treated as absent — the normal boot is always the safe fallback.
 //
-// offline: taken from init()'s loadAccounts catch, where there is no account
-// list to validate against — the account is synthesized from the snapshot
-// itself (freshness gate only) and the refresh cascade is skipped entirely;
-// handleOnline re-runs init() on reconnect for the full boot.
+// offline: taken from init()'s pre-fetch paint (kata 2chc) and its loadAccounts
+// catch, where there is no LIVE account list to validate against — the account
+// comes from the snapshot's own cached accounts list (freshness gate only) and
+// the refresh cascade is skipped entirely, since there may well be no server to
+// refresh from. init() re-runs this in full online mode the moment /accounts
+// answers, and handleOnline re-runs init() on reconnect.
 function restoreFromSnapshot({ offline = false } = {}) {
     let snapshot;
     try {
@@ -2974,10 +3258,16 @@ function restoreFromSnapshot({ offline = false } = {}) {
     // no account list exists to check against), the snapshot fresh (< 24h — a
     // day-old list misleads more than it helps), and the row array present.
     // Any miss discards the snapshot and falls through to normal boot.
+    // Offline, the cached accounts list is the best source for the account
+    // object — it carries provider and authStatus, so the account button gets
+    // its brand mark and the picker works. The synthesized {id, email} fallback
+    // covers a snapshot written before kata 2chc added the list.
     const account = offline
-        ? (snapshot?.accountId
-            ? { id: snapshot.accountId, email: snapshot.accountEmail || snapshot.accountId }
-            : null)
+        ? ((Array.isArray(snapshot?.accounts)
+            && snapshot.accounts.find(a => a.id === snapshot.accountId))
+            || (snapshot?.accountId
+                ? { id: snapshot.accountId, email: snapshot.accountEmail || snapshot.accountId }
+                : null))
         : connectedAccounts().find(a => a.id === snapshot?.accountId);
     const fresh = typeof snapshot?.savedAt === 'number'
         && Date.now() - snapshot.savedAt < STATE_MAX_AGE_MS;
@@ -2993,6 +3283,13 @@ function restoreFromSnapshot({ offline = false } = {}) {
     // background refresh below shares selectAccount's abort/stale protocol.
     abortListLoad();
     const acct = account.id;
+    // The cached accounts list (kata 2chc). Offline only: online, loadAccounts
+    // has already put the live list in state.accounts and the snapshot's copy
+    // is by definition the older one. Restoring it offline is what makes the
+    // account button and picker work with no /accounts response in hand.
+    if (offline && Array.isArray(snapshot.accounts) && snapshot.accounts.length) {
+        state.accounts = snapshot.accounts;
+    }
     state.currentAccount = account;
     state.api = makeApi(acct);
     state.currentSplit = snapshot.splitId || 'all';
@@ -3005,6 +3302,17 @@ function restoreFromSnapshot({ offline = false } = {}) {
     // session (see persistState).
     state.emailsFetchedAt = snapshot.savedAt;
     state.listScrollTop = snapshot.listScrollTop || 0;
+    // Cached bodies (kata 2chc) — the difference between "the list is there but
+    // every message is blank" and actually reading mail on a plane. Seeded
+    // oldest-first through cacheEmail so the restored cache carries the live
+    // cache's eviction order — and so even an over-limit blob (impossible
+    // today: the snapshot caps at 20, the cache at 50) would evict correctly
+    // rather than overflow.
+    if (Array.isArray(snapshot.bodies)) {
+        for (const cached of snapshot.bodies) {
+            if (cached && typeof cached.id === 'string') cacheEmail(cached);
+        }
+    }
     renderAccountButton();
     if (state.searchQuery) {
         document.getElementById('search-input').value = state.searchQuery;
@@ -3086,6 +3394,19 @@ function restoreFromSnapshot({ offline = false } = {}) {
 // selectAccount against each other, so a second call while one is still
 // pending is a no-op rather than a re-entrant boot.
 let initInFlight = false;
+// An online event that landed while a boot was in flight (roborev 522): the
+// reentrancy guard swallows the re-run, but the signal must not be lost —
+// the boot's own fetch may have started before the radio came back and be
+// about to fail into a degraded session no future online event will fix.
+let reconnectedDuringBoot = false;
+// True between a boot that exited without live accounts and the next boot
+// that gets them (roborev 525). offlineMode covers the degraded exit, but the
+// painted-boot-hits-ApiAuthError exit leaves accounts and currentAccount
+// seeded from the snapshot with offlineMode false — a terminal state the
+// recovery predicates can't otherwise tell from a healthy session, so a
+// reconnect or pull after re-authorizing would bare-refresh a session that
+// never fetched mailboxes.
+let bootIncomplete = false;
 
 async function init() {
     if (initInFlight) return;
@@ -3097,31 +3418,79 @@ async function init() {
 
         document.getElementById('app-shell').classList.add('active');
 
+        // Restore-then-revalidate (kata 2chc). This paint is SYNCHRONOUS and
+        // comes BEFORE the first network call on purpose: an offline phone
+        // can't reach /api/accounts at all (the SW never caches /api/*), and
+        // the pre-2chc order — fetch, then restore only in the catch — meant a
+        // cold start with no signal sat on the splash for a full network
+        // timeout and then dead-ended at 'Cannot reach server' with a perfectly
+        // good snapshot on disk. Offline mode is NOT entered here: the server
+        // may well answer in a moment, and a banner that flashes 'Offline' on
+        // every warm launch teaches the user to ignore it. Until the fetch
+        // actually fails, this is a stale-while-revalidate paint. Known
+        // tradeoff (roborev 521): the painted UI is interactive before the
+        // snapshot's account is validated, so a tap in that window acts on an
+        // account the fetch may be about to reject — each such request fails
+        // server-side with its own error toast, and the rejected-paint
+        // cleanup below resets the display, so the window self-corrects.
+        const painted = restoreFromSnapshot({ offline: true });
+        if (painted) hideBootSplash();
+
         try {
             await loadAccounts();
         } catch (err) {
             // A boot error dismisses the splash so the error/offline banner is
             // visible instead of hanging on the splash forever. Placed before
             // the early return so both the degraded-restore and the error
-            // paths dismiss it.
+            // paths dismiss it. (No-op when the paint above already did it.)
             hideBootSplash();
-            // Server unreachable (offline relaunch — the SW never caches /api/*,
-            // so there's no cached account list either). A DEGRADED restore still
-            // beats a dead end: render the snapshot list with the account
-            // synthesized from the snapshot itself and skip the refresh cascade —
-            // the offline banner covers the state, and handleOnline re-runs
-            // init() on reconnect for the full boot. With no usable snapshot,
-            // keep today's error path.
-            if (restoreFromSnapshot({ offline: true })) return;
+            // Whatever branch below runs, this boot has no live session —
+            // arm the recovery predicates (roborev 525).
+            bootIncomplete = true;
+            // Now the failure is confirmed — but only a CONNECTIVITY failure
+            // degrades. ApiAuthError (api.js taxonomy) means the session needs
+            // re-authorization in desktop Settings; dressing that as 'Offline'
+            // would send the user to debug their wifi over a login problem, so
+            // it falls through to the normal error path with the snapshot list
+            // left on screen.
+            if (painted && !(err instanceof ApiAuthError)) {
+                // Cached mail on screen and no server behind it: commit to the
+                // degraded session — banner up, every server-touching action
+                // disabled (read-only, never queued). handleOnline re-runs
+                // init() on reconnect for the full boot.
+                setOfflineMode(true);
+                return;
+            }
+            // A degraded session can reach here too — handleOnline and the
+            // offline pull-to-refresh reboot through init(), and the reboot
+            // may discover the session EXPIRED rather than the network back.
+            // Keeping the cached-mail banner and dimmed controls over the
+            // re-authorize status would be the exact mixed signal the
+            // carve-out above exists to prevent, so drop the degraded state
+            // before showing it (roborev 521).
+            if (err instanceof ApiAuthError && state.offlineMode) {
+                setOfflineMode(false);
+            }
             showError('Load accounts', err);
-            showStatus('Cannot reach server');
+            showStatus(err instanceof ApiAuthError
+                ? 'Account needs re-authorization — open desktop Settings'
+                : 'Cannot reach server');
             return;
         }
 
+
+        // Live accounts in hand: whatever degraded session was on screen is
+        // over (kata 2chc) — banner down, actions re-enabled.
+        bootIncomplete = false;
+        setOfflineMode(false);
+
         // Resume from a snapshot when one is valid (kata mhck, task A13): renders
         // the last list instantly and arms a silent refresh, short-circuiting the
-        // default-account boot. With no usable snapshot this is a no-op and the
-        // original boot below runs unchanged — the first-run path is untouched.
+        // default-account boot. This is also how the cached paint above gets
+        // swapped for live state — same snapshot, now validated against the real
+        // account list and with the refresh cascade armed. With no usable
+        // snapshot this is a no-op and the original boot below runs unchanged —
+        // the first-run path is untouched.
         if (restoreFromSnapshot()) return;
 
         const connected = connectedAccounts();
@@ -3129,6 +3498,28 @@ async function init() {
         if (defaultAcc) {
             selectAccount(defaultAcc);
         } else {
+            // Nothing to select, and the pre-fetch paint above skipped the
+            // connected-account check by design (there was no list yet). If the
+            // online restore just rejected that snapshot — its account was
+            // disconnected since it was saved — the painted mail belongs to an
+            // account this app can no longer touch, and unlike selectAccount
+            // this branch never resets the list. Clear it rather than leave a
+            // fully interactive foreign inbox under the status line (roborev 517).
+            if (painted) {
+                state.currentAccount = null;
+                state.api = null;
+                state.emails = [];
+                state.emailCache = {};
+                state.emailsFetchedAt = null;
+                // The paint also seeded search/split state and opened the
+                // search bar (roborev 520) — clear those too, or the foreign
+                // query sits in an open bar over the no-accounts status.
+                state.searchQuery = '';
+                state.currentSplit = 'all';
+                document.getElementById('search-input').value = '';
+                document.getElementById('app-header').classList.remove('searching');
+                renderEmailList();
+            }
             renderAccountButton();
             showStatus(state.accounts.length
                 ? 'No authorized accounts — authorize in desktop Settings'
@@ -3136,6 +3527,19 @@ async function init() {
         }
     } finally {
         initInFlight = false;
+        // Honor a reconnect the reentrancy guard swallowed — but only when
+        // this boot ended somewhere it can't self-recover from: a degraded
+        // session, or the snapshot-less 'Cannot reach server' dead end
+        // (accounts never loaded, roborev 523) — the device is already
+        // online, so no future online event will fire for either. A boot
+        // that succeeded already has live data. Deliberately NOT gated on
+        // currentMailbox, which is transiently null after a successful
+        // online restore while its cascade is still in flight. One retry per
+        // swallowed event: the flag clears before the re-run (roborev 522).
+        if (reconnectedDuringBoot) {
+            reconnectedDuringBoot = false;
+            if (state.offlineMode || !state.accounts.length) init();
+        }
     }
 }
 
@@ -3165,6 +3569,9 @@ document.getElementById('account-picker').addEventListener('click', (e) => {
 document.getElementById('bottom-nav').addEventListener('click', (e) => {
     const btn = e.target.closest('.nav-item');
     if (!btn) return;
+    // A degraded session never fetched /mailboxes, so the lookup below would
+    // miss and the tap would do nothing at all — say why instead (kata 2chc).
+    if (offlineBlocked('Switch mailbox')) return;
     const mailbox = state.mailboxes.find(m => m.role === btn.dataset.role);
     if (mailbox) selectMailbox(mailbox);
 });
@@ -3262,6 +3669,16 @@ document.getElementById('compose-attachments-list').addEventListener('click', ha
 // Detail attachments: delegated so re-renders (a fresh innerHTML per email)
 // never need their own rebind.
 document.getElementById('detail-attachments').addEventListener('click', (e) => {
+    // Attachment blobs are served under /api/, which the SW never caches — in
+    // a degraded session (kata 2chc) these anchors are the one server-touching
+    // tap the disabled-controls list can't reach, and following one opens a
+    // tab onto a failed request. Refuse with the standard toast instead
+    // (roborev 520).
+    if (state.offlineMode && e.target.closest('.att-item, .att-download-all')) {
+        e.preventDefault();
+        offlineBlocked('Download attachment');
+        return;
+    }
     if (e.target.closest('.att-download-all')) downloadAllAttachments();
 });
 
