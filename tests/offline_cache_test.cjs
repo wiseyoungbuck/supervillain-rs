@@ -332,6 +332,25 @@ test('snapshot keeps only the most recent SNAPSHOT_BODY_LIMIT bodies, oldest evi
     assert.strictEqual(ids[ids.length - 1], 'e' + (limit + 4));
 });
 
+test('opened bodies also evict oldest-first when more than the limit were opened', () => {
+    // The cap test above exercises the prefetched arm of snapshotBodies; this
+    // one pins the opened arm, where an eviction that kept the OLDEST opens
+    // would ship a snapshot of last week's reading and drop today's.
+    const h = makeHarness();
+    const limit = h.SNAPSHOT_BODY_LIMIT;
+    h.state.accounts = [{ id: 'acct-1' }];
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    for (let i = 0; i < limit + 5; i++) h.cacheEmail(body('e' + i), { opened: true });
+
+    h.persistState();
+
+    const ids = h.snapshot().bodies.map(b => b.id);
+    assert.strictEqual(ids.length, limit);
+    assert.strictEqual(ids[0], 'e5', 'the five oldest opens must be evicted, not the newest');
+    assert.strictEqual(ids[ids.length - 1], 'e' + (limit + 4));
+});
+
 test('prefetched neighbours never crowd opened mail out of the snapshot', () => {
     // roborev 517: prefetchAdjacentEmails caches up to 3 unread neighbours per
     // open, so a purely recency-ordered tail would fill the 20 body slots with
