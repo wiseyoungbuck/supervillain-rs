@@ -40,6 +40,16 @@ function extractConst(name) {
     return match[0];
 }
 
+// A top-level `document.getElementById('x').addEventListener(...)` statement,
+// closed by a column-0 `});` — extract() would cut the `);` off.
+function extractListener(prefix) {
+    const start = MOBILE.indexOf(prefix);
+    assert.notStrictEqual(start, -1, `listener ${prefix} must exist`);
+    const close = MOBILE.indexOf('\n});', start);
+    assert.notStrictEqual(close, -1, `listener ${prefix} must close`);
+    return MOBILE.slice(start, close + 4);
+}
+
 // Multi-line `const NAME = [ ... ];` declarations.
 function extractConstArray(name) {
     const start = MOBILE.indexOf(`const ${name} = [`);
@@ -55,6 +65,7 @@ function extractConstArray(name) {
 
 function makeElement(id) {
     const classes = new Set();
+    const listeners = {};
     return {
         id,
         textContent: '',
@@ -64,6 +75,8 @@ function makeElement(id) {
         disabled: false,
         readOnly: false,
         style: {},
+        listeners,
+        addEventListener(type, fn) { listeners[type] = fn; },
         classList: {
             add: (c) => { classes.add(c); },
             remove: (c) => { classes.delete(c); },
@@ -205,8 +218,11 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         extract(MOBILE, 'async function sendComposedEmail('),
         extract(MOBILE, 'async function renderScreenDetail('),
         extract(MOBILE, 'async function init('),
+        extract(MOBILE, 'function handleOnline('),
         extract(MOBILE, 'const pullToRefreshRecognizer = {'),
+        extractListener("document.getElementById('detail-attachments').addEventListener('click'"),
         `return { persistState, restoreFromSnapshot, snapshotBodies, pullToRefreshRecognizer,
+                  handleOnline,
                   serializeSnapshot, setOfflineMode, offlineBlocked, cacheEmail,
                   emailAction, submitSearch, clearSearch, sendComposedEmail,
                   renderScreenDetail, init,
@@ -227,7 +243,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         'prefetchAdjacentEmails', 'renderEmailDetail',
         'renderEmailDetailPartial', 'renderDetailActionBar',
         'setComposeSending', 'doSendComposedEmail', 'cancelAutosave',
-        'finishPullRefresh',
+        'finishPullRefresh', 'downloadAllAttachments',
         code,
     )(
         state, document, localStorage, { onLine: true },
@@ -265,6 +281,7 @@ function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {})
         async () => { calls.push({ name: 'doSendComposedEmail', args: [] }); },
         log('cancelAutosave'),
         log('finishPullRefresh'),
+        log('downloadAllAttachments'),
     );
 
     const snapshot = () => JSON.parse(localStorage.getItem('supervillain_mobile_state_v1'));
@@ -725,6 +742,82 @@ test('pull-to-refresh online still refreshes the list rather than rebooting', ()
 
     assert.ok(h.names().includes('loadEmails'));
     assert.ok(!h.names().includes('loadAccounts'), 'an online pull must not re-run the boot');
+});
+
+// ============================================================================
+// roborev 520: degraded-session seams
+// ============================================================================
+
+test('handleOnline keeps the cached-mail banner up while the degraded reboot runs', () => {
+    // roborev 520: the online event only proves the DEVICE has a network, not
+    // that the server answers (captive portal, server outage). Blanking the
+    // banner before init() settles leaves dimmed controls with no explanation
+    // for the whole loadAccounts timeout.
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: new ApiError('Network error: failed to fetch'),
+        stateOverrides: { offlineMode: true },
+    });
+    h.setOfflineMode(true);
+
+    h.handleOnline();
+
+    // Asserted synchronously, before init()'s fetch settles — the transient
+    // window is the bug.
+    assert.ok(h.document.getElementById('offline-banner').classList.contains('visible'),
+        'the cached-mail banner must survive until the reboot actually succeeds');
+});
+
+test('a rejected paint also clears restored search and split state', async () => {
+    // roborev 520: the offline paint seeds searchQuery, the search input and
+    // the open search bar; the rejected-paint cleanup must not leave the
+    // foreign query sitting over the no-accounts status.
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob({ searchQuery: 'from:foreign', splitId: 'work' }) },
+        accountsResult: [{ id: 'other', email: 'other@example.com', authStatus: 'pending' }],
+    });
+
+    await h.init();
+
+    assert.strictEqual(h.state.searchQuery, '', 'the foreign query must not survive');
+    assert.strictEqual(h.state.currentSplit, 'all', 'the foreign split must not survive');
+    assert.strictEqual(h.document.getElementById('search-input').value, '');
+    assert.strictEqual(
+        h.document.getElementById('app-header').classList.contains('searching'), false,
+        'the search bar must not stay open over the no-accounts status');
+});
+
+test('attachment taps are refused offline instead of opening a doomed tab', () => {
+    // roborev 520: cached bodies render live /api/ anchors, and the SW never
+    // caches /api/ blobs — the tap can only open a tab onto a failed request.
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    const handler = h.document.getElementById('detail-attachments').listeners.click;
+    assert.ok(handler, 'the delegated attachment click handler must be registered');
+
+    let prevented = false;
+    handler({
+        target: { closest: sel => (sel.includes('.att-item') ? {} : null) },
+        preventDefault: () => { prevented = true; },
+    });
+
+    assert.ok(prevented, 'the anchor navigation must be prevented offline');
+    assert.ok(h.names().includes('showToast'), 'the refusal must be visible');
+    assert.ok(!h.names().includes('downloadAllAttachments'));
+});
+
+test('attachment download-all still fires online', () => {
+    const h = makeHarness();
+    const handler = h.document.getElementById('detail-attachments').listeners.click;
+
+    let prevented = false;
+    handler({
+        target: { closest: sel => (sel.includes('.att-download-all') ? {} : null) },
+        preventDefault: () => { prevented = true; },
+    });
+
+    assert.ok(h.names().includes('downloadAllAttachments'),
+        'the offline guard must not eat online download-all taps');
+    assert.strictEqual(prevented, false);
 });
 
 test('a successful revalidate swaps in live state and clears the offline banner', async () => {

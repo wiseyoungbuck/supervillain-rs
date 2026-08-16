@@ -2999,7 +2999,13 @@ function handleOffline() {
 }
 
 function handleOnline() {
-    setOfflineBanner(false);
+    // In a degraded session the banner belongs to setOfflineMode: the online
+    // event only proves the device found a network, not that the server
+    // answers (captive portal, server-side outage), and init() below may take
+    // a full fetch timeout to find out. Clearing eagerly here would blank the
+    // 'showing cached mail' surface over still-dimmed controls for that whole
+    // window (roborev 520).
+    if (!state.offlineMode) setOfflineBanner(false);
     // A degraded offline boot (kata mhck — loadAccounts failed; the SW never
     // caches /api/*) has no account list, and therefore no mailboxes, splits,
     // or identities either. A bare list refresh against that half-initialized
@@ -3425,6 +3431,13 @@ async function init() {
                 state.emails = [];
                 state.emailCache = {};
                 state.emailsFetchedAt = null;
+                // The paint also seeded search/split state and opened the
+                // search bar (roborev 520) — clear those too, or the foreign
+                // query sits in an open bar over the no-accounts status.
+                state.searchQuery = '';
+                state.currentSplit = 'all';
+                document.getElementById('search-input').value = '';
+                document.getElementById('app-header').classList.remove('searching');
                 renderEmailList();
             }
             renderAccountButton();
@@ -3563,6 +3576,16 @@ document.getElementById('compose-attachments-list').addEventListener('click', ha
 // Detail attachments: delegated so re-renders (a fresh innerHTML per email)
 // never need their own rebind.
 document.getElementById('detail-attachments').addEventListener('click', (e) => {
+    // Attachment blobs are served under /api/, which the SW never caches — in
+    // a degraded session (kata 2chc) these anchors are the one server-touching
+    // tap the disabled-controls list can't reach, and following one opens a
+    // tab onto a failed request. Refuse with the standard toast instead
+    // (roborev 520).
+    if (state.offlineMode && e.target.closest('.att-item, .att-download-all')) {
+        e.preventDefault();
+        offlineBlocked('Download attachment');
+        return;
+    }
     if (e.target.closest('.att-download-all')) downloadAllAttachments();
 });
 
