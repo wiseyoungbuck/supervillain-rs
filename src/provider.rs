@@ -949,6 +949,129 @@ mod tests {
             .to_string()
     }
 
+    #[tokio::test]
+    async fn rsvp_fastmail_wire_carries_client_scheduling_and_consumes_inbox() {
+        // Behavioral pin for the full Fastmail RSVP arm (kata 8gn5) against
+        // a scripted CalDAV recorder — the source-shape test below can't
+        // catch a refactor that calls set_schedule_agent_client but drops
+        // its return value. The iTIP reply email is attempted first and
+        // fails fast (no JMAP account_id on the session); by design that is
+        // warn-only and must not gate the calendar write.
+        use crate::jmap::caldav_recorder;
+        let uid = "uid-8gn5-behavioral";
+        let inbox_obj = "/dav/calendars/user/u/Inbox/queued.ics".to_string();
+        let multistatus = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+ <D:response>
+  <D:href>{inbox_obj}</D:href>
+  <D:propstat><D:prop><D:getetag>"e1"</D:getetag>
+   <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:{uid}
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+</D:multistatus>"#
+        );
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, _path| {
+            if method == "REPORT" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    multistatus.clone().into_bytes(),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, Vec::new())
+            }
+        })
+        .await;
+
+        let mut jmap_sess =
+            crate::jmap::JmapSession::new("att@aristoi.test", "token", Some("app-pass"));
+        jmap_sess.caldav_base = base.clone();
+        jmap_sess
+            .caldav_collection_url
+            .set(crate::jmap::DiscoveredCalendars {
+                default_collection: format!("{base}/dav/calendars/user/u/coll"),
+                schedule_inbox: Some(format!("{base}/dav/calendars/user/u/Inbox")),
+            })
+            .expect("prefill discovery");
+        let mut session = ProviderSession::Fastmail(Box::new(jmap_sess));
+
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             ORGANIZER:mailto:org@example.com\r\n\
+             ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@aristoi.test\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let event = CalendarEvent {
+            uid: uid.into(),
+            summary: "8gn5 behavioral".into(),
+            dtstart: chrono::DateTime::parse_from_rfc3339("2026-08-20T15:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: "org@example.com".into(),
+            organizer_name: None,
+            attendees: vec![crate::types::Attendee {
+                email: "att@aristoi.test".into(),
+                name: None,
+                status: "NEEDS-ACTION".into(),
+            }],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: ics.clone(),
+            user_rsvp_status: None,
+            is_update: false,
+        };
+
+        rsvp(
+            &mut session,
+            &ics,
+            &event,
+            "att@aristoi.test",
+            &crate::types::RsvpStatus::Tentative,
+            chrono_tz::UTC,
+        )
+        .await
+        .expect("fastmail rsvp must succeed against the loopback");
+
+        let rec = recorded.lock().unwrap();
+        let puts: Vec<_> = rec.iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(puts.len(), 1, "exactly one PARTSTAT PUT expected: {rec:?}");
+        let put_body = std::str::from_utf8(&puts[0].body).unwrap_or("");
+        assert!(
+            put_body.contains("ORGANIZER;SCHEDULE-AGENT=CLIENT:mailto:org@example.com"),
+            "the stored copy must suppress server-side scheduling: {put_body}"
+        );
+        assert!(
+            put_body.contains("PARTSTAT=TENTATIVE"),
+            "the stored copy must carry the updated PARTSTAT: {put_body}"
+        );
+        let reports: Vec<_> = rec.iter().filter(|r| r.method == "REPORT").collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "exactly one inbox REPORT expected: {rec:?}"
+        );
+        assert!(
+            reports[0].path.ends_with("/dav/calendars/user/u/Inbox"),
+            "REPORT must address the schedule-inbox: {}",
+            reports[0].path
+        );
+        let dels: Vec<_> = rec.iter().filter(|r| r.method == "DELETE").collect();
+        assert_eq!(
+            dels.len(),
+            1,
+            "the queued invitation must be consumed: {rec:?}"
+        );
+        assert_eq!(dels[0].path, inbox_obj);
+        assert_eq!(dels[0].header("schedule-reply"), Some("F"));
+    }
+
     fn rsvp_fastmail_arm_src() -> String {
         let src = include_str!("provider.rs");
         let handler_src = src.split("mod tests").next().unwrap_or(src);
