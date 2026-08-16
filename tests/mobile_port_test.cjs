@@ -323,6 +323,18 @@ test('r29v: mobile formatFileSize scales units and keeps whole bytes exact', () 
     assert.equal(formatFileSize(3 * 1024 * 1024 * 1024), '3.0 GB');
 });
 
+// Documents a real gap rather than blessing it: `units` stops at GB and the
+// index is unclamped, so a terabyte-scale size renders the unit as
+// "undefined". Unreachable through the app today — no provider accepts an
+// attachment near 1 TB — which is why this is pinned rather than fixed here
+// (the function is byte-identical to desktop's, so a clamp would have to land
+// in both bundles). If you add a TB unit or clamp `i`, this test is where the
+// old behavior was written down; update it.
+test('r29v: mobile formatFileSize has no unit beyond GB', () => {
+    const formatFileSize = loadMobile(['function formatFileSize('], 'formatFileSize');
+    assert.equal(formatFileSize(1024 ** 4), '1.0 undefined');
+});
+
 test('r29v: mobile getFileIcon prefers MIME type and falls back to extension', () => {
     const getFileIcon = loadMobile(['function getFileIcon('], 'getFileIcon');
     assert.equal(getFileIcon('image/png', 'a.png'), '\u{1F5BC}');
@@ -382,13 +394,15 @@ test('r29v: mobile renderAttachments shows Download All only for 2+ attachments'
     const renderAttachments = loadRenderAttachments();
     // kata 0g9v: one attachment already has its own row; a second control is
     // noise until there is more than one thing to download.
-    assert.doesNotMatch(renderAttachments([], 'e'), /att-download-all/);
     assert.doesNotMatch(renderAttachments([attachment()], 'e'), /att-download-all/);
     assert.match(
         renderAttachments([attachment(), attachment({ blob_id: 'b2' })], 'e'),
         /att-download-all/,
     );
-    assert.match(renderAttachments([], 'e'), /Attachments \(0\)/);
+    // The empty list is deliberately not pinned beyond the button's absence:
+    // renderEmailDetail guards with `if (attachments.length)` and clears the
+    // container otherwise, so what this returns for [] is not a contract.
+    assert.doesNotMatch(renderAttachments([], 'e'), /att-download-all/);
 });
 
 test('r29v: mobile renderAttachments inlines a preview for images only', () => {
