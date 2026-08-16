@@ -622,6 +622,9 @@ function loadToggleUnread({ emails = [], cache = {}, screen = 'list', currentEma
             renderEmailList: () => renders.push('list'),
             renderDetailActionBar: (email) => renders.push({ detail: email && email.id }),
             showError: (context, err) => errors.push({ context, message: err.message }),
+            // Always-online stub: this suite pins the online mark-read path.
+            // The offline refusal itself is pinned by offline_cache_test.cjs.
+            offlineBlocked: () => false,
         },
     );
     return { toggleUnread, state, calls, errors, renders };
