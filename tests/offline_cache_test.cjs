@@ -893,22 +893,45 @@ test('prefetches past the cache limit never evict opened mail from the cache its
         `all 20 opened messages must survive to the snapshot, got ${ids.join(',')}`);
 });
 
-test('handleOnline mid-revalidation reroutes to the full boot, not a bare list refresh', () => {
+test('handleOnline mid-revalidation reroutes to the full boot, not a bare list refresh', async () => {
     // roborev 522: the pre-fetch paint seeds state.accounts from the snapshot
-    // while offlineMode is still false and currentMailbox is still null. An
+    // while offlineMode is still false and the account fetch is in flight. An
     // online event in that window must not take the bare-refresh path — a
-    // mailbox-less loadEmails cannot recover a half-initialized session.
-    const h = makeHarness({ accountsResult: [{ id: 'acct-1', email: 'me@example.com' }] });
-    h.state.accounts = [{ id: 'acct-1', email: 'me@example.com' }];
-    h.state.currentAccount = h.state.accounts[0];
-    h.state.currentMailbox = null;
+    // mailbox-less loadEmails cannot recover a half-initialized session. The
+    // window is entered through a real pending init(), matching how the app
+    // reaches it (roborev 524 narrowed the predicate to exactly this).
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: [{ id: 'acct-1', email: 'me@example.com' }],
+    });
+
+    const boot = h.init();   // paint done synchronously, fetch still pending
+    h.handleOnline();
+
+    assert.ok(!h.names().includes('loadEmails'),
+        'a bare mailbox-less refresh cannot recover the session');
+    await boot;
+});
+
+test('an online event during an account switch never reboots into the old account', () => {
+    // roborev 524: selectAccount nulls currentMailbox until its cascade
+    // resolves. A reboot in that window re-applies the persisted snapshot —
+    // written for the PREVIOUS account — silently reverting the user's tap;
+    // the bare-refresh path never touches account selection.
+    const h = makeHarness({ storage: { [KEY]: savedBlob() } });
+    h.state.accounts = [
+        { id: 'acct-1', email: 'me@example.com' },
+        { id: 'acct-2', email: 'other@example.com' },
+    ];
+    h.state.currentAccount = h.state.accounts[1];
+    h.state.currentMailbox = null;   // the switch's cascade is still in flight
 
     h.handleOnline();
 
-    assert.ok(h.names().includes('loadAccounts'),
-        'a session with no mailbox must re-run the boot');
-    assert.ok(!h.names().includes('loadEmails'),
-        'a bare mailbox-less refresh cannot recover the session');
+    assert.ok(!h.names().includes('loadAccounts'),
+        'a mid-switch online event must not re-run the boot');
+    assert.strictEqual(h.state.currentAccount.id, 'acct-2',
+        'the switch must not be reverted to the snapshot account');
 });
 
 test('an online event swallowed by an in-flight boot still escapes the degraded session', async () => {

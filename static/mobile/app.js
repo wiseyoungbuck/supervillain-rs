@@ -3023,10 +3023,14 @@ function handleOnline() {
     // even though it HAS an accounts list — that list came out of the snapshot,
     // not the server, and mailboxes/splits/identities are still unfetched. So
     // does the pre-fetch paint's revalidation window (roborev 522): the paint
-    // seeds state.accounts from the snapshot before offlineMode is decided,
-    // and currentMailbox is still null — a bare mailbox-less refresh can't
-    // recover that state either.
-    if (initInFlight || state.offlineMode || !state.accounts.length || !state.currentMailbox) {
+    // seeds state.accounts from the snapshot before offlineMode is decided —
+    // that window is exactly initInFlight, NOT a currentMailbox probe, which
+    // would also match the transient null during a normal account switch and
+    // reboot the old account's snapshot over the user's tap (roborev 524).
+    // The currentAccount check covers the rejected-paint aftermath, where
+    // accounts exist but nothing is selected — a bare refresh has no API to
+    // refresh through.
+    if (initInFlight || state.offlineMode || !state.accounts.length || !state.currentAccount) {
         // A boot already in flight will swallow the init() below via its
         // reentrancy guard — remember the connectivity signal so its finally
         // block can honor it (roborev 522).
@@ -3444,6 +3448,7 @@ async function init() {
                 : 'Cannot reach server');
             return;
         }
+
 
         // Live accounts in hand: whatever degraded session was on screen is
         // over (kata 2chc) — banner down, actions re-enabled.

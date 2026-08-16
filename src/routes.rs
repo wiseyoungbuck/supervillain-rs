@@ -7042,13 +7042,28 @@ mod tests {
              before the account fetch, not in its catch block"
         );
         // Revalidate side: a successful fetch must leave the degraded session.
-        let clear = block
-            .find("setOfflineMode(false)")
+        // Anchor on the SUCCESS-PATH call specifically (roborev 524): the
+        // catch block also contains a setOfflineMode(false) — the ApiAuthError
+        // carve-out from roborev 521 — and it too sits after the fetch, so a
+        // first-occurrence find would pass vacuously with the success-path
+        // call deleted. The success call is the one between the catch's end
+        // (past the 'Cannot reach server' status literal) and the online
+        // restoreFromSnapshot() call.
+        let online_restore = block
+            .find("restoreFromSnapshot()")
+            .expect("init must attempt the online restore");
+        // rfind: a code comment above the try also mentions the status string;
+        // the showStatus literal is the LAST occurrence before the restore.
+        let catch_tail = block[..online_restore]
+            .rfind("'Cannot reach server'")
+            .expect("init's catch must end at the no-snapshot dead end");
+        let clear = block[..online_restore]
+            .rfind("setOfflineMode(false)")
             .expect("init must clear offline mode once accounts load");
         assert!(
-            fetch < clear,
-            "offline mode must be cleared AFTER the account fetch succeeds, \
-             so the banner survives a failed one"
+            catch_tail < clear && fetch < clear,
+            "offline mode must be cleared on the success path AFTER the \
+             account fetch, so the banner survives a failed one"
         );
     }
 
