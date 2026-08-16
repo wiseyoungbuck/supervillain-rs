@@ -881,6 +881,23 @@
             color: var(--accent);
         }
 
+        /* Offline (kata 2chc): a disabled button swallows its own click, so the
+           refusal toast never fires for these — the dimming IS the feedback.
+           Without it a degraded session looks broken rather than read-only.
+           Applies to the header icons too (compose ✎, search 🔍), which are
+           disabled by the same list. */
+        #app-header .icon-btn:disabled,
+        .detail-action-btn:disabled {
+            color: var(--text-muted);
+            opacity: 0.5;
+            cursor: default;
+        }
+
+        #app-header .icon-btn:disabled:active,
+        .detail-action-btn:disabled:active {
+            background: none;
+        }
+
         /* Reply/reply-all/forward row — text labels rather than glyphs, sitting
            above the stateful icon row. */
         #detail-compose-actions {

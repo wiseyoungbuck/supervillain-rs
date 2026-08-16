@@ -1,0 +1,599 @@
+// Behavioral tests for offline mail (kata 2chc).
+//
+// The mobile client's only offline dataset is its own localStorage snapshot —
+// the service worker deliberately bypasses /api/ — so these tests extract the
+// real snapshot writer, the real restore, the real offline gate, and the real
+// init() from static/mobile/app.js and drive them against a fake localStorage
+// and a mock DOM. They pin behavior (what lands in the blob, what renders, what
+// stops touching the server), not source shape.
+//
+// Scope pins as much as coverage pins: offline is READ-ONLY. Blocked actions
+// must be blocked, never queued — a test that accepted a queued archive would
+// be waving through the sync engine this ticket explicitly refuses to build.
+
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const MOBILE = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'mobile', 'app.js'), 'utf8');
+const API_JS = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'api.js'), 'utf8');
+
+// Slice a declaration out of a bundle: from the declaration to the first
+// column-0 closing brace. Same assumption as every other extract-and-eval
+// suite here (tests/refill_test.cjs, tests/email_refresh_test.cjs).
+function extract(source, declaration) {
+    const start = source.indexOf(declaration);
+    assert.notStrictEqual(start, -1, `${declaration} must exist`);
+    const close = source.indexOf('\n}', start);
+    assert.notStrictEqual(close, -1, `${declaration} must close`);
+    return source.slice(start, close + 2);
+}
+
+// Single-line `const NAME = ...;` declarations, pulled from the bundle so the
+// tests run against the shipped values rather than copies that can drift.
+function extractConst(name) {
+    const match = MOBILE.match(new RegExp(`^const ${name} = .*$`, 'm'));
+    assert.ok(match, `const ${name} must exist`);
+    return match[0];
+}
+
+// Multi-line `const NAME = [ ... ];` declarations.
+function extractConstArray(name) {
+    const start = MOBILE.indexOf(`const ${name} = [`);
+    assert.notStrictEqual(start, -1, `const ${name} must exist`);
+    const close = MOBILE.indexOf('\n];', start);
+    assert.notStrictEqual(close, -1, `const ${name} must close`);
+    return MOBILE.slice(start, close + 3);
+}
+
+// ============================================================================
+// Mock DOM / storage
+// ============================================================================
+
+function makeElement(id) {
+    const classes = new Set();
+    return {
+        id,
+        textContent: '',
+        innerHTML: '',
+        value: '',
+        scrollTop: 0,
+        disabled: false,
+        readOnly: false,
+        style: {},
+        classList: {
+            add: (c) => { classes.add(c); },
+            remove: (c) => { classes.delete(c); },
+            contains: (c) => classes.has(c),
+            toggle: (c, on) => {
+                const next = on === undefined ? !classes.has(c) : !!on;
+                if (next) classes.add(c); else classes.delete(c);
+                return next;
+            },
+        },
+        setAttribute() {},
+        removeAttribute() {},
+        focus() {},
+    };
+}
+
+// Auto-vivifying: any id the code under test reaches for exists, so a mock
+// that lags behind the real index.html can't turn a behavior failure into a
+// null-dereference.
+function makeDocument() {
+    const els = new Map();
+    return {
+        getElementById(id) {
+            if (!els.has(id)) els.set(id, makeElement(id));
+            return els.get(id);
+        },
+    };
+}
+
+function makeStorage(initial = {}) {
+    const data = { ...initial };
+    return {
+        getItem: (k) => (k in data ? data[k] : null),
+        setItem(k, v) { data[k] = String(v); },
+        removeItem(k) { delete data[k]; },
+        raw: data,
+    };
+}
+
+// The real error taxonomy (static/api.js): ApiAuthError extends ApiError, and
+// the offline path must be able to tell them apart.
+function loadErrorTaxonomy() {
+    const code = [
+        extract(API_JS, 'class ApiError extends Error {'),
+        extract(API_JS, 'class ApiAuthError extends ApiError {'),
+        'return { ApiError, ApiAuthError };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    return new Function(code)();
+}
+
+const { ApiError, ApiAuthError } = loadErrorTaxonomy();
+
+// ============================================================================
+// Harness
+// ============================================================================
+
+function email(id, overrides = {}) {
+    return {
+        id,
+        subject: 'Subject ' + id,
+        preview: 'preview',
+        from: [{ name: 'Sender', email: 'sender@example.com' }],
+        receivedAt: '2026-08-16T10:00:00Z',
+        isUnread: false,
+        isFlagged: false,
+        ...overrides,
+    };
+}
+
+function body(id, size = 8) {
+    return { ...email(id), textBody: 'x'.repeat(size), htmlBody: null };
+}
+
+function makeHarness({ storage = {}, accountsResult, stateOverrides = {} } = {}) {
+    const calls = [];
+    const localStorage = makeStorage(storage);
+    const document = makeDocument();
+    const state = {
+        accounts: [],
+        currentAccount: null,
+        api: null,
+        mailboxes: [],
+        currentMailbox: null,
+        currentSplit: 'all',
+        splits: [],
+        splitCounts: {},
+        emails: [],
+        loading: false,
+        loadAbort: null,
+        screen: 'list',
+        currentEmailId: null,
+        listScrollTop: 0,
+        emailCache: {},
+        undoStack: [],
+        identities: [],
+        pendingAttachments: [],
+        searchQuery: '',
+        emailsFetchedAt: null,
+        sending: false,
+        composeSession: 0,
+        offlineMode: false,
+        ...stateOverrides,
+    };
+
+    const log = (name) => (...args) => { calls.push({ name, args }); };
+    const api = async (method, path) => {
+        calls.push({ name: 'api', args: [method, path] });
+        return null;
+    };
+    const loadAccounts = async () => {
+        calls.push({ name: 'loadAccounts', args: [] });
+        if (accountsResult instanceof Error) throw accountsResult;
+        state.accounts = accountsResult || [];
+    };
+
+    const code = [
+        extractConst('PAGE_SIZE'),
+        extractConst('BODY_CACHE_LIMIT'),
+        extractConst('MOBILE_STATE_KEY'),
+        extractConst('STATE_MAX_AGE_MS'),
+        extractConst('SNAPSHOT_BODY_LIMIT'),
+        extractConst('SNAPSHOT_MAX_CHARS'),
+        extractConst('OFFLINE_BANNER_STALE'),
+        extractConst('OFFLINE_BANNER_CACHED'),
+        extractConstArray('OFFLINE_DISABLED_CONTROLS'),
+        'let initInFlight = false;',
+        extract(MOBILE, 'function cacheEmail('),
+        extract(MOBILE, 'function snapshotBodies('),
+        extract(MOBILE, 'function serializeSnapshot('),
+        extract(MOBILE, 'function persistState('),
+        extract(MOBILE, 'function restoreFromSnapshot('),
+        extract(MOBILE, 'function setOfflineBanner('),
+        extract(MOBILE, 'function setOfflineMode('),
+        extract(MOBILE, 'function offlineBlocked('),
+        extract(MOBILE, 'async function emailAction('),
+        extract(MOBILE, 'function submitSearch('),
+        extract(MOBILE, 'function clearSearch('),
+        extract(MOBILE, 'async function sendComposedEmail('),
+        extract(MOBILE, 'async function renderScreenDetail('),
+        extract(MOBILE, 'async function init('),
+        `return { persistState, restoreFromSnapshot, snapshotBodies,
+                  serializeSnapshot, setOfflineMode, offlineBlocked, cacheEmail,
+                  emailAction, submitSearch, clearSearch, sendComposedEmail,
+                  renderScreenDetail, init,
+                  SNAPSHOT_BODY_LIMIT, SNAPSHOT_MAX_CHARS,
+                  OFFLINE_BANNER_CACHED, OFFLINE_BANNER_STALE,
+                  OFFLINE_DISABLED_CONTROLS };`,
+    ].join('\n');
+
+    // eslint-disable-next-line no-new-func
+    const fns = new Function(
+        'state', 'document', 'localStorage', 'navigator', 'console', 'Screen',
+        'AbortController', 'ApiError', 'ApiAuthError',
+        'makeApi', 'connectedAccounts', 'abortListLoad', 'renderAccountButton',
+        'renderEmailList', 'showStatus', 'showToast', 'showError',
+        'loadAccounts', 'hideBootSplash', 'selectAccount',
+        'loadIdentities', 'loadSplits', 'loadMailboxes', 'loadEmails',
+        'adjustSplitCounts', 'pushUndo', 'hideUndoToast', 'capUndoStack',
+        'prefetchAdjacentEmails', 'renderEmailDetail',
+        'renderEmailDetailPartial', 'renderDetailActionBar',
+        'setComposeSending', 'doSendComposedEmail', 'cancelAutosave',
+        code,
+    )(
+        state, document, localStorage, { onLine: true },
+        { warn: log('console.warn'), info: log('console.info') },
+        { LIST: 'list', DETAIL: 'detail', COMPOSE: 'compose' },
+        AbortController, ApiError, ApiAuthError,
+        () => api,
+        () => state.accounts.filter(a => a.authStatus !== 'pending'),
+        () => { calls.push({ name: 'abortListLoad', args: [] }); state.loadAbort = new AbortController(); },
+        log('renderAccountButton'),
+        log('renderEmailList'),
+        log('showStatus'),
+        log('showToast'),
+        (context, err) => { calls.push({ name: 'showError', args: [context, err] }); },
+        loadAccounts,
+        log('hideBootSplash'),
+        log('selectAccount'),
+        log('loadIdentities'),
+        async () => { calls.push({ name: 'loadSplits', args: [] }); },
+        async () => { calls.push({ name: 'loadMailboxes', args: [] }); },
+        async () => { calls.push({ name: 'loadEmails', args: [] }); },
+        log('adjustSplitCounts'),
+        (action, e, index) => {
+            const entry = { action, email: e, index, settled: null };
+            state.undoStack.push(entry);
+            return entry;
+        },
+        log('hideUndoToast'),
+        log('capUndoStack'),
+        log('prefetchAdjacentEmails'),
+        log('renderEmailDetail'),
+        log('renderEmailDetailPartial'),
+        log('renderDetailActionBar'),
+        (sending) => { state.sending = sending; calls.push({ name: 'setComposeSending', args: [sending] }); },
+        async () => { calls.push({ name: 'doSendComposedEmail', args: [] }); },
+        log('cancelAutosave'),
+    );
+
+    const snapshot = () => JSON.parse(localStorage.getItem('supervillain_mobile_state_v1'));
+    const names = () => calls.map(c => c.name);
+    return { ...fns, state, calls, names, localStorage, document, snapshot };
+}
+
+// A snapshot blob shaped exactly as persistState writes it.
+function savedBlob(overrides = {}) {
+    return JSON.stringify({
+        accountId: 'acct-1',
+        accountEmail: 'me@example.com',
+        accounts: [{ id: 'acct-1', email: 'me@example.com', provider: 'fastmail' }],
+        mailboxRole: 'inbox',
+        mailboxId: 'mb-inbox',
+        splitId: 'all',
+        searchQuery: '',
+        emails: [email('e1'), email('e2')],
+        bodies: [body('e1')],
+        listScrollTop: 0,
+        savedAt: Date.now(),
+        ...overrides,
+    });
+}
+
+const KEY = 'supervillain_mobile_state_v1';
+
+// ============================================================================
+// Snapshot coverage
+// ============================================================================
+
+test('persistState snapshots the accounts list, the header list and opened bodies', () => {
+    const h = makeHarness();
+    h.state.accounts = [{ id: 'acct-1', email: 'me@example.com', provider: 'fastmail' }];
+    h.state.currentAccount = h.state.accounts[0];
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    h.state.emails = [email('e1'), email('e2')];
+    h.cacheEmail(body('e1'));
+
+    h.persistState();
+
+    const snap = h.snapshot();
+    assert.deepStrictEqual(snap.accounts, h.state.accounts,
+        'the accounts list must be cached — an offline cold start has no /api/accounts to fetch');
+    assert.deepStrictEqual(snap.emails.map(e => e.id), ['e1', 'e2']);
+    assert.deepStrictEqual(snap.bodies.map(b => b.id), ['e1'],
+        'opened message bodies must be cached for offline read');
+    assert.strictEqual(snap.bodies[0].textBody, 'x'.repeat(8));
+});
+
+test('snapshot keeps only the most recent SNAPSHOT_BODY_LIMIT bodies, oldest evicted first', () => {
+    const h = makeHarness();
+    const limit = h.SNAPSHOT_BODY_LIMIT;
+    assert.strictEqual(limit, 20, 'the ticket sizes the body cache at ~20 opened messages');
+    h.state.accounts = [{ id: 'acct-1' }];
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.currentMailbox = { id: 'mb-inbox', role: 'inbox' };
+    for (let i = 0; i < limit + 5; i++) h.cacheEmail(body('e' + i));
+
+    h.persistState();
+
+    const ids = h.snapshot().bodies.map(b => b.id);
+    assert.strictEqual(ids.length, limit);
+    assert.strictEqual(ids[0], 'e5', 'the five oldest opens must be evicted, not the newest');
+    assert.strictEqual(ids[ids.length - 1], 'e' + (limit + 4));
+});
+
+test('serializeSnapshot drops bodies oldest-first until the blob fits the cap', () => {
+    const h = makeHarness();
+    const snap = {
+        accountId: 'acct-1',
+        emails: [email('e1')],
+        bodies: [body('old', 400), body('mid', 400), body('new', 400)],
+        savedAt: Date.now(),
+    };
+    const json = h.serializeSnapshot(snap, 1000);
+    assert.ok(json.length <= 1000, `blob must fit the cap, got ${json.length}`);
+    const kept = JSON.parse(json).bodies.map(b => b.id);
+    assert.ok(!kept.includes('old'), 'the oldest body must go first');
+    assert.ok(kept.includes('new'), 'the newest body must survive longest');
+});
+
+test('serializeSnapshot keeps the list rows even when every body has to go', () => {
+    const h = makeHarness();
+    const snap = {
+        accountId: 'acct-1',
+        emails: [email('e1')],
+        bodies: [body('a', 5000), body('b', 5000)],
+        savedAt: Date.now(),
+    };
+    const parsed = JSON.parse(h.serializeSnapshot(snap, 600));
+    assert.deepStrictEqual(parsed.bodies, [],
+        'bodies are the sacrificial payload; the list is what a cold start needs most');
+    assert.deepStrictEqual(parsed.emails.map(e => e.id), ['e1']);
+});
+
+test('the default blob cap stays under the localStorage quota', () => {
+    const h = makeHarness();
+    assert.ok(h.SNAPSHOT_MAX_CHARS >= 1024 * 1024 && h.SNAPSHOT_MAX_CHARS <= 3 * 1024 * 1024,
+        `cap must sit in the 1–3 MB band against a ~5 MB quota, got ${h.SNAPSHOT_MAX_CHARS}`);
+});
+
+test('persistState carries the previous accounts list forward when state has none', () => {
+    const h = makeHarness({ storage: { [KEY]: savedBlob() } });
+    h.state.currentAccount = { id: 'acct-1', email: 'me@example.com' };
+    h.state.emails = [email('e1')];
+
+    h.persistState();
+
+    assert.deepStrictEqual(h.snapshot().accounts.map(a => a.id), ['acct-1'],
+        'a degraded session that never fetched accounts must not blank the cached list');
+});
+
+// ============================================================================
+// Offline restore
+// ============================================================================
+
+test('offline restore seeds accounts, the header list and the cached bodies', () => {
+    const h = makeHarness({ storage: { [KEY]: savedBlob() } });
+
+    assert.strictEqual(h.restoreFromSnapshot({ offline: true }), true);
+    assert.deepStrictEqual(h.state.accounts.map(a => a.id), ['acct-1'],
+        'the cached accounts list is what makes an offline cold start possible');
+    assert.strictEqual(h.state.currentAccount.id, 'acct-1');
+    assert.deepStrictEqual(h.state.emails.map(e => e.id), ['e1', 'e2']);
+    assert.deepStrictEqual(Object.keys(h.state.emailCache), ['e1'],
+        'cached bodies must land in the body cache so an offline open renders');
+    assert.ok(h.names().includes('renderEmailList'), 'the cached list must be painted');
+});
+
+test('offline restore skips the refresh cascade — there is no server to ask', () => {
+    const h = makeHarness({ storage: { [KEY]: savedBlob() } });
+    h.restoreFromSnapshot({ offline: true });
+    assert.ok(!h.names().includes('loadMailboxes'));
+    assert.ok(!h.names().includes('loadEmails'));
+});
+
+test('a stale snapshot is discarded rather than restored offline', () => {
+    const old = Date.now() - (25 * 60 * 60 * 1000);
+    const h = makeHarness({ storage: { [KEY]: savedBlob({ savedAt: old }) } });
+    assert.strictEqual(h.restoreFromSnapshot({ offline: true }), false);
+    assert.strictEqual(h.localStorage.getItem(KEY), null);
+});
+
+// ============================================================================
+// Offline mode: banner + disabled actions
+// ============================================================================
+
+test('offline mode raises the cached-mail banner and disables server-touching controls', () => {
+    const h = makeHarness();
+    h.setOfflineMode(true);
+
+    const banner = h.document.getElementById('offline-banner');
+    assert.strictEqual(banner.textContent, 'Offline — showing cached mail');
+    assert.ok(banner.classList.contains('visible'));
+    for (const id of h.OFFLINE_DISABLED_CONTROLS) {
+        assert.strictEqual(h.document.getElementById(id).disabled, true,
+            `${id} must be disabled offline`);
+    }
+    for (const id of ['compose-btn', 'search-btn', 'detail-archive-btn',
+        'detail-trash-btn', 'compose-send-btn']) {
+        assert.ok(h.OFFLINE_DISABLED_CONTROLS.includes(id),
+            `${id} touches the server and must be disabled offline`);
+    }
+});
+
+test('leaving offline mode clears the banner and re-enables the controls', () => {
+    const h = makeHarness();
+    h.setOfflineMode(true);
+    h.setOfflineMode(false);
+
+    const banner = h.document.getElementById('offline-banner');
+    assert.strictEqual(banner.classList.contains('visible'), false);
+    for (const id of h.OFFLINE_DISABLED_CONTROLS) {
+        assert.strictEqual(h.document.getElementById(id).disabled, false);
+    }
+});
+
+test('archive is refused offline — not queued', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.emails = [email('e1'), email('e2')];
+
+    await h.emailAction('archive', 'e1');
+
+    assert.ok(!h.names().includes('api'), 'no request may be attempted offline');
+    assert.deepStrictEqual(h.state.emails.map(e => e.id), ['e1', 'e2'],
+        'the list must not change optimistically for an action that never happens');
+    assert.deepStrictEqual(h.state.undoStack, [],
+        'nothing may be queued for later replay — offline is read-only');
+    assert.ok(h.names().includes('showToast'), 'the refusal must be visible');
+});
+
+test('trash is refused offline — not queued', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.emails = [email('e1')];
+    await h.emailAction('trash', 'e1');
+    assert.ok(!h.names().includes('api'));
+    assert.deepStrictEqual(h.state.emails.map(e => e.id), ['e1']);
+});
+
+test('search is refused offline — the cached list stays put', () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.document.getElementById('search-input').value = 'from:someone';
+
+    h.submitSearch();
+
+    assert.strictEqual(h.state.searchQuery, '');
+    assert.ok(!h.names().includes('loadEmails'), 'search is a server round-trip');
+});
+
+test('send is refused offline — no lock taken, no draft posted', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    await h.sendComposedEmail();
+    assert.ok(!h.names().includes('doSendComposedEmail'));
+    assert.ok(!h.names().includes('setComposeSending'));
+    assert.strictEqual(h.state.sending, false);
+});
+
+test('actions are allowed again once offline mode clears', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.currentAccount = { id: 'acct-1' };
+    h.state.api = async (method, p) => { h.calls.push({ name: 'api', args: [method, p] }); };
+    h.state.emails = [email('e1')];
+    h.setOfflineMode(false);
+
+    await h.emailAction('archive', 'e1');
+
+    assert.ok(h.names().includes('api'), 'the offline gate must not outlive the offline session');
+});
+
+// ============================================================================
+// Offline read
+// ============================================================================
+
+test('an opened message with a cached body renders offline without a request', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.emails = [email('e1')];
+    h.state.currentEmailId = 'e1';
+    h.cacheEmail(body('e1'));
+
+    await h.renderScreenDetail('e1');
+
+    assert.ok(!h.names().includes('api'), 'a cache hit must never reach the network');
+    assert.ok(h.names().includes('renderEmailDetail'), 'the cached body must render');
+});
+
+test('an uncached message reports honestly offline instead of firing a doomed GET', async () => {
+    const h = makeHarness({ stateOverrides: { offlineMode: true } });
+    h.state.emails = [email('e9')];
+    h.state.currentEmailId = 'e9';
+
+    await h.renderScreenDetail('e9');
+
+    assert.ok(!h.names().includes('api'), 'no fetch may be attempted offline');
+    const shown = h.document.getElementById('email-body').innerHTML;
+    assert.match(shown, /offline/i, `body pane must explain why, got: ${shown}`);
+});
+
+// ============================================================================
+// init(): restore → paint → revalidate
+// ============================================================================
+
+test('init paints the cached snapshot BEFORE fetching accounts', async () => {
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: [{ id: 'acct-1', email: 'me@example.com' }],
+    });
+
+    await h.init();
+
+    const order = h.names();
+    const painted = order.indexOf('renderEmailList');
+    const fetched = order.indexOf('loadAccounts');
+    assert.notStrictEqual(painted, -1, 'the cached list must be painted');
+    assert.ok(painted < fetched,
+        `restore must precede the account fetch, got ${JSON.stringify(order)}`);
+});
+
+test('an offline cold start renders cached mail instead of dead-ending', async () => {
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: new ApiError('Network error: failed to fetch'),
+    });
+
+    await h.init();
+
+    assert.deepStrictEqual(h.state.emails.map(e => e.id), ['e1', 'e2']);
+    assert.strictEqual(h.state.offlineMode, true);
+    assert.strictEqual(h.document.getElementById('offline-banner').textContent,
+        'Offline — showing cached mail');
+    const statuses = h.calls.filter(c => c.name === 'showStatus').map(c => c.args[0]);
+    assert.ok(!statuses.includes('Cannot reach server'),
+        'a phone with cached mail must not be told the app is unusable');
+});
+
+test('init still dead-ends at "Cannot reach server" with no usable snapshot', async () => {
+    const h = makeHarness({ accountsResult: new ApiError('Network error: failed to fetch') });
+
+    await h.init();
+
+    assert.strictEqual(h.state.offlineMode, false, 'there is nothing cached to show');
+    const statuses = h.calls.filter(c => c.name === 'showStatus').map(c => c.args[0]);
+    assert.ok(statuses.includes('Cannot reach server'));
+});
+
+test('an auth failure is NOT swallowed into the offline path', async () => {
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: new ApiAuthError('session expired', 401),
+    });
+
+    await h.init();
+
+    assert.strictEqual(h.state.offlineMode, false,
+        'ApiAuthError means re-authorize, not airplane mode — the taxonomy must survive');
+    assert.strictEqual(h.document.getElementById('offline-banner').classList.contains('visible'), false);
+    const reported = h.calls.find(c => c.name === 'showError');
+    assert.ok(reported, 'the auth failure must still be reported');
+    assert.ok(reported.args[1] instanceof ApiAuthError);
+});
+
+test('a successful revalidate swaps in live state and clears the offline banner', async () => {
+    const h = makeHarness({
+        storage: { [KEY]: savedBlob() },
+        accountsResult: [{ id: 'acct-1', email: 'me@example.com' }],
+        stateOverrides: { offlineMode: true },
+    });
+
+    await h.init();
+
+    assert.strictEqual(h.state.offlineMode, false);
+    assert.strictEqual(h.document.getElementById('offline-banner').classList.contains('visible'), false);
+    assert.ok(h.names().includes('loadMailboxes'),
+        'the online restore must arm the refresh cascade so live state replaces the cache');
+});

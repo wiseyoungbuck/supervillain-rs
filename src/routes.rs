@@ -6961,6 +6961,116 @@ mod tests {
     }
 
     #[test]
+    fn mobile_sw_still_bypasses_the_api_for_offline_mail() {
+        // kata 2chc, design point 3: offline mail lives in the app's own
+        // localStorage snapshot, NOT in the service-worker cache. Two caches
+        // over one dataset is how "which copy is stale" bugs are born, so the
+        // /api/ bypass stays — a future edit that starts caching API responses
+        // here would give the dataset a second owner.
+        assert!(
+            MOBILE_SW.contains("url.pathname.startsWith('/api/')"),
+            "service worker must keep bypassing /api/ — the offline dataset is \
+             owned by the app snapshot (kata 2chc), not the SW cache"
+        );
+        assert!(
+            !MOBILE_SW.contains("api.fastmail.com"),
+            "service worker must not reference the provider API directly"
+        );
+    }
+
+    #[test]
+    fn mobile_offline_disabled_controls_exist_and_look_disabled() {
+        // kata 2chc: OFFLINE_DISABLED_CONTROLS is a list of ids, so a renamed
+        // or deleted button degrades silently into a control that stays LIVE
+        // offline. Pin every id against the shipped markup.
+        let start = MOBILE_APP_JS
+            .find("const OFFLINE_DISABLED_CONTROLS = [")
+            .expect("the offline-disabled control list must exist");
+        let rest = &MOBILE_APP_JS[start..];
+        let end = rest.find("\n];").expect("the control list must close");
+        let list = &rest[..end];
+        let mut count = 0;
+        for line in list.lines().skip(1) {
+            let id = line.trim().trim_end_matches(',').trim_matches('\'');
+            if id.is_empty() {
+                continue;
+            }
+            assert!(
+                MOBILE_HTML.contains(&format!("id=\"{id}\"")),
+                "OFFLINE_DISABLED_CONTROLS names #{id}, which does not exist in the \
+                 mobile markup — the control would stay live offline"
+            );
+            count += 1;
+        }
+        assert!(
+            count >= 8,
+            "every server-touching control must be listed (found only {count})"
+        );
+        // A disabled button swallows its own click, so offlineBlocked's toast
+        // never fires for these — the dimmed style is the only feedback the
+        // user gets, and without it a read-only session looks broken.
+        assert!(
+            MOBILE_HTML.contains(".detail-action-btn:disabled"),
+            "disabled detail actions need a visibly-disabled style (kata 2chc)"
+        );
+        assert!(
+            MOBILE_HTML.contains("#app-header .icon-btn:disabled"),
+            "disabled header icons need a visibly-disabled style (kata 2chc)"
+        );
+    }
+
+    #[test]
+    fn mobile_init_restores_the_snapshot_before_fetching_accounts() {
+        // kata 2chc: the cold-start contract. init() must paint the cached
+        // snapshot SYNCHRONOUSLY before the first await, so an offline phone
+        // sees mail rather than a splash that resolves into 'Cannot reach
+        // server'. Ordering is the whole behavior — a restore that runs after
+        // the fetch is the pre-2chc code — so pin the byte offsets, not just
+        // the presence of both calls. The behavioral suite
+        // (tests/offline_cache_test.cjs) drives the same order through the real
+        // function; this pins the source order so the two can't drift.
+        let block = js_fn_body(MOBILE_APP_JS, "async function init(");
+        let restore = block
+            .find("restoreFromSnapshot({ offline: true })")
+            .expect("init must restore the snapshot in offline mode");
+        let fetch = block
+            .find("await loadAccounts()")
+            .expect("init must fetch accounts");
+        assert!(
+            restore < fetch,
+            "init must restore-then-revalidate: the cached paint has to happen \
+             before the account fetch, not in its catch block"
+        );
+        // Revalidate side: a successful fetch must leave the degraded session.
+        let clear = block
+            .find("setOfflineMode(false)")
+            .expect("init must clear offline mode once accounts load");
+        assert!(
+            fetch < clear,
+            "offline mode must be cleared AFTER the account fetch succeeds, \
+             so the banner survives a failed one"
+        );
+    }
+
+    #[test]
+    fn mobile_init_keeps_auth_failures_out_of_the_offline_path() {
+        // kata 2chc + the api.js taxonomy: ApiAuthError means "re-authorize in
+        // desktop Settings", never "you are offline". Degrading an auth failure
+        // into a cached-mail session would hide a login problem behind an
+        // Offline banner and send the user to debug their wifi.
+        let block = js_fn_body(MOBILE_APP_JS, "async function init(");
+        let catch = block
+            .find("} catch (err) {")
+            .expect("init must catch the account-fetch failure");
+        let tail = &block[catch..];
+        assert!(
+            tail.contains("instanceof ApiAuthError"),
+            "init's account-fetch catch must distinguish ApiAuthError before \
+             entering offline mode (kata 2chc)"
+        );
+    }
+
+    #[test]
     fn mobile_html_has_touch_optimized_styles() {
         assert!(
             MOBILE_HTML.contains("min-height: 72px"),
@@ -11664,9 +11774,20 @@ white   = '#fdf6e3'
         // show/hide must NOT live inside setScreen or use .style.display,
         // or it would trip the display-ownership invariant (see
         // mobile_app_js_setscreen_owns_all_display_toggles above).
+        //
+        // kata 2chc split the banner's text from its visibility (a degraded
+        // session says "showing cached mail", a plain connectivity drop says
+        // "data may be stale"), so the toggle now runs off a local element
+        // handle instead of an inline getElementById chain. Slice the setter
+        // and pin what actually matters: a class toggle, never a style write.
+        let block = js_fn_body(MOBILE_APP_JS, "function setOfflineBanner(");
         assert!(
-            MOBILE_APP_JS.contains("getElementById('offline-banner').classList.toggle("),
+            block.contains("classList.toggle('visible'"),
             "offline banner visibility should be a classList.toggle, not .style.display"
+        );
+        assert!(
+            !block.contains("style.display"),
+            "offline banner must never write .style.display — that belongs to setScreen"
         );
     }
 
@@ -11857,10 +11978,17 @@ white   = '#fdf6e3'
     }
 
     #[test]
-    fn mobile_app_js_restore_runs_after_load_accounts() {
-        // Restore lives in init() after loadAccounts() succeeds (it needs the
-        // connected-account list to validate the snapshot), and the no-snapshot
-        // path falls through to the original default-account boot unchanged.
+    fn mobile_app_js_online_restore_runs_after_load_accounts() {
+        // The ONLINE restore — the one that validates the snapshot against the
+        // connected-account list and arms the refresh cascade — still lives
+        // after loadAccounts() succeeds, and the no-snapshot path still falls
+        // through to the original default-account boot unchanged.
+        //
+        // kata 2chc added an EARLIER, offline-flavored restore before the
+        // fetch (pinned by mobile_init_restores_the_snapshot_before_fetching_accounts);
+        // that one deliberately runs without an account list. This test is
+        // about the online one, so it looks for the no-argument call
+        // specifically rather than any restoreFromSnapshot(.
         let start = MOBILE_APP_JS
             .find("async function init(")
             .expect("init must exist");
@@ -11871,11 +11999,12 @@ white   = '#fdf6e3'
             .find("await loadAccounts()")
             .expect("init loads accounts");
         let restore = region
-            .find("restoreFromSnapshot(")
-            .expect("init attempts restore");
+            .find("restoreFromSnapshot()")
+            .expect("init attempts an online restore");
         assert!(
             restore > load_accounts,
-            "restore must run after loadAccounts() so the connected-account list is available"
+            "the online restore must run after loadAccounts() so the \
+             connected-account list is available to validate against"
         );
         // First-run byte-identical: the default-account selection still runs.
         assert!(
