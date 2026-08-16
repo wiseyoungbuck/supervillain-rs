@@ -137,12 +137,14 @@ pub struct JmapSession {
     /// the constant lives in one place (not four inline string literals) and
     /// tests can point it at a loopback recorder.
     pub caldav_base: String,
-    /// Resolved default calendar collection URL (absolute, no trailing slash),
-    /// discovered once via CalDAV PROPFIND and cached for the session
-    /// lifetime (kata wybm). Replaces the hardcoded `/Default/` that
-    /// 301→404'd on real Fastmail accounts. Populated lazily on first CalDAV
-    /// use by `resolve_calendar_collection` via `OnceCell::get_or_try_init`;
-    /// the four CalDAV functions append `/{uid}.ics` to it. `tokio::sync::OnceCell`
+    /// Resolved CalDAV discovery result — the default calendar collection
+    /// URL (absolute, no trailing slash; the event read/write functions
+    /// append `/{uid}.ics` to it) plus the optional RFC 6638 schedule-inbox
+    /// URL consumed by `clear_scheduling_inbox` — discovered once via
+    /// PROPFIND and cached for the session lifetime (kata wybm). Replaces
+    /// the hardcoded `/Default/` that 301→404'd on real Fastmail accounts.
+    /// Populated lazily on first CalDAV use via `OnceCell::get_or_try_init`.
+    /// `tokio::sync::OnceCell`
     /// (not `std::sync::Mutex`) because it coordinates concurrent first-callers
     /// on the same session — the `get_email` flow spawns fire-and-forget
     /// writers — so only one runs the two-PROPFIND discovery while the rest
@@ -150,7 +152,7 @@ pub struct JmapSession {
     /// call). A failed init leaves the cell empty (cancellation releases the
     /// init permit, no poisoning), so a transient discovery failure retries
     /// on the next call while a permanent one (no writable calendar) keeps
-    /// surfacing. The four `&self` CalDAV functions populate it without `&mut`.
+    /// surfacing. The `&self` CalDAV functions populate it without `&mut`.
     pub caldav_collection_url: std::sync::Arc<tokio::sync::OnceCell<DiscoveredCalendars>>,
     pub api_url: Option<String>,
     pub account_id: Option<String>,
@@ -2417,6 +2419,12 @@ static SCHEDULE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCHEDULE_INBOX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<(?:[A-Za-z0-9_.-]+:)?schedule-inbox\b").expect("static regex"));
+static CALENDAR_DATA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<(?:[A-Za-z0-9_.-]+:)?calendar-data\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?calendar-data\s*>",
+    )
+    .expect("static regex")
+});
 static DISPLAYNAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?s)<(?:[A-Za-z0-9_.-]+:)?displayname\b[^>]*>(.*?)</(?:[A-Za-z0-9_.-]+:)?displayname\s*>",
@@ -2903,6 +2911,27 @@ fn xml_escape_text(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Reverse of [`xml_escape_text`] plus the two standard XML entities a
+/// server may emit in `calendar-data` text nodes. `&amp;` last so decoded
+/// ampersands can't cascade into a second decode.
+fn xml_unescape_text(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Extract the VEVENT UID from raw ICS text (folded lines unfolded first).
+fn ics_uid(ics: &str) -> Option<String> {
+    let unfolded = ics.replace("\r\n ", "").replace("\n ", "");
+    unfolded
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .find_map(|l| l.strip_prefix("UID:"))
+        .map(|v| v.to_string())
+}
+
 /// Consume the RFC 6638 scheduling-Inbox objects for `uid` after an RSVP.
 ///
 /// Fastmail queues each incoming iTIP invitation as an object in the
@@ -2927,10 +2956,15 @@ pub async fn clear_scheduling_inbox(s: &JmapSession, uid: &str) -> Result<usize,
         return Ok(0);
     };
 
+    // `calendar-data` is requested so each hit's UID can be verified
+    // exactly: RFC 4791 §9.7.5's text-match is a SUBSTRING match (CalDAV
+    // has no match-type attribute), so the query alone would also return —
+    // and this fn would then delete — queued invitations whose UID merely
+    // contains this one (roborev 509).
     let query = format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:prop><D:getetag/></D:prop>
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
   <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
     <C:prop-filter name="UID"><C:text-match collation="i;octet">{}</C:text-match></C:prop-filter>
   </C:comp-filter></C:comp-filter></C:filter>
@@ -2959,10 +2993,17 @@ pub async fn clear_scheduling_inbox(s: &JmapSession, uid: &str) -> Result<usize,
         return Err(caldav_failure("REPORT", &inbox, status, &body));
     }
     let xml = resp.text().await?;
+    // Keep only response blocks whose calendar-data carries EXACTLY this
+    // UID — the query's text-match is a substring match, and deleting a
+    // near-miss would silently consume another event's pending invitation.
     let hrefs: Vec<String> = RESPONSE_RE
         .find_iter(&xml)
-        .filter_map(|m| HREF_RE.captures(m.as_str()).map(|c| element_text(&c[1])))
-        .filter(|h| h.ends_with(".ics"))
+        .filter_map(|m| {
+            let block = m.as_str();
+            let href = element_text(&HREF_RE.captures(block)?[1]);
+            let data = xml_unescape_text(&element_text(&CALENDAR_DATA_RE.captures(block)?[1]));
+            (ics_uid(&data).as_deref() == Some(uid)).then_some(href)
+        })
         .collect();
 
     let mut removed = 0;
@@ -6875,15 +6916,35 @@ END:VCALENDAR";
     }
 
     /// A 207 multistatus body for the Inbox REPORT: one queued invitation
-    /// object (the collection itself has no `.ics` suffix and is skipped by
-    /// the href filter).
-    fn inbox_report_multistatus(inbox_object_href: &str) -> Vec<u8> {
+    /// matching the requested UID exactly, plus a substring-collision
+    /// sibling (`<uid>-extra`) that RFC 4791's substring text-match would
+    /// also return — the exact-UID filter must skip it (roborev 509).
+    fn inbox_report_multistatus(inbox_object_href: &str, uid: &str, sibling_href: &str) -> Vec<u8> {
+        let escape = |s: &str| {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let ics = |u: &str| {
+            escape(&format!(
+                "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{u}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ))
+        };
+        let exact = ics(uid);
+        let sibling = ics(&format!("{uid}-extra"));
         format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
-<D:multistatus xmlns:D="DAV:">
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
  <D:response>
   <D:href>{inbox_object_href}</D:href>
-  <D:propstat><D:prop><D:getetag>"etag-1"</D:getetag></D:prop>
+  <D:propstat><D:prop><D:getetag>"etag-1"</D:getetag>
+   <C:calendar-data>{exact}</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+ <D:response>
+  <D:href>{sibling_href}</D:href>
+  <D:propstat><D:prop><D:getetag>"etag-2"</D:getetag>
+   <C:calendar-data>{sibling}</C:calendar-data></D:prop>
    <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
  </D:response>
 </D:multistatus>"#
@@ -6900,11 +6961,12 @@ END:VCALENDAR";
         // the inbox from the home listing's schedule-inbox resourcetype.
         let user = "user@fastmail.com";
         let inbox_obj = format!("/dav/calendars/user/{user}/Inbox/queued-entry.ics");
+        let sibling_obj = format!("/dav/calendars/user/{user}/Inbox/queued-sibling.ics");
         let (base, recorded) = spawn_discovery(
             &format!("/dav/principals/user/{user}/"),
             &default_coll_path(user),
             axum::http::StatusCode::MULTI_STATUS,
-            inbox_report_multistatus(&inbox_obj),
+            inbox_report_multistatus(&inbox_obj, "uid-8gn5&<odd>", &sibling_obj),
         )
         .await;
         let mut sess = JmapSession::new(user, "fmu1-test-token", Some("test-app-pass"));
@@ -6913,7 +6975,10 @@ END:VCALENDAR";
         let removed = clear_scheduling_inbox(&sess, "uid-8gn5&<odd>")
             .await
             .expect("inbox clear should succeed");
-        assert_eq!(removed, 1, "the one queued invitation must be consumed");
+        assert_eq!(
+            removed, 1,
+            "exactly the exact-UID invitation must be consumed — not the substring-collision sibling"
+        );
 
         let rec = recorded.lock().unwrap();
         let reports = recorded_by_method(&rec, "REPORT");
