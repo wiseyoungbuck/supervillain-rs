@@ -6,6 +6,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+ORIG_PATH="$PATH"
 
 setup() {
     TMP="$(mktemp -d)"
@@ -19,10 +20,19 @@ printf 'xdg-open %s\n' "$@" > "$LAUNCH_ARGS_FILE"
 STUB
     chmod +x "$BIN/xdg-open"
 
-    # Scope PATH to the stub bin plus a minimal system path so command -v
-    # lookups don't find the host's real omarchy-launch-or-focus-webapp or
-    # xdg-open when a stub for either is intentionally absent.
-    export PATH="$BIN:/usr/bin:/bin"
+    # Scope PATH to the stub bin plus symlinks to the few real tools the
+    # test needs, so command -v can't find the host's real
+    # omarchy-launch-or-focus-webapp or xdg-open when a stub for either is
+    # intentionally absent. /usr/bin must NOT be on this PATH: Omarchy 4.0
+    # packages every omarchy-* binary there, and finding the real webapp
+    # launcher opens an actual browser that inherits our pipes and hangs
+    # `cargo test` (scripts_test) until the browser exits.
+    local sysbin="$TMP/sysbin" tool
+    mkdir -p "$sysbin"
+    for tool in bash cat chmod mkdir rm; do
+        ln -s "$(command -v "$tool")" "$sysbin/$tool"
+    done
+    export PATH="$BIN:$sysbin"
     export LAUNCH_ARGS_FILE="$TMP/launch_args"
     export HOME="$TMP/home"
     mkdir -p "$HOME"
@@ -32,6 +42,7 @@ STUB
 }
 
 teardown() {
+    export PATH="$ORIG_PATH"
     rm -rf "$TMP"
 }
 

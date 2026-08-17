@@ -682,28 +682,36 @@ async fn list_identities(
 }
 
 async fn get_theme() -> impl IntoResponse {
-    let theme_dir = dirs_next::config_dir()
-        .unwrap_or_default()
-        .join("omarchy/current/theme");
+    // Omarchy 4.0 renders the active theme under XDG state; 3.x used XDG
+    // config. Check the 4.0 location first, then fall back.
+    let theme_dirs = [
+        dirs_next::state_dir()
+            .unwrap_or_default()
+            .join("omarchy/current/theme"),
+        dirs_next::config_dir()
+            .unwrap_or_default()
+            .join("omarchy/current/theme"),
+    ];
 
     // Both sources mirror the terminal palette, and terminal palettes reuse
     // slots (Everforest: color0 == color8, selection-bg == foreground), which
     // yields text painted in the color of the surface under it. Repair at the
     // serve point so every theme stays readable (kata: black-on-black labels).
+    for theme_dir in &theme_dirs {
+        // 1. Prefer supervillain.css (template-generated for colors.toml themes)
+        if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
+            && !css.is_empty()
+        {
+            let css = theme::sanitize_theme_css(&css);
+            return (StatusCode::OK, [("content-type", "text/css")], css);
+        }
 
-    // 1. Prefer supervillain.css (template-generated for colors.toml themes)
-    if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
-        && !css.is_empty()
-    {
-        let css = theme::sanitize_theme_css(&css);
-        return (StatusCode::OK, [("content-type", "text/css")], css);
-    }
-
-    // 2. Parse terminal color config (ghostty.conf → alacritty.toml)
-    if let Some(colors) = theme::load_from_theme_dir(&theme_dir) {
-        let is_light = theme::is_light_theme(&theme_dir);
-        let css = theme::sanitize_theme_css(&theme::generate_theme_css(&colors, is_light));
-        return (StatusCode::OK, [("content-type", "text/css")], css);
+        // 2. Parse terminal color config (ghostty.conf → alacritty.toml)
+        if let Some(colors) = theme::load_from_theme_dir(theme_dir) {
+            let is_light = theme::is_light_theme(theme_dir);
+            let css = theme::sanitize_theme_css(&theme::generate_theme_css(&colors, is_light));
+            return (StatusCode::OK, [("content-type", "text/css")], css);
+        }
     }
 
     // 3. No theme available — base CSS defaults apply
@@ -13223,6 +13231,17 @@ mod dirs_next {
             .or_else(|| {
                 std::env::var("HOME")
                     .map(|h| std::path::PathBuf::from(h).join(".config"))
+                    .ok()
+            })
+    }
+
+    pub fn state_dir() -> Option<std::path::PathBuf> {
+        std::env::var("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".local/state"))
                     .ok()
             })
     }
