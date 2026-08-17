@@ -693,28 +693,13 @@ async fn get_theme() -> impl IntoResponse {
             .join("omarchy/current/theme"),
     ];
 
-    // Both sources mirror the terminal palette, and terminal palettes reuse
-    // slots (Everforest: color0 == color8, selection-bg == foreground), which
-    // yields text painted in the color of the surface under it. Repair at the
-    // serve point so every theme stays readable (kata: black-on-black labels).
     for theme_dir in &theme_dirs {
-        // 1. Prefer supervillain.css (template-generated for colors.toml themes)
-        if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
-            && !css.is_empty()
-        {
-            let css = theme::sanitize_theme_css(&css);
-            return (StatusCode::OK, [("content-type", "text/css")], css);
-        }
-
-        // 2. Parse terminal color config (ghostty.conf → alacritty.toml)
-        if let Some(colors) = theme::load_from_theme_dir(theme_dir) {
-            let is_light = theme::is_light_theme(theme_dir);
-            let css = theme::sanitize_theme_css(&theme::generate_theme_css(&colors, is_light));
+        if let Some(css) = theme::css_for_theme_dir(theme_dir) {
             return (StatusCode::OK, [("content-type", "text/css")], css);
         }
     }
 
-    // 3. No theme available — base CSS defaults apply
+    // No theme available — base CSS defaults apply
     (
         StatusCode::OK,
         [("content-type", "text/css")],
