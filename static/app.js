@@ -102,6 +102,7 @@ const state = {
     // 'YYYY-MM-DD' day the view is centered on; events holds the fetched
     // RangeEvents for the visible window.
     calendarPeek: { visible: false, mode: 'day', anchor: null, events: [], loading: false, error: null },
+    triage: null,             // { queue, index, total } — Get-Me-To-Zero flow (kata 5np4)
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -258,6 +259,7 @@ function init() {
     els.remindModal = document.getElementById('remind-modal');
     els.moveModal = document.getElementById('move-modal');
     els.bulkBar = document.getElementById('bulk-bar');
+    els.triageProgress = document.getElementById('triage-progress');
     els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
     els.sendUndoToast = document.getElementById('send-undo-toast');
     els.sendUndoMessage = document.getElementById('send-undo-message');
@@ -6430,6 +6432,11 @@ function commandsForView(view) {
                 cmds.push({ name: 'Clear Selection', desc: 'Deselect all emails', shortcut: 'Esc', action: 'bulk-clear' });
             }
             cmds.push({ name: 'Read Statuses', desc: 'Open tracking for sent email (needs the tracking base configured)', shortcut: '', action: 'read-statuses' });
+            // 5np4: Get-Me-To-Zero — only when something is unread, so the
+            // palette never offers a flow that would end before it starts.
+            if (state.emails.some(e => e.isUnread)) {
+                cmds.push({ name: 'Triage Mode', desc: 'Walk unread emails one at a time to inbox zero', shortcut: 'T', action: 'triage' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
@@ -6608,6 +6615,7 @@ function executeCommand(action) {
         case 'bulk-clear': clearBulkSelection(); break;
         case 'calendar-peek': toggleCalendarPeek(); break;
         case 'share-availability': openAvailabilityPicker(); break;
+        case 'triage': enterTriage(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {

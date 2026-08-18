@@ -2791,3 +2791,14 @@ body:not(.light-theme) .compose-quote a * {
 }
 #avail-modal.hidden { display: none; }
 .avail-status-error { color: var(--error, #ff5555); }
+
+/* Triage progress (kata 5np4): the Get-Me-To-Zero counter in the statusbar. */
+#triage-progress {
+    color: var(--accent);
+    font-weight: 600;
+    margin-left: auto;
+}
+
+#triage-progress.hidden {
+    display: none;
+}
