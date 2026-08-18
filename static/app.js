@@ -414,6 +414,8 @@ function init() {
     els.composeAttachmentsList.addEventListener('click', handleAttachmentListClick);
     setupComposeDragDrop();
     els.composeBody.addEventListener('paste', handleComposePaste);
+    // From identity change → swap the signature block in place (kata zqrn).
+    els.composeFrom.addEventListener('change', applyComposeSignatureForFrom);
 
     // Single delegated click handler for email list — never re-bound, survives innerHTML updates
     els.emailList.addEventListener('click', (e) => {
