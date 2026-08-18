@@ -3155,6 +3155,24 @@ fn attendee_status_from_ics(
         .map(|a| a.status.clone())
 }
 
+/// Fetch the raw ICS payload of every event overlapping `[start, end)` from
+/// the default calendar collection, via a CalDAV `calendar-query` REPORT
+/// with a time-range filter (RFC 4791 §7.8.1). One `String` per calendar
+/// resource — a resource may contain several VEVENTs (recurrence master +
+/// overrides); `calendar::events_in_range` does the normalization.
+///
+/// READ-ONLY by design: the REPORT addresses the resolved default collection
+/// (never the schedule-inbox) and issues no PUT/DELETE — writes against
+/// Fastmail scheduling collections have iTIP side effects (kata 8gn5).
+pub async fn get_calendar_ics_in_range(
+    s: &JmapSession,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error> {
+    let _ = (s, start, end);
+    Ok(Vec::new())
+}
+
 /// UUID v4 generation using /dev/urandom for proper randomness.
 #[cfg(test)]
 fn uuid_v4() -> String {
@@ -8019,6 +8037,92 @@ END:VCALENDAR";
         assert!(
             calls.lock().unwrap().is_empty(),
             "cached mailbox must avoid a second create/fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_report_is_read_only_and_time_bounded() {
+        use chrono::TimeZone;
+        // Two events overlapping the window, as Cyrus would return them.
+        let multistatus = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+ <D:response>
+  <D:href>/dav/calendars/user/u/coll/ev1.ics</D:href>
+  <D:propstat><D:prop><D:getetag>"a"</D:getetag>
+   <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ev1@fixture
+DTSTART:20260818T100000Z
+DTEND:20260818T110000Z
+SUMMARY:First
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+ <D:response>
+  <D:href>/dav/calendars/user/u/coll/ev2.ics</D:href>
+  <D:propstat><D:prop><D:getetag>"b"</D:getetag>
+   <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ev2@fixture
+DTSTART:20260819T100000Z
+DTEND:20260819T110000Z
+SUMMARY:Second
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+</D:multistatus>"#
+            .to_string();
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, _path| {
+            if method == "REPORT" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    multistatus.clone().into_bytes(),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, Vec::new())
+            }
+        })
+        .await;
+
+        let mut s = JmapSession::new("u@aristoi.test", "token", Some("app-pass"));
+        s.caldav_base = base.clone();
+        s.caldav_collection_url
+            .set(DiscoveredCalendars {
+                default_collection: format!("{base}/dav/calendars/user/u/coll"),
+                schedule_inbox: Some(format!("{base}/dav/calendars/user/u/Inbox")),
+            })
+            .expect("prefill discovery");
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 8, 17, 0, 0, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2026, 8, 24, 0, 0, 0).unwrap();
+        let ics = get_calendar_ics_in_range(&s, start, end)
+            .await
+            .expect("range query");
+        assert_eq!(ics.len(), 2, "{ics:?}");
+        assert!(ics[0].contains("UID:ev1@fixture"), "{}", ics[0]);
+        assert!(ics[1].contains("UID:ev2@fixture"), "{}", ics[1]);
+
+        let rec = recorded.lock().unwrap().clone();
+        assert_eq!(rec.len(), 1, "exactly one request expected: {rec:?}");
+        let req = &rec[0];
+        assert_eq!(req.method, "REPORT");
+        assert_eq!(
+            req.path, "/dav/calendars/user/u/coll",
+            "REPORT must address the default collection, never the schedule-inbox"
+        );
+        assert_eq!(req.header("depth"), Some("1"));
+        let body = String::from_utf8(req.body.clone()).unwrap();
+        assert!(
+            body.contains(r#"time-range start="20260817T000000Z" end="20260824T000000Z""#),
+            "REPORT body must carry the UTC time-range filter: {body}"
+        );
+        assert!(body.contains("calendar-data"), "{body}");
+        assert!(
+            rec.iter()
+                .all(|r| r.method != "PUT" && r.method != "DELETE"),
+            "range query must be read-only: {rec:?}"
         );
     }
 }

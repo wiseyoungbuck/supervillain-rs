@@ -1191,6 +1191,59 @@ pub fn strip_method(ics: &str) -> String {
 // Tests
 // =============================================================================
 
+// =============================================================================
+// Range events (kata j6e4)
+// =============================================================================
+
+/// One normalized event occurrence inside a queried time range — the wire
+/// shape the day/week peek view renders. Unlike [`CalendarEvent`] (a parsed
+/// iTIP invitation), a `RangeEvent` is an *occurrence*: a recurring VEVENT
+/// expands to one `RangeEvent` per instance that overlaps the window.
+///
+/// All-day occurrences (`all_day: true`) carry their DATE values as midnight
+/// UTC (matching `parse_ics_datetime_property`'s DATE handling); the client
+/// renders them as dates, not instants. `account` is filled by the route
+/// handler — the parser leaves it empty.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeEvent {
+    pub uid: String,
+    pub summary: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub account: String,
+}
+
+/// Parse a set of raw ICS calendar objects (one CalDAV resource each — a
+/// resource may hold several VEVENTs: a recurrence master plus
+/// RECURRENCE-ID overrides) and return every occurrence overlapping
+/// `[range_start, range_end)`, sorted by start time.
+///
+/// Overlap uses CalDAV time-range semantics (RFC 4791 §9.9): an occurrence
+/// matches when `start < range_end && end > range_start`, or — for
+/// zero-length occurrences — `start` lies within the window.
+///
+/// Recurrence support is deliberately scoped to the simple RRULEs real
+/// invites use: FREQ=DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, COUNT,
+/// UNTIL, BYDAY (weekly only), plus EXDATE and RECURRENCE-ID overrides.
+/// Out of scope (occurrences from such rules follow the plain FREQ cycle or
+/// are dropped): RDATE, BYSETPOS, BYMONTH/BYMONTHDAY/BYYEARDAY modifiers,
+/// the DURATION property, and WKST. Timed expansions iterate in
+/// `primary_tz` wall-clock so a weekly 09:00 meeting stays 09:00 across
+/// the user's DST transitions; MONTHLY pins DTSTART's day-of-month and
+/// skips months without it; YEARLY pins month+day.
+pub fn events_in_range(
+    ics_objects: &[String],
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+    primary_tz: Tz,
+) -> Vec<RangeEvent> {
+    let _ = (ics_objects, range_start, range_end, primary_tz);
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3312,5 +3365,198 @@ END:VCALENDAR";
                 "smuggled mailto must not become a standalone ATTENDEE line"
             );
         }
+    }
+
+    // --- events_in_range (kata j6e4) ---
+
+    const RANGE_MIXED: &str = include_str!("../tests/fixtures/range_mixed.ics");
+    const RANGE_RECURRING: &str = include_str!("../tests/fixtures/range_recurring.ics");
+    const RANGE_DAILY: &str = include_str!("../tests/fixtures/range_daily.ics");
+    const RANGE_ALLDAY_WEEKLY: &str = include_str!("../tests/fixtures/range_allday_weekly.ics");
+
+    fn range_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// The fixtures' query window: Mon 2026-08-17 .. Mon 2026-08-24 (UTC).
+    fn week_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (range_utc(2026, 8, 17, 0, 0), range_utc(2026, 8, 24, 0, 0))
+    }
+
+    #[test]
+    fn range_mixed_fixture_filters_and_sorts() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_MIXED.to_string()], start, end, chrono_tz::UTC);
+        let uids: Vec<&str> = events.iter().map(|e| e.uid.as_str()).collect();
+        // Out-of-window and STATUS:CANCELLED events are excluded; the event
+        // straddling the window start is included; results sort by start.
+        assert_eq!(
+            uids,
+            ["straddle-1@fixture", "timed-1@fixture", "allday-1@fixture"],
+            "{events:?}"
+        );
+        assert_eq!(events[0].start, range_utc(2026, 8, 16, 23, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 17, 1, 0));
+        let timed = &events[1];
+        assert!(!timed.all_day);
+        assert_eq!(timed.summary, "Standup review");
+        assert_eq!(timed.location.as_deref(), Some("Room 1"));
+        assert_eq!(timed.start, range_utc(2026, 8, 19, 10, 0));
+        assert_eq!(timed.end, range_utc(2026, 8, 19, 11, 0));
+        let allday = &events[2];
+        assert!(allday.all_day);
+        assert_eq!(allday.start, range_utc(2026, 8, 20, 0, 0));
+        assert_eq!(allday.end, range_utc(2026, 8, 21, 0, 0));
+    }
+
+    #[test]
+    fn range_daily_count_rule_counts_pre_window_occurrences() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_DAILY.to_string()], start, end, chrono_tz::UTC);
+        // FREQ=DAILY;COUNT=5 from Aug 15: occurrences 15–19; the two before
+        // the window still consume COUNT, so the window sees 17, 18, 19.
+        let starts: Vec<_> = events.iter().map(|e| e.start).collect();
+        assert_eq!(
+            starts,
+            [
+                range_utc(2026, 8, 17, 8, 0),
+                range_utc(2026, 8, 18, 8, 0),
+                range_utc(2026, 8, 19, 8, 0),
+            ],
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.uid == "daily-1@fixture" && !e.all_day)
+        );
+        assert_eq!(events[0].end, range_utc(2026, 8, 17, 8, 30));
+    }
+
+    #[test]
+    fn range_weekly_byday_exdate_and_override() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_RECURRING.to_string()], start, end, chrono_tz::UTC);
+        // MO,WE weekly at 09:00 Europe/London (08:00 UTC in August): the
+        // Wed 19th instance is EXDATE'd; the Mon 17th instance is replaced
+        // by its RECURRENCE-ID override, moved to 14:00 London.
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e.uid, "rec-1@fixture");
+        assert_eq!(e.summary, "Weekly sync (moved)");
+        assert!(!e.all_day);
+        assert_eq!(e.start, range_utc(2026, 8, 17, 13, 0));
+        assert_eq!(e.end, range_utc(2026, 8, 17, 13, 30));
+    }
+
+    #[test]
+    fn range_weekly_until_stops_expansion() {
+        // Window entirely after UNTIL=20260831T230000Z: nothing recurs.
+        let events = events_in_range(
+            &[RANGE_RECURRING.to_string()],
+            range_utc(2026, 9, 1, 0, 0),
+            range_utc(2026, 9, 30, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn range_allday_weekly_recurs_on_dates() {
+        let (start, end) = week_window();
+        let events = events_in_range(
+            &[RANGE_ALLDAY_WEEKLY.to_string()],
+            start,
+            end,
+            chrono_tz::UTC,
+        );
+        // Weekly all-day from Thu 2026-08-06 → Thu 2026-08-20 in the window.
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].all_day);
+        assert_eq!(events[0].start, range_utc(2026, 8, 20, 0, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 21, 0, 0));
+    }
+
+    #[test]
+    fn range_allday_without_dtend_spans_one_day() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:ad@fixture\n\
+                   DTSTART;VALUE=DATE:20260818\nSUMMARY:Anniversary\n\
+                   END:VEVENT\nEND:VCALENDAR"
+            .to_string();
+        let (start, end) = week_window();
+        let events = events_in_range(&[ics], start, end, chrono_tz::UTC);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].all_day);
+        assert_eq!(events[0].start, range_utc(2026, 8, 18, 0, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 19, 0, 0));
+    }
+
+    #[test]
+    fn range_monthly_on_day_31_skips_short_months() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:m31@fixture\n\
+                   DTSTART:20260131T120000Z\nDTEND:20260131T130000Z\n\
+                   RRULE:FREQ=MONTHLY\nSUMMARY:Payday\nEND:VEVENT\nEND:VCALENDAR"
+            .to_string();
+        let feb = events_in_range(
+            &[ics.clone()],
+            range_utc(2026, 2, 1, 0, 0),
+            range_utc(2026, 3, 1, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert!(feb.is_empty(), "no Feb 31st exists: {feb:?}");
+        let mar = events_in_range(
+            &[ics],
+            range_utc(2026, 3, 1, 0, 0),
+            range_utc(2026, 4, 1, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert_eq!(mar.len(), 1, "{mar:?}");
+        assert_eq!(mar[0].start, range_utc(2026, 3, 31, 12, 0));
+    }
+
+    #[test]
+    fn range_merges_multiple_ics_objects_sorted() {
+        let (start, end) = week_window();
+        let events = events_in_range(
+            &[RANGE_DAILY.to_string(), RANGE_MIXED.to_string()],
+            start,
+            end,
+            chrono_tz::UTC,
+        );
+        assert_eq!(events.len(), 6, "3 daily + 3 mixed: {events:?}");
+        let starts: Vec<_> = events.iter().map(|e| e.start).collect();
+        let mut sorted = starts.clone();
+        sorted.sort();
+        assert_eq!(starts, sorted, "merged results must sort by start");
+    }
+
+    #[test]
+    fn range_parse_1000_events_within_budget() {
+        // Perf budget (kata j6e4 / plan table): parse + normalize a
+        // 1,000-event range in < 100ms. CI-tolerant (~5x local headroom),
+        // synthetic data, no network — modeled on rate_limit.rs's timing
+        // asserts.
+        let objects: Vec<String> = (0..1000)
+            .map(|i| {
+                let day = 17 + (i % 7);
+                let hour = i % 23;
+                format!(
+                    "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:perf-{i}@fixture\n\
+                     DTSTART:202608{day:02}T{hour:02}0000Z\n\
+                     DTEND:202608{day:02}T{hour:02}3000Z\n\
+                     SUMMARY:Perf event {i}\nLOCATION:Nowhere {i}\n\
+                     END:VEVENT\nEND:VCALENDAR"
+                )
+            })
+            .collect();
+        let (start, end) = week_window();
+        let started = std::time::Instant::now();
+        let events = events_in_range(&objects, start, end, chrono_tz::UTC);
+        let elapsed = started.elapsed();
+        assert_eq!(events.len(), 1000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "1,000-event range parse took {elapsed:?} (budget 100ms)"
+        );
     }
 }
