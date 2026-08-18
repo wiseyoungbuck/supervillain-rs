@@ -50,9 +50,7 @@ pub struct AiConfig {
 /// sending a blank model string to the API.
 pub fn resolve_ai_config(api_key: Option<&str>, model: Option<&str>) -> Option<AiConfig> {
     let api_key = api_key.filter(|k| !k.is_empty())?;
-    let model = model
-        .filter(|m| !m.is_empty())
-        .unwrap_or(DEFAULT_AI_MODEL);
+    let model = model.filter(|m| !m.is_empty()).unwrap_or(DEFAULT_AI_MODEL);
     Some(AiConfig {
         api_key: api_key.to_string(),
         model: model.to_string(),
@@ -479,7 +477,11 @@ mod tests {
 
     #[test]
     fn summarize_prompt_carries_subject_sender_and_text_body() {
-        let email = mk_email("Q3 planning", Some("Let's meet Tuesday.\n> older quoted reply"), None);
+        let email = mk_email(
+            "Q3 planning",
+            Some("Let's meet Tuesday.\n> older quoted reply"),
+            None,
+        );
         let prompt = summarize_prompt(&email);
         assert!(prompt.contains("Q3 planning"));
         assert!(prompt.contains("jane@example.com"));
@@ -557,27 +559,25 @@ mod tests {
         let recorded_clone = recorded.clone();
         let app = axum::Router::new().route(
             "/v1/messages",
-            post(
-                move |headers: axum::http::HeaderMap, req_body: String| {
-                    let recorded = recorded_clone.clone();
-                    async move {
-                        let h = |name: &str| {
-                            headers
-                                .get(name)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or_default()
-                                .to_string()
-                        };
-                        *recorded.lock().unwrap() =
-                            Some((h("x-api-key"), h("anthropic-version"), req_body));
-                        (
-                            axum::http::StatusCode::from_u16(status).unwrap(),
-                            [("content-type", "application/json")],
-                            body,
-                        )
-                    }
-                },
-            ),
+            post(move |headers: axum::http::HeaderMap, req_body: String| {
+                let recorded = recorded_clone.clone();
+                async move {
+                    let h = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    *recorded.lock().unwrap() =
+                        Some((h("x-api-key"), h("anthropic-version"), req_body));
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -680,7 +680,10 @@ mod tests {
             "\"/api/ai/summarize\"",
             "\"/api/ai/draft\"",
         ] {
-            assert!(routes_src.contains(route), "router chain must expose {route}");
+            assert!(
+                routes_src.contains(route),
+                "router chain must expose {route}"
+            );
         }
     }
 }

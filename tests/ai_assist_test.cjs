@@ -202,7 +202,15 @@ test('6rhw: detail palette offers AI commands only when the feature is enabled',
     const make = (ai) => new Function(
         'state',
         code + '\nreturn commandsForView;'
-    )({ ai, currentEmail: null, mailboxes: [], splits: [] })('detail').map(c => c.action);
+    )({
+        ai,
+        currentEmail: null,
+        mailboxes: [],
+        splits: [],
+        accounts: [],
+        undoStack: [],
+        currentMailbox: null,
+    })('detail').map(c => c.action);
 
     const withAi = make({ enabled: true });
     assert.ok(withAi.includes('ai-summarize'), 'enabled → ai-summarize offered');
