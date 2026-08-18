@@ -8214,5 +8214,154 @@ function handleCalendarPeekKey(e) {
     return true;
 }
 
+// =============================================================================
+// Share Availability (kata mtqp) — insert free time slots into compose
+// =============================================================================
+
+// Build the text block inserted into the compose body from a
+// /api/calendar/free-slots response. Pure: no state, no clock reads —
+// tests drive it directly (tests/share_availability_test.cjs). Contiguous
+// slots merge into ranges; ranges group per local day; an empty slot list
+// yields '' so the caller can show a status instead of inserting nothing.
+// Day labels are pinned to en-US: this text is pasted into outgoing mail,
+// where a stable format beats tracking the sender's UI locale.
+function availabilityText(slots, tzLabel) {
+    if (!slots.length) return '';
+    const ranges = [];
+    for (const s of slots) {
+        const startMs = Date.parse(s.start);
+        const endMs = Date.parse(s.end);
+        const last = ranges[ranges.length - 1];
+        if (last && last.endMs === startMs) {
+            last.endMs = endMs;
+        } else {
+            ranges.push({ startMs, endMs });
+        }
+    }
+    const dayLabels = [];
+    const byDay = new Map();
+    for (const r of ranges) {
+        const start = new Date(r.startMs);
+        const label = start.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        if (!byDay.has(label)) {
+            byDay.set(label, []);
+            dayLabels.push(label);
+        }
+        byDay.get(label).push(`${peekTimeLabel(start)}–${peekTimeLabel(new Date(r.endMs))}`);
+    }
+    const lines = dayLabels.map((label) => `- ${label}: ${byDay.get(label).join(', ')}`);
+    const footer = tzLabel ? `\n\n(times in ${tzLabel})` : '';
+    return `Would any of these times work?\n\n${lines.join('\n')}${footer}`;
+}
+
+// Splice `text` into `value` at the selection, returning the new value and
+// caret. Pure counterpart of insertIntoComposeBody.
+function insertAtCursor(value, selStart, selEnd, text) {
+    return {
+        value: value.slice(0, selStart) + text + value.slice(selEnd),
+        caret: selStart + text.length,
+    };
+}
+
+// Insert into the compose BODY only — the send path (doSendEmail & friends)
+// is never touched; the inserted availability block travels as ordinary
+// body text. The input dispatch feeds the same autosave/resize listeners a
+// keystroke would.
+function insertIntoComposeBody(text) {
+    const body = els.composeBody;
+    const selStart = body.selectionStart ?? body.value.length;
+    const selEnd = body.selectionEnd ?? body.value.length;
+    const { value, caret } = insertAtCursor(body.value, selStart, selEnd, text);
+    body.value = value;
+    body.selectionStart = body.selectionEnd = caret;
+    body.dispatchEvent(new Event('input', { bubbles: true }));
+    body.focus();
+}
+
+function openAvailabilityPicker() {
+    if (state.view !== 'compose') return;
+    els.availModal.innerHTML = `
+        <div class="modal-content avail-content">
+            <h3>Share Availability</h3>
+            <div class="modal-field">
+                <label for="avail-days">Window:</label>
+                <select id="avail-days">
+                    <option value="1">Today</option>
+                    <option value="3" selected>Next 3 days</option>
+                    <option value="7">Next 7 days</option>
+                </select>
+            </div>
+            <div class="modal-field">
+                <label for="avail-slot">Slot length:</label>
+                <select id="avail-slot">
+                    <option value="30" selected>30 minutes</option>
+                    <option value="60">1 hour</option>
+                </select>
+            </div>
+            <div id="avail-status" class="modal-hint" role="status"></div>
+            <div class="modal-hint">Enter inserts &middot; Esc cancels</div>
+            <div class="modal-buttons"><button id="avail-cancel" type="button">Cancel</button><button id="avail-insert" type="button">Insert times</button></div>
+        </div>`;
+    els.availModal.classList.remove('hidden');
+    document.getElementById('avail-cancel').addEventListener('click', closeAvailabilityPicker);
+    document.getElementById('avail-insert').addEventListener('click', confirmAvailabilityPicker);
+    document.getElementById('avail-days').focus();
+}
+
+function closeAvailabilityPicker() {
+    els.availModal.classList.add('hidden');
+    els.composeBody.focus();
+}
+
+function availabilityStatus(message, isError) {
+    const status = document.getElementById('avail-status');
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle('avail-status-error', Boolean(isError));
+}
+
+async function confirmAvailabilityPicker() {
+    const days = parseInt(document.getElementById('avail-days')?.value, 10) || 3;
+    const slot = parseInt(document.getElementById('avail-slot')?.value, 10) || 30;
+    // From the next half-hour boundary (offered slots sit on the grid and
+    // never in the past) through local midnight N days out.
+    const now = new Date();
+    const start = new Date(Math.ceil(now.getTime() / 1_800_000) * 1_800_000);
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + days);
+    if (end <= start) {
+        availabilityStatus('That window is already over — pick a longer one.', true);
+        return;
+    }
+    availabilityStatus('Finding free times…', false);
+    try {
+        const resp = await api(
+            'GET',
+            `/calendar/free-slots?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}&slot=${slot}`
+        );
+        const tzLabel = state.timezone?.primary
+            || Intl.DateTimeFormat().resolvedOptions().timeZone
+            || '';
+        const text = availabilityText(resp.slots || [], tzLabel);
+        if (!text) {
+            availabilityStatus((resp.errors || [])[0] || 'No free times found in this window.', true);
+            return;
+        }
+        insertIntoComposeBody(text);
+        closeAvailabilityPicker();
+    } catch (err) {
+        availabilityStatus(err.message, true);
+    }
+}
+
+function handleAvailPickerKey(e) {
+    if (e.key === 'Escape') {
+        closeAvailabilityPicker();
+        e.preventDefault();
+    } else if (e.key === 'Enter') {
+        confirmAvailabilityPicker();
+        e.preventDefault();
+    }
+}
+
 // Initialize on load
 document.addEventListener('DOMContentLoaded', init);
