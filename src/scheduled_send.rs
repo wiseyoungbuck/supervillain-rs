@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::error::Error;
+use crate::provider;
 use crate::types::EmailSubmission;
 
 /// A failed dispatch stays queued and retries on later ticks (transient
@@ -73,7 +74,26 @@ impl ScheduledSendStore {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Self {
-        Self::new(path.as_ref().to_path_buf())
+        let store = Self::new(path.as_ref().to_path_buf());
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return store;
+        };
+        let parsed: Vec<ScheduledSend> = match serde_json::from_str(&contents) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("Failed to load scheduled-sends.json: {error}");
+                return store;
+            }
+        };
+        let mut records = store
+            .records
+            .write()
+            .expect("scheduled send store lock poisoned");
+        for record in parsed {
+            records.insert(record.id.clone(), record);
+        }
+        drop(records);
+        store
     }
 
     pub fn path(&self) -> &Path {
@@ -121,11 +141,17 @@ impl ScheduledSendStore {
             .collect()
     }
 
-    pub fn due(&self, _now: DateTime<Utc>) -> Vec<ScheduledSend> {
-        Vec::new()
+    pub fn due(&self, now: DateTime<Utc>) -> Vec<ScheduledSend> {
+        self.records()
+            .into_iter()
+            .filter(|record| record.send_at <= now)
+            .collect()
     }
 
     pub fn save(&self) -> Result<(), Error> {
+        let records = self.records();
+        let json = serde_json::to_string_pretty(&records)?;
+        crate::accounts::atomic_write_bytes(&self.path, json.as_bytes(), false)?;
         Ok(())
     }
 }
@@ -134,10 +160,75 @@ impl ScheduledSendStore {
 /// The interval wrapper in `spawn_daemon` supplies the wall clock; this
 /// function always receives `now` for deterministic tests.
 pub async fn tick_scheduled_send_daemon(
-    _state: &std::sync::Arc<crate::types::AppState>,
-    _now: DateTime<Utc>,
+    state: &std::sync::Arc<crate::types::AppState>,
+    now: DateTime<Utc>,
 ) -> Vec<DispatchedSend> {
-    Vec::new()
+    let due = state.scheduled_sends.due(now);
+    let mut dispatched = Vec::new();
+    let mut mutated = false;
+    for record in due {
+        let (session_lock, account_configured) = {
+            let accounts = state.accounts.read().await;
+            (
+                accounts.sessions.get(&record.account_id).cloned(),
+                accounts.account_configs.contains_key(&record.account_id),
+            )
+        };
+        let Some(session_lock) = session_lock else {
+            // A missing session is transient when the account is still
+            // configured (OAuth pending, startup connect failure) — the
+            // queued mail must wait for it, not vanish. Only records for
+            // accounts removed from the config are dropped.
+            if !account_configured {
+                state.scheduled_sends.remove(&record.id);
+                mutated = true;
+            }
+            continue;
+        };
+        let mut session = session_lock.write().await;
+        // Strip send_at before dispatch so no downstream consumer can ever
+        // read a queued submission as "defer again".
+        let mut submission = record.submission.clone();
+        submission.send_at = None;
+        match provider::send_email(&mut session, &submission, &record.from_addr, None).await {
+            Ok(email_id) => {
+                state.scheduled_sends.remove(&record.id);
+                mutated = true;
+                dispatched.push(DispatchedSend {
+                    id: record.id.clone(),
+                    account_id: record.account_id.clone(),
+                    email_id,
+                });
+            }
+            Err(error) => {
+                // An Err from the send path means the provider refused or
+                // was unreachable before acceptance — keep the record and
+                // retry next tick, up to the attempts cap.
+                let attempts = record.attempts + 1;
+                mutated = true;
+                if attempts >= MAX_DISPATCH_ATTEMPTS {
+                    tracing::error!(
+                        "Giving up on scheduled send {} after {attempts} attempts: {error}",
+                        record.id
+                    );
+                    state.scheduled_sends.remove(&record.id);
+                } else {
+                    tracing::warn!(
+                        "Scheduled send {} failed (attempt {attempts}): {error}",
+                        record.id
+                    );
+                    state.scheduled_sends.insert(ScheduledSend {
+                        attempts,
+                        ..record.clone()
+                    });
+                }
+            }
+        }
+    }
+    if mutated && let Err(error) = state.scheduled_sends.save() {
+        tracing::warn!("Failed to persist scheduled-send daemon update: {error}");
+    }
+    dispatched
 }
 
 pub fn spawn_daemon(state: std::sync::Arc<crate::types::AppState>) {

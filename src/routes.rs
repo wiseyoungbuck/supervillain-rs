@@ -2145,9 +2145,36 @@ async fn send_email_handler(
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: body.attachments,
-        send_at: None,
+        send_at: body.send_at,
         calendar_ics: None,
     };
+
+    // Deferred send (kata vj6k/acag): a future send_at queues the submission
+    // for the daemon instead of dispatching. A past/absent send_at sends on
+    // the request path — a stale Undo window must not park mail for a tick.
+    if let Some(send_at) = submission.send_at
+        && send_at > chrono::Utc::now()
+    {
+        drop(session);
+        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+        let record = crate::scheduled_send::ScheduledSend {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id,
+            from_addr,
+            send_at,
+            queued_at: chrono::Utc::now(),
+            submission,
+            attempts: 0,
+        };
+        state.scheduled_sends.insert(record.clone());
+        state.scheduled_sends.save()?;
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "id": record.id,
+            "sendAt": record.send_at,
+        })));
+    }
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
     Ok(send_success_response(result))
@@ -2157,10 +2184,12 @@ async fn send_email_handler(
 
 /// List the account's queued deferred sends, soonest first.
 async fn list_scheduled_sends(
-    State(_state): State<Arc<AppState>>,
-    Query(_params): Query<AccountParam>,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    Err(Error::Internal("scheduled sends not implemented".into()))
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let records = state.scheduled_sends.records_for_account(&account_id);
+    Ok(Json(serde_json::to_value(records)?))
 }
 
 /// Cancel a queued deferred send. Returns the removed record (submission
@@ -2168,10 +2197,14 @@ async fn list_scheduled_sends(
 /// unknown — including "already dispatched", which is exactly what an
 /// Undo click after the window closes should surface.
 async fn cancel_scheduled_send(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    Err(Error::Internal("scheduled sends not implemented".into()))
+    let Some(record) = state.scheduled_sends.remove(&id) else {
+        return Err(Error::NotFound(format!("no scheduled send '{id}'")));
+    };
+    state.scheduled_sends.save()?;
+    Ok(Json(serde_json::to_value(record)?))
 }
 
 // --- Persistent drafts (kata wm57) -----------------------------------------
