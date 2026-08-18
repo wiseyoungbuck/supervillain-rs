@@ -203,6 +203,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/calendar/invite", post(send_invite_handler))
         .route("/api/calendar/events", get(calendar_events_range))
         .route("/api/build-id", get(build_id))
+        .route("/api/scheduled-sends", get(list_scheduled_sends))
+        .route(
+            "/api/scheduled-sends/{id}",
+            axum::routing::delete(cancel_scheduled_send),
+        )
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))

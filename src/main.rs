@@ -140,6 +140,7 @@ async fn main() {
     // split-count requests.
     prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
     reminders::spawn_daemon(state.clone());
+    scheduled_send::spawn_daemon(state.clone());
 
     let app = routes::router(state).layer(routes::compression_layer());
 
