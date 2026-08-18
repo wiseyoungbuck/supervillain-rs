@@ -213,6 +213,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/contacts/insights",
             get(crate::contacts::contact_insights),
         )
+        .route("/api/ai/status", get(crate::ai::ai_status_handler))
+        .route("/api/ai/summarize", post(crate::ai::ai_summarize))
+        .route("/api/ai/draft", post(crate::ai::ai_draft))
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))

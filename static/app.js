@@ -95,6 +95,9 @@ const state = {
     // aggregated history from /api/contacts/insights. Account-prefixed keys
     // follow the contactIndex isolation convention.
     contactInsights: new Map(),
+    // AI assist availability (kata 6rhw): {enabled, model} from
+    // GET /api/ai/status; null until the boot probe resolves.
+    ai: null,
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -214,6 +217,7 @@ function init() {
     els.emailMeta = document.getElementById('email-meta');
     els.emailBody = document.getElementById('email-body');
     els.contactSidebar = document.getElementById('contact-sidebar');
+    els.aiSummary = document.getElementById('ai-summary');
     els.composeView = document.getElementById('compose-view');
     els.composeFrom = document.getElementById('compose-from');
     els.composeTo = document.getElementById('compose-to');
@@ -609,6 +613,7 @@ function init() {
     // Load data
     loadTheme();
     loadAccounts();
+    loadAiStatus();
     // Wake notifications are server-side; poll the shared reminder table so
     // a browser open on any device notices a daemon wake without a websocket.
     setInterval(() => { if (state.currentAccount) loadReminders(); }, 30_000);
@@ -6071,6 +6076,14 @@ function commandsForView(view) {
                     { name: 'Tentative', desc: 'RSVP tentative', shortcut: 'm', action: 'rsvp-tentative' },
                 );
             }
+            // AI assist (kata 6rhw): offered only when the server reports a
+            // configured ANTHROPIC_API_KEY — hidden, not broken, without one.
+            if (state.ai?.enabled) {
+                cmds.push(
+                    { name: 'AI: Summarize', desc: 'Summarize this email with Claude', shortcut: '', action: 'ai-summarize' },
+                    { name: 'AI: Draft Reply', desc: 'Draft a reply with Claude', shortcut: '', action: 'ai-draft-reply' },
+                );
+            }
             // Global tail (Superhuman Rule #5: most commands available from
             // everywhere), ranked below the view-native ones.
             cmds.push(
@@ -6308,6 +6321,10 @@ function executeCommand(action) {
         case 'rsvp-accept': rsvpToEvent('ACCEPTED'); break;
         case 'rsvp-decline': rsvpToEvent('DECLINED'); break;
         case 'rsvp-tentative': rsvpToEvent('TENTATIVE'); break;
+        // AI assist (kata 6rhw): palette-only entry points, gated in
+        // commandsForView on state.ai.enabled.
+        case 'ai-summarize': summarizeCurrentEmail(); break;
+        case 'ai-draft-reply': aiDraftReply(); break;
         case 'search': openSearch(); break;
         case 'toggle-unread': toggleUnreadSelected(); break;
         case 'toggle-flag': toggleFlagSelected(); break;

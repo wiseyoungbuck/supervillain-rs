@@ -2632,3 +2632,39 @@ body:not(.light-theme) .compose-quote a * {
     font-style: italic;
     margin-top: 8px;
 }
+
+/* ============================================================================
+   AI assist (kata 6rhw)
+   ========================================================================= */
+
+#ai-summary {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-size: 13px;
+}
+
+#ai-summary.hidden {
+    display: none;
+}
+
+.ai-summary-label {
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+
+.ai-summary-text {
+    white-space: pre-wrap;
+    color: var(--fg);
+}
+
+.ai-summary-loading {
+    color: var(--fg-dim);
+    font-style: italic;
+}
+
+.ai-summary-error {
+    color: var(--error, #c66);
+}
