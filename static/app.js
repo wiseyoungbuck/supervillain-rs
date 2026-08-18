@@ -5295,6 +5295,31 @@ function commandsForView(view) {
                 { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
             );
+            // map4: existing functionality newly reachable from the palette.
+            // Every action calls the SAME function its keybinding/click path
+            // calls, and every gate mirrors that path's own no-op condition
+            // so the palette never offers a command that would do nothing.
+            cmds.push({ name: 'Unsubscribe & Archive All', desc: 'Unsubscribe from this sender and archive all their emails', shortcut: 'U', action: 'unsubscribe' });
+            if (state.undoStack.length) {
+                cmds.push({ name: 'Undo', desc: 'Undo the last archive, trash, or reminder', shortcut: 'z', action: 'undo' });
+            }
+            if (state.mailboxes.some(m => m.role === 'drafts')) {
+                cmds.push({ name: 'Go to Drafts', desc: 'Switch to drafts', shortcut: '', action: 'go-drafts' });
+            }
+            if (state.mailboxes.some(m => m.role === 'sent')) {
+                cmds.push({ name: 'Go to Sent', desc: 'Switch to sent', shortcut: '', action: 'go-sent' });
+            }
+            if (state.mailboxes.some(m => m.role === 'spam')) {
+                cmds.push({ name: 'Go to Spam', desc: 'Switch to spam', shortcut: '', action: 'go-spam' });
+            }
+            state.accounts.forEach((acct, i) => {
+                const label = acct.email || acct.id;
+                cmds.push({ name: `Switch Account: ${label}`, desc: `Switch to ${label}`, shortcut: i < 9 ? String(i + 1) : '', action: `switch-account:${acct.id}` });
+            });
+            cmds.push(
+                { name: 'Back to List', desc: 'Return to the email list', shortcut: 'q', action: 'back-to-list' },
+                { name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' },
+            );
             return cmds;
         }
         case 'list': {
@@ -5333,6 +5358,47 @@ function commandsForView(view) {
                     action: `delete-split:${split.id}`,
                 });
             });
+            // map4: existing functionality newly reachable from the palette.
+            // Every action calls the SAME function its keybinding/click path
+            // calls, and every gate mirrors that path's own no-op condition
+            // so the palette never offers a command that would do nothing.
+            if (visibleRows()[state.selectedIndex]) {
+                cmds.push({ name: 'Unsubscribe & Archive All', desc: 'Unsubscribe from this sender and archive all their emails', shortcut: 'U', action: 'unsubscribe' });
+            }
+            if (state.undoStack.length) {
+                cmds.push({ name: 'Undo', desc: 'Undo the last archive, trash, or reminder', shortcut: 'z', action: 'undo' });
+            }
+            if (state.currentMailbox) {
+                cmds.push(
+                    { name: 'Toggle Starred Only', desc: 'Show only starred emails', shortcut: '', action: 'toggle-starred' },
+                    { name: 'Toggle Sort Order', desc: 'Newest/oldest first (Gmail sorts oldest-first per fetched page only)', shortcut: '', action: 'toggle-sort' },
+                );
+            }
+            if (state.mailboxes.some(m => m.role === 'drafts')) {
+                cmds.push({ name: 'Go to Drafts', desc: 'Switch to drafts', shortcut: '', action: 'go-drafts' });
+            }
+            if (state.mailboxes.some(m => m.role === 'sent')) {
+                cmds.push({ name: 'Go to Sent', desc: 'Switch to sent', shortcut: '', action: 'go-sent' });
+            }
+            if (state.mailboxes.some(m => m.role === 'spam')) {
+                cmds.push({ name: 'Go to Spam', desc: 'Switch to spam', shortcut: '', action: 'go-spam' });
+            }
+            // Split navigation mirrors cycleSplit/selectSplitByIndex's own
+            // gate (inbox + at least one split) — outside it they no-op.
+            if (state.currentMailbox?.role === 'inbox' && state.splits.length > 0) {
+                cmds.push(
+                    { name: 'Next Split', desc: 'Cycle to the next split tab', shortcut: 'Tab', action: 'next-split' },
+                    { name: 'Previous Split', desc: 'Cycle to the previous split tab', shortcut: 'Shift+Tab', action: 'prev-split' },
+                );
+                state.splits.forEach(split => {
+                    cmds.push({ name: `Go to Split: ${split.name}`, desc: `Switch to the "${split.name}" split`, shortcut: '', action: `go-split:${split.id}` });
+                });
+            }
+            state.accounts.forEach((acct, i) => {
+                const label = acct.email || acct.id;
+                cmds.push({ name: `Switch Account: ${label}`, desc: `Switch to ${label}`, shortcut: i < 9 ? String(i + 1) : '', action: `switch-account:${acct.id}` });
+            });
+            cmds.push({ name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' });
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -5365,6 +5431,13 @@ function commandsForView(view) {
                     action: `remove-account:${acct.id}`,
                 });
             });
+            // map4: Timezone Settings is the Reminder Settings sibling; Set
+            // Default Account mirrors the settings Shift+D keybinding's gate
+            // (handleSettingsNormalKey acts only with a selected account).
+            cmds.push({ name: 'Timezone Settings', desc: 'Primary and additional timezones', shortcut: '', action: 'timezone-settings' });
+            if (state.selectedAccountId) {
+                cmds.push({ name: 'Set Default Account', desc: 'Make the selected account the default', shortcut: 'D', action: 'set-default-account' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -5446,6 +5519,42 @@ function executeCommand(action) {
         case 'reminder-settings':
             openReminderSettings();
             break;
+        // map4: each case calls the SAME function the keybinding/click path
+        // calls (kata sefy invariant). The dynamic switch-account:/go-split:
+        // prefixes are handled in the default branch below, next to
+        // delete-split:/remove-account:.
+        case 'undo': performUndo(); break;
+        case 'unsubscribe': unsubscribeAndArchiveAll(); break;
+        case 'open-settings': openSettings(); break;
+        case 'back-to-list': showView('list'); break;
+        case 'toggle-starred': toggleStarredOnly(); break;
+        case 'toggle-sort': toggleSortOrder(); break;
+        case 'next-split': cycleSplit(1); break;
+        case 'prev-split': cycleSplit(-1); break;
+        case 'go-drafts': {
+            const drafts = state.mailboxes.find(m => m.role === 'drafts');
+            if (drafts) selectMailbox(drafts);
+            break;
+        }
+        case 'go-sent': {
+            const sent = state.mailboxes.find(m => m.role === 'sent');
+            if (sent) selectMailbox(sent);
+            break;
+        }
+        case 'go-spam': {
+            const spam = state.mailboxes.find(m => m.role === 'spam');
+            if (spam) selectMailbox(spam);
+            break;
+        }
+        case 'set-default-account':
+            if (state.selectedAccountId) setDefaultAccount(state.selectedAccountId);
+            break;
+        case 'timezone-settings':
+            // No dedicated open function exists — the timezone section lives
+            // on the settings screen; land there and bring it into view.
+            openSettings();
+            document.getElementById('timezone-settings')?.scrollIntoView({ block: 'start' });
+            break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {
@@ -5454,6 +5563,19 @@ function executeCommand(action) {
             } else if (action.startsWith('remove-account:')) {
                 const id = action.slice('remove-account:'.length);
                 removeAccountById(id);
+            } else if (action.startsWith('switch-account:')) {
+                const id = action.slice('switch-account:'.length);
+                const acct = state.accounts.find(a => a.id === id);
+                if (acct) {
+                    selectAccount(acct);
+                    showStatus(`Switched to ${acct.email}`, 'success');
+                }
+            } else if (action.startsWith('go-split:')) {
+                // selectSplitByIndex is the Ctrl+1-9 path; its index 0 is
+                // the 'all' tab, so splits start at 1.
+                const id = action.slice('go-split:'.length);
+                const idx = state.splits.findIndex(s => s.id === id);
+                if (idx !== -1) selectSplitByIndex(idx + 1);
             }
             break;
     }
