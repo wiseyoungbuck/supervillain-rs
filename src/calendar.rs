@@ -1669,6 +1669,56 @@ fn expand_rule_starts(
     out
 }
 
+// =============================================================================
+// Free-slot computation (kata mtqp)
+// =============================================================================
+
+/// One shareable free slot, `[start, end)` in UTC. Serialized camelCase for
+/// the client (compose-side "Share Availability" insertion, later wave).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeSlot {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// Constraints for [`free_slots`]. Working hours are wall-clock times in the
+/// user's primary timezone, applied to every day of the window (weekday
+/// filtering, if wanted, is the caller's window to shape).
+#[derive(Debug, Clone)]
+pub struct FreeSlotOptions {
+    /// Exact length of every emitted slot, in minutes. `0` yields no slots.
+    pub slot_minutes: u32,
+    /// Padding added before and after every busy block, in minutes.
+    pub buffer_minutes: u32,
+    /// Daily availability start (primary-timezone wall clock).
+    pub work_start: NaiveTime,
+    /// Daily availability end (exclusive). Must be after `work_start`; days
+    /// where it isn't produce nothing.
+    pub work_end: NaiveTime,
+}
+
+/// Compute free slots in `[window_start, window_end)` given busy occurrences
+/// (the [`events_in_range`] output) and constraints. Pure: no network, no
+/// clock reads — past slots are the caller's to trim.
+///
+/// Semantics: busy blocks are padded by `buffer_minutes` and merged; all-day
+/// occurrences (midnight-UTC date anchors) block their full *local* days in
+/// `primary_tz`. What remains of each day's working hours inside the window
+/// is chopped into consecutive `slot_minutes` slots from the start of each
+/// free gap; remainders shorter than a slot are dropped. Slots are returned
+/// sorted and non-overlapping.
+pub fn free_slots(
+    busy: &[RangeEvent],
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    primary_tz: Tz,
+    opts: &FreeSlotOptions,
+) -> Vec<FreeSlot> {
+    let _ = (busy, window_start, window_end, primary_tz, opts);
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3982,6 +4032,235 @@ END:VCALENDAR";
         assert!(
             elapsed < std::time::Duration::from_millis(100),
             "1,000-event range parse took {elapsed:?} (budget 100ms)"
+        );
+    }
+
+    // --- free_slots (kata mtqp) ---
+
+    fn busy_block(uid: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> RangeEvent {
+        RangeEvent {
+            uid: uid.into(),
+            summary: String::new(),
+            start,
+            end,
+            all_day: false,
+            location: None,
+            account: String::new(),
+        }
+    }
+
+    fn slot_opts(slot: u32, buffer: u32, ws: (u32, u32), we: (u32, u32)) -> FreeSlotOptions {
+        FreeSlotOptions {
+            slot_minutes: slot,
+            buffer_minutes: buffer,
+            work_start: NaiveTime::from_hms_opt(ws.0, ws.1, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(we.0, we.1, 0).unwrap(),
+        }
+    }
+
+    fn slot(s: DateTime<Utc>, e: DateTime<Utc>) -> FreeSlot {
+        FreeSlot { start: s, end: e }
+    }
+
+    #[test]
+    fn free_slots_empty_calendar_fills_working_hours() {
+        // Tue 2026-08-18, 09:00–17:00 UTC, hour slots, no events → 8 slots.
+        let day_start = range_utc(2026, 8, 18, 0, 0);
+        let day_end = range_utc(2026, 8, 19, 0, 0);
+        let slots = free_slots(
+            &[],
+            day_start,
+            day_end,
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 8, "{slots:?}");
+        assert_eq!(
+            slots[0],
+            slot(range_utc(2026, 8, 18, 9, 0), range_utc(2026, 8, 18, 10, 0))
+        );
+        assert_eq!(
+            slots[7],
+            slot(range_utc(2026, 8, 18, 16, 0), range_utc(2026, 8, 18, 17, 0))
+        );
+    }
+
+    #[test]
+    fn free_slots_overlapping_busy_blocks_merge() {
+        // 10:00–11:00 and 10:30–11:30 merge: free 09:00–10:00, 11:30–17:00.
+        let busy = [
+            busy_block(
+                "a",
+                range_utc(2026, 8, 18, 10, 0),
+                range_utc(2026, 8, 18, 11, 0),
+            ),
+            busy_block(
+                "b",
+                range_utc(2026, 8, 18, 10, 30),
+                range_utc(2026, 8, 18, 11, 30),
+            ),
+        ];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(30, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 2 + 11, "{slots:?}");
+        assert_eq!(slots[1].end, range_utc(2026, 8, 18, 10, 0));
+        assert_eq!(
+            slots[2].start,
+            range_utc(2026, 8, 18, 11, 30),
+            "first slot after the merged block must start at 11:30"
+        );
+        assert!(
+            slots.windows(2).all(|w| w[0].end <= w[1].start),
+            "slots must be sorted and non-overlapping: {slots:?}"
+        );
+    }
+
+    #[test]
+    fn free_slots_buffer_pads_busy_blocks() {
+        // 12:00–13:00 with 15-min buffer blocks 11:45–13:15; hour slots from
+        // gap starts: 09:00–11:00 (2, remainder 45min dropped), 13:15–16:15
+        // (3, remainder dropped).
+        let busy = [busy_block(
+            "a",
+            range_utc(2026, 8, 18, 12, 0),
+            range_utc(2026, 8, 18, 13, 0),
+        )];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 15, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 2 + 3, "{slots:?}");
+        assert_eq!(slots[1].end, range_utc(2026, 8, 18, 11, 0));
+        assert_eq!(slots[2].start, range_utc(2026, 8, 18, 13, 15));
+        assert_eq!(slots[4].end, range_utc(2026, 8, 18, 16, 15));
+    }
+
+    #[test]
+    fn free_slots_allday_event_blocks_local_day() {
+        // All-day Tue 2026-08-18 (midnight-UTC anchors) in New York: blocks
+        // the local Tuesday, so Tue working hours (13:00–21:00 UTC in EDT)
+        // vanish and Wednesday's survive.
+        let allday = RangeEvent {
+            uid: "ad".into(),
+            summary: String::new(),
+            start: range_utc(2026, 8, 18, 0, 0),
+            end: range_utc(2026, 8, 19, 0, 0),
+            all_day: true,
+            location: None,
+            account: String::new(),
+        };
+        let slots = free_slots(
+            &[allday],
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 20, 0, 0),
+            chrono_tz::America::New_York,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        // Window ends Thu 00:00 UTC = Wed 20:00 EDT: Wed slots run 09:00–16:00
+        // EDT (7 hour-slots, the 16:00–17:00 slot is clamped away), Tue none.
+        assert_eq!(slots.len(), 7, "{slots:?}");
+        assert_eq!(
+            slots[0].start,
+            range_utc(2026, 8, 19, 13, 0),
+            "first free slot must be Wednesday 09:00 EDT"
+        );
+    }
+
+    #[test]
+    fn free_slots_busy_across_midnight_clips_both_days() {
+        // Busy Tue 16:00 → Wed 10:00: Tue keeps 09:00–16:00, Wed 10:00–17:00.
+        let busy = [busy_block(
+            "overnight",
+            range_utc(2026, 8, 18, 16, 0),
+            range_utc(2026, 8, 19, 10, 0),
+        )];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 20, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 7 + 7, "{slots:?}");
+        assert_eq!(slots[6].end, range_utc(2026, 8, 18, 16, 0));
+        assert_eq!(slots[7].start, range_utc(2026, 8, 19, 10, 0));
+    }
+
+    #[test]
+    fn free_slots_window_clamps_partial_day() {
+        // Window opens mid-morning: first slot starts at the window, not 09:00.
+        let slots = free_slots(
+            &[],
+            range_utc(2026, 8, 18, 11, 0),
+            range_utc(2026, 8, 18, 14, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 3, "{slots:?}");
+        assert_eq!(slots[0].start, range_utc(2026, 8, 18, 11, 0));
+        assert_eq!(slots[2].end, range_utc(2026, 8, 18, 14, 0));
+    }
+
+    #[test]
+    fn free_slots_zero_slot_minutes_yields_nothing() {
+        let slots = free_slots(
+            &[],
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(0, 0, (9, 0), (17, 0)),
+        );
+        assert!(slots.is_empty(), "{slots:?}");
+    }
+
+    #[test]
+    fn free_slots_5000_events_4_weeks_within_budget() {
+        // Perf budget (kata mtqp / plan table): 5,000 events × 4-week window
+        // < 50ms. CI-tolerant, synthetic data, no network — modeled on
+        // rate_limit.rs's timing asserts.
+        let window_start = range_utc(2026, 8, 3, 0, 0);
+        let window_end = range_utc(2026, 8, 31, 0, 0);
+        // Heavily-overlapping mornings (every 5-min offset 09:00–12:55, each
+        // 30 min long) on every day; afternoons stay free. Merged+buffered
+        // the mornings cover 08:55–13:30, leaving 13:30–17:00 = 7 half-hour
+        // slots per day × 28 days.
+        let busy: Vec<RangeEvent> = (0..5000)
+            .map(|i| {
+                let start = window_start
+                    + chrono::Duration::days(i % 28)
+                    + chrono::Duration::minutes(9 * 60 + (i % 48) * 5);
+                busy_block(
+                    &format!("perf-{i}"),
+                    start,
+                    start + chrono::Duration::minutes(30),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let slots = free_slots(
+            &busy,
+            window_start,
+            window_end,
+            chrono_tz::UTC,
+            &slot_opts(30, 5, (9, 0), (17, 0)),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(slots.len(), 7 * 28, "{} slots", slots.len());
+        assert!(
+            slots.windows(2).all(|w| w[0].end <= w[1].start),
+            "slots must be sorted and non-overlapping"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "5,000-event free-slot computation took {elapsed:?} (budget 50ms)"
         );
     }
 }
