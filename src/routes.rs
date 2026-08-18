@@ -681,6 +681,13 @@ async fn list_identities(
     Ok(Json(serde_json::json!(identities)))
 }
 
+/// CSS from the first candidate theme dir that holds a usable theme.
+fn first_theme_css(theme_dirs: &[std::path::PathBuf]) -> Option<String> {
+    theme_dirs
+        .iter()
+        .find_map(|dir| theme::css_for_theme_dir(dir))
+}
+
 async fn get_theme() -> impl IntoResponse {
     // Omarchy 4.0 renders the active theme under XDG state; 3.x used XDG
     // config. Check the 4.0 location first, then fall back.
@@ -693,10 +700,8 @@ async fn get_theme() -> impl IntoResponse {
             .join("omarchy/current/theme"),
     ];
 
-    for theme_dir in &theme_dirs {
-        if let Some(css) = theme::css_for_theme_dir(theme_dir) {
-            return (StatusCode::OK, [("content-type", "text/css")], css);
-        }
+    if let Some(css) = first_theme_css(&theme_dirs) {
+        return (StatusCode::OK, [("content-type", "text/css")], css);
     }
 
     // No theme available — base CSS defaults apply
@@ -8180,6 +8185,32 @@ mod tests {
     }
 
     #[test]
+    fn theme_dir_precedence_state_wins_then_config() {
+        // Omarchy 4.0 (XDG state) must win over the 3.x location (XDG
+        // config), and the 3.x location must still serve when the 4.0 dir
+        // is absent (roborev 530 #2).
+        let state = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("supervillain.css"),
+            ":root { --bg: #3d3021; }",
+        )
+        .unwrap();
+        let dirs = [state.path().to_path_buf(), config.path().to_path_buf()];
+
+        assert!(first_theme_css(&dirs).unwrap().contains("#3d3021"));
+
+        std::fs::write(
+            state.path().join("supervillain.css"),
+            ":root { --bg: #1d2021; }",
+        )
+        .unwrap();
+        assert!(first_theme_css(&dirs).unwrap().contains("#1d2021"));
+
+        assert!(first_theme_css(&[]).is_none());
+    }
+
+    #[test]
     fn theme_fallback_generates_css_from_ghostty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -13209,25 +13240,25 @@ white   = '#fdf6e3'
 
 // External dep for theme path
 mod dirs_next {
-    pub fn config_dir() -> Option<std::path::PathBuf> {
-        std::env::var("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
+    // XDG Base Directory spec: an empty variable must be treated as unset.
+    fn xdg_dir(var: &str, home_suffix: &str) -> Option<std::path::PathBuf> {
+        std::env::var(var)
             .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".config"))
                     .ok()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| std::path::PathBuf::from(h).join(home_suffix))
             })
     }
 
+    pub fn config_dir() -> Option<std::path::PathBuf> {
+        xdg_dir("XDG_CONFIG_HOME", ".config")
+    }
+
     pub fn state_dir() -> Option<std::path::PathBuf> {
-        std::env::var("XDG_STATE_HOME")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| {
-                std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".local/state"))
-                    .ok()
-            })
+        xdg_dir("XDG_STATE_HOME", ".local/state")
     }
 }

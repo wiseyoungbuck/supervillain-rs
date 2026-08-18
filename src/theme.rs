@@ -234,7 +234,10 @@ pub fn load_from_theme_dir(theme_dir: &std::path::Path) -> Option<ThemeColors> {
 /// Mirrors `resolve_theme_mode` in Omarchy 4.0's omarchy-theme-color, in its
 /// precedence order: the colors.toml `mode` key, the legacy `theme_type`
 /// key, the 3.x `light.mode` marker file, then a background-luminance
-/// heuristic (r+g+b > 382 reads as light), defaulting to dark.
+/// heuristic (r+g+b > 382 reads as light), defaulting to dark. As upstream,
+/// ANY non-empty mode/theme_type value is authoritative and suppresses the
+/// fallbacks — an unrecognized value (`mode = "auto"`) resolves dark there
+/// too, since only an exact "light" ever reads as light downstream.
 pub fn is_light_theme(theme_dir: &std::path::Path) -> bool {
     let toml = std::fs::read_to_string(theme_dir.join("colors.toml")).unwrap_or_default();
 
@@ -1138,6 +1141,18 @@ white   =   '#cccccc'
         // Legacy theme_type key counts like mode.
         std::fs::write(dir.path().join("colors.toml"), "theme_type = \"light\"\n").unwrap();
         assert!(is_light_theme(dir.path()));
+
+        // TOML single-quoted literal strings parse too (roborev 531).
+        std::fs::write(dir.path().join("colors.toml"), "mode = 'light'\n").unwrap();
+        assert!(is_light_theme(dir.path()));
+
+        // With both keys present, mode wins over theme_type (roborev 532).
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "mode = \"dark\"\ntheme_type = \"light\"\n",
+        )
+        .unwrap();
+        assert!(!is_light_theme(dir.path()));
 
         // An explicit dark mode key beats a stale 3.x light.mode file.
         std::fs::write(dir.path().join("light.mode"), "").unwrap();
