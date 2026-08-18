@@ -557,10 +557,7 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
     // are deliberately written out — `signature.x = ` means "identity x
     // signs nothing", which is different from having no entry at all.
     for (email, sig) in acct.identity_signatures() {
-        lines.push(format!(
-            "signature.{email} = {}",
-            escape_ini_multiline(sig)
-        ));
+        lines.push(format!("signature.{email} = {}", escape_ini_multiline(sig)));
     }
     lines
 }
@@ -4390,10 +4387,7 @@ api-token = tok
     // Per-identity signatures (kata zqrn)
     // =========================================================================
 
-    fn fastmail_with_idsigs(
-        sigs: &[(&str, &str)],
-        account_sig: Option<&str>,
-    ) -> AccountConfig {
+    fn fastmail_with_idsigs(sigs: &[(&str, &str)], account_sig: Option<&str>) -> AccountConfig {
         AccountConfig::Fastmail {
             username: "u@fm.com".into(),
             api_token: "tok".into(),
