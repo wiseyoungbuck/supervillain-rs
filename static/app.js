@@ -91,6 +91,10 @@ const state = {
     movePickerIndex: 0,       // selected row in the move picker list
     bulkSelected: new Set(),  // bulk selection: email IDS, list view (kata pakx)
     bulkAnchorId: null,       // last-toggled id, the Shift+X range anchor
+    // Contact insights cache (kata wcsg): `${accountId}:${email}` →
+    // aggregated history from /api/contacts/insights. Account-prefixed keys
+    // follow the contactIndex isolation convention.
+    contactInsights: new Map(),
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -209,6 +213,7 @@ function init() {
     els.emailSubject = document.getElementById('email-subject');
     els.emailMeta = document.getElementById('email-meta');
     els.emailBody = document.getElementById('email-body');
+    els.contactSidebar = document.getElementById('contact-sidebar');
     els.composeView = document.getElementById('compose-view');
     els.composeFrom = document.getElementById('compose-from');
     els.composeTo = document.getElementById('compose-to');

@@ -209,6 +209,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/scheduled-sends/{id}",
             axum::routing::delete(cancel_scheduled_send),
         )
+        .route(
+            "/api/contacts/insights",
+            get(crate::contacts::contact_insights),
+        )
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))

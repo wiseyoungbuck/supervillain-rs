@@ -2552,3 +2552,83 @@ body:not(.light-theme) .compose-quote a * {
     background: var(--bg-secondary);
     box-shadow: inset 3px 0 0 var(--accent);
 }
+
+/* ============================================================================
+   Contact insights sidebar (kata wcsg)
+   ========================================================================= */
+
+/* The detail view becomes a row: main column (existing header/body flow)
+   plus the insights sidebar on the right. */
+#email-detail-view.active {
+    flex-direction: row;
+}
+
+#email-detail-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#contact-sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    padding: 16px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-size: 12.5px;
+    color: var(--fg-muted);
+}
+
+#contact-sidebar.hidden {
+    display: none;
+}
+
+.contact-sidebar-name {
+    font-weight: bold;
+    color: var(--fg);
+}
+
+.contact-sidebar-email {
+    word-break: break-all;
+}
+
+.contact-sidebar-stats {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.contact-sidebar-section {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 11px;
+}
+
+.contact-thread {
+    margin-top: 8px;
+}
+
+.contact-thread-subject {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.contact-thread-date {
+    color: var(--fg-dim);
+    font-size: 11.5px;
+}
+
+.contact-sidebar-loading,
+.contact-sidebar-empty {
+    color: var(--fg-dim);
+    font-style: italic;
+    margin-top: 8px;
+}
