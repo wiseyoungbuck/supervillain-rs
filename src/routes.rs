@@ -599,7 +599,10 @@ fn ensure_known_account(reg: &AccountRegistry, id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn resolve_session(state: &AppState, account: Option<&str>) -> Result<SessionLock, Error> {
+pub(crate) async fn resolve_session(
+    state: &AppState,
+    account: Option<&str>,
+) -> Result<SessionLock, Error> {
     let reg = state.accounts.read().await;
     let key = account.unwrap_or(&reg.default_account);
     reg.sessions
@@ -4322,7 +4325,7 @@ mod tests {
         );
         assert!(
             API_JS.contains(
-                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends)"
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts)"
             ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );

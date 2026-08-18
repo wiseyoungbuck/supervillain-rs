@@ -4,6 +4,209 @@
 //! threads). Built from two provider searches (`from:` / `to:` the
 //! contact); no external data sources.
 
+use crate::error::Error;
+use crate::provider::{self, ProviderSession};
+use crate::types::{AppState, Email, EmailSort, ParsedQuery};
+use axum::extract::{Query, State};
+use axum::response::Json;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Threads shown in the sidebar. Server-capped so the payload stays flat
+/// no matter how deep the history runs.
+pub const RECENT_THREADS_CAP: usize = 5;
+
+/// Per-direction provider search window. 100 each way = a "200-message
+/// contact" is fully aggregated in one request; deeper history saturates
+/// the counts at the cap, which the sidebar presents as frequency, not an
+/// exact ledger.
+pub const INSIGHTS_SCAN_LIMIT: usize = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// The contact sent it to us.
+    From,
+    /// We sent it to the contact.
+    To,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStub {
+    pub thread_id: String,
+    pub email_id: String,
+    pub subject: String,
+    pub received_at: DateTime<Utc>,
+    pub direction: Direction,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactInsights {
+    pub email: String,
+    /// Display name from the most recent message that carried one; empty
+    /// when the contact never sent a named address.
+    pub name: String,
+    pub messages_from: usize,
+    pub messages_to: usize,
+    pub first_contact: Option<DateTime<Utc>>,
+    pub last_contact: Option<DateTime<Utc>>,
+    /// Newest-first, deduped by thread, capped at [`RECENT_THREADS_CAP`].
+    pub recent_threads: Vec<ThreadStub>,
+}
+
+/// Pure aggregation over the two search results. `from_them` are messages
+/// the contact sent; `to_them` are messages we sent to the contact.
+pub fn aggregate_insights(
+    contact_email: &str,
+    from_them: &[Email],
+    to_them: &[Email],
+) -> ContactInsights {
+    let mut first_contact: Option<DateTime<Utc>> = None;
+    let mut last_contact: Option<DateTime<Utc>> = None;
+    for email in from_them.iter().chain(to_them) {
+        if first_contact.is_none_or(|t| email.received_at < t) {
+            first_contact = Some(email.received_at);
+        }
+        if last_contact.is_none_or(|t| email.received_at > t) {
+            last_contact = Some(email.received_at);
+        }
+    }
+
+    // Display name: the most recent message where the contact's address
+    // carried one. A newer message without a name must not blank it out.
+    let mut name = String::new();
+    let mut name_ts: Option<DateTime<Utc>> = None;
+    for email in from_them {
+        let named = email
+            .from
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(contact_email))
+            .and_then(|a| a.name.as_deref())
+            .filter(|n| !n.is_empty());
+        if let Some(n) = named
+            && name_ts.is_none_or(|t| email.received_at > t)
+        {
+            name = n.to_string();
+            name_ts = Some(email.received_at);
+        }
+    }
+
+    // Dedup by thread (message id when the provider left thread_id empty),
+    // keeping each thread's most recent message — direction and subject
+    // travel with it.
+    let mut threads: std::collections::HashMap<&str, ThreadStub> = std::collections::HashMap::new();
+    let tagged = from_them
+        .iter()
+        .map(|e| (e, Direction::From))
+        .chain(to_them.iter().map(|e| (e, Direction::To)));
+    for (email, direction) in tagged {
+        let key: &str = if email.thread_id.is_empty() {
+            &email.id
+        } else {
+            &email.thread_id
+        };
+        let newer = threads
+            .get(key)
+            .is_none_or(|existing| email.received_at > existing.received_at);
+        if newer {
+            threads.insert(
+                key,
+                ThreadStub {
+                    thread_id: email.thread_id.clone(),
+                    email_id: email.id.clone(),
+                    subject: email.subject.clone(),
+                    received_at: email.received_at,
+                    direction,
+                },
+            );
+        }
+    }
+    let mut recent_threads: Vec<ThreadStub> = threads.into_values().collect();
+    recent_threads.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+    recent_threads.truncate(RECENT_THREADS_CAP);
+
+    ContactInsights {
+        email: contact_email.to_string(),
+        name,
+        messages_from: from_them.len(),
+        messages_to: to_them.len(),
+        first_contact,
+        last_contact,
+        recent_threads,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct InsightsParams {
+    pub email: String,
+    pub account: Option<String>,
+}
+
+/// `GET /api/contacts/insights?email=<addr>` — aggregate this account's
+/// history with one contact. Two provider searches (from:/to:, all
+/// mailboxes) run concurrently, then one metadata fetch per direction;
+/// bodies are never fetched.
+pub async fn contact_insights(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<InsightsParams>,
+) -> Result<Json<ContactInsights>, Error> {
+    let contact = params.email.trim().to_ascii_lowercase();
+    if crate::accounts::validate_email(&contact).is_err() {
+        return Err(Error::BadRequest(format!(
+            "invalid contact email '{}'",
+            params.email
+        )));
+    }
+
+    let session_lock = crate::routes::resolve_session(&state, params.account.as_deref()).await?;
+    let session = session_lock.read().await;
+
+    let from_query = ParsedQuery {
+        from: vec![contact.clone()],
+        ..Default::default()
+    };
+    let to_query = ParsedQuery {
+        to: vec![contact.clone()],
+        ..Default::default()
+    };
+    let (from_ids, to_ids) = tokio::join!(
+        provider::query_emails(
+            &session,
+            None,
+            INSIGHTS_SCAN_LIMIT,
+            0,
+            Some(&from_query),
+            EmailSort::default(),
+        ),
+        provider::query_emails(
+            &session,
+            None,
+            INSIGHTS_SCAN_LIMIT,
+            0,
+            Some(&to_query),
+            EmailSort::default(),
+        ),
+    );
+    let (from_ids, to_ids) = (from_ids?, to_ids?);
+
+    let (from_them, to_them) = tokio::join!(
+        fetch_metadata(&session, &from_ids),
+        fetch_metadata(&session, &to_ids),
+    );
+    let insights = aggregate_insights(&contact, &from_them?, &to_them?);
+    Ok(Json(insights))
+}
+
+async fn fetch_metadata(session: &ProviderSession, ids: &[String]) -> Result<Vec<Email>, Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    provider::get_emails(session, ids, false, None, false).await
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

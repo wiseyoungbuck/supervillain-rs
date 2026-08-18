@@ -19,6 +19,25 @@ function extractFunction(declaration) {
     return APP_JS.slice(start, close + 2);
 }
 
+// Minimal DOM shim for escapeHtml's textContent→innerHTML round-trip —
+// same contract as tests/escape_test.cjs's makeDocument.
+function makeDocument() {
+    return {
+        createElement() {
+            let _text = '';
+            return {
+                set textContent(v) { _text = String(v); },
+                get innerHTML() {
+                    return _text
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+                },
+            };
+        },
+    };
+}
+
 // contactSidebarHtml depends on escapeHtml; bundle both.
 function loadSidebarHtml() {
     const code =
@@ -26,7 +45,7 @@ function loadSidebarHtml() {
         '\n' +
         extractFunction('function contactSidebarHtml(');
     // eslint-disable-next-line no-new-func
-    return new Function(code + '\nreturn contactSidebarHtml;')();
+    return new Function('document', code + '\nreturn contactSidebarHtml;')(makeDocument());
 }
 
 const INSIGHTS = {

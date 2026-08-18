@@ -3415,6 +3415,90 @@ function renderEmailDetail() {
         els.emailBody.innerHTML = linkifyText(e.textBody || '(no content)');
         els.emailBody.classList.remove('html-content');
     }
+
+    renderContactSidebar();
+}
+
+// ============================================================================
+// Contact insights sidebar (kata wcsg) — sender history next to an open
+// email. Data comes pre-aggregated from GET /api/contacts/insights (counts
+// both directions, first contact, recent threads); this layer only fetches,
+// caches per account+contact, and renders.
+// ============================================================================
+
+// Pure HTML builder — insights → sidebar markup. null renders the loading
+// state. Everything user-controlled (names, subjects) is escaped at this
+// innerHTML boundary.
+function contactSidebarHtml(insights) {
+    if (!insights) {
+        return '<div class="contact-sidebar-loading">Loading contact history…</div>';
+    }
+    const name = escapeHtml(insights.name || '');
+    const email = escapeHtml(insights.email || '');
+    const received = insights.messagesFrom || 0;
+    const sent = insights.messagesTo || 0;
+    const header = `
+        <div class="contact-sidebar-header">
+            ${name ? `<div class="contact-sidebar-name">${name}</div>` : ''}
+            <div class="contact-sidebar-email">${email}</div>
+        </div>`;
+    if (received + sent === 0) {
+        return header + '<div class="contact-sidebar-empty">No previous history</div>';
+    }
+    const first = insights.firstContact
+        ? new Date(insights.firstContact).toLocaleDateString()
+        : '';
+    const threads = (insights.recentThreads || []).map(t => `
+        <div class="contact-thread">
+            <div class="contact-thread-subject">${escapeHtml(t.subject || '(no subject)')}</div>
+            <div class="contact-thread-date">${t.direction === 'to' ? '→ ' : ''}${new Date(t.receivedAt).toLocaleDateString()}</div>
+        </div>`).join('');
+    return `${header}
+        <div class="contact-sidebar-stats">
+            <div>${received}${received >= 100 ? '+' : ''} received · ${sent}${sent >= 100 ? '+' : ''} sent</div>
+            ${first ? `<div>First contact: ${first}</div>` : ''}
+        </div>
+        ${threads ? `<div class="contact-sidebar-section">Recent threads</div>${threads}` : ''}`;
+}
+
+// Fetch-with-cache. Keyed per account + lowercased contact so an account
+// switch never surfaces another account's history (contactIndex convention).
+// Failures degrade to null — the sidebar is enrichment, never load-bearing.
+async function loadContactInsights(email) {
+    const accountId = state.currentAccount?.id;
+    if (!email || !accountId) return null;
+    const key = `${accountId}:${email.toLowerCase()}`;
+    const cached = state.contactInsights.get(key);
+    if (cached) return cached;
+    try {
+        const insights = await api('GET', `/contacts/insights?email=${encodeURIComponent(email)}`);
+        state.contactInsights.set(key, insights);
+        return insights;
+    } catch (err) {
+        console.warn('Contact insights fetch failed:', err);
+        return null;
+    }
+}
+
+// Orchestrator: paint loading (or cache), fetch, re-paint — unless the user
+// has moved on to a different sender while the fetch was in flight.
+async function renderContactSidebar() {
+    const sidebar = els.contactSidebar;
+    if (!sidebar) return;
+    const sender = state.currentEmail?.from?.[0]?.email;
+    if (!sender) {
+        sidebar.classList.add('hidden');
+        return;
+    }
+    sidebar.classList.remove('hidden');
+    sidebar.innerHTML = contactSidebarHtml(null);
+    const insights = await loadContactInsights(sender);
+    if (state.currentEmail?.from?.[0]?.email !== sender) return;
+    if (!insights) {
+        sidebar.classList.add('hidden');
+        return;
+    }
+    sidebar.innerHTML = contactSidebarHtml(insights);
 }
 
 function renderCommandPalette() {
