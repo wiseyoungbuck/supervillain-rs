@@ -231,20 +231,52 @@ pub fn load_from_theme_dir(theme_dir: &std::path::Path) -> Option<ThemeColors> {
 
 /// Check if the theme directory indicates a light theme.
 ///
-/// Omarchy 3.x marked light themes with a `light.mode` file; 4.0 dropped the
-/// marker file and carries `mode = "light"` in the theme's colors.toml.
+/// Mirrors `resolve_theme_mode` in Omarchy 4.0's omarchy-theme-color, in its
+/// precedence order: the colors.toml `mode` key, the legacy `theme_type`
+/// key, the 3.x `light.mode` marker file, then a background-luminance
+/// heuristic (r+g+b > 382 reads as light), defaulting to dark.
 pub fn is_light_theme(theme_dir: &std::path::Path) -> bool {
+    let toml = std::fs::read_to_string(theme_dir.join("colors.toml")).unwrap_or_default();
+
+    let raw_value = |wanted: &str| -> Option<&str> {
+        toml.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == wanted).then_some(value)
+        })
+    };
+    // mode/theme_type values are bare words, safe to strip `# comment` from.
+    let mode_word = |raw: &str| -> Option<String> {
+        let word = raw
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['"', '\'']);
+        (!word.is_empty()).then(|| word.to_ascii_lowercase())
+    };
+
+    if let Some(mode) = raw_value("mode")
+        .and_then(mode_word)
+        .or_else(|| raw_value("theme_type").and_then(mode_word))
+    {
+        return mode == "light";
+    }
+
     if theme_dir.join("light.mode").exists() {
         return true;
     }
-    std::fs::read_to_string(theme_dir.join("colors.toml")).is_ok_and(|toml| {
-        toml.lines().any(|line| {
-            let line = line.split('#').next().unwrap_or("").trim();
-            line.strip_prefix("mode")
-                .and_then(|rest| rest.trim_start().strip_prefix('='))
-                .is_some_and(|value| value.trim().trim_matches('"') == "light")
-        })
-    })
+
+    // normalize_hex (not mode_word) here: hex values contain `#`.
+    if let Some(bg) = raw_value("background").and_then(normalize_hex) {
+        let sum: u32 = [&bg[1..3], &bg[3..5], &bg[5..7]]
+            .iter()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .map(u32::from)
+            .sum();
+        return sum > 382;
+    }
+
+    false
 }
 
 /// Serve-ready CSS for one theme directory, or None if it holds no usable
@@ -1095,6 +1127,33 @@ white   =   '#cccccc'
         )
         .unwrap();
         assert!(is_light_theme(dir.path()));
+    }
+
+    #[test]
+    fn is_light_theme_matches_omarchy_mode_precedence() {
+        // omarchy-theme-color's resolve_theme_mode: mode key > theme_type
+        // key > light.mode file > background luminance > dark.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Legacy theme_type key counts like mode.
+        std::fs::write(dir.path().join("colors.toml"), "theme_type = \"light\"\n").unwrap();
+        assert!(is_light_theme(dir.path()));
+
+        // An explicit dark mode key beats a stale 3.x light.mode file.
+        std::fs::write(dir.path().join("light.mode"), "").unwrap();
+        std::fs::write(dir.path().join("colors.toml"), "mode = \"dark\"\n").unwrap();
+        assert!(!is_light_theme(dir.path()));
+        std::fs::remove_file(dir.path().join("light.mode")).unwrap();
+
+        // No mode signal at all: background luminance decides (r+g+b > 382).
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "background = \"#fdf6e3\" # solarized paper\n",
+        )
+        .unwrap();
+        assert!(is_light_theme(dir.path()));
+        std::fs::write(dir.path().join("colors.toml"), "background = \"#1d2021\"\n").unwrap();
+        assert!(!is_light_theme(dir.path()));
     }
 
     #[test]
