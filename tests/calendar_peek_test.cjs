@@ -170,7 +170,7 @@ test('perf budget: 200-event week renders under 100ms', () => {
     const started = process.hrtime.bigint();
     const html = calendarPeekHtml(events, 'week', ANCHOR);
     const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.strictEqual((html.match(/class="peek-event/g) || []).length, 200);
+    assert.strictEqual((html.match(/data-uid="perf-/g) || []).length, 200);
     assert.ok(
         elapsedMs < 100,
         `200-event week render took ${elapsedMs.toFixed(1)}ms (budget 100ms)`,

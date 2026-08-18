@@ -7981,5 +7981,216 @@ async function rsvpToEvent(status) {
     }
 }
 
+// =============================================================================
+// Calendar peek (kata j6e4) — Superhuman's C-key day/week view alongside email
+// =============================================================================
+
+// Local YYYY-MM-DD of a Date — the peek's day-column key.
+function peekDayKey(date) {
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${date.getFullYear()}-${m}-${d}`;
+}
+
+// Local HH:MM (24h) label for a timed event block.
+function peekTimeLabel(date) {
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+// Pure render of the peek grid: events (GET /api/calendar/events camelCase
+// RangeEvents) + mode ('day' | 'week') + anchor day ('YYYY-MM-DD') → HTML.
+// No state, no clock reads, no DOM — tests drive it directly
+// (tests/calendar_peek_test.cjs). Week columns are Monday-first. All-day
+// events use their UTC date anchors verbatim (the server emits midnight-UTC
+// dates) and chip every covered day; timed events land on their LOCAL start
+// day as absolutely-positioned blocks on the hour grid, sized via the
+// --peek-start/--peek-dur minute variables and clamped to their day.
+function calendarPeekHtml(events, mode, anchorDay) {
+    const [ay, am, ad] = anchorDay.split('-').map(Number);
+    const anchor = new Date(ay, am - 1, ad);
+    const first = new Date(anchor);
+    if (mode === 'week') {
+        first.setDate(first.getDate() - ((first.getDay() + 6) % 7));
+    }
+    const days = Array.from({ length: mode === 'week' ? 7 : 1 }, (_, i) => {
+        const d = new Date(first);
+        d.setDate(first.getDate() + i);
+        return d;
+    });
+
+    const allDayByDay = new Map();
+    const timedByDay = new Map();
+    const bucket = (map, key, entry) => {
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(entry);
+    };
+    for (const ev of events) {
+        if (ev.allDay) {
+            // Cover [start, end) in date space; a defensive end<=start chips
+            // just the start day. Capped at the 62-day range the API allows.
+            const endKey = ev.end.slice(0, 10);
+            const day = new Date(`${ev.start.slice(0, 10)}T00:00:00`);
+            let key = peekDayKey(day);
+            let hops = 0;
+            do {
+                bucket(allDayByDay, key, ev);
+                day.setDate(day.getDate() + 1);
+                key = peekDayKey(day);
+                hops += 1;
+            } while (key < endKey && hops < 62);
+        } else {
+            const start = new Date(ev.start);
+            const startMin = start.getHours() * 60 + start.getMinutes();
+            const rawDur = Math.round((new Date(ev.end) - start) / 60000);
+            const dur = Math.min(Math.max(rawDur, 0), 1440 - startMin);
+            bucket(timedByDay, peekDayKey(start), { ev, startMin, dur });
+        }
+    }
+
+    const headFmt = { weekday: 'short', month: 'short', day: 'numeric' };
+    const cols = days.map((d) => {
+        const key = peekDayKey(d);
+        const chips = (allDayByDay.get(key) || []).map((ev) =>
+            `<div class="peek-event peek-event-allday" data-uid="${escapeAttr(ev.uid)}" title="${escapeAttr(ev.summary)}">${escapeHtml(ev.summary)}</div>`
+        ).join('');
+        const blocks = (timedByDay.get(key) || [])
+            .sort((a, b) => a.startMin - b.startMin)
+            .map(({ ev, startMin, dur }) =>
+                `<div class="peek-event" data-uid="${escapeAttr(ev.uid)}" style="--peek-start:${startMin};--peek-dur:${dur};" title="${escapeAttr(ev.summary)}">` +
+                `<span class="peek-event-time">${peekTimeLabel(new Date(ev.start))}</span> ` +
+                `<span class="peek-event-title">${escapeHtml(ev.summary)}</span></div>`
+            ).join('');
+        return `<div class="peek-day" data-day="${escapeAttr(key)}">` +
+            `<div class="peek-day-head">${escapeHtml(d.toLocaleDateString(undefined, headFmt))}</div>` +
+            `<div class="peek-allday">${chips}</div>` +
+            `<div class="peek-timed">${blocks}</div></div>`;
+    }).join('');
+
+    const hours = Array.from({ length: 24 }, (_, h) =>
+        `<div class="peek-hour-label">${String(h).padStart(2, '0')}:00</div>`
+    ).join('');
+    const rangeLabel = mode === 'week'
+        ? `${days[0].toLocaleDateString(undefined, headFmt)} – ${days[6].toLocaleDateString(undefined, headFmt)}`
+        : days[0].toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    return `<div class="peek-head">` +
+        `<span class="peek-head-title">Calendar</span>` +
+        `<span class="peek-head-range">${escapeHtml(rangeLabel)}</span>` +
+        `<span class="peek-head-hint">d day · w week · [ ] move · Esc close</span></div>` +
+        `<div class="peek-grid" data-mode="${escapeAttr(mode)}">` +
+        `<div class="peek-hours"><div class="peek-hours-spacer-head"></div><div class="peek-hours-spacer-allday"></div>` +
+        `<div class="peek-hour-rail">${hours}</div></div>${cols}</div>`;
+}
+
+// Guards a stale in-flight fetch from clobbering a newer one after rapid
+// d/w/[/] presses — only the latest sequence number may write state.
+let peekLoadSeq = 0;
+
+function toggleCalendarPeek() {
+    if (state.calendarPeek.visible) {
+        closeCalendarPeek();
+        return;
+    }
+    state.calendarPeek.visible = true;
+    // Reopen always lands on today — a stale anchor from a past session
+    // reads as "my calendar is empty".
+    state.calendarPeek.anchor = peekDayKey(new Date());
+    els.calendarPeek.classList.remove('hidden');
+    loadCalendarPeek();
+}
+
+function closeCalendarPeek() {
+    state.calendarPeek.visible = false;
+    els.calendarPeek.classList.add('hidden');
+}
+
+// The peek's visible local-day window as UTC instants for the range query.
+function peekWindow() {
+    const [y, m, d] = state.calendarPeek.anchor.split('-').map(Number);
+    const start = new Date(y, m - 1, d);
+    if (state.calendarPeek.mode === 'week') {
+        start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+    }
+    const end = new Date(start);
+    end.setDate(start.getDate() + (state.calendarPeek.mode === 'week' ? 7 : 1));
+    return { start, end };
+}
+
+async function loadCalendarPeek() {
+    const peek = state.calendarPeek;
+    const { start, end } = peekWindow();
+    const seq = ++peekLoadSeq;
+    peek.loading = true;
+    peek.error = null;
+    renderCalendarPeek();
+    try {
+        const resp = await api(
+            'GET',
+            `/calendar/events?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`
+        );
+        if (seq !== peekLoadSeq) return;
+        peek.events = resp.events || [];
+        // Per-account errors: surface the first (rare; the rest are in the
+        // server log) without blanking the events that did load.
+        peek.error = (resp.errors || [])[0] || null;
+    } catch (err) {
+        if (seq !== peekLoadSeq) return;
+        peek.events = [];
+        peek.error = err.message;
+    }
+    peek.loading = false;
+    renderCalendarPeek();
+}
+
+function renderCalendarPeek() {
+    const peek = state.calendarPeek;
+    const status = peek.loading
+        ? '<div class="peek-status">Loading…</div>'
+        : peek.error
+            ? `<div class="peek-status peek-status-error">${escapeHtml(peek.error)}</div>`
+            : '';
+    els.calendarPeek.innerHTML = status + calendarPeekHtml(peek.events, peek.mode, peek.anchor);
+    // Scroll the hour grid to the working morning so the default view isn't
+    // anchored at midnight.
+    const grid = els.calendarPeek.querySelector('.peek-grid');
+    if (grid) grid.scrollTop = 7 * 40;
+}
+
+// Keys the open peek owns. Returns true when consumed so handleKeyDown's
+// early-return chain stops; everything unhandled falls through and the list
+// keeps its j/k/o navigation while the peek is up.
+function handleCalendarPeekKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    const peek = state.calendarPeek;
+    switch (e.key) {
+        case 'Escape':
+        case 'C':
+            closeCalendarPeek();
+            break;
+        case 'd':
+        case 'w': {
+            const mode = e.key === 'd' ? 'day' : 'week';
+            if (peek.mode !== mode) {
+                peek.mode = mode;
+                loadCalendarPeek();
+            }
+            break;
+        }
+        case '[':
+        case ']': {
+            const step = (peek.mode === 'week' ? 7 : 1) * (e.key === '[' ? -1 : 1);
+            const [y, m, d] = peek.anchor.split('-').map(Number);
+            const anchor = new Date(y, m - 1, d);
+            anchor.setDate(anchor.getDate() + step);
+            peek.anchor = peekDayKey(anchor);
+            loadCalendarPeek();
+            break;
+        }
+        default:
+            return false;
+    }
+    e.preventDefault();
+    return true;
+}
+
 // Initialize on load
 document.addEventListener('DOMContentLoaded', init);
