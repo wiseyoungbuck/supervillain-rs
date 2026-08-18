@@ -137,11 +137,22 @@ function loadPaletteLifecycle(state, els, document, renderCommandPalette, setMod
 }
 
 // Minimal stub state: every field commandsForView reads (view, selectedIndex,
-// currentEmail, accounts). visibleRows is injected separately because it is a
+// currentEmail, accounts, splits, mailboxes, currentMailbox, undoStack,
+// selectedAccountId). visibleRows is injected separately because it is a
 // module-level function in app.js, not a state field.
 function makeState(overrides) {
     return Object.assign(
-        { view: 'list', selectedIndex: 0, currentEmail: null, accounts: [], splits: [] },
+        {
+            view: 'list',
+            selectedIndex: 0,
+            currentEmail: null,
+            accounts: [],
+            splits: [],
+            mailboxes: [],
+            currentMailbox: null,
+            undoStack: [],
+            selectedAccountId: null,
+        },
         overrides || {},
     );
 }
@@ -472,4 +483,450 @@ test('sqke: repeated ArrowDown stays on the final filtered command', () => {
     });
     assert.equal(state.commandPaletteIndex, commands.length - 1);
     assert.equal(prevented, true);
+});
+
+// ---------------------------------------------------------------------------
+// map4: palette completeness — every audited app action is reachable from the
+// palette. The offering tests assert commandsForView emits each command in the
+// right view under the right state gate (the gate mirrors the key/click path's
+// own no-op condition). The exec tests drive the REAL executeCommand together
+// with the REAL target function — only leaf dependencies (api, DOM renderers,
+// data loaders) are recording stubs — and assert the observable state change
+// or request contract, not "the right function was called".
+
+// Assemble the real executeCommand plus the named real functions extracted
+// from app.js, with everything else injected as parameters. Identifiers in
+// branches a test never executes are simply never resolved.
+function loadExecutor(declarations, deps, preamble = '') {
+    const code = [
+        preamble,
+        ...declarations.map((d) => extractFunction(APP_JS, d)),
+        extractFunction(APP_JS, 'function executeCommand('),
+        'return executeCommand;',
+    ].join('\n');
+    const names = Object.keys(deps);
+    // eslint-disable-next-line no-new-func
+    return new Function(...names, code)(...names.map((n) => deps[n]));
+}
+
+test('map4: list and detail offer Undo only when the undo stack is non-empty', () => {
+    for (const view of ['list', 'detail']) {
+        const base = { view, currentEmail: view === 'detail' ? {} : null };
+        assert.ok(
+            !actionsFor(makeState(base), () => []).includes('undo'),
+            `${view} view must not offer Undo with an empty undo stack (same gate as the undo button)`,
+        );
+        assert.ok(
+            actionsFor(makeState({ ...base, undoStack: [{ action: 'archived' }] }), () => []).includes('undo'),
+            `${view} view must offer Undo once something is undoable`,
+        );
+    }
+});
+
+test('map4: Unsubscribe & Archive All needs a selection in list, is always on in detail', () => {
+    assert.ok(
+        !actionsFor(makeState({ view: 'list' }), () => []).includes('unsubscribe'),
+        'list with no selected row must not offer Unsubscribe (unsubscribeAndArchiveAll no-ops without a selection)',
+    );
+    assert.ok(
+        actionsFor(makeState({ view: 'list' }), () => [{ emailId: 'e-1' }]).includes('unsubscribe'),
+        'list with a selected row must offer Unsubscribe & Archive All',
+    );
+    assert.ok(
+        actionsFor(makeState({ view: 'detail', currentEmail: { id: 'e-1' } }), () => []).includes('unsubscribe'),
+        'detail must offer Unsubscribe & Archive All (the open email is the selection)',
+    );
+});
+
+test('map4: Open Settings is offered from list and detail (the g-s chord surface)', () => {
+    for (const view of ['list', 'detail']) {
+        const a = actionsFor(makeState({ view, currentEmail: {} }), () => []);
+        assert.ok(a.includes('open-settings'), `${view} view must offer Open Settings`);
+    }
+});
+
+test('map4: Switch Account is emitted per account on list and detail, never settings', () => {
+    const accounts = [{ id: 'a1', email: 'one@x.com' }, { id: 'a2', email: 'two@x.com' }];
+    for (const view of ['list', 'detail']) {
+        const a = actionsFor(makeState({ view, currentEmail: {}, accounts }), () => []);
+        assert.ok(
+            a.includes('switch-account:a1') && a.includes('switch-account:a2'),
+            `${view} view must emit one Switch Account command per account`,
+        );
+    }
+    const s = actionsFor(makeState({ view: 'settings', accounts }), () => []);
+    assert.ok(
+        !s.some((x) => x.startsWith('switch-account:')),
+        'settings disables 1-9 account switching; the palette must mirror that gate',
+    );
+});
+
+test('map4: split navigation commands are offered only on the inbox with splits', () => {
+    const splits = [{ id: 'work', name: 'Work' }, { id: 'news', name: 'News' }];
+    const a = actionsFor(
+        makeState({ view: 'list', currentMailbox: { role: 'inbox' }, splits }),
+        () => [],
+    );
+    assert.ok(a.includes('go-split:work') && a.includes('go-split:news'), 'one Go to Split per split');
+    assert.ok(a.includes('next-split') && a.includes('prev-split'), 'Tab-cycling must be palette-reachable');
+    const archive = actionsFor(
+        makeState({ view: 'list', currentMailbox: { role: 'archive' }, splits }),
+        () => [],
+    );
+    assert.ok(
+        !archive.some((x) => x.startsWith('go-split:')) && !archive.includes('next-split'),
+        'cycleSplit/selectSplitByIndex no-op outside the inbox; the palette must not offer them there',
+    );
+    const noSplits = actionsFor(
+        makeState({ view: 'list', currentMailbox: { role: 'inbox' } }),
+        () => [],
+    );
+    assert.ok(!noSplits.includes('next-split'), 'no splits → nothing to cycle');
+});
+
+test('map4: Back to List is detail-only', () => {
+    assert.ok(
+        actionsFor(makeState({ view: 'detail', currentEmail: {} }), () => []).includes('back-to-list'),
+        'detail must offer Back to List (the q/Esc path)',
+    );
+    assert.ok(
+        !actionsFor(makeState({ view: 'list' }), () => []).includes('back-to-list'),
+        'list must not offer Back to List — it is already the list',
+    );
+});
+
+test('map4: Set Default Account is settings-only, gated on a selected account', () => {
+    assert.ok(
+        actionsFor(makeState({ view: 'settings', selectedAccountId: 'a1' }), () => []).includes('set-default-account'),
+        'settings with a selected account must offer Set Default Account (the Shift+D path)',
+    );
+    assert.ok(
+        !actionsFor(makeState({ view: 'settings' }), () => []).includes('set-default-account'),
+        "Shift+D no-ops without a selected account; the palette must mirror that gate",
+    );
+    assert.ok(
+        !actionsFor(makeState({ view: 'list', selectedAccountId: 'a1' }), () => []).includes('set-default-account'),
+        'Set Default Account is a settings action, not a list action',
+    );
+});
+
+test('map4: starred filter and sort toggles are list commands gated on a mailbox', () => {
+    const a = actionsFor(makeState({ view: 'list', currentMailbox: { role: 'inbox' } }), () => []);
+    assert.ok(a.includes('toggle-starred'), 'list must offer Toggle Starred Only (click-only until now)');
+    assert.ok(a.includes('toggle-sort'), 'list must offer Toggle Sort Order (click-only until now)');
+    const none = actionsFor(makeState({ view: 'list' }), () => []);
+    assert.ok(
+        !none.includes('toggle-starred') && !none.includes('toggle-sort'),
+        'both toggles no-op without a current mailbox; the palette must mirror that gate',
+    );
+});
+
+test('map4: Toggle Sort Order keeps the Gmail per-page caveat in its description', () => {
+    const state = makeState({ view: 'list', currentMailbox: { role: 'inbox' } });
+    const cmd = loadGetCommands(state, () => [])().find((c) => c.action === 'toggle-sort');
+    assert.ok(cmd, 'list must offer toggle-sort');
+    assert.match(
+        cmd.desc,
+        /per (fetched )?page/i,
+        'the Gmail oldest-first-per-page caveat (roborev 291) must survive into the command description',
+    );
+});
+
+test('map4: Go to Drafts/Sent/Spam are offered only where the role exists', () => {
+    const mailboxes = [
+        { id: 'm1', role: 'inbox' },
+        { id: 'm2', role: 'drafts' },
+        { id: 'm3', role: 'sent' },
+    ];
+    for (const view of ['list', 'detail']) {
+        const a = actionsFor(makeState({ view, currentEmail: {}, mailboxes }), () => []);
+        assert.ok(a.includes('go-drafts'), `${view} must offer Go to Drafts when a drafts mailbox exists`);
+        assert.ok(a.includes('go-sent'), `${view} must offer Go to Sent when a sent mailbox exists`);
+        assert.ok(
+            !a.includes('go-spam'),
+            `${view} must not offer Go to Spam when no spam mailbox exists (the palette must not offer a no-op)`,
+        );
+    }
+});
+
+test('map4: settings offers Timezone Settings alongside Reminder Settings', () => {
+    const a = actionsFor(makeState({ view: 'settings' }), () => []);
+    assert.ok(a.includes('timezone-settings'), 'settings must offer Timezone Settings');
+    assert.ok(a.includes('reminder-settings'), 'Reminder Settings (the sibling) must survive');
+});
+
+test('map4 exec: Undo re-inserts the archived email and moves it back on the server', () => {
+    const state = makeState({
+        view: 'list',
+        emails: [],
+        mailboxes: [{ id: 'm-inbox', role: 'inbox' }],
+        undoStack: [{ action: 'archived', emailId: 'e-9', emailData: { id: 'e-9' }, insertIndex: 0 }],
+    });
+    const apiCalls = [];
+    const executeCommand = loadExecutor(['async function performUndo('], {
+        state,
+        els: { undoToast: { classList: { add() {}, remove() {} } } },
+        api: (method, path, body) => { apiCalls.push({ method, path, body }); return Promise.resolve({}); },
+        showStatus() {},
+        refillSuppressedIds: new Set(),
+        extendThreadGroups() {},
+        visibleRowIndexForEmailId: () => 0,
+        invalidateSplitListCache() {},
+        renderEmailList() {},
+        adjustSplitCounts() {},
+        loadSplitCounts() {},
+        loadReminders() {},
+    });
+    executeCommand('undo');
+    assert.equal(state.undoStack.length, 0, 'Undo must consume the stack entry');
+    assert.deepEqual(
+        state.emails.map((e) => e.id),
+        ['e-9'],
+        'the archived email must be re-inserted into the list',
+    );
+    assert.deepEqual(
+        apiCalls,
+        [{ method: 'POST', path: '/emails/e-9/move', body: { mailbox_id: 'm-inbox' } }],
+        'Undo must move the email back to the inbox on the server',
+    );
+});
+
+test('map4 exec: Unsubscribe & Archive All removes the sender and posts the bulk archive', () => {
+    const state = makeState({
+        view: 'list',
+        selectedIndex: 0,
+        emails: [
+            { id: 'e-1', from: [{ email: 'spam@x.com' }] },
+            { id: 'e-2', from: [{ email: 'keep@x.com' }] },
+            { id: 'e-3', from: [{ email: 'SPAM@x.com' }] },
+        ],
+    });
+    const apiCalls = [];
+    const executeCommand = loadExecutor(
+        [
+            'async function unsubscribeAndArchiveAll(',
+            'function getSelectedEmailId(',
+            'function removeEmailsFromList(',
+        ],
+        {
+            state,
+            visibleRows: () => state.emails.map((e) => ({ emailId: e.id })),
+            refillSuppressedIds: new Set(),
+            splitListCache: {},
+            adjustSplitCounts() {},
+            invalidateSplitListCache() {},
+            renderEmailList() {},
+            maybeRefillEmails() {},
+            showStatus() {},
+            goToNextEmail() {},
+            api: (method, path) => {
+                apiCalls.push({ method, path });
+                return Promise.resolve({ archived: 2, sender: 'spam@x.com' });
+            },
+            loadSplitCounts() {},
+        },
+    );
+    executeCommand('unsubscribe');
+    assert.deepEqual(
+        state.emails.map((e) => e.id),
+        ['e-2'],
+        'every email from the selected sender (case-insensitive) must leave the list immediately',
+    );
+    assert.deepEqual(apiCalls, [{ method: 'POST', path: '/emails/e-1/unsubscribe-and-archive-all' }]);
+});
+
+test('map4 exec: Open Settings and Back to List drive the real showView', () => {
+    const classes = {};
+    const mkView = (name) => ({ classList: { toggle(_cls, on) { classes[name] = on; } } });
+    const state = makeState({ view: 'list' });
+    const executeCommand = loadExecutor(['function openSettings(', 'function showView('], {
+        state,
+        els: {
+            emailListView: mkView('list'),
+            emailDetailView: mkView('detail'),
+            composeView: mkView('compose'),
+            settingsView: mkView('settings'),
+        },
+        renderSettings() {},
+        openWizard() {},
+        saveScrollPosition() {},
+    });
+    executeCommand('open-settings');
+    assert.equal(state.view, 'settings', 'Open Settings must land on the settings screen');
+    assert.equal(classes.settings, true);
+    assert.equal(classes.list, false);
+
+    state.currentEmail = { id: 'e-1' };
+    state.view = 'detail';
+    executeCommand('back-to-list');
+    assert.equal(state.view, 'list', 'Back to List must return to the list view');
+    assert.equal(classes.list, true);
+});
+
+test('map4 exec: Switch Account changes the live account through the real selectAccount', () => {
+    const accounts = [{ id: 'a1', email: 'one@x.com' }, { id: 'a2', email: 'two@x.com' }];
+    const state = makeState({
+        view: 'list',
+        accounts,
+        currentAccount: accounts[0],
+        emails: [{ id: 'stale' }],
+        currentMailbox: { role: 'inbox' },
+    });
+    const executeCommand = loadExecutor(['function selectAccount('], {
+        state,
+        els: { emailList: { innerHTML: 'stale' } },
+        authorizeAccountFromBanner() {},
+        renderSortToggle() {},
+        renderAccounts() {},
+        loadMailboxes() {},
+        loadIdentities() {},
+        loadSplits() {},
+        showStatus() {},
+    }, 'let lastRenderedContext = null;');
+    executeCommand('switch-account:a2');
+    assert.equal(state.currentAccount, accounts[1], 'the live account must switch');
+    assert.deepEqual(state.emails, [], "the previous account's emails must clear immediately");
+    assert.equal(state.currentMailbox, null, 'mailbox context resets for the new account');
+});
+
+test('map4 exec: split commands drive the real selectSplit state change', () => {
+    const state = makeState({
+        view: 'list',
+        currentMailbox: { role: 'inbox' },
+        splits: [{ id: 'work', name: 'Work' }, { id: 'news', name: 'News' }],
+        currentSplit: 'all',
+    });
+    const executeCommand = loadExecutor(
+        ['function selectSplit(', 'function cycleSplit(', 'function selectSplitByIndex('],
+        { state, renderSplitTabs() {}, loadEmails() {} },
+    );
+    executeCommand('go-split:news');
+    assert.equal(state.currentSplit, 'news', 'Go to Split must land on the named split');
+    executeCommand('next-split');
+    assert.equal(state.currentSplit, 'all', 'news is the last tab; Next Split wraps to All');
+    executeCommand('prev-split');
+    assert.equal(state.currentSplit, 'news', 'Previous Split cycles back');
+});
+
+test('map4 exec: starred and sort toggles flip the real state', () => {
+    const state = makeState({
+        view: 'list',
+        currentMailbox: { role: 'inbox' },
+        starredOnly: false,
+        sortOrder: 'date_desc',
+    });
+    const executeCommand = loadExecutor(
+        ['function toggleStarredOnly(', 'function toggleSortOrder('],
+        {
+            state,
+            renderStarredItem() {},
+            updateMailboxNameDisplay() {},
+            loadEmails() {},
+            loadSplitCounts() {},
+            renderSortToggle() {},
+        },
+    );
+    executeCommand('toggle-starred');
+    assert.equal(state.starredOnly, true, 'Toggle Starred Only must enable the filter');
+    executeCommand('toggle-sort');
+    assert.equal(state.sortOrder, 'date_asc', 'Toggle Sort Order must flip to oldest-first');
+    executeCommand('toggle-sort');
+    assert.equal(state.sortOrder, 'date_desc', 'toggling again must flip back');
+});
+
+test('map4 exec: Go to Drafts selects the drafts mailbox through the real selectMailbox', () => {
+    const drafts = { id: 'm-drafts', role: 'drafts', name: 'Drafts' };
+    const state = makeState({
+        view: 'list',
+        mailboxes: [{ id: 'm-inbox', role: 'inbox' }, drafts],
+        searchTokens: [{ type: 'text', value: 'q' }],
+    });
+    const executeCommand = loadExecutor(['function selectMailbox('], {
+        state,
+        updateMailboxNameDisplay() {},
+        renderMailboxes() {},
+        renderSplitTabs() {},
+        updateActiveFilters() {},
+        loadEmails() {},
+        loadSplitCounts() {},
+    });
+    executeCommand('go-drafts');
+    assert.equal(state.currentMailbox, drafts, 'Go to Drafts must select the drafts mailbox');
+    assert.deepEqual(state.searchTokens, [], 'mailbox switch clears search tokens (same as clicking the mailbox)');
+});
+
+test('map4 exec: Set Default Account PUTs the default-account contract', () => {
+    const state = makeState({ view: 'settings', selectedAccountId: 'a2' });
+    const apiCalls = [];
+    const executeCommand = loadExecutor(['async function setDefaultAccount('], {
+        state,
+        api: (method, path) => { apiCalls.push({ method, path }); return Promise.resolve({}); },
+        showStatus() {},
+        showFormError() {},
+        loadAccounts() {},
+    });
+    executeCommand('set-default-account');
+    assert.deepEqual(apiCalls, [{ method: 'PUT', path: '/accounts/a2/default' }]);
+});
+
+test('map4 exec: Timezone Settings lands on the settings screen at the timezone section', () => {
+    const state = makeState({ view: 'settings' });
+    let scrolledTo = null;
+    const mkView = () => ({ classList: { toggle() {} } });
+    const executeCommand = loadExecutor(['function openSettings(', 'function showView('], {
+        state,
+        els: {
+            emailListView: mkView(),
+            emailDetailView: mkView(),
+            composeView: mkView(),
+            settingsView: mkView(),
+        },
+        renderSettings() {},
+        openWizard() {},
+        saveScrollPosition() {},
+        document: { getElementById(id) { return { scrollIntoView() { scrolledTo = id; } }; } },
+    });
+    executeCommand('timezone-settings');
+    assert.equal(state.view, 'settings');
+    assert.equal(scrolledTo, 'timezone-settings', 'the timezone section must be brought into view');
+});
+
+test('map4 perf: filtering 1,000 synthetic commands stays under the 100ms budget', () => {
+    // Budget per the kata plan's perf table: 100ms with ~5x headroom over
+    // local (filter+markup of 1,000 commands runs in a few ms here) so CI
+    // jitter can't flake it. Synthetic commands, no network, no DOM parse —
+    // renderCommandPalette's filter + innerHTML string build is the cost.
+    const commands = [];
+    for (let i = 0; i < 1000; i++) {
+        commands.push({
+            name: `Synthetic Command ${i}`,
+            desc: `does synthetic thing number ${i}`,
+            shortcut: '',
+            action: `syn-${i}`,
+        });
+    }
+    const state = makeState({ commandPaletteIndex: 0 });
+    const code = [
+        extractFunction(APP_JS, 'function renderCommandPalette('),
+        extractFunction(APP_JS, 'function escapeHtml('),
+        extractFunction(APP_JS, 'function escapeAttr('),
+        'return renderCommandPalette;',
+    ].join('\n');
+    const commandResults = { innerHTML: '', querySelectorAll() { return []; } };
+    const els = { commandInput: { value: '99' }, commandResults };
+    // eslint-disable-next-line no-new-func
+    const render = new Function('state', 'els', 'document', 'getCommands', code)(
+        state,
+        els,
+        makeEscapeDocument(),
+        () => commands,
+    );
+    const start = process.hrtime.bigint();
+    render();
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+    assert.ok(commandResults.innerHTML.includes('Synthetic Command 99'), 'the filter must match the query');
+    assert.ok(
+        elapsedMs < 100,
+        `filter+render of 1,000 commands took ${elapsedMs.toFixed(1)}ms (budget 100ms)`,
+    );
 });
