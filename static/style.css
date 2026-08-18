@@ -2495,3 +2495,41 @@ body:not(.light-theme) .compose-quote a * {
     color: var(--fg-muted);
     margin: 12px 0;
 }
+
+/* Move to Folder / Apply Label picker (kata e993). Overlay pattern matches
+   #remind-modal; rules are standalone appends (seam discipline) rather than
+   additions to the shared selector lists above. */
+#move-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+
+#move-modal.hidden {
+    display: none;
+}
+
+#move-filter {
+    width: 100%;
+    margin-bottom: 10px;
+}
+
+#move-picker-list {
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.move-picker-item {
+    padding: 6px 8px;
+    cursor: pointer;
+}
+
+.move-picker-item.selected,
+.move-picker-item:hover {
+    background: var(--bg-secondary);
+    color: var(--accent);
+}

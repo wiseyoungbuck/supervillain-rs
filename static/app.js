@@ -86,6 +86,9 @@ const state = {
     timezone: null,           // { primary, display, system, system_changed, use_system, ... }
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
     sendUndo: null,           // { id, deadline, timerId } — active Undo Send countdown (kata vj6k)
+    movePickerOpen: false,    // Move to Folder picker (kata e993)
+    moveEmailId: null,        // email the open move picker acts on
+    movePickerIndex: 0,       // selected row in the move picker list
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -238,6 +241,7 @@ function init() {
     els.splitPatternField = document.getElementById('split-pattern-field');
     els.splitHint = document.getElementById('split-hint');
     els.remindModal = document.getElementById('remind-modal');
+    els.moveModal = document.getElementById('move-modal');
     els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
     els.sendUndoToast = document.getElementById('send-undo-toast');
     els.sendUndoMessage = document.getElementById('send-undo-message');
@@ -4221,6 +4225,13 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Move picker owns its keys; unhandled keys reach the filter input
+    // natively (kata e993).
+    if (!els.moveModal.classList.contains('hidden')) {
+        handleMovePickerKey(e);
+        return;
+    }
+
     // Command palette shortcut (kata sefy): hoisted ABOVE the per-view
     // early returns so Cmd+K reaches the palette from every screen —
     // settings (wizard/insert/normal) and compose insert included — not
@@ -5685,6 +5696,10 @@ function commandsForView(view) {
                 { name: 'Back to List', desc: 'Return to the email list', shortcut: 'q', action: 'back-to-list' },
                 { name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' },
             );
+            // e993: the open email is the selection; only mailboxes gate it.
+            if (state.mailboxes.length) {
+                cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
+            }
             return cmds;
         }
         case 'list': {
@@ -5765,6 +5780,10 @@ function commandsForView(view) {
             });
             cmds.push({ name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' });
             cmds.push({ name: 'Scheduled Sends', desc: 'View and cancel queued sends', shortcut: '', action: 'scheduled-sends' });
+            // e993: needs a selection to act on and mailboxes to move to.
+            if (visibleRows()[state.selectedIndex] && state.mailboxes.length) {
+                cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -5925,6 +5944,7 @@ function executeCommand(action) {
             openSettings();
             document.getElementById('timezone-settings')?.scrollIntoView({ block: 'start' });
             break;
+        case 'move-to': openMovePicker(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {
