@@ -73,6 +73,10 @@ function sendHarness({
         'state', 'els', 'api', 'showStatus', 'escapeHtml', 'cancelAutosave',
         'sendingSession', 'saveInFlight', 'trackedDraftSession',
         'trackedDraftId', 'deleteDraftById', 'clearCompose', 'showView',
+        // Deferral collaborators (kata vj6k/acag), neutralized so the
+        // characterized contract is exactly the pre-deferral behavior:
+        // window disabled, no picker hand-off.
+        'undoSendDelaySecs', 'showSendUndoToast', 'sendLaterAt',
         code,
     )(
         state, els, api,
@@ -83,6 +87,7 @@ function sendHarness({
         (id) => out.deleted.push(id),
         () => { out.cleared++; },
         (view) => out.views.push(view),
+        () => 0, () => {}, null,
     );
     out.doSendEmail = doSendEmail;
     return out;

@@ -1297,6 +1297,14 @@ function closeRemindPicker() {
 function resolveReminderInput() {
     const natural = document.getElementById('remind-natural')?.value.trim();
     const typed = document.getElementById('remind-datetime')?.value;
+    return resolveTimeInput(natural, typed);
+}
+
+// Shared natural/explicit time vocabulary for the Remind Me and Send Later
+// pickers (kata acag): an explicit datetime-local wins; otherwise the same
+// small phrase set the pickers advertise (3H/3D/1MO, tomorrow 3pm, in N
+// hours/days). Returns null when nothing parses.
+function resolveTimeInput(natural, typed) {
     if (typed) return new Date(typed);
     if (!natural) return null;
     const upper = natural.toUpperCase();
@@ -2225,6 +2233,195 @@ async function toggleFlag(emailId) {
 // editor: silent data loss.
 let sendingSession = null;
 
+// The Send Later picker's hand-off to the send path (kata acag): set just
+// before sendEmail(), snapshotted and cleared at the top of doSendEmail so
+// it can never leak onto a later unrelated send. A module slot (not a
+// parameter) because the `await doSendEmail()` call shape is contract-pinned.
+let sendLaterAt = null;
+
+// Undo Send window in seconds (kata vj6k). localStorage-configurable
+// ('undoSendDelaySecs'); unset/garbage falls back to 10, clamped to 0–60.
+// 0 disables the window entirely — sends go out immediately, as before.
+function undoSendDelaySecs() {
+    const raw = localStorage.getItem('undoSendDelaySecs');
+    if (raw === null || raw === '') return 10;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return 10;
+    return Math.min(Math.max(n, 0), 60);
+}
+
+// Countdown toast for a deferred send (kata vj6k). Single-slot: a newer
+// deferred send replaces the toast; the older one simply departs on
+// schedule. The interval only repaints the countdown — expiry is the
+// server's daemon dispatching the queued record, not a client action.
+function showSendUndoToast(id, deadline) {
+    clearSendUndoToast();
+    const update = () => {
+        const secs = Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 1000));
+        els.sendUndoMessage.textContent = `Sending in ${secs}s`;
+        if (secs <= 0) clearSendUndoToast();
+    };
+    state.sendUndo = { id, deadline, timerId: setInterval(update, 250) };
+    update();
+    els.sendUndoToast.classList.remove('hidden');
+}
+
+function clearSendUndoToast() {
+    if (state.sendUndo) clearInterval(state.sendUndo.timerId);
+    state.sendUndo = null;
+    els.sendUndoToast.classList.add('hidden');
+}
+
+// The toast's Undo click: race the daemon for the queued record.
+async function cancelPendingSend() {
+    const pending = state.sendUndo;
+    if (!pending) return;
+    clearSendUndoToast();
+    await cancelScheduledSend(pending.id);
+}
+
+// Cancel a queued deferred send and restore its draft. Shared by the undo
+// toast and the Scheduled list. A 404 means the daemon already dispatched
+// it — exactly what an Undo click after the window closes should surface.
+async function cancelScheduledSend(id) {
+    try {
+        const record = await api('DELETE', `/scheduled-sends/${id}`);
+        restoreComposeFromScheduledSend(record);
+        showStatus('Send cancelled — draft restored', 'success');
+    } catch (err) {
+        showStatus(err.status === 404
+            ? 'Too late — already sent'
+            : 'Cancel failed: ' + err.message, 'error');
+    }
+}
+
+// Rebuild the compose surface from a cancelled queue record. The quote text
+// was already merged into text_body at send time, so the restored draft is
+// plain-text with the quote inline (same fidelity caveat as server drafts,
+// kata wm57); in_reply_to keeps the threading. Attachment blobs were never
+// consumed (the send didn't dispatch), so their upload ids re-arm as ready.
+function restoreComposeFromScheduledSend(record) {
+    const sub = record.submission || {};
+    clearCompose();
+    els.composeTo.value = (sub.to || []).join(', ');
+    els.composeCc.value = (sub.cc || []).join(', ');
+    els.composeSubject.value = sub.subject || '';
+    els.composeBody.value = sub.text_body || '';
+    if (els.composeFrom && record.from_addr) els.composeFrom.value = record.from_addr;
+    state.replyContext = sub.in_reply_to
+        ? { inReplyTo: sub.in_reply_to, quotedText: null, quotedHtml: null }
+        : null;
+    state.pendingAttachments = (sub.attachments || []).map(a => ({
+        blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size,
+        status: 'ready',
+    }));
+    renderComposeAttachments();
+    showView('compose');
+}
+
+// --- Send Later picker + Scheduled list (kata acag) -------------------------
+// Modeled on the Remind Me picker: same modal shell, same quick options,
+// same natural-language vocabulary (via resolveTimeInput). Confirming hands
+// the picked instant to the send path through sendLaterAt.
+
+function openSendLaterPicker() {
+    if (state.view !== 'compose') return;
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Send Later</h3>
+            <div class="remind-quick-options">
+                <button type="button" data-send-later-quick="hour">In 1 hour</button>
+                <button type="button" data-send-later-quick="later">Later today</button>
+                <button type="button" data-send-later-quick="tomorrow">Tomorrow 8am</button>
+                <button type="button" data-send-later-quick="week">Next week 8am</button>
+            </div>
+            <label>Type a time (tomorrow 3pm, next week, 3H/3D/1MO)</label>
+            <input id="send-later-natural" type="text" placeholder="tomorrow 9am" autocomplete="off">
+            <label>Or choose a date &amp; time</label>
+            <input id="send-later-datetime" type="datetime-local">
+            <div class="modal-hint">Enter schedules · Esc cancels</div>
+            <div class="modal-buttons"><button id="send-later-cancel" type="button">Cancel</button><button id="send-later-confirm" type="button">Schedule</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    els.sendLaterModal.querySelectorAll('[data-send-later-quick]').forEach(button => {
+        button.addEventListener('click', () => {
+            confirmSendLaterAt(reminderQuickDate(button.dataset.sendLaterQuick));
+        });
+    });
+    document.getElementById('send-later-cancel').addEventListener('click', closeSendLaterPicker);
+    document.getElementById('send-later-confirm').addEventListener('click', confirmSendLaterPicker);
+    els.sendLaterModal.querySelector('#send-later-natural').focus();
+}
+
+function closeSendLaterPicker() {
+    els.sendLaterModal.classList.add('hidden');
+    els.sendLaterModal.innerHTML = '';
+}
+
+function handleSendLaterPickerKey(e) {
+    if (e.key === 'Escape') {
+        closeSendLaterPicker();
+        e.preventDefault();
+    } else if (e.key === 'Enter' && document.getElementById('send-later-confirm')) {
+        confirmSendLaterPicker();
+        e.preventDefault();
+    }
+}
+
+function resolveSendLaterInput() {
+    const natural = document.getElementById('send-later-natural')?.value.trim();
+    const typed = document.getElementById('send-later-datetime')?.value;
+    return resolveTimeInput(natural, typed);
+}
+
+function confirmSendLaterPicker() {
+    confirmSendLaterAt(resolveSendLaterInput());
+}
+
+function confirmSendLaterAt(date) {
+    if (!date || Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+        showStatus('Choose a future send time', 'error');
+        return;
+    }
+    closeSendLaterPicker();
+    sendLaterAt = date;
+    sendEmail();
+}
+
+// The Scheduled list: every queued send for the current account, soonest
+// first (server order), each cancelable back into a compose draft. Reuses
+// the Send Later modal shell — only one can be open at a time.
+async function openScheduledSends() {
+    let records;
+    try {
+        records = await api('GET', '/scheduled-sends');
+    } catch (err) {
+        showStatus('Failed to load scheduled sends: ' + err.message, 'error');
+        return;
+    }
+    const rows = records.map(r => `
+        <div class="scheduled-send-row">
+            <span class="scheduled-send-subject">${escapeHtml(r.submission?.subject || '(no subject)')}</span>
+            <span class="scheduled-send-time">${escapeHtml(new Date(r.send_at).toLocaleString())}</span>
+            <button type="button" data-cancel-scheduled="${escapeAttr(r.id)}">Cancel</button>
+        </div>`).join('');
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Scheduled</h3>
+            <div class="scheduled-send-list">${rows || '<div class="scheduled-send-empty">Nothing scheduled</div>'}</div>
+            <div class="modal-hint">Esc closes</div>
+            <div class="modal-buttons"><button id="scheduled-sends-close" type="button">Close</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    document.getElementById('scheduled-sends-close').addEventListener('click', closeSendLaterPicker);
+    els.sendLaterModal.querySelectorAll('[data-cancel-scheduled]').forEach(button => {
+        button.addEventListener('click', () => {
+            closeSendLaterPicker();
+            cancelScheduledSend(button.dataset.cancelScheduled);
+        });
+    });
+}
+
 // Lock the compose surface while ITS send is in flight (roborev 321): the
 // payload is snapshotted at send initiation (see doSendEmail), so anything
 // typed after Ctrl+Enter would be silently discarded — the session-scoped
@@ -2288,6 +2485,10 @@ async function doSendEmail() {
     // (see sendingSession) blocks this compose's new saves from running
     // until the send settles.
     cancelAutosave();
+    // Snapshot the Send Later hand-off with the rest of the payload and
+    // clear the slot: it belongs to THIS send only (kata acag).
+    const sendAt = sendLaterAt;
+    sendLaterAt = null;
     // Snapshot EVERYTHING the send posts — and the session token its
     // completion gates compare against — synchronously, before the settle
     // await below can yield (roborev 320). That await can block >3s, and the
@@ -2445,8 +2646,16 @@ async function doSendEmail() {
         return;
     }
 
+    // Deferred send (kata vj6k/acag): an explicit Send Later time wins over
+    // the Undo Send window; a zero window keeps today's immediate send.
+    // Invites never defer — the queue cannot carry calendar_ics — which is
+    // why this sits below the invite path.
+    const delaySecs = undoSendDelaySecs();
+    const deferUntil = sendAt
+        || (delaySecs > 0 ? new Date(Date.now() + delaySecs * 1000) : null);
+
     try {
-        await api('POST', '/emails/send', {
+        const resp = await api('POST', '/emails/send', {
             to,
             cc,
             subject,
@@ -2455,8 +2664,17 @@ async function doSendEmail() {
             in_reply_to: inReplyTo,
             from_address: fromAddress,
             attachments: readyAttachments.length ? readyAttachments : undefined,
+            send_at: deferUntil ? deferUntil.toISOString() : undefined,
         });
-        showStatus('Sent!', 'success');
+        if (resp?.scheduled) {
+            if (sendAt) {
+                showStatus(`Scheduled for ${deferUntil.toLocaleString()}`, 'success');
+            } else {
+                showSendUndoToast(resp.id, deferUntil);
+            }
+        } else {
+            showStatus('Sent!', 'success');
+        }
         // Same shape as the invite path above: captured-id delete unless a
         // newer session recaptured the id (see the comment there),
         // clear/navigate only while this send still owns the compose.
@@ -3947,6 +4165,10 @@ function handleKeyDown(e) {
             e.preventDefault();
         } else if (e.key === 'A' && e.ctrlKey && e.shiftKey) {
             els.composeFileInput.click();
+            e.preventDefault();
+        } else if (e.key === 'L' && (e.ctrlKey || e.metaKey) && e.shiftKey) {
+            // Send Later (kata acag) — Superhuman's Cmd+Shift+L.
+            openSendLaterPicker();
             e.preventDefault();
         }
         return;
