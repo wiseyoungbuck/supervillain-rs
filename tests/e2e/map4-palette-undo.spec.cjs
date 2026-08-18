@@ -24,8 +24,14 @@ test('map4: Undo runs from the palette and restores the archived row', async ({ 
     emails: EMAILS,
     extra: {
       routes: {
-        // Undo's server side: move the email back to the inbox.
-        '**/api/emails/*/move': (route) => route.fulfill({ status: 204 }),
+        // Undo's server side: move the email back to the inbox. Trailing **
+        // swallows the ?account= suffix makeApi appends (same as 9rg8's
+        // unsubscribe mock). The archive POST needs the same treatment:
+        // fixtures' query-less '**/api/emails/*/archive' misses the scoped
+        // URL, the POST falls through to the real server, and the eventual
+        // failure-revert re-inserts the row a second time mid-test.
+        '**/api/emails/*/archive**': (route) => route.fulfill({ status: 204 }),
+        '**/api/emails/*/move**': (route) => route.fulfill({ status: 204 }),
         // Post-archive the list drops below REFILL_THRESHOLD and the app
         // refills with offset=<count>. Serve the refill EMPTY so the mock
         // can't race the suppression window and re-add the archived row —
