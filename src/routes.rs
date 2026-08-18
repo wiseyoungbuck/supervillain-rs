@@ -4329,7 +4329,7 @@ mod tests {
         );
         assert!(
             API_JS.contains(
-                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts)"
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts|ai)"
             ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );

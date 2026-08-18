@@ -3421,6 +3421,13 @@ function renderEmailDetail() {
         els.emailBody.classList.remove('html-content');
     }
 
+    // AI summary is on-demand (palette) and per-email — never let a previous
+    // email's summary linger under a new message (kata 6rhw).
+    if (els.aiSummary) {
+        els.aiSummary.classList.add('hidden');
+        els.aiSummary.innerHTML = '';
+    }
+
     renderContactSidebar();
 }
 
@@ -3483,6 +3490,80 @@ async function loadContactInsights(email) {
         console.warn('Contact insights fetch failed:', err);
         return null;
     }
+}
+
+// ============================================================================
+// AI assist (kata 6rhw) — summarize the open email and draft replies via the
+// server's Claude endpoints. Optional: every entry point gates on
+// state.ai.enabled (GET /api/ai/status), so without an ANTHROPIC_API_KEY the
+// feature is invisible, never broken.
+// ============================================================================
+
+// Fetched once at boot. A failed fetch means "disabled", not an error.
+async function loadAiStatus() {
+    try {
+        state.ai = await api('GET', '/ai/status');
+    } catch (err) {
+        console.warn('AI status fetch failed:', err);
+        state.ai = { enabled: false };
+    }
+}
+
+// Pure HTML builder for the summary panel: {status: 'loading'|'done'|'error',
+// text}. Summary text and error messages are escaped at this innerHTML
+// boundary (the model's output is untrusted content like any other).
+function aiSummaryHtml(s) {
+    if (!s || s.status === 'loading') {
+        return '<div class="ai-summary-loading">Summarizing with Claude…</div>';
+    }
+    if (s.status === 'error') {
+        return `<div class="ai-summary-error">AI summary failed: ${escapeHtml(s.text || 'unknown error')}</div>`;
+    }
+    return `
+        <div class="ai-summary-label">AI summary</div>
+        <div class="ai-summary-text">${escapeHtml(s.text || '')}</div>`;
+}
+
+// Palette "AI: Summarize" — paints loading into the panel, calls the server,
+// re-paints. A stale guard drops the response if the user opened a different
+// email while Claude was thinking.
+async function summarizeCurrentEmail() {
+    const panel = els.aiSummary;
+    if (!panel) return;
+    if (!state.ai?.enabled || !state.currentEmail) {
+        panel.classList.add('hidden');
+        return;
+    }
+    const emailId = state.currentEmail.id;
+    panel.classList.remove('hidden');
+    panel.innerHTML = aiSummaryHtml({ status: 'loading' });
+    try {
+        const resp = await api('POST', '/ai/summarize', { emailId });
+        if (state.currentEmail?.id !== emailId) return;
+        panel.innerHTML = aiSummaryHtml({ status: 'done', text: resp.summary || '' });
+    } catch (err) {
+        console.warn('AI summarize failed:', err);
+        if (state.currentEmail?.id !== emailId) return;
+        panel.innerHTML = aiSummaryHtml({ status: 'error', text: err.message || String(err) });
+    }
+}
+
+// Palette "AI: Draft Reply" — draft FIRST, open compose only on success (a
+// failed draft must never strand the user in an empty compose view).
+async function aiDraftReply() {
+    if (!state.ai?.enabled || !state.currentEmail) return;
+    showStatus('Drafting reply with Claude…');
+    let resp;
+    try {
+        resp = await api('POST', '/ai/draft', { emailId: state.currentEmail.id });
+    } catch (err) {
+        console.warn('AI draft failed:', err);
+        showStatus(`AI draft failed: ${err.message || err}`, 'error');
+        return;
+    }
+    startReply(false);
+    els.composeBody.value = resp.draft || '';
+    showStatus('Draft inserted — review before sending');
 }
 
 // Orchestrator: paint loading (or cache), fetch, re-paint — unless the user
