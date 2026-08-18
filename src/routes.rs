@@ -3159,13 +3159,26 @@ async fn calendar_events_range(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CalendarRangeParams>,
 ) -> Result<impl IntoResponse, Error> {
+    let (start, end) = parse_calendar_range(&params.start, &params.end)?;
+    let (events, errors) = collect_range_events(&state, start, end).await;
+    Ok(Json(
+        serde_json::json!({ "events": events, "errors": errors }),
+    ))
+}
+
+/// Parse and validate a `?start=<RFC3339>&end=<RFC3339>` window shared by
+/// the calendar range endpoints.
+fn parse_calendar_range(
+    start: &str,
+    end: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), Error> {
     let parse_bound = |label: &str, v: &str| {
         chrono::DateTime::parse_from_rfc3339(v)
             .map(|d| d.with_timezone(&chrono::Utc))
             .map_err(|e| Error::BadRequest(format!("invalid {label} '{v}': {e}")))
     };
-    let start = parse_bound("start", &params.start)?;
-    let end = parse_bound("end", &params.end)?;
+    let start = parse_bound("start", start)?;
+    let end = parse_bound("end", end)?;
     if end <= start {
         return Err(Error::BadRequest("end must be after start".into()));
     }
@@ -3174,7 +3187,18 @@ async fn calendar_events_range(
             "range too large (max {MAX_CALENDAR_RANGE_DAYS} days)"
         )));
     }
-    let primary_tz = configured_primary_tz(&state);
+    Ok((start, end))
+}
+
+/// Normalized occurrences overlapping `[start, end)` across every configured
+/// account, sorted by start, plus per-account error strings. Accounts whose
+/// provider has no range support or no CalDAV credentials are skipped.
+async fn collect_range_events(
+    state: &AppState,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> (Vec<calendar::RangeEvent>, Vec<String>) {
+    let primary_tz = configured_primary_tz(state);
 
     // Snapshot the session locks so the registry lock is not held across
     // network I/O.
@@ -3208,8 +3232,73 @@ async fn calendar_events_range(
         }
     }
     events.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.cmp(&b.uid)));
+    (events, errors)
+}
+
+#[derive(Deserialize)]
+struct FreeSlotsParams {
+    start: String,
+    end: String,
+    /// Slot length in minutes (default 30).
+    slot: Option<u32>,
+    /// Padding around busy blocks in minutes (default 0).
+    buffer: Option<u32>,
+    /// Daily availability start, `HH:MM` primary-timezone wall clock
+    /// (default 09:00).
+    work_start: Option<String>,
+    /// Daily availability end, `HH:MM` (default 17:00).
+    work_end: Option<String>,
+}
+
+/// GET /api/calendar/free-slots?start=&end=[&slot=30&buffer=0&work_start=09:00
+/// &work_end=17:00] — free slots in the window for Share Availability
+/// (kata mtqp): busy occurrences from every account (the /api/calendar/events
+/// plumbing) fed through `calendar::free_slots`.
+async fn calendar_free_slots(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FreeSlotsParams>,
+) -> Result<impl IntoResponse, Error> {
+    let (start, end) = parse_calendar_range(&params.start, &params.end)?;
+    let slot_minutes = params.slot.unwrap_or(30);
+    if !(5..=480).contains(&slot_minutes) {
+        return Err(Error::BadRequest("slot must be 5–480 minutes".into()));
+    }
+    let buffer_minutes = params.buffer.unwrap_or(0);
+    if buffer_minutes > 120 {
+        return Err(Error::BadRequest(
+            "buffer must be at most 120 minutes".into(),
+        ));
+    }
+    let parse_wall = |label: &str, v: Option<&str>, default: (u32, u32)| {
+        let Some(v) = v else {
+            return Ok(chrono::NaiveTime::from_hms_opt(default.0, default.1, 0).unwrap());
+        };
+        chrono::NaiveTime::parse_from_str(v, "%H:%M")
+            .map_err(|e| Error::BadRequest(format!("invalid {label} '{v}': {e}")))
+    };
+    let work_start = parse_wall("work_start", params.work_start.as_deref(), (9, 0))?;
+    let work_end = parse_wall("work_end", params.work_end.as_deref(), (17, 0))?;
+    if work_end <= work_start {
+        return Err(Error::BadRequest(
+            "work_end must be after work_start".into(),
+        ));
+    }
+
+    let (busy, errors) = collect_range_events(&state, start, end).await;
+    let slots = calendar::free_slots(
+        &busy,
+        start,
+        end,
+        configured_primary_tz(&state),
+        &calendar::FreeSlotOptions {
+            slot_minutes,
+            buffer_minutes,
+            work_start,
+            work_end,
+        },
+    );
     Ok(Json(
-        serde_json::json!({ "events": events, "errors": errors }),
+        serde_json::json!({ "slots": slots, "errors": errors }),
     ))
 }
 

@@ -1715,8 +1715,110 @@ pub fn free_slots(
     primary_tz: Tz,
     opts: &FreeSlotOptions,
 ) -> Vec<FreeSlot> {
-    let _ = (busy, window_start, window_end, primary_tz, opts);
-    Vec::new()
+    if opts.slot_minutes == 0 || opts.work_end <= opts.work_start || window_end <= window_start {
+        return Vec::new();
+    }
+    let slot_len = chrono::Duration::minutes(opts.slot_minutes as i64);
+    let buffer = chrono::Duration::minutes(opts.buffer_minutes as i64);
+    let local_midnight = |d: NaiveDate| -> Option<DateTime<Utc>> {
+        resolve_local_datetime_lenient(&primary_tz, d.and_time(NaiveTime::MIN))
+            .map(|x| x.with_timezone(&Utc))
+    };
+
+    // Busy intervals in UTC, buffered; all-day anchors (naive dates at
+    // midnight UTC) become the *local* day(s) they actually block.
+    let mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = busy
+        .iter()
+        .filter_map(|e| {
+            let (s, end) = if e.all_day {
+                let first = e.start.naive_utc().date();
+                let mut last = e.end.naive_utc().date();
+                if last <= first {
+                    last = first + chrono::Duration::days(1);
+                }
+                (local_midnight(first)?, local_midnight(last)?)
+            } else {
+                (e.start, e.end.max(e.start))
+            };
+            let (s, end) = (s - buffer, end + buffer);
+            (end > window_start && s < window_end).then_some((s, end))
+        })
+        .collect();
+    intervals.sort_by_key(|iv| iv.0);
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    for iv in intervals {
+        match merged.last_mut() {
+            Some(last) if iv.0 <= last.1 => last.1 = last.1.max(iv.1),
+            _ => merged.push(iv),
+        }
+    }
+
+    // Per local day: working hours ∩ window, minus merged busy, chopped
+    // into slots.
+    let mut out = Vec::new();
+    let first_day = window_start.with_timezone(&primary_tz).date_naive();
+    let last_day = window_end.with_timezone(&primary_tz).date_naive();
+    let mut day = first_day;
+    while day <= last_day {
+        let seg = resolve_local_datetime_lenient(&primary_tz, day.and_time(opts.work_start))
+            .zip(resolve_local_datetime_lenient(
+                &primary_tz,
+                day.and_time(opts.work_end),
+            ))
+            .map(|(s, e)| {
+                (
+                    s.with_timezone(&Utc).max(window_start),
+                    e.with_timezone(&Utc).min(window_end),
+                )
+            });
+        if let Some((seg_start, seg_end)) = seg
+            && seg_end > seg_start
+        {
+            emit_segment_slots(&mut out, seg_start, seg_end, &merged, slot_len);
+        }
+        day += chrono::Duration::days(1);
+    }
+    out
+}
+
+/// Chop the free gaps of one working segment (busy intervals subtracted)
+/// into consecutive `slot_len` slots. `merged` is sorted and disjoint, so
+/// gaps come out in order.
+fn emit_segment_slots(
+    out: &mut Vec<FreeSlot>,
+    seg_start: DateTime<Utc>,
+    seg_end: DateTime<Utc>,
+    merged: &[(DateTime<Utc>, DateTime<Utc>)],
+    slot_len: chrono::Duration,
+) {
+    let mut cursor = seg_start;
+    let idx = merged.partition_point(|iv| iv.1 <= seg_start);
+    for iv in &merged[idx..] {
+        if iv.0 >= seg_end {
+            break;
+        }
+        emit_gap_slots(out, cursor, iv.0.min(seg_end), slot_len);
+        cursor = cursor.max(iv.1);
+        if cursor >= seg_end {
+            return;
+        }
+    }
+    emit_gap_slots(out, cursor, seg_end, slot_len);
+}
+
+fn emit_gap_slots(
+    out: &mut Vec<FreeSlot>,
+    mut start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    slot_len: chrono::Duration,
+) {
+    while start + slot_len <= end {
+        out.push(FreeSlot {
+            start,
+            end: start + slot_len,
+        });
+        start += slot_len;
+    }
 }
 
 #[cfg(test)]
@@ -4164,9 +4266,10 @@ END:VCALENDAR";
             chrono_tz::America::New_York,
             &slot_opts(60, 0, (9, 0), (17, 0)),
         );
-        // Window ends Thu 00:00 UTC = Wed 20:00 EDT: Wed slots run 09:00–16:00
-        // EDT (7 hour-slots, the 16:00–17:00 slot is clamped away), Tue none.
-        assert_eq!(slots.len(), 7, "{slots:?}");
+        // Tue's working hours vanish entirely; Wed keeps its full 09:00–17:00
+        // EDT (the window's Thu-00:00-UTC end is Wed 20:00 EDT, past work
+        // end), so 8 hour-slots survive.
+        assert_eq!(slots.len(), 8, "{slots:?}");
         assert_eq!(
             slots[0].start,
             range_utc(2026, 8, 19, 13, 0),
