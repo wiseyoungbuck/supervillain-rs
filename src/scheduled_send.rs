@@ -194,6 +194,19 @@ pub async fn tick_scheduled_send_daemon(
             Ok(email_id) => {
                 state.scheduled_sends.remove(&record.id);
                 mutated = true;
+                // A pixeled body was recorded at enqueue time (kata e2h4);
+                // attach the provider's message id now that dispatch has one.
+                if let (Some(token), Some(id)) = (
+                    submission
+                        .html_body
+                        .as_deref()
+                        .and_then(crate::tracking::extract_token),
+                    email_id.as_deref(),
+                ) && state.tracking.set_email_id(&token, id)
+                    && let Err(error) = state.tracking.save()
+                {
+                    tracing::warn!("Failed to persist tracking email id: {error}");
+                }
                 dispatched.push(DispatchedSend {
                     id: record.id.clone(),
                     account_id: record.account_id.clone(),

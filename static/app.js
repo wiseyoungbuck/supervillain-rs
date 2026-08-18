@@ -2748,6 +2748,45 @@ function confirmSendLaterAt(date) {
     sendEmail();
 }
 
+// --- Read statuses (kata e2h4) ----------------------------------------------
+// Minimal by design: a palette-opened list in the shared modal shell,
+// sourced from /api/tracking/status. Joining statuses onto the Sent
+// list/detail rows belongs to those regions' owners.
+
+function readStatusRows(records) {
+    return records.map(r => {
+        const opens = (r.opens || []).length;
+        const detail = opens
+            ? `Opened ${opens}× · last ${new Date(r.opens[opens - 1]).toLocaleString()}`
+            : 'Not opened';
+        return `
+        <div class="scheduled-send-row">
+            <span class="scheduled-send-subject">${escapeHtml(r.subject || '(no subject)')} → ${escapeHtml((r.recipients || []).join(', '))}</span>
+            <span class="scheduled-send-time">${escapeHtml(detail)}</span>
+        </div>`;
+    }).join('');
+}
+
+async function openReadStatuses() {
+    let records;
+    try {
+        records = await api('GET', '/tracking/status');
+    } catch (err) {
+        showStatus('Failed to load read statuses: ' + err.message, 'error');
+        return;
+    }
+    const rows = readStatusRows(records);
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Read Statuses</h3>
+            <div class="scheduled-send-list">${rows || '<div class="scheduled-send-empty">No tracked sends</div>'}</div>
+            <div class="modal-hint">Esc closes · opens record only when the tracking base is configured</div>
+            <div class="modal-buttons"><button id="read-statuses-close" type="button">Close</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    document.getElementById('read-statuses-close').addEventListener('click', closeSendLaterPicker);
+}
+
 // The Scheduled list: every queued send for the current account, soonest
 // first (server order), each cancelable back into a compose draft. Reuses
 // the Send Later modal shell — only one can be open at a time.

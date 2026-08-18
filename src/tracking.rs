@@ -60,7 +60,23 @@ impl TrackingStore {
     }
 
     pub fn load(path: impl AsRef<Path>) -> Self {
-        Self::new(path.as_ref().to_path_buf())
+        let store = Self::new(path.as_ref().to_path_buf());
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return store;
+        };
+        let parsed: Vec<TrackedSend> = match serde_json::from_str(&contents) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("Failed to load tracking.json: {error}");
+                return store;
+            }
+        };
+        let mut records = store.records.write().expect("tracking store lock poisoned");
+        for record in parsed {
+            records.insert(record.token.clone(), record);
+        }
+        drop(records);
+        store
     }
 
     pub fn path(&self) -> &Path {
@@ -105,16 +121,33 @@ impl TrackingStore {
     /// Append one open event. Returns false for an unknown token (the
     /// pixel route still serves the gif either way — validity must not
     /// leak to whoever fetches).
-    pub fn record_open(&self, _token: &str, _at: DateTime<Utc>) -> bool {
-        false
+    pub fn record_open(&self, token: &str, at: DateTime<Utc>) -> bool {
+        let mut records = self.records.write().expect("tracking store lock poisoned");
+        match records.get_mut(token) {
+            Some(record) => {
+                record.opens.push(at);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Attach the provider's message id once dispatch reports it.
-    pub fn set_email_id(&self, _token: &str, _email_id: &str) -> bool {
-        false
+    pub fn set_email_id(&self, token: &str, email_id: &str) -> bool {
+        let mut records = self.records.write().expect("tracking store lock poisoned");
+        match records.get_mut(token) {
+            Some(record) => {
+                record.email_id = Some(email_id.to_string());
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn save(&self) -> Result<(), Error> {
+        let records = self.records();
+        let json = serde_json::to_string_pretty(&records)?;
+        crate::accounts::atomic_write_bytes(&self.path, json.as_bytes(), false)?;
         Ok(())
     }
 }
@@ -129,12 +162,32 @@ pub fn new_token() -> String {
 /// (`sanitize_outgoing_html` runs before injection, but a pixel that would
 /// not survive it is a footgun). Inserted before `</body>` when present,
 /// appended otherwise.
-pub fn inject_pixel(html: &str, _base: &str, _token: &str) -> String {
-    html.to_string()
+pub fn inject_pixel(html: &str, base: &str, token: &str) -> String {
+    let base = base.trim_end_matches('/');
+    // src/width/height/alt only — all on ammonia's default img allowlist,
+    // so the pixel survives even if a refactor moves injection before the
+    // outgoing sanitizer. Clients hide 1×1 images on their own; a style
+    // attribute would be stripped anyway.
+    let img = format!(r#"<img src="{base}/t/{token}.gif" width="1" height="1" alt="">"#);
+    match html.rfind("</body>") {
+        Some(pos) => format!("{}{}{}", &html[..pos], img, &html[pos..]),
+        None => format!("{html}{img}"),
+    }
 }
 
 /// Find an already-injected pixel's token: `/t/` + 32 hex + `.gif`.
-pub fn extract_token(_html: &str) -> Option<String> {
+pub fn extract_token(html: &str) -> Option<String> {
+    let mut rest = html;
+    while let Some(idx) = rest.find("/t/") {
+        let after = &rest[idx + 3..];
+        if after.len() >= 36
+            && after.as_bytes()[..32].iter().all(|b| b.is_ascii_hexdigit())
+            && after[32..].starts_with(".gif")
+        {
+            return Some(after[..32].to_string());
+        }
+        rest = after;
+    }
     None
 }
 
@@ -146,12 +199,31 @@ pub fn has_pixel(html: &str) -> bool {
 /// Idempotent: an already-pixeled body (a re-entry, a daemon re-dispatch)
 /// is left untouched and no duplicate record is created.
 pub fn track_outgoing(
-    _store: &TrackingStore,
-    _base: &str,
-    _account_id: &str,
-    _submission: &mut crate::types::EmailSubmission,
+    store: &TrackingStore,
+    base: &str,
+    account_id: &str,
+    submission: &mut crate::types::EmailSubmission,
 ) -> Result<(), Error> {
-    Ok(())
+    let Some(html) = submission.html_body.as_deref() else {
+        return Ok(());
+    };
+    if has_pixel(html) {
+        return Ok(());
+    }
+    let token = new_token();
+    submission.html_body = Some(inject_pixel(html, base, &token));
+    let mut recipients = submission.to.clone();
+    recipients.extend(submission.cc.iter().cloned());
+    store.insert(TrackedSend {
+        token,
+        account_id: account_id.to_string(),
+        email_id: None,
+        subject: submission.subject.clone(),
+        recipients,
+        sent_at: Utc::now(),
+        opens: Vec::new(),
+    });
+    store.save()
 }
 
 #[cfg(test)]

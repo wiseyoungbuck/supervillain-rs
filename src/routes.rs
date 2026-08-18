@@ -2147,7 +2147,7 @@ async fn send_email_handler(
         .unwrap_or(session.username())
         .to_string();
 
-    let submission = EmailSubmission {
+    let mut submission = EmailSubmission {
         to: body.to,
         cc: body.cc,
         subject: body.subject,
@@ -2164,6 +2164,18 @@ async fn send_email_handler(
         send_at: body.send_at,
         calendar_ics: None,
     };
+
+    // Open tracking (kata e2h4): pixel the HTML body ONCE, here, so the
+    // immediate path and the deferred path (whose daemon dispatches the
+    // stored submission untouched) share the same recorded token. Inert
+    // without a configured public base; text-only sends stay untracked.
+    // Runs after the sanitizer so ammonia can't eat the pixel.
+    if let Some(base) = state.tracking_base.as_deref()
+        && submission.html_body.is_some()
+    {
+        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+        crate::tracking::track_outgoing(&state.tracking, base, &account_id, &mut submission)?;
+    }
 
     // Deferred send (kata vj6k/acag): a future send_at queues the submission
     // for the daemon instead of dispatching. A past/absent send_at sends on
@@ -2193,6 +2205,19 @@ async fn send_email_handler(
     }
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
+    // Join the provider's message id onto the tracking record so the client
+    // can map read statuses onto the Sent list (kata e2h4).
+    if let (Some(token), Some(email_id)) = (
+        submission
+            .html_body
+            .as_deref()
+            .and_then(crate::tracking::extract_token),
+        result.as_deref(),
+    ) && state.tracking.set_email_id(&token, email_id)
+        && let Err(error) = state.tracking.save()
+    {
+        tracing::warn!("Failed to persist tracking email id: {error}");
+    }
     Ok(send_success_response(result))
 }
 
@@ -2225,22 +2250,47 @@ async fn cancel_scheduled_send(
 
 // --- Open tracking (kata e2h4) ----------------------------------------------
 
+/// 1×1 transparent GIF89a — the classic 43-byte tracking pixel.
+const TRACKING_GIF: [u8; 43] = [
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+];
+
 /// Public pixel route (`/t/{token}.gif`, deliberately outside `/api`): serve
 /// the 1×1 gif unconditionally — a 404 or slow path would leak token
 /// validity to whoever probes — and record an open event for known tokens.
+/// no-store so a re-open re-fetches instead of hitting the client cache.
 async fn tracking_pixel(
-    State(_state): State<Arc<AppState>>,
-    Path(_filename): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_FOUND.into_response()
+    if let Some(token) = filename.strip_suffix(".gif")
+        && state.tracking.record_open(token, chrono::Utc::now())
+        && let Err(error) = state.tracking.save()
+    {
+        tracing::warn!("Failed to persist tracked open: {error}");
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/gif"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, private, max-age=0",
+            ),
+        ],
+        TRACKING_GIF,
+    )
 }
 
 /// Read statuses for the account's tracked sends, most recent first.
 async fn tracking_status(
-    State(_state): State<Arc<AppState>>,
-    Query(_params): Query<AccountParam>,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
 ) -> Result<Json<serde_json::Value>, Error> {
-    Err(Error::Internal("tracking not implemented".into()))
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let records = state.tracking.records_for_account(&account_id);
+    Ok(Json(serde_json::to_value(records)?))
 }
 
 // --- Persistent drafts (kata wm57) -----------------------------------------
@@ -4352,7 +4402,7 @@ mod tests {
         );
         assert!(
             API_JS.contains(
-                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts|ai)"
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts|ai|tracking)"
             ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );
