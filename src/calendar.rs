@@ -3923,7 +3923,7 @@ END:VCALENDAR";
                    RRULE:FREQ=MONTHLY\nSUMMARY:Payday\nEND:VEVENT\nEND:VCALENDAR"
             .to_string();
         let feb = events_in_range(
-            &[ics.clone()],
+            std::slice::from_ref(&ics),
             range_utc(2026, 2, 1, 0, 0),
             range_utc(2026, 3, 1, 0, 0),
             chrono_tz::UTC,
