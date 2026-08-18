@@ -336,13 +336,19 @@ mod tests {
         for i in 0..3 {
             store.insert(record(&format!("due-{i}"), now - Duration::seconds(i + 1)));
         }
-        let start = std::time::Instant::now();
-        let due = store.due(now);
-        let elapsed = start.elapsed();
-        assert_eq!(due.len(), 3, "scan must find exactly the due records");
+        // Best-of-5: a single wall-clock sample flakes when the full suite
+        // saturates every core; the minimum strips scheduler noise while
+        // still catching an algorithmic regression in the scan itself.
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let due = store.due(now);
+            best = best.min(start.elapsed());
+            assert_eq!(due.len(), 3, "scan must find exactly the due records");
+        }
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "due scan over 10k queued took {elapsed:?} (budget 50ms)"
+            best < std::time::Duration::from_millis(50),
+            "due scan over 10k queued took {best:?} (budget 50ms)"
         );
     }
 }
