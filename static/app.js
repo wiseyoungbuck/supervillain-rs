@@ -89,6 +89,8 @@ const state = {
     movePickerOpen: false,    // Move to Folder picker (kata e993)
     moveEmailId: null,        // email the open move picker acts on
     movePickerIndex: 0,       // selected row in the move picker list
+    bulkSelected: new Set(),  // bulk selection: email IDS, list view (kata pakx)
+    bulkAnchorId: null,       // last-toggled id, the Shift+X range anchor
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -242,6 +244,7 @@ function init() {
     els.splitHint = document.getElementById('split-hint');
     els.remindModal = document.getElementById('remind-modal');
     els.moveModal = document.getElementById('move-modal');
+    els.bulkBar = document.getElementById('bulk-bar');
     els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
     els.sendUndoToast = document.getElementById('send-undo-toast');
     els.sendUndoMessage = document.getElementById('send-undo-message');
@@ -6024,6 +6027,25 @@ function commandsForView(view) {
             if (visibleRows()[state.selectedIndex] && state.mailboxes.length) {
                 cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
             }
+            // pakx: Select All whenever rows exist; the batch commands only
+            // while a selection is active. Each calls the same function the
+            // e/#/u/s/v keys route to when a selection is live.
+            if (visibleRows().length) {
+                cmds.push({ name: 'Select All in View', desc: 'Select every visible email', shortcut: '', action: 'select-all' });
+            }
+            const nSelected = bulkIds().length;
+            if (nSelected) {
+                cmds.push(
+                    { name: `Archive ${nSelected} Selected`, desc: 'Archive every selected email', shortcut: 'e', action: 'bulk-archive' },
+                    { name: `Trash ${nSelected} Selected`, desc: 'Move every selected email to trash', shortcut: '#', action: 'bulk-trash' },
+                    { name: `Toggle Read on ${nSelected} Selected`, desc: 'Flip read/unread on every selected email', shortcut: 'u', action: 'bulk-unread' },
+                    { name: `Star ${nSelected} Selected`, desc: 'Toggle star on every selected email', shortcut: 's', action: 'bulk-flag' },
+                );
+                if (state.mailboxes.length) {
+                    cmds.push({ name: `Move ${nSelected} Selected…`, desc: 'File every selected email in a folder or label', shortcut: 'v', action: 'bulk-move' });
+                }
+                cmds.push({ name: 'Clear Selection', desc: 'Deselect all emails', shortcut: 'Esc', action: 'bulk-clear' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -6185,6 +6207,14 @@ function executeCommand(action) {
             document.getElementById('timezone-settings')?.scrollIntoView({ block: 'start' });
             break;
         case 'move-to': openMovePicker(); break;
+        // pakx: batch commands converge on the same functions the keys use.
+        case 'select-all': selectAllVisible(); break;
+        case 'bulk-archive': bulkEmailAction('archive'); break;
+        case 'bulk-trash': bulkEmailAction('trash'); break;
+        case 'bulk-unread': bulkToggleUnread(); break;
+        case 'bulk-flag': bulkToggleFlag(); break;
+        case 'bulk-move': openMovePicker(); break;
+        case 'bulk-clear': clearBulkSelection(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {

@@ -2533,3 +2533,22 @@ body:not(.light-theme) .compose-quote a * {
     background: var(--bg-secondary);
     color: var(--accent);
 }
+
+/* Bulk selection (kata pakx): the selection bar above the list and the
+   per-row marker. Standalone appends (seam discipline). */
+#bulk-bar {
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+}
+
+#bulk-bar.hidden {
+    display: none;
+}
+
+.email-row.bulk-selected {
+    background: var(--bg-secondary);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
