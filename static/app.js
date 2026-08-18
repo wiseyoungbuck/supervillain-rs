@@ -328,6 +328,7 @@ function init() {
     els.acctConfirmDelete = document.getElementById('acct-confirm-delete');
     els.acctFormError = document.getElementById('acct-form-error');
     els.calendarPeek = document.getElementById('calendar-peek');
+    els.availModal = document.getElementById('avail-modal');
     // Event listeners
     if (els.starredItem) {
         els.starredItem.addEventListener('click', toggleStarredOnly);
@@ -4645,6 +4646,18 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Share Availability picker (kata mtqp): while open it owns Enter/Esc;
+    // Ctrl+Shift+H opens it from compose (both modes).
+    if (!els.availModal.classList.contains('hidden')) {
+        handleAvailPickerKey(e);
+        return;
+    }
+    if (state.view === 'compose' && (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'h') {
+        openAvailabilityPicker();
+        e.preventDefault();
+        return;
+    }
+
     // Command palette shortcut (kata sefy): hoisted ABOVE the per-view
     // early returns so Cmd+K reaches the palette from every screen —
     // settings (wizard/insert/normal) and compose insert included — not
@@ -6268,6 +6281,7 @@ function commandsForView(view) {
                 { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'close-draft' },
                 { name: 'Attach', desc: 'Attach a file', shortcut: 'a', action: 'attach' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
+                { name: 'Share Availability', desc: 'Insert free time slots from your calendar', shortcut: '\u2303\u21e7H', action: 'share-availability' },
             ];
         case 'settings': {
             // Settings is a low-action surface: account management + Help only.
@@ -6424,6 +6438,7 @@ function executeCommand(action) {
         case 'bulk-move': openMovePicker(); break;
         case 'bulk-clear': clearBulkSelection(); break;
         case 'calendar-peek': toggleCalendarPeek(); break;
+        case 'share-availability': openAvailabilityPicker(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {

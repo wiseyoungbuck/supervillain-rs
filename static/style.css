@@ -2777,3 +2777,17 @@ body:not(.light-theme) .compose-quote a * {
     border-left-color: var(--accent-dim);
 }
 .peek-event-time { color: var(--fg-muted); font-size: 10.5px; }
+
+/* Share Availability picker (kata mtqp) — same overlay treatment as the
+   Remind Me / Reminder Settings modals. */
+#avail-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+#avail-modal.hidden { display: none; }
+.avail-status-error { color: var(--error, #ff5555); }
