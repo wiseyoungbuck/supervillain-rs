@@ -3169,8 +3169,55 @@ pub async fn get_calendar_ics_in_range(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<String>, Error> {
-    let _ = (s, start, end);
-    Ok(Vec::new())
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
+    // Resolved collection URL (cached) — never /Default/ (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y%m%dT%H%M%SZ").to_string();
+    let query = format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range start="{}" end="{}"/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>"#,
+        fmt(start),
+        fmt(end)
+    );
+
+    let resp = s
+        .client
+        .request(
+            reqwest::Method::from_bytes(b"REPORT").expect("REPORT is a valid method"),
+            &collection,
+        )
+        .header("Authorization", auth)
+        .header("Depth", "1")
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(query)
+        .send()
+        .await?;
+    let status = resp.status();
+    // 404: the discovered collection vanished mid-session — no events, not
+    // a hard failure (the next discovery re-resolves).
+    if status.as_u16() == 404 {
+        return Ok(Vec::new());
+    }
+    if status.as_u16() != 207 {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("REPORT", &collection, status, &body));
+    }
+    let xml = resp.text().await?;
+    // Response blocks without calendar-data (the collection's own row) are
+    // skipped silently.
+    Ok(RESPONSE_RE
+        .find_iter(&xml)
+        .filter_map(|m| {
+            let data = xml_unescape_text(&element_text(&CALENDAR_DATA_RE.captures(m.as_str())?[1]));
+            (!data.trim().is_empty()).then_some(data)
+        })
+        .collect())
 }
 
 /// UUID v4 generation using /dev/urandom for proper randomness.

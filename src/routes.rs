@@ -3073,6 +3073,80 @@ async fn send_invite_handler(
     Ok(send_success_response(result))
 }
 
+#[derive(Deserialize)]
+struct CalendarRangeParams {
+    start: String,
+    end: String,
+}
+
+/// The peek view asks for a day or a week; anything past this is a client
+/// bug that would balloon the CalDAV REPORT responses.
+const MAX_CALENDAR_RANGE_DAYS: i64 = 62;
+
+/// GET /api/calendar/events?start=<RFC3339>&end=<RFC3339> — normalized event
+/// occurrences overlapping `[start, end)` across every configured account,
+/// sorted by start, for the day/week peek view (kata j6e4). Accounts whose
+/// provider has no range support (Outlook/Gmail, out of scope) or no CalDAV
+/// credentials are skipped; other per-account failures are reported in
+/// `errors` so one broken account doesn't blank the whole view.
+async fn calendar_events_range(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CalendarRangeParams>,
+) -> Result<impl IntoResponse, Error> {
+    let parse_bound = |label: &str, v: &str| {
+        chrono::DateTime::parse_from_rfc3339(v)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .map_err(|e| Error::BadRequest(format!("invalid {label} '{v}': {e}")))
+    };
+    let start = parse_bound("start", &params.start)?;
+    let end = parse_bound("end", &params.end)?;
+    if end <= start {
+        return Err(Error::BadRequest("end must be after start".into()));
+    }
+    if end - start > chrono::Duration::days(MAX_CALENDAR_RANGE_DAYS) {
+        return Err(Error::BadRequest(format!(
+            "range too large (max {MAX_CALENDAR_RANGE_DAYS} days)"
+        )));
+    }
+    let primary_tz = configured_primary_tz(&state);
+
+    // Snapshot the session locks so the registry lock is not held across
+    // network I/O.
+    let sessions: Vec<(String, SessionLock)> = {
+        let reg = state.accounts.read().await;
+        reg.sessions
+            .iter()
+            .map(|(name, lock)| (name.clone(), lock.clone()))
+            .collect()
+    };
+
+    let mut events: Vec<calendar::RangeEvent> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (name, lock) in sessions {
+        let session = lock.read().await;
+        match provider::get_calendar_ics_in_range(&session, start, end).await {
+            Ok(Some(objects)) => {
+                for mut ev in calendar::events_in_range(&objects, start, end, primary_tz) {
+                    ev.account = name.clone();
+                    events.push(ev);
+                }
+            }
+            // Provider without range support: documented out of scope.
+            Ok(None) => {}
+            // No CalDAV app password: not a calendar-enabled account.
+            Err(Error::CalendarAuthUnconfigured) => {}
+            Err(e) => {
+                tracing::warn!("calendar range query failed for account {name}: {e}");
+                errors.push(format!("{name}: calendar query failed"));
+            }
+        }
+    }
+    events.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.cmp(&b.uid)));
+    Ok(Json(
+        serde_json::json!({ "events": events, "errors": errors }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

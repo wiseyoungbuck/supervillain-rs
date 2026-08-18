@@ -1,5 +1,7 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
@@ -1240,8 +1242,431 @@ pub fn events_in_range(
     range_end: DateTime<Utc>,
     primary_tz: Tz,
 ) -> Vec<RangeEvent> {
-    let _ = (ics_objects, range_start, range_end, primary_tz);
-    Vec::new()
+    let mut masters: Vec<RangeVevent> = Vec::new();
+    let mut overrides: Vec<RangeVevent> = Vec::new();
+    for obj in ics_objects {
+        let data = obj.trim();
+        if !data.contains("BEGIN:VCALENDAR") {
+            continue;
+        }
+        let tz_offsets = parse_vtimezone_offsets(data);
+        for block in vevent_blocks(data) {
+            let Some(ev) = parse_range_vevent(block, &tz_offsets, primary_tz) else {
+                continue;
+            };
+            if ev.recurrence_id.is_some() {
+                overrides.push(ev);
+            } else {
+                masters.push(ev);
+            }
+        }
+    }
+
+    // An override VEVENT (same UID + RECURRENCE-ID) replaces the master's
+    // occurrence at the RECURRENCE-ID instant — suppress that instant here,
+    // emit the override's own DTSTART below.
+    let suppressed: BTreeSet<(&str, DateTime<Utc>)> = overrides
+        .iter()
+        .filter_map(|o| o.recurrence_id.map(|r| (o.uid.as_str(), r)))
+        .collect();
+
+    let mut out: Vec<RangeEvent> = Vec::new();
+    for ev in &masters {
+        if ev.cancelled {
+            continue;
+        }
+        let duration = range_event_duration(ev);
+        let starts = match &ev.rrule {
+            Some(rule) => expand_rule_starts(ev, rule, range_end, primary_tz),
+            None => vec![ev.dtstart],
+        };
+        for s in starts {
+            if suppressed.contains(&(ev.uid.as_str(), s)) || ev.exdates.contains(&s) {
+                continue;
+            }
+            push_if_overlapping(&mut out, ev, s, s + duration, range_start, range_end);
+        }
+    }
+    for ov in &overrides {
+        if ov.cancelled {
+            continue;
+        }
+        let duration = range_event_duration(ov);
+        push_if_overlapping(
+            &mut out,
+            ov,
+            ov.dtstart,
+            ov.dtstart + duration,
+            range_start,
+            range_end,
+        );
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.cmp(&b.uid)));
+    out
+}
+
+/// A VEVENT as parsed for range queries — just enough structure to expand
+/// occurrences. `dtstart`/`dtend` are resolved instants; `all_day` mirrors
+/// DTSTART's VALUE=DATE flag.
+struct RangeVevent {
+    uid: String,
+    summary: String,
+    location: Option<String>,
+    dtstart: DateTime<Utc>,
+    dtend: Option<DateTime<Utc>>,
+    all_day: bool,
+    rrule: Option<Rrule>,
+    exdates: Vec<DateTime<Utc>>,
+    recurrence_id: Option<DateTime<Utc>>,
+    cancelled: bool,
+}
+
+enum RruleFreq {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+struct Rrule {
+    freq: RruleFreq,
+    interval: u32,
+    count: Option<u32>,
+    until: Option<DateTime<Utc>>,
+    /// Weekly BYDAY weekdays, sorted Monday-first so per-cycle candidates
+    /// ascend. Empty = recur on DTSTART's weekday.
+    byday: Vec<chrono::Weekday>,
+}
+
+/// Recurrence-cycle cap: ~54 years of a daily rule. An event recurring since
+/// long before the window truncates there rather than looping unbounded on a
+/// pathological rule; real calendars sit far under this.
+const MAX_EXPANSION_CYCLES: i64 = 20_000;
+
+fn range_event_duration(ev: &RangeVevent) -> chrono::Duration {
+    match ev.dtend {
+        Some(e) => e - ev.dtstart,
+        // RFC 5545 §3.6.1: DTSTART DATE with no DTEND spans one day;
+        // a timed event with no DTEND has zero duration.
+        None if ev.all_day => chrono::Duration::days(1),
+        None => chrono::Duration::zero(),
+    }
+}
+
+/// CalDAV time-range overlap (RFC 4791 §9.9): half-open window, with the
+/// zero-length special case included when its instant lies in the window.
+fn range_overlaps(
+    s: DateTime<Utc>,
+    e: DateTime<Utc>,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> bool {
+    if s == e {
+        s >= range_start && s < range_end
+    } else {
+        s < range_end && e > range_start
+    }
+}
+
+fn push_if_overlapping(
+    out: &mut Vec<RangeEvent>,
+    ev: &RangeVevent,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) {
+    if !range_overlaps(start, end, range_start, range_end) {
+        return;
+    }
+    out.push(RangeEvent {
+        uid: ev.uid.clone(),
+        summary: ev.summary.clone(),
+        start,
+        end,
+        all_day: ev.all_day,
+        location: ev.location.clone(),
+        account: String::new(),
+    });
+}
+
+/// Successive `BEGIN:VEVENT … END:VEVENT` blocks. Same anchored-END scoping
+/// as `parse_ics` (kata 4ycd): each END search starts after its BEGIN.
+fn vevent_blocks(data: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut rest = data;
+    while let Some(start) = rest.find("BEGIN:VEVENT") {
+        let after = &rest[start..];
+        let Some(end) = after.find("END:VEVENT") else {
+            break;
+        };
+        let end = end + "END:VEVENT".len();
+        blocks.push(&after[..end]);
+        rest = &after[end..];
+    }
+    blocks
+}
+
+/// Whether property `name` in the unfolded VEVENT text carries a DATE (not
+/// DATE-TIME) value — the same detection `parse_ics_datetime_property` uses.
+fn property_is_date_only(text: &str, name: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        let (params, value) = if let Some(v) = rest.strip_prefix(':') {
+            ("", v)
+        } else if rest.starts_with(';') {
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
+            (&rest[1..colon], &rest[colon + 1..])
+        } else {
+            continue;
+        };
+        let date_only = (params.contains("VALUE=DATE") && !params.contains("VALUE=DATE-TIME"))
+            || value.trim().len() == 8;
+        return date_only;
+    }
+    false
+}
+
+/// Every EXDATE instant in the VEVENT. EXDATE may repeat and each line may
+/// carry several comma-separated values; each value is re-wrapped as a
+/// single-value property line so TZID/UTC/floating/DATE resolution stays in
+/// `parse_ics_datetime_property`.
+fn parse_exdates(
+    unfolded: &str,
+    tz_offsets: &HashMap<String, FixedOffset>,
+    primary_tz: Tz,
+) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    for line in unfolded.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix("EXDATE") else {
+            continue;
+        };
+        let (params, values) = if let Some(v) = rest.strip_prefix(':') {
+            ("", v)
+        } else if rest.starts_with(';') {
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
+            (&rest[1..colon], &rest[colon + 1..])
+        } else {
+            continue;
+        };
+        for value in values.split(',') {
+            let synth = if params.is_empty() {
+                format!("EXDATE:{value}")
+            } else {
+                format!("EXDATE;{params}:{value}")
+            };
+            if let Some(dt) = parse_ics_datetime_property(&synth, "EXDATE", tz_offsets, primary_tz)
+            {
+                out.push(dt);
+            }
+        }
+    }
+    out
+}
+
+fn parse_range_vevent(
+    block: &str,
+    tz_offsets: &HashMap<String, FixedOffset>,
+    primary_tz: Tz,
+) -> Option<RangeVevent> {
+    let unfolded = unfold_lines(block);
+    let uid = extract_property(&unfolded, "UID")?;
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", tz_offsets, primary_tz)?;
+    Some(RangeVevent {
+        uid,
+        summary: extract_property(&unfolded, "SUMMARY").unwrap_or_default(),
+        location: extract_property(&unfolded, "LOCATION"),
+        dtstart,
+        dtend: parse_ics_datetime_property(&unfolded, "DTEND", tz_offsets, primary_tz),
+        all_day: property_is_date_only(&unfolded, "DTSTART"),
+        rrule: extract_property(&unfolded, "RRULE").and_then(|v| parse_rrule(&v, primary_tz)),
+        exdates: parse_exdates(&unfolded, tz_offsets, primary_tz),
+        recurrence_id: parse_ics_datetime_property(
+            &unfolded,
+            "RECURRENCE-ID",
+            tz_offsets,
+            primary_tz,
+        ),
+        cancelled: extract_property(&unfolded, "STATUS").as_deref() == Some("CANCELLED"),
+    })
+}
+
+fn parse_rrule_weekday(s: &str) -> Option<chrono::Weekday> {
+    // Ordinal-prefixed BYDAY entries ("2MO") are out of scope — dropped, not
+    // misread as plain weekdays.
+    match s.trim() {
+        "MO" => Some(chrono::Weekday::Mon),
+        "TU" => Some(chrono::Weekday::Tue),
+        "WE" => Some(chrono::Weekday::Wed),
+        "TH" => Some(chrono::Weekday::Thu),
+        "FR" => Some(chrono::Weekday::Fri),
+        "SA" => Some(chrono::Weekday::Sat),
+        "SU" => Some(chrono::Weekday::Sun),
+        _ => None,
+    }
+}
+
+/// UNTIL is inclusive (RFC 5545 §3.3.10). A DATE value covers its whole day;
+/// a DATE-TIME is UTC when `Z`-suffixed, else interpreted in `primary_tz`
+/// (matching the floating-time policy of `parse_ics_datetime_property`).
+fn parse_rrule_until(v: &str, primary_tz: Tz) -> Option<DateTime<Utc>> {
+    let v = v.trim();
+    if v.len() == 8 {
+        let date = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
+        let dt = NaiveDateTime::new(date, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+    if let Some(stripped) = v.strip_suffix('Z') {
+        let dt = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S").ok()?;
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+    let dt = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
+    Some(resolve_local_datetime_lenient(&primary_tz, dt)?.with_timezone(&Utc))
+}
+
+/// Parse an RRULE value into the supported subset. `None` for unsupported
+/// FREQ values (SECONDLY/MINUTELY/HOURLY) — the event then contributes only
+/// its DTSTART occurrence, never a wrong expansion. Unsupported modifiers
+/// (BYSETPOS, BYMONTH, RDATE lives elsewhere, …) are ignored; see
+/// [`events_in_range`] for the documented scope.
+fn parse_rrule(value: &str, primary_tz: Tz) -> Option<Rrule> {
+    let mut freq = None;
+    let mut interval = 1u32;
+    let mut count = None;
+    let mut until = None;
+    let mut byday: Vec<chrono::Weekday> = Vec::new();
+    for part in value.split(';') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k.trim().to_ascii_uppercase().as_str() {
+            "FREQ" => {
+                freq = match v.trim().to_ascii_uppercase().as_str() {
+                    "DAILY" => Some(RruleFreq::Daily),
+                    "WEEKLY" => Some(RruleFreq::Weekly),
+                    "MONTHLY" => Some(RruleFreq::Monthly),
+                    "YEARLY" => Some(RruleFreq::Yearly),
+                    _ => return None,
+                }
+            }
+            "INTERVAL" => interval = v.trim().parse().unwrap_or(1),
+            "COUNT" => count = v.trim().parse().ok(),
+            "UNTIL" => until = parse_rrule_until(v, primary_tz),
+            "BYDAY" => byday = v.split(',').filter_map(parse_rrule_weekday).collect(),
+            _ => {}
+        }
+    }
+    byday.sort_by_key(|w| w.num_days_from_monday());
+    byday.dedup();
+    freq.map(|freq| Rrule {
+        freq,
+        interval,
+        count,
+        until,
+        byday,
+    })
+}
+
+/// Candidate wall-clock starts for recurrence cycle `k` (already multiplied
+/// by INTERVAL), ascending. Monthly/yearly may yield none when the pinned
+/// day doesn't exist in the cycle's month (Jan 31 → February); skipped
+/// cycles produce no occurrence and consume no COUNT (RFC 5545 §3.8.5.3).
+fn cycle_candidates(base: NaiveDateTime, rule: &Rrule, offset: i64) -> Vec<NaiveDateTime> {
+    match rule.freq {
+        RruleFreq::Daily => vec![base + chrono::Duration::days(offset)],
+        RruleFreq::Weekly if rule.byday.is_empty() => {
+            vec![base + chrono::Duration::weeks(offset)]
+        }
+        RruleFreq::Weekly => {
+            let monday = base.date()
+                - chrono::Duration::days(base.date().weekday().num_days_from_monday() as i64);
+            let week = monday + chrono::Duration::weeks(offset);
+            rule.byday
+                .iter()
+                .map(|wd| {
+                    (week + chrono::Duration::days(wd.num_days_from_monday() as i64))
+                        .and_time(base.time())
+                })
+                .collect()
+        }
+        RruleFreq::Monthly => {
+            let months = base.date().year() as i64 * 12 + base.date().month0() as i64 + offset;
+            NaiveDate::from_ymd_opt(
+                (months.div_euclid(12)) as i32,
+                months.rem_euclid(12) as u32 + 1,
+                base.date().day(),
+            )
+            .map(|d| d.and_time(base.time()))
+            .into_iter()
+            .collect()
+        }
+        RruleFreq::Yearly => NaiveDate::from_ymd_opt(
+            base.date().year() + offset as i32,
+            base.date().month(),
+            base.date().day(),
+        )
+        .map(|d| d.and_time(base.time()))
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// Expand a rule into ascending occurrence starts from DTSTART up to (not
+/// including) `range_end`, honoring COUNT and UNTIL. Occurrences before the
+/// query window are generated too — they consume COUNT, and a long
+/// occurrence starting before the window can still overlap it; the caller
+/// filters by overlap.
+///
+/// Timed rules iterate in `primary_tz` wall-clock (a weekly 09:00 stays
+/// 09:00 across the user's DST changes); all-day rules iterate in date
+/// space on their midnight-UTC anchors.
+fn expand_rule_starts(
+    ev: &RangeVevent,
+    rule: &Rrule,
+    range_end: DateTime<Utc>,
+    primary_tz: Tz,
+) -> Vec<DateTime<Utc>> {
+    let base_wall = if ev.all_day {
+        ev.dtstart.naive_utc()
+    } else {
+        ev.dtstart.with_timezone(&primary_tz).naive_local()
+    };
+    let to_utc = |naive: NaiveDateTime| -> Option<DateTime<Utc>> {
+        if ev.all_day {
+            Some(DateTime::from_naive_utc_and_offset(naive, Utc))
+        } else {
+            resolve_local_datetime_lenient(&primary_tz, naive).map(|d| d.with_timezone(&Utc))
+        }
+    };
+
+    let interval = rule.interval.max(1) as i64;
+    let mut out = Vec::new();
+    let mut produced: u32 = 0;
+    for k in 0..MAX_EXPANSION_CYCLES {
+        for cand in cycle_candidates(base_wall, rule, k * interval) {
+            if cand < base_wall {
+                continue;
+            }
+            let Some(utc) = to_utc(cand) else { continue };
+            if rule.until.is_some_and(|until| utc > until) || utc >= range_end {
+                return out;
+            }
+            out.push(utc);
+            produced += 1;
+            if rule.count.is_some_and(|c| produced >= c) {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

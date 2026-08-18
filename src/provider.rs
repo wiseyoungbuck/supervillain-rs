@@ -434,6 +434,23 @@ pub async fn get_calendar_event(
     }
 }
 
+/// Raw ICS calendar objects overlapping `[start, end)` for this account, or
+/// `None` when the provider has no range-query support yet — Outlook Graph
+/// and Google Calendar event listing are out of scope for the wave-0 peek
+/// backend (kata j6e4); callers skip those accounts rather than erroring.
+pub async fn get_calendar_ics_in_range(
+    s: &ProviderSession,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Vec<String>>, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::get_calendar_ics_in_range(s, start, end)
+            .await
+            .map(Some),
+        ProviderSession::Outlook(_) | ProviderSession::Gmail(_) => Ok(None),
+    }
+}
+
 // =============================================================================
 // Blob upload/download dispatch
 // =============================================================================
