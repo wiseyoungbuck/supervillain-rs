@@ -2668,3 +2668,112 @@ body:not(.light-theme) .compose-quote a * {
 .ai-summary-error {
     color: var(--error, #c66);
 }
+/* ============================================================
+   Calendar peek (kata j6e4) — C-key day/week pane
+   ============================================================ */
+#calendar-peek {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(760px, 70vw);
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+    z-index: 90;
+    display: flex;
+    flex-direction: column;
+    font-size: 12.5px;
+}
+#calendar-peek.hidden { display: none; }
+.peek-head {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    flex: none;
+}
+.peek-head-title {
+    color: var(--accent);
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.peek-head-range { color: var(--fg); }
+.peek-head-hint { margin-left: auto; color: var(--fg-dim); font-size: 11px; }
+.peek-status { padding: 8px 14px; color: var(--fg-muted); flex: none; }
+.peek-status-error { color: var(--error, #ff5555); }
+.peek-grid {
+    --peek-hour-h: 40px;
+    display: flex;
+    flex: 1;
+    overflow-y: auto;
+    align-items: flex-start;
+}
+.peek-hours { width: 52px; flex: none; color: var(--fg-dim); }
+.peek-hours-spacer-head { height: 26px; }
+.peek-hours-spacer-allday { height: 28px; border-bottom: 1px solid var(--border); }
+.peek-hour-rail { height: calc(24 * var(--peek-hour-h)); }
+.peek-hour-label {
+    height: var(--peek-hour-h);
+    font-size: 10.5px;
+    text-align: right;
+    padding-right: 6px;
+    transform: translateY(-6px);
+}
+.peek-day {
+    flex: 1;
+    min-width: 0;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+}
+.peek-day-head {
+    height: 26px;
+    line-height: 26px;
+    padding: 0 6px;
+    color: var(--fg-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.peek-allday {
+    min-height: 28px;
+    border-bottom: 1px solid var(--border);
+    padding: 2px 3px;
+}
+.peek-timed {
+    position: relative;
+    height: calc(24 * var(--peek-hour-h));
+    background: repeating-linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent calc(var(--peek-hour-h) - 1px),
+        var(--border) calc(var(--peek-hour-h) - 1px),
+        var(--border) var(--peek-hour-h)
+    );
+}
+.peek-event {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    top: calc(var(--peek-start) / 60 * var(--peek-hour-h));
+    height: max(calc(var(--peek-dur) / 60 * var(--peek-hour-h)), 14px);
+    background: var(--bg-tertiary);
+    border-left: 2px solid var(--accent);
+    border-radius: 2px;
+    padding: 1px 4px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--fg);
+}
+.peek-event-allday {
+    position: static;
+    height: auto;
+    display: block;
+    margin: 1px 0;
+    border-left-color: var(--accent-dim);
+}
+.peek-event-time { color: var(--fg-muted); font-size: 10.5px; }

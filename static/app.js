@@ -98,6 +98,10 @@ const state = {
     // AI assist availability (kata 6rhw): {enabled, model} from
     // GET /api/ai/status; null until the boot probe resolves.
     ai: null,
+    // Calendar peek (kata j6e4): the C-key day/week pane. anchor is the local
+    // 'YYYY-MM-DD' day the view is centered on; events holds the fetched
+    // RangeEvents for the visible window.
+    calendarPeek: { visible: false, mode: 'day', anchor: null, events: [], loading: false, error: null },
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -323,6 +327,7 @@ function init() {
     els.acctDelete = document.getElementById('acct-delete');
     els.acctConfirmDelete = document.getElementById('acct-confirm-delete');
     els.acctFormError = document.getElementById('acct-form-error');
+    els.calendarPeek = document.getElementById('calendar-peek');
     // Event listeners
     if (els.starredItem) {
         els.starredItem.addEventListener('click', toggleStarredOnly);
@@ -4626,6 +4631,20 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Calendar peek (kata j6e4): while open the peek owns only its own nav
+    // keys (d/w/[/]/Esc/C, see handleCalendarPeekKey) and lets everything
+    // else fall through so list navigation keeps working alongside it.
+    // C toggles it from list/detail normal mode.
+    if (state.calendarPeek.visible && handleCalendarPeekKey(e)) {
+        return;
+    }
+    if (state.mode === 'normal' && !e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'C'
+        && (state.view === 'list' || state.view === 'detail')) {
+        toggleCalendarPeek();
+        e.preventDefault();
+        return;
+    }
+
     // Command palette shortcut (kata sefy): hoisted ABOVE the per-view
     // early returns so Cmd+K reaches the palette from every screen —
     // settings (wizard/insert/normal) and compose insert included — not
@@ -6126,6 +6145,7 @@ function commandsForView(view) {
             if (state.mailboxes.length) {
                 cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
             }
+            cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
         }
         case 'list': {
@@ -6230,6 +6250,7 @@ function commandsForView(view) {
                 cmds.push({ name: 'Clear Selection', desc: 'Deselect all emails', shortcut: 'Esc', action: 'bulk-clear' });
             }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
+            cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
         }
         case 'compose':
@@ -6402,6 +6423,7 @@ function executeCommand(action) {
         case 'bulk-flag': bulkToggleFlag(); break;
         case 'bulk-move': openMovePicker(); break;
         case 'bulk-clear': clearBulkSelection(); break;
+        case 'calendar-peek': toggleCalendarPeek(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {
