@@ -6301,6 +6301,7 @@ function commandsForView(view) {
                 }
                 cmds.push({ name: 'Clear Selection', desc: 'Deselect all emails', shortcut: 'Esc', action: 'bulk-clear' });
             }
+            cmds.push({ name: 'Read Statuses', desc: 'Open tracking for sent email (needs the tracking base configured)', shortcut: '', action: 'read-statuses' });
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
@@ -6388,6 +6389,7 @@ function executeCommand(action) {
         case 'send': sendEmail(); break;
         case 'send-later': openSendLaterPicker(); break;
         case 'scheduled-sends': openScheduledSends(); break;
+        case 'read-statuses': openReadStatuses(); break;
         case 'close-draft': escapeCompose(); break;
         case 'attach': els.composeFileInput.click(); break;
         // RSVP (kata sefy): the detail palette offers these only behind the

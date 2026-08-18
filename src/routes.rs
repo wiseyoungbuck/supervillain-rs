@@ -216,6 +216,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/ai/status", get(crate::ai::ai_status_handler))
         .route("/api/ai/summarize", post(crate::ai::ai_summarize))
         .route("/api/ai/draft", post(crate::ai::ai_draft))
+        .route("/api/tracking/status", get(tracking_status))
+        .route("/t/{filename}", get(tracking_pixel))
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))
