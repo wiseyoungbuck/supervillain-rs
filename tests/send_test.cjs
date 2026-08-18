@@ -194,3 +194,323 @@ test('send: the post-settle autosave cancel is scoped to the sending session', a
     await other.doSendEmail();
     assert.equal(other.autosaveCancels, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Deferred send (kata vj6k Undo Send + kata acag Send Later)
+// ---------------------------------------------------------------------------
+
+const API_JS = fs.readFileSync(path.join(__dirname, '..', 'static', 'api.js'), 'utf8');
+
+function classListStub(initialHidden = true) {
+    const classes = new Set(initialHidden ? ['hidden'] : []);
+    return {
+        add: (c) => classes.add(c),
+        remove: (c) => classes.delete(c),
+        contains: (c) => classes.has(c),
+    };
+}
+
+// Deferred-send harness: the characterization harness plus the deferral
+// collaborators (delay setting, undo toast, the picker's module slot).
+function deferHarness({ apiImpl, delaySecs = 0, sendLaterAt = null, ...rest } = {}) {
+    const base = { apiImpl, ...rest };
+    const state = {
+        pendingAttachments: base.pendingAttachments || [],
+        replyContext: base.replyContext || null,
+        composeSession: 1,
+        draftId: 'd-1',
+        timezone: null,
+    };
+    const els = {
+        composeTo: { value: 'to@x.com' },
+        composeCc: { value: '' },
+        composeFrom: { value: 'me@example.com' },
+        composeSubject: { value: 'Subj' },
+        composeBody: { value: 'Body' },
+        composeInviteEnabled: { checked: false },
+    };
+    const out = {
+        state, els, apiCalls: [], statuses: [], deleted: [], views: [],
+        cleared: 0, toasts: [],
+    };
+    const api = async (method, path, body) => {
+        out.apiCalls.push({ method, path, body });
+        if (apiImpl) return apiImpl(method, path, body);
+        return { success: true };
+    };
+    const code = [
+        extractFunction('async function doSendEmail('),
+        'return doSendEmail;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    out.doSendEmail = new Function(
+        'state', 'els', 'api', 'showStatus', 'escapeHtml', 'cancelAutosave',
+        'sendingSession', 'saveInFlight', 'trackedDraftSession',
+        'trackedDraftId', 'deleteDraftById', 'clearCompose', 'showView',
+        'undoSendDelaySecs', 'showSendUndoToast', 'sendLaterAt',
+        code,
+    )(
+        state, els, api,
+        (msg, kind) => out.statuses.push([msg, kind]),
+        (s) => String(s), () => {},
+        1, null, 1, 'd-1',
+        (id) => out.deleted.push(id),
+        () => { out.cleared++; },
+        (view) => out.views.push(view),
+        () => delaySecs,
+        (id, deadline) => out.toasts.push({ id, deadline }),
+        sendLaterAt,
+    );
+    return out;
+}
+
+test('vj6k: the undo window defers the send and raises the countdown toast', async () => {
+    const before = Date.now();
+    const h = deferHarness({
+        delaySecs: 10,
+        apiImpl: () => ({ success: true, scheduled: true, id: 'q-1' }),
+    });
+    await h.doSendEmail();
+    const sendAt = h.apiCalls[0].body.send_at;
+    assert.ok(sendAt, 'the POST must carry send_at when the undo window is on');
+    const delta = new Date(sendAt).getTime() - before;
+    assert.ok(delta >= 9_000 && delta <= 12_000,
+        `send_at must be ~10s out, got ${delta}ms`);
+    assert.equal(h.toasts.length, 1, 'the undo toast must be shown');
+    assert.equal(h.toasts[0].id, 'q-1');
+    assert.ok(!h.statuses.some(([msg]) => msg === 'Sent!'),
+        'a deferred send must not claim Sent!');
+    // The compose finishes exactly like a sent mail: the queued record now
+    // owns the content; Undo restores it from there.
+    assert.deepEqual(h.deleted, ['d-1']);
+    assert.equal(h.cleared, 1);
+    assert.deepEqual(h.views, ['list']);
+});
+
+test('vj6k: a zero undo window sends immediately with no toast', async () => {
+    const h = deferHarness({ delaySecs: 0 });
+    await h.doSendEmail();
+    assert.equal(h.apiCalls[0].body.send_at, undefined);
+    assert.deepEqual(h.statuses, [['Sent!', 'success']]);
+    assert.equal(h.toasts.length, 0);
+});
+
+test('acag: an explicit Send Later time wins over the undo window', async () => {
+    const later = new Date(Date.now() + 3 * 3600_000);
+    const h = deferHarness({
+        delaySecs: 10,
+        sendLaterAt: later,
+        apiImpl: () => ({ success: true, scheduled: true, id: 'q-2' }),
+    });
+    await h.doSendEmail();
+    assert.equal(h.apiCalls[0].body.send_at, later.toISOString());
+    assert.equal(h.toasts.length, 0, 'an explicit schedule is not an undo window');
+    assert.ok(h.statuses.some(([msg, kind]) =>
+        kind === 'success' && msg.startsWith('Scheduled for')),
+        'the user must see when the mail will go out');
+    assert.deepEqual(h.deleted, ['d-1']);
+});
+
+test('vj6k: undoSendDelaySecs reads localStorage with default 10, clamped 0..60', () => {
+    const code = [
+        extractFunction('function undoSendDelaySecs('),
+        'return undoSendDelaySecs;',
+    ].join('\n');
+    const at = (stored) => {
+        // eslint-disable-next-line no-new-func
+        const fn = new Function('localStorage', code)({ getItem: () => stored });
+        return fn();
+    };
+    assert.equal(at(null), 10, 'unset defaults to 10s');
+    assert.equal(at(''), 10);
+    assert.equal(at('garbage'), 10);
+    assert.equal(at('25'), 25);
+    assert.equal(at('0'), 0, '0 disables the window');
+    assert.equal(at('-5'), 0);
+    assert.equal(at('999'), 60, 'clamped to 60s');
+});
+
+test('vj6k: cancelScheduledSend restores the compose draft from the record', async () => {
+    const record = {
+        id: 'q-1',
+        from_addr: 'me@example.com',
+        submission: {
+            to: ['a@x.com', 'b@x.com'],
+            cc: ['c@x.com'],
+            subject: 'Deferred hello',
+            text_body: 'see you\n\n> quoted',
+            in_reply_to: 'm-9',
+            attachments: [{ blob_id: 'b-1', name: 'a.txt', mime_type: 'text/plain', size: 3 }],
+        },
+    };
+    const state = { pendingAttachments: [], replyContext: null };
+    const els = {
+        composeTo: { value: '' }, composeCc: { value: '' },
+        composeSubject: { value: '' }, composeBody: { value: '' },
+        composeFrom: { value: '' },
+    };
+    const out = { apiCalls: [], statuses: [], views: [], cleared: 0, rendered: 0 };
+    const api = async (method, path) => {
+        out.apiCalls.push({ method, path });
+        return record;
+    };
+    const code = [
+        extractFunction('async function cancelScheduledSend('),
+        extractFunction('function restoreComposeFromScheduledSend('),
+        'return cancelScheduledSend;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const cancel = new Function(
+        'state', 'els', 'api', 'showStatus', 'clearCompose', 'showView',
+        'renderComposeAttachments',
+        code,
+    )(
+        state, els, api,
+        (msg, kind) => out.statuses.push([msg, kind]),
+        () => { out.cleared++; },
+        (view) => out.views.push(view),
+        () => { out.rendered++; },
+    );
+    await cancel('q-1');
+    assert.deepEqual(out.apiCalls, [{ method: 'DELETE', path: '/scheduled-sends/q-1' }]);
+    assert.equal(out.cleared, 1, 'restore starts from a clean compose session');
+    assert.equal(els.composeTo.value, 'a@x.com, b@x.com');
+    assert.equal(els.composeCc.value, 'c@x.com');
+    assert.equal(els.composeSubject.value, 'Deferred hello');
+    assert.equal(els.composeBody.value, 'see you\n\n> quoted');
+    assert.equal(els.composeFrom.value, 'me@example.com');
+    assert.equal(state.replyContext.inReplyTo, 'm-9', 'threading survives the round trip');
+    assert.equal(state.pendingAttachments.length, 1);
+    assert.equal(state.pendingAttachments[0].status, 'ready');
+    assert.equal(out.rendered, 1);
+    assert.deepEqual(out.views, ['compose']);
+    assert.ok(out.statuses.some(([, kind]) => kind === 'success'));
+});
+
+test('vj6k: cancelScheduledSend after dispatch surfaces "too late"', async () => {
+    const err = new Error('no scheduled send');
+    err.status = 404;
+    const out = { statuses: [], views: [] };
+    const code = [
+        extractFunction('async function cancelScheduledSend('),
+        extractFunction('function restoreComposeFromScheduledSend('),
+        'return cancelScheduledSend;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const cancel = new Function(
+        'state', 'els', 'api', 'showStatus', 'clearCompose', 'showView',
+        'renderComposeAttachments',
+        code,
+    )(
+        {}, {}, async () => { throw err; },
+        (msg, kind) => out.statuses.push([msg, kind]),
+        () => {}, (view) => out.views.push(view), () => {},
+    );
+    await cancel('q-1');
+    assert.deepEqual(out.statuses, [['Too late — already sent', 'error']]);
+    assert.deepEqual(out.views, [], 'no restore after the mail has departed');
+});
+
+test('vj6k: the undo toast counts down and clears itself at zero', () => {
+    let fakeNow = 0;
+    let tick = null;
+    const state = { sendUndo: null };
+    const els = {
+        sendUndoToast: { classList: classListStub(true) },
+        sendUndoMessage: { textContent: '' },
+    };
+    const cleared = [];
+    const code = [
+        extractFunction('function showSendUndoToast('),
+        extractFunction('function clearSendUndoToast('),
+        'return showSendUndoToast;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const show = new Function(
+        'state', 'els', 'setInterval', 'clearInterval', 'Date',
+        code,
+    )(
+        state, els,
+        (fn) => { tick = fn; return 7; },
+        (id) => cleared.push(id),
+        { now: () => fakeNow },
+    );
+    show('q-1', new Date(10_000));
+    assert.equal(els.sendUndoMessage.textContent, 'Sending in 10s');
+    assert.ok(!els.sendUndoToast.classList.contains('hidden'), 'toast must show');
+    assert.equal(state.sendUndo.id, 'q-1');
+    fakeNow = 9_600;
+    tick();
+    assert.equal(els.sendUndoMessage.textContent, 'Sending in 1s');
+    fakeNow = 10_500;
+    tick();
+    assert.ok(els.sendUndoToast.classList.contains('hidden'), 'toast hides at zero');
+    assert.equal(state.sendUndo, null);
+    assert.deepEqual(cleared, [7], 'the countdown interval must be stopped');
+});
+
+test('acag: confirmSendLaterAt rejects past times and schedules future ones', () => {
+    const out = { statuses: [], closed: 0, sends: 0 };
+    const code = [
+        extractFunction('function confirmSendLaterAt('),
+        'return { confirmSendLaterAt, probe: () => sendLaterAt };',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const { confirmSendLaterAt, probe } = new Function(
+        'showStatus', 'closeSendLaterPicker', 'sendEmail', 'sendLaterAt',
+        code,
+    )(
+        (msg, kind) => out.statuses.push([msg, kind]),
+        () => { out.closed++; },
+        () => { out.sends++; },
+        null,
+    );
+    confirmSendLaterAt(new Date(Date.now() - 1000));
+    assert.equal(out.sends, 0, 'a past time must not send');
+    assert.deepEqual(out.statuses, [['Choose a future send time', 'error']]);
+    const future = new Date(Date.now() + 3600_000);
+    confirmSendLaterAt(future);
+    assert.equal(out.closed, 1);
+    assert.equal(out.sends, 1);
+    assert.equal(probe(), future, 'the picked time must be handed to the send path');
+});
+
+test('acag: resolveSendLaterInput parses the picker inputs like Remind Me', () => {
+    const fields = { 'send-later-natural': { value: '' }, 'send-later-datetime': { value: '' } };
+    const code = [
+        extractFunction('function resolveSendLaterInput('),
+        extractFunction('function resolveTimeInput('),
+        'return resolveSendLaterInput;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const resolve = new Function(
+        'document', 'localReminderDate',
+        code,
+    )(
+        { getElementById: (id) => fields[id] },
+        (days) => {
+            const d = new Date();
+            d.setDate(d.getDate() + days);
+            d.setHours(8, 0, 0, 0);
+            return d;
+        },
+    );
+    fields['send-later-datetime'].value = '2030-01-02T15:00';
+    assert.equal(resolve().getTime(), new Date('2030-01-02T15:00').getTime(),
+        'an explicit datetime wins');
+    fields['send-later-datetime'].value = '';
+    fields['send-later-natural'].value = '3h';
+    const delta = resolve().getTime() - Date.now();
+    assert.ok(delta > 2.9 * 3600_000 && delta < 3.1 * 3600_000, '3h shorthand');
+    fields['send-later-natural'].value = 'tomorrow 9am';
+    assert.equal(resolve().getHours(), 9, 'tomorrow 9am sets the hour');
+    fields['send-later-natural'].value = '';
+    assert.equal(resolve(), null, 'empty input resolves to nothing');
+});
+
+test('vj6k/acag: scheduled-sends is an account-scoped api.js path', () => {
+    const m = API_JS.match(/const ACCOUNT_SCOPED_API = (.*);/);
+    assert.ok(m, 'ACCOUNT_SCOPED_API must exist in api.js');
+    assert.ok(m[1].includes('scheduled-sends'),
+        'GET /scheduled-sends must carry ?account= like the other scoped routes');
+});
