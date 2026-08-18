@@ -44,14 +44,15 @@ function extractGetCommands(src) {
     return src.slice(cfStart, close + 2);
 }
 
-// Load the real getCommands with `state` and `visibleRows` injected as
-// PARAMETERS (not globalThis) so Node's own globals are untouched. The evaled
-// getCommands closes over the injected `state`; commandsForView reads `state`
-// (and calls `visibleRows()`) from the same closure.
-function loadGetCommands(state, visibleRows) {
+// Load the real getCommands with `state`, `visibleRows`, and `bulkIds`
+// injected as PARAMETERS (not globalThis) so Node's own globals are
+// untouched. The evaled getCommands closes over the injected `state`;
+// commandsForView reads `state` (and calls `visibleRows()`/`bulkIds()`, the
+// two injected row/selection models) from the same closure.
+function loadGetCommands(state, visibleRows, bulkIds = () => []) {
     const code = extractGetCommands(APP_JS);
     // eslint-disable-next-line no-new-func
-    return new Function('state', 'visibleRows', code + '\nreturn getCommands;')(state, visibleRows);
+    return new Function('state', 'visibleRows', 'bulkIds', code + '\nreturn getCommands;')(state, visibleRows, bulkIds);
 }
 
 // Extract one real column-0 function body from app.js. This follows the same
@@ -152,6 +153,9 @@ function makeState(overrides) {
             currentMailbox: null,
             undoStack: [],
             selectedAccountId: null,
+            emails: [],
+            bulkSelected: new Set(),
+            bulkAnchorId: null,
         },
         overrides || {},
     );

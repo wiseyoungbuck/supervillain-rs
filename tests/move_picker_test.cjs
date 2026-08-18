@@ -93,6 +93,8 @@ function makeState(overrides) {
             movePickerOpen: false,
             moveEmailId: null,
             movePickerIndex: 0,
+            bulkSelected: new Set(),
+            bulkAnchorId: null,
         },
         overrides || {},
     );
@@ -141,6 +143,7 @@ function makePicker(stateOverrides, { apiImpl } = {}) {
     const code = [
         extractFunction(APP_JS, 'function escapeHtml('),
         extractFunction(APP_JS, 'function escapeAttr('),
+        extractFunction(APP_JS, 'function bulkIds('),
         extractFunction(APP_JS, 'function movePickerMailboxes('),
         extractFunction(APP_JS, 'function renderMovePickerList('),
         extractFunction(APP_JS, 'function openMovePicker('),
@@ -332,8 +335,9 @@ test('e993: the palette offers Move to Folder in list (with selection) and detai
     const region = extractGetCommands(APP_JS);
     const load = (state, visibleRows) =>
         // eslint-disable-next-line no-new-func
-        new Function('state', 'visibleRows', region + '\nreturn getCommands;')(state, visibleRows)()
-            .map((c) => c.action);
+        new Function('state', 'visibleRows', 'bulkIds', region + '\nreturn getCommands;')(
+            state, visibleRows, () => [],
+        )().map((c) => c.action);
     const withSel = load(makeState({ view: 'list', mailboxes: MAILBOXES }), () => [{ emailId: 'e-1' }]);
     assert.ok(withSel.includes('move-to'), 'list with a selection must offer Move to Folder');
     const noSel = load(makeState({ view: 'list', mailboxes: MAILBOXES }), () => []);

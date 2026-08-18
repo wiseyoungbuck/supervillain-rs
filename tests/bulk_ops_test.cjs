@@ -284,7 +284,9 @@ test('pakx: e archives the whole selection — batch contract + one undo entry',
     assert.equal(b.state.bulkSelected.size, 0, 'the selection must clear after acting');
     assert.equal(b.state.undoStack.length, 1, 'ONE undo entry must cover the whole batch');
     assert.equal(b.state.undoStack[0].entries.length, 2);
-    await Promise.resolve();
+    // The keystroke path fires bulkEmailAction without awaiting it; flush the
+    // allSettled round-trip before asserting the release.
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(b.refillSuppressedIds.size, 0, 'suppression must release once the batch settles');
 });
 
