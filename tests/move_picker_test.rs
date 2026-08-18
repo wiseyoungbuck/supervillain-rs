@@ -19,7 +19,9 @@ use std::process::Command;
 #[test]
 fn move_picker_behavior_tests_pass() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let test_js: PathBuf = [manifest_dir, "tests", "move_picker_test.cjs"].iter().collect();
+    let test_js: PathBuf = [manifest_dir, "tests", "move_picker_test.cjs"]
+        .iter()
+        .collect();
     assert!(
         test_js.exists(),
         "tests/move_picker_test.cjs must exist (next to this file)"
