@@ -7,7 +7,7 @@ use supervillain::{
     platform::{FsTokenStore, TokenStore},
     prefetch, provider,
     provider::ProviderSession,
-    reminders, routes, scheduled_send, splits, timezone,
+    reminders, routes, scheduled_send, splits, timezone, tracking,
     types::{AccountError, AccountRegistry, AppState, SessionLock},
 };
 
@@ -30,6 +30,7 @@ async fn main() {
     let reminders_path = config_dir.join("supervillain/reminders.json");
     let reminder_settings_path = config_dir.join("supervillain/reminder-settings.json");
     let scheduled_sends_path = config_dir.join("supervillain/scheduled-sends.json");
+    let tracking_path = config_dir.join("supervillain/tracking.json");
 
     platform::init_tracing();
 
@@ -130,6 +131,13 @@ async fn main() {
         reminders: reminders::ReminderStore::load(&reminders_path),
         reminder_settings_path,
         scheduled_sends: scheduled_send::ScheduledSendStore::load(&scheduled_sends_path),
+        tracking: tracking::TrackingStore::load(&tracking_path),
+        // Tracking is inert without an explicitly configured public base —
+        // a pixel URL nobody can reach would only leak intent, never opens.
+        tracking_base: std::env::var("SUPERVILLAIN_TRACKING_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty()),
     });
 
     // Kick off the background prefetch warmer. The first pass starts

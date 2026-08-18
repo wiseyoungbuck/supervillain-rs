@@ -492,6 +492,12 @@ pub struct AppState {
     pub reminder_settings_path: PathBuf,
     /// Durable deferred-send queue (Undo Send + Send Later, kata vj6k/acag).
     pub scheduled_sends: crate::scheduled_send::ScheduledSendStore,
+    /// Durable open-tracking records (kata e2h4).
+    pub tracking: crate::tracking::TrackingStore,
+    /// Publicly reachable base URL for the tracking pixel
+    /// (`SUPERVILLAIN_TRACKING_BASE`). `None` disables tracking entirely —
+    /// no pixel is injected and nothing is recorded.
+    pub tracking_base: Option<String>,
 }
 
 impl AppState {

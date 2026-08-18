@@ -21,5 +21,6 @@ pub mod search;
 pub mod splits;
 pub mod theme;
 pub mod timezone;
+pub mod tracking;
 pub mod types;
 pub mod validate;

@@ -2984,6 +2984,10 @@ api-token = tok
             scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
                 std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
             ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -3160,6 +3164,10 @@ api-token = tok
             scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
                 std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
             ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -3483,6 +3491,10 @@ api-token = tok
             scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
                 std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
             ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         })
     }
 

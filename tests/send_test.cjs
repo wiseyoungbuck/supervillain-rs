@@ -519,3 +519,37 @@ test('vj6k/acag: scheduled-sends is an account-scoped api.js path', () => {
     assert.ok(m[1].includes('scheduled-sends'),
         'GET /scheduled-sends must carry ?account= like the other scoped routes');
 });
+
+// ---------------------------------------------------------------------------
+// Open tracking (kata e2h4) — minimal read-status UI
+// ---------------------------------------------------------------------------
+
+test('e2h4: readStatusRows renders open counts and escapes subjects', () => {
+    const code = [
+        extractFunction('function readStatusRows('),
+        'return readStatusRows;',
+    ].join('\n');
+    const escapeHtml = (s) => String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // eslint-disable-next-line no-new-func
+    const rows = new Function('escapeHtml', code)(escapeHtml);
+    const html = rows([
+        {
+            subject: '<img src=x onerror=alert(1)>',
+            recipients: ['a@x.com'],
+            opens: ['2030-01-02T15:00:00Z', '2030-01-02T16:00:00Z'],
+        },
+        { subject: 'Quiet one', recipients: ['b@x.com'], opens: [] },
+    ]);
+    assert.ok(!html.includes('<img src=x'), 'subjects must be escaped');
+    assert.ok(html.includes('&lt;img'), 'escaped subject still shown');
+    assert.ok(/Opened 2×/.test(html), 'open count shown');
+    assert.ok(html.includes('Not opened'), 'unopened sends say so');
+});
+
+test('e2h4: tracking is an account-scoped api.js path', () => {
+    const m = API_JS.match(/const ACCOUNT_SCOPED_API = (.*);/);
+    assert.ok(m, 'ACCOUNT_SCOPED_API must exist in api.js');
+    assert.ok(m[1].includes('tracking'),
+        'GET /tracking/status must carry ?account= like the other scoped routes');
+});

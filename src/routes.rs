@@ -2223,6 +2223,26 @@ async fn cancel_scheduled_send(
     Ok(Json(serde_json::to_value(record)?))
 }
 
+// --- Open tracking (kata e2h4) ----------------------------------------------
+
+/// Public pixel route (`/t/{token}.gif`, deliberately outside `/api`): serve
+/// the 1×1 gif unconditionally — a 404 or slow path would leak token
+/// validity to whoever probes — and record an open event for known tokens.
+async fn tracking_pixel(
+    State(_state): State<Arc<AppState>>,
+    Path(_filename): Path<String>,
+) -> impl IntoResponse {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// Read statuses for the account's tracked sends, most recent first.
+async fn tracking_status(
+    State(_state): State<Arc<AppState>>,
+    Query(_params): Query<AccountParam>,
+) -> Result<Json<serde_json::Value>, Error> {
+    Err(Error::Internal("tracking not implemented".into()))
+}
+
 // --- Persistent drafts (kata wm57) -----------------------------------------
 
 /// Build a plain-text `EmailSubmission` from a draft body. v1 persists no
@@ -4682,6 +4702,19 @@ mod tests {
                     }
                 )),
             ),
+            tracking: crate::tracking::TrackingStore::new(std::env::temp_dir().join(format!(
+                // Unique per call: open/send tests trigger save().
+                "supervillain-test-tracking-{}-{}.json",
+                std::process::id(),
+                {
+                    static T: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    T.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+            ))),
+            // A configured base so the send-path tests exercise injection;
+            // sends without an html_body stay untracked either way.
+            tracking_base: Some("https://track.example.com".into()),
         }
     }
 
@@ -5101,6 +5134,292 @@ mod tests {
             .map(|r| r["id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["first", "second"]);
+    }
+
+    // =========================================================================
+    // Open tracking (kata e2h4)
+    // =========================================================================
+
+    /// Like `spawn_mock_jmap`, but also captures every JMAP request payload
+    /// so tests can assert what actually went to the provider (the pixel
+    /// must be IN the outgoing mail, not merely in a store).
+    async fn spawn_capturing_jmap(
+        payloads: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> String {
+        use axum::routing::post as axum_post;
+        let app = Router::new().route(
+            "/jmap",
+            axum_post(move |Json(payload): Json<serde_json::Value>| {
+                let payloads = payloads.clone();
+                async move {
+                    payloads.lock().unwrap().push(payload);
+                    Json(serde_json::json!({
+                        "methodResponses": [
+                            ["Email/set", {"created": {"draft": {"id": "M123"}}}, "0"],
+                            ["EmailSubmission/set",
+                             {"created": {"send": {"id": "S1", "emailId": "M123"}}}, "1"]
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jmap")
+    }
+
+    fn html_send_body(send_at: Option<chrono::DateTime<chrono::Utc>>) -> SendEmailBody {
+        SendEmailBody {
+            html_body: Some("<p>rich hello</p>".into()),
+            ..send_body(send_at)
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_send_carries_a_recorded_pixel_to_the_provider() {
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+
+        let records = state.tracking.records_for_account("known");
+        assert_eq!(records.len(), 1, "one tracked record per send");
+        let record = &records[0];
+        assert_eq!(record.subject, "deferred hello");
+        assert!(record.recipients.contains(&"dest@example.com".to_string()));
+        assert_eq!(
+            record.email_id.as_deref(),
+            Some("M123"),
+            "the provider's message id must attach after dispatch"
+        );
+        let sent = serde_json::to_string(&payloads.lock().unwrap()[0]).unwrap();
+        assert!(
+            sent.contains(&format!("/t/{}.gif", record.token)),
+            "the outgoing mail must carry the recorded token's pixel"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_when_no_base_or_no_html() {
+        // No public base configured → no pixel even for HTML sends; and a
+        // text-only send is never tracked even with a base.
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let mut bare = test_state(&["known"], "known");
+        bare.tracking_base = None;
+        let state = Arc::new(bare);
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url.clone())));
+        send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+        assert!(state.tracking.records().is_empty());
+        assert!(
+            !serde_json::to_string(&payloads.lock().unwrap()[0])
+                .unwrap()
+                .contains("/t/"),
+            "no pixel without a configured public base"
+        );
+
+        let tracked = Arc::new(test_state(&["known"], "known"));
+        tracked
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        send_email_handler(
+            State(tracked.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+        assert!(
+            tracked.tracking.records().is_empty(),
+            "text-only sends are never tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_tracked_send_keeps_one_pixel_through_daemon_dispatch() {
+        // Enqueue injects; the daemon dispatches the already-pixeled body.
+        // Exactly one pixel must reach the provider and the record must gain
+        // the provider's message id — never a second pixel or record.
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let send_at = chrono::Utc::now() + chrono::Duration::minutes(30);
+        send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(Some(send_at))),
+        )
+        .await
+        .expect("deferred send must queue")
+        .into_response();
+
+        let queued = state.scheduled_sends.records();
+        assert_eq!(queued.len(), 1);
+        let html = queued[0].submission.html_body.clone().unwrap();
+        let token = crate::tracking::extract_token(&html)
+            .expect("the queued body must already carry the pixel");
+        assert_eq!(html.matches("/t/").count(), 1);
+        let record = state.tracking.get(&token).expect("recorded at enqueue");
+        assert_eq!(record.email_id, None, "no message id before dispatch");
+
+        crate::scheduled_send::tick_scheduled_send_daemon(
+            &state,
+            send_at + chrono::Duration::seconds(1),
+        )
+        .await;
+        let sent = serde_json::to_string(&payloads.lock().unwrap()[0]).unwrap();
+        assert_eq!(
+            sent.matches(&format!("/t/{token}.gif")).count(),
+            1,
+            "exactly one pixel reaches the provider on daemon dispatch"
+        );
+        assert_eq!(state.tracking.records().len(), 1, "still one record");
+        assert_eq!(
+            state.tracking.get(&token).unwrap().email_id.as_deref(),
+            Some("M123"),
+            "dispatch must attach the provider's message id"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_pixel_serves_the_gif_and_records_each_open() {
+        let state = Arc::new(test_state(&["known"], "known"));
+        state.tracking.insert(crate::tracking::TrackedSend {
+            token: "0123456789abcdef0123456789abcdef".into(),
+            account_id: "known".into(),
+            email_id: Some("M123".into()),
+            subject: "tracked".into(),
+            recipients: vec!["dest@example.com".into()],
+            sent_at: chrono::Utc::now(),
+            opens: vec![],
+        });
+        for expected_opens in [1usize, 2] {
+            let response = tracking_pixel(
+                State(state.clone()),
+                Path("0123456789abcdef0123456789abcdef.gif".into()),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("image/gif")
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.starts_with(b"GIF89a"), "a real gif must come back");
+            assert_eq!(
+                state
+                    .tracking
+                    .get("0123456789abcdef0123456789abcdef")
+                    .unwrap()
+                    .opens
+                    .len(),
+                expected_opens,
+                "each fetch is one open event"
+            );
+        }
+
+        // Unknown token: identical response, nothing recorded — validity
+        // must not leak to whoever probes the public route.
+        let response = tracking_pixel(
+            State(state.clone()),
+            Path("ffffffffffffffffffffffffffffffff.gif".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"GIF89a"));
+        assert_eq!(state.tracking.records().len(), 1, "no phantom records");
+    }
+
+    #[tokio::test]
+    async fn tracking_status_lists_the_accounts_records_newest_first() {
+        let state = Arc::new(test_state(&["known", "other"], "known"));
+        let now = chrono::Utc::now();
+        for (token_char, account, subject, age_mins) in [
+            ("a", "known", "older", 20i64),
+            ("b", "known", "newer", 5),
+            ("c", "other", "foreign", 1),
+        ] {
+            state.tracking.insert(crate::tracking::TrackedSend {
+                token: token_char.repeat(32),
+                account_id: account.into(),
+                email_id: None,
+                subject: subject.into(),
+                recipients: vec![],
+                sent_at: now - chrono::Duration::minutes(age_mins),
+                opens: if subject == "newer" {
+                    vec![now]
+                } else {
+                    vec![]
+                },
+            });
+        }
+        let response = tracking_status(State(state), Query(AccountParam { account: None }))
+            .await
+            .expect("listing must succeed");
+        let body = serde_json::to_value(response.0).unwrap();
+        let rows = body.as_array().expect("a JSON array");
+        let subjects: Vec<_> = rows
+            .iter()
+            .map(|r| r["subject"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["newer", "older"],
+            "account-scoped, newest first"
+        );
+        assert_eq!(
+            rows[0]["opens"].as_array().unwrap().len(),
+            1,
+            "open events ride along for the client"
+        );
     }
 
     #[tokio::test]
