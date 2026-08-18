@@ -4286,4 +4286,119 @@ api-token = tok
             "expected a re-authorize banner, got {errors:?}"
         );
     }
+
+    // =========================================================================
+    // Per-identity signatures (kata zqrn)
+    // =========================================================================
+
+    fn fastmail_with_idsigs(
+        sigs: &[(&str, &str)],
+        account_sig: Option<&str>,
+    ) -> AccountConfig {
+        AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: "tok".into(),
+            app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: sigs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            signature: account_sig.map(String::from),
+        }
+    }
+
+    #[test]
+    fn parse_identity_signature_keys_into_lowercased_map() {
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\napi-token = tok\n\
+                       signature = Acct\nsignature.Jane@Ex.com = Hi\\nJane\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                identity_signatures,
+                signature,
+                ..
+            } => {
+                assert_eq!(signature.as_deref(), Some("Acct"));
+                assert_eq!(
+                    identity_signatures.get("jane@ex.com").map(String::as_str),
+                    Some("Hi\nJane"),
+                    "identity keys must be lowercased and values unescaped: {identity_signatures:?}"
+                );
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_signatures_round_trip_including_explicit_empty() {
+        // An explicit empty entry means "this identity signs nothing" — it
+        // overrides the account signature and must survive a round trip.
+        let acct = fastmail_with_idsigs(
+            &[("jane@ex.com", "Hi\nJane"), ("noreply@ex.com", "")],
+            Some("Acct sig"),
+        );
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), acct);
+        let cfg = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        assert!(
+            s.contains("signature.jane@ex.com = Hi\\nJane"),
+            "serialized: {s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(parsed.accounts, cfg.accounts);
+    }
+
+    #[test]
+    fn wire_account_list_exposes_identity_signatures() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "fm".to_string(),
+            fastmail_with_idsigs(&[("jane@ex.com", "Jane sig")], Some("Acct")),
+        );
+        let live = std::collections::HashMap::new();
+        let list = wire_account_list(&configs, &live, "fm");
+        assert_eq!(
+            list[0]["identitySignatures"]["jane@ex.com"], "Jane sig",
+            "wire: {list:?}"
+        );
+    }
+
+    #[test]
+    fn merge_secrets_carries_incoming_identity_signatures() {
+        let existing = fastmail_with_idsigs(&[("old@ex.com", "Old")], Some("Acct"));
+        let incoming = fastmail_with_idsigs(&[("new@ex.com", "New")], Some("Acct"));
+        match merge_secrets(&existing, incoming) {
+            AccountConfig::Fastmail {
+                identity_signatures,
+                ..
+            } => {
+                assert_eq!(
+                    identity_signatures.get("new@ex.com").map(String::as_str),
+                    Some("New")
+                );
+                assert!(
+                    !identity_signatures.contains_key("old@ex.com"),
+                    "identity signatures are not secrets — incoming replaces, like signature"
+                );
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_email_identity_signature_key() {
+        let acct = fastmail_with_idsigs(&[("not-an-email", "x")], None);
+        let errs = validate_account(&acct, "fm").unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("identity")),
+            "expected an identity-signature key error, got {errs:?}"
+        );
+    }
 }
