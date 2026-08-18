@@ -201,6 +201,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/timezone/zones", get(list_timezones))
         .route("/api/calendar/invite", post(send_invite_handler))
+        .route("/api/calendar/events", get(calendar_events_range))
         .route("/api/build-id", get(build_id))
         .with_state(state)
         .route("/", get(index_html))
