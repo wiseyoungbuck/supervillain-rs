@@ -5241,7 +5241,7 @@ mod tests {
             .await
             .sessions
             .insert("known".into(), mock_fastmail_session(Some(url)));
-        send_email_handler(
+        let _ = send_email_handler(
             State(state.clone()),
             Query(AccountParam { account: None }),
             Json(html_send_body(None)),
@@ -5282,7 +5282,7 @@ mod tests {
             .await
             .sessions
             .insert("known".into(), mock_fastmail_session(Some(url.clone())));
-        send_email_handler(
+        let _ = send_email_handler(
             State(state.clone()),
             Query(AccountParam { account: None }),
             Json(html_send_body(None)),
@@ -5305,7 +5305,7 @@ mod tests {
             .await
             .sessions
             .insert("known".into(), mock_fastmail_session(Some(url)));
-        send_email_handler(
+        let _ = send_email_handler(
             State(tracked.clone()),
             Query(AccountParam { account: None }),
             Json(send_body(None)),
@@ -5334,7 +5334,7 @@ mod tests {
             .sessions
             .insert("known".into(), mock_fastmail_session(Some(url)));
         let send_at = chrono::Utc::now() + chrono::Duration::minutes(30);
-        send_email_handler(
+        let _ = send_email_handler(
             State(state.clone()),
             Query(AccountParam { account: None }),
             Json(html_send_body(Some(send_at))),
