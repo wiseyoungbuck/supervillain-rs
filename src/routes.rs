@@ -4704,6 +4704,7 @@ mod tests {
                     api_token: "tok".into(),
                     app_password: None,
                     auth: accounts::FastmailAuthMode::ApiToken,
+                    identity_signatures: std::collections::BTreeMap::new(),
                     signature: None,
                 },
             );
@@ -11947,6 +11948,7 @@ white   = '#fdf6e3'
                 accounts::AccountConfig::Outlook {
                     client_id: "test-client".into(),
                     email: Some("boss@example.com".into()),
+                    identity_signatures: std::collections::BTreeMap::new(),
                     signature: None,
                 },
             );

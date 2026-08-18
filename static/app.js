@@ -5660,13 +5660,72 @@ function startForward() {
     showView('compose');
 }
 
-// Per-account plain-text signature, prefilled into a fresh compose body.
-// clearCompose is the single choke point for new/reply/forward (all three
-// call it before anything else), so prefilling here covers all of them
-// uniformly. Never re-injected at send time — sendEmail sends exactly
-// what's left in the textarea after the user edits/deletes freely. The
-// account is per-account, not per-identity: switching compose-from does
-// NOT swap this (accounts can't be switched mid-compose anyway).
+// ============================================================================
+// Per-identity signatures (kata zqrn). The three helpers below are verbatim
+// desktop/mobile twins (1v8z one-file guardrail: mobile duplicates them) —
+// identity_signature_test.cjs pins them byte-identical; change both or
+// neither.
+// ============================================================================
+
+// The exact block composeSignaturePrefill plants: RFC-3676 style delimiter
+// plus the signature. Empty signature → empty block.
+function sigBlock(sig) {
+    return sig ? `\n\n-- \n${sig}` : '';
+}
+
+// Signature for one From identity: the per-identity override when an entry
+// exists (an EMPTY entry means "this identity signs nothing" and does not
+// fall through), else the account-level signature.
+function signatureForIdentity(email) {
+    const acct = state.currentAccount;
+    if (!acct) return '';
+    const perIdentity = acct.identitySignatures || {};
+    const key = (email || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(perIdentity, key)) {
+        return perIdentity[key] || '';
+    }
+    return acct.signature || '';
+}
+
+// Swap ONLY the signature block: replace the tracked old block with the new
+// one. If the user edited or deleted the old block, their edit wins and this
+// is a no-op; with no old block the new one is appended. Pure — returns the
+// new body.
+function swapComposeSignature(body, oldSig, newSig) {
+    const oldBlock = sigBlock(oldSig);
+    const newBlock = sigBlock(newSig);
+    if (oldBlock === newBlock) return body;
+    if (!oldBlock) return body + newBlock;
+    const at = body.lastIndexOf(oldBlock);
+    if (at === -1) return body;
+    return body.slice(0, at) + newBlock + body.slice(at + oldBlock.length);
+}
+
+// Re-resolve the signature for the current compose-From identity and swap it
+// into the body. Called on the From <select> change, from clearCompose after
+// the From default is set, and from autoSelectFromAddress — never from the
+// draft-restore paths, whose saved body must round-trip untouched. A
+// pristine body drags the dirty-check baseline along so an unedited compose
+// doesn't start autosaving just because the signature swapped.
+function applyComposeSignatureForFrom() {
+    if (!els.composeBody) return;
+    const fromEmail = els.composeFrom?.value || state.identities[0]?.email || '';
+    const newSig = signatureForIdentity(fromEmail);
+    const prevSig = state.composeSignature ?? (state.currentAccount?.signature || '');
+    if (prevSig === newSig) return;
+    const wasPristine = els.composeBody.value === state.composeBaseline;
+    els.composeBody.value = swapComposeSignature(els.composeBody.value, prevSig, newSig);
+    if (wasPristine) state.composeBaseline = els.composeBody.value;
+    state.composeSignature = newSig;
+}
+
+// Plain-text signature, prefilled into a fresh compose body. clearCompose is
+// the single choke point for new/reply/forward (all three call it before
+// anything else), so prefilling here covers all of them uniformly. Never
+// re-injected at send time — sendEmail sends exactly what's left in the
+// textarea after the user edits/deletes freely. Prefill is account-level;
+// per-identity swaps happen in applyComposeSignatureForFrom once the From
+// identity is known (kata zqrn).
 function composeSignaturePrefill() {
     const sig = state.currentAccount?.signature;
     return sig ? `\n\n-- \n${sig}` : '';
@@ -5707,12 +5766,18 @@ function clearCompose() {
     // Dirty-check baseline: composeDirty compares the body against this exact
     // string, so an untouched signature prefill isn't autosaved as a draft.
     state.composeBaseline = els.composeBody.value;
+    // The prefill is the account-level signature; track it so the per-
+    // identity swap knows which block it planted (kata zqrn).
+    state.composeSignature = state.currentAccount?.signature || '';
     els.composeBody.setSelectionRange(0, 0);
     els.composeQuote.innerHTML = '';
     els.composeQuote.classList.add('hidden');
     if (els.composeFrom && state.identities.length) {
         els.composeFrom.value = state.identities[0].email;
     }
+    // The default identity may carry its own signature — swap it in while
+    // the body is still pristine (kata zqrn).
+    applyComposeSignatureForFrom();
     state.replyContext = null;
     // Clear pending attachments and abort any in-progress uploads
     for (const att of state.pendingAttachments) {
@@ -6194,6 +6259,9 @@ function autoSelectFromAddress(email) {
             for (const id of state.identities) {
                 if (id.email.toLowerCase() === addr) {
                     els.composeFrom.value = id.email;
+                    // Programmatic select fires no 'change' event — swap the
+                    // signature for the matched identity here (kata zqrn).
+                    applyComposeSignatureForFrom();
                     return;
                 }
             }

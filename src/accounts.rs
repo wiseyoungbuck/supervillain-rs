@@ -51,6 +51,13 @@ pub enum AccountConfig {
         /// account, not an auth-strategy abstraction (kata ngzw).
         #[serde(default)]
         auth: FastmailAuthMode,
+        /// Per-identity signature overrides (kata zqrn): lowercased identity
+        /// email → plain-text signature. INI: one `signature.<email> = …`
+        /// line per entry. An entry that is present but EMPTY means "this
+        /// identity signs nothing" (overriding `signature`); an absent entry
+        /// falls back to the account-level `signature`.
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         /// Per-account plain-text signature, prefilled into compose (never
         /// re-injected at send time). `None`/empty both mean "no signature" —
         /// see `AccountConfig::signature()`.
@@ -62,6 +69,9 @@ pub enum AccountConfig {
         client_id: String,
         #[serde(default)]
         email: Option<String>,
+        /// See the Fastmail variant's field of the same name (kata zqrn).
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         #[serde(default)]
         signature: Option<String>,
     },
@@ -72,6 +82,9 @@ pub enum AccountConfig {
         client_secret: String,
         #[serde(default)]
         email: Option<String>,
+        /// See the Fastmail variant's field of the same name (kata zqrn).
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         #[serde(default)]
         signature: Option<String>,
     },
@@ -121,6 +134,25 @@ impl AccountConfig {
         match self {
             Self::Outlook { client_id, .. } | Self::Gmail { client_id, .. } => Some(client_id),
             Self::Fastmail { .. } => None,
+        }
+    }
+
+    /// Per-identity signature overrides, common to every provider (kata
+    /// zqrn). Keys are lowercased identity emails.
+    pub fn identity_signatures(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Fastmail {
+                identity_signatures,
+                ..
+            }
+            | Self::Outlook {
+                identity_signatures,
+                ..
+            }
+            | Self::Gmail {
+                identity_signatures,
+                ..
+            } => identity_signatures,
         }
     }
 
@@ -369,6 +401,16 @@ fn account_from_props(
     // normalizes an empty string to `None`, so a hand-edited `signature = `
     // (empty value) round-trips as "no signature" same as an omitted key.
     let signature = props.get("signature").map(|s| unescape_ini_multiline(s));
+    // Per-identity overrides (kata zqrn): every `signature.<email>` key.
+    // Keys are lowercased so lookups by identity email can't miss on case;
+    // empty values are KEPT (explicit "this identity signs nothing").
+    let identity_signatures: BTreeMap<String, String> = props
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("signature.")
+                .map(|email| (email.to_ascii_lowercase(), unescape_ini_multiline(v)))
+        })
+        .collect();
     match provider {
         "fastmail" => {
             let auth = match props.get("auth").map(String::as_str) {
@@ -402,6 +444,7 @@ fn account_from_props(
                     .map(|s| unescape_ini_multiline(s))
                     .filter(|s| !s.is_empty()),
                 auth,
+                identity_signatures,
                 signature,
             })
         }
@@ -414,12 +457,14 @@ fn account_from_props(
                 .get("email")
                 .or_else(|| props.get("username"))
                 .cloned(),
+            identity_signatures,
             signature,
         }),
         "gmail" => Ok(AccountConfig::Gmail {
             client_id: require("client-id")?,
             client_secret: require("client-secret")?,
             email: props.get("email").cloned(),
+            identity_signatures,
             signature,
         }),
         other => Err(format!("unknown provider `{other}`")),
@@ -507,6 +552,15 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
     // the normalizing accessor rather than duplicated in each match arm.
     if let Some(sig) = acct.signature() {
         lines.push(format!("signature = {}", escape_ini_multiline(sig)));
+    }
+    // Per-identity overrides (kata zqrn), one line per entry. Empty values
+    // are deliberately written out — `signature.x = ` means "identity x
+    // signs nothing", which is different from having no entry at all.
+    for (email, sig) in acct.identity_signatures() {
+        lines.push(format!(
+            "signature.{email} = {}",
+            escape_ini_multiline(sig)
+        ));
     }
     lines
 }
@@ -658,6 +712,7 @@ pub enum FieldId {
     ClientId,
     ClientSecret,
     Email,
+    IdentitySignatures,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -812,6 +867,16 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
     let mut errs = Vec::new();
     if let Err(e) = validate_section_name(name) {
         errs.push(FieldError::new(FieldId::Name, e));
+    }
+    // Per-identity signature keys must be identity emails (kata zqrn) — a
+    // typo'd key would silently never match any From address.
+    for email in cfg.identity_signatures().keys() {
+        if validate_email(email).is_err() {
+            errs.push(FieldError::new(
+                FieldId::IdentitySignatures,
+                format!("identity signature key '{email}' is not a valid email"),
+            ));
+        }
     }
     match cfg {
         AccountConfig::Fastmail {
@@ -990,6 +1055,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 api_token: incoming,
                 app_password: incoming_app,
                 auth,
+                identity_signatures,
                 signature,
             },
         ) => AccountConfig::Fastmail {
@@ -1008,6 +1074,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 old_app.clone()
             },
             auth,
+            identity_signatures,
             signature,
         },
         (
@@ -1018,6 +1085,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 client_id,
                 client_secret: incoming,
                 email,
+                identity_signatures,
                 signature,
             },
         ) => AccountConfig::Gmail {
@@ -1028,6 +1096,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 incoming
             },
             email,
+            identity_signatures,
             signature,
         },
         (_, new) => new,
@@ -1081,6 +1150,7 @@ pub fn wire_account_list(
                 "authStatus": if session.is_some() { "ok" } else { "pending" },
                 "clientId": acct.oauth_client_id(),
                 "signature": acct.signature(),
+                "identitySignatures": acct.identity_signatures(),
             })
         })
         .collect()
@@ -1692,6 +1762,7 @@ pub fn update_email_from_session(
                 api_token,
                 app_password,
                 auth: FastmailAuthMode::Oauth,
+                identity_signatures,
                 signature,
                 ..
             },
@@ -1701,11 +1772,13 @@ pub fn update_email_from_session(
             api_token,
             app_password,
             auth: FastmailAuthMode::Oauth,
+            identity_signatures,
             signature,
         },
         (
             AccountConfig::Outlook {
                 client_id,
+                identity_signatures,
                 signature,
                 ..
             },
@@ -1713,12 +1786,14 @@ pub fn update_email_from_session(
         ) => AccountConfig::Outlook {
             client_id,
             email: Some(email),
+            identity_signatures,
             signature,
         },
         (
             AccountConfig::Gmail {
                 client_id,
                 client_secret,
+                identity_signatures,
                 signature,
                 ..
             },
@@ -1727,6 +1802,7 @@ pub fn update_email_from_session(
             client_id,
             client_secret,
             email: Some(email),
+            identity_signatures,
             signature,
         },
         (other, _) => other,
@@ -1943,6 +2019,7 @@ mod tests {
             api_token: token.into(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -1950,6 +2027,7 @@ mod tests {
         AccountConfig::Outlook {
             client_id: client_id.into(),
             email: email.map(String::from),
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -1958,6 +2036,7 @@ mod tests {
             client_id: client_id.into(),
             client_secret: secret.into(),
             email: email.map(String::from),
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -2031,6 +2110,7 @@ mod tests {
                 api_token: "fmu1-tok".into(),
                 app_password: Some("ap-pass-123".into()),
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: None,
             },
         );
@@ -2065,6 +2145,7 @@ mod tests {
                         api_token: "fmu1-tok".into(),
                         app_password: None,
                         auth: FastmailAuthMode::ApiToken,
+                        identity_signatures: BTreeMap::new(),
                         signature: None,
                     },
                 );
@@ -2115,6 +2196,7 @@ mod tests {
             api_token: "fmu1-tok".into(),
             app_password: Some("old-pass".into()),
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let incoming_keep = AccountConfig::Fastmail {
@@ -2122,6 +2204,7 @@ mod tests {
             api_token: String::new(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let merged_keep = merge_secrets(&existing, incoming_keep);
@@ -2141,6 +2224,7 @@ mod tests {
             api_token: String::new(),
             app_password: Some("new-pass".into()),
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let merged_replace = merge_secrets(&existing, incoming_replace);
@@ -2170,6 +2254,7 @@ mod tests {
                 api_token: "tok".into(),
                 app_password: None,
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Best,\nAlice\nAcme Inc.".into()),
             },
         );
@@ -2180,6 +2265,7 @@ mod tests {
                 client_id: "cid".into(),
                 client_secret: "cs".into(),
                 email: Some("bob@gmail.com".into()),
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Sent from my phone".into()),
             },
         );
@@ -2261,6 +2347,7 @@ mod tests {
                     api_token: "tok".into(),
                     app_password: None,
                     auth: FastmailAuthMode::ApiToken,
+                    identity_signatures: BTreeMap::new(),
                     signature: Some(sig.into()),
                 },
             );
@@ -2316,6 +2403,7 @@ mod tests {
                     api_token: "tok".into(),
                     app_password: None,
                     auth: FastmailAuthMode::ApiToken,
+                    identity_signatures: BTreeMap::new(),
                     signature: Some(sig.into()),
                 },
             );
@@ -2342,6 +2430,7 @@ mod tests {
             api_token: "tok".into(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: Some(String::new()),
         };
         assert_eq!(acct.signature(), None);
@@ -2795,6 +2884,7 @@ api-token = tok
                 api_token: "tok".into(),
                 app_password: None,
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Best,\nAlice".into()),
             },
         );
@@ -2817,6 +2907,7 @@ api-token = tok
                 api_token: "tok".into(),
                 app_password: None,
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some(String::new()),
             },
         );
@@ -3176,6 +3267,7 @@ api-token = tok
             api_token: String::new(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: Some("Cheers,\nBob".into()),
         };
 
@@ -3268,6 +3360,7 @@ api-token = tok
             api_token: String::new(),
             app_password: Some("new-app-pass".into()),
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
@@ -3363,6 +3456,7 @@ api-token = tok
             api_token: String::new(),
             app_password: Some("app-pass".into()),
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
@@ -3874,6 +3968,7 @@ api-token = tok
                 api_token: String::new(), // empty => "keep whatever is current"
                 app_password: None,
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("from-A".into()),
             };
             upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
@@ -3890,6 +3985,7 @@ api-token = tok
             api_token: "secret-from-B".into(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         upsert_account(
@@ -3952,6 +4048,7 @@ api-token = tok
                 api_token: String::new(), // empty => "keep whatever is current"
                 app_password: None,
                 auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("from-A".into()),
             };
             upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
@@ -3990,6 +4087,7 @@ api-token = tok
             api_token: String::new(),
             app_password: None,
             auth: FastmailAuthMode::Oauth,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -4093,6 +4191,7 @@ api-token = tok
             api_token: String::new(),
             app_password: None,
             auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let errs = validate_account(&acct, "fm").unwrap_err();

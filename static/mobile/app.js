@@ -1819,6 +1819,9 @@ function autoSelectFromAddress(email) {
             for (const id of state.identities) {
                 if (id.email.toLowerCase() === addr) {
                     sel.value = id.email;
+                    // Programmatic select fires no 'change' event — swap the
+                    // signature for the matched identity here (kata zqrn).
+                    applyComposeSignatureForFrom();
                     return;
                 }
             }
@@ -1980,13 +1983,72 @@ function clearPendingAttachments() {
     renderComposeAttachments();
 }
 
-// Per-account plain-text signature, prefilled into a fresh compose body.
-// Mirrors desktop's composeSignaturePrefill: clearComposeFields is the single
-// choke point for new/reply/forward (all three call it first), so prefilling
-// here covers all of them uniformly. Never re-injected at send time —
+// ============================================================================
+// Per-identity signatures (kata zqrn). The three helpers below are verbatim
+// desktop/mobile twins (1v8z one-file guardrail: mobile duplicates them) —
+// identity_signature_test.cjs pins them byte-identical; change both or
+// neither.
+// ============================================================================
+
+// The exact block composeSignaturePrefill plants: RFC-3676 style delimiter
+// plus the signature. Empty signature → empty block.
+function sigBlock(sig) {
+    return sig ? `\n\n-- \n${sig}` : '';
+}
+
+// Signature for one From identity: the per-identity override when an entry
+// exists (an EMPTY entry means "this identity signs nothing" and does not
+// fall through), else the account-level signature.
+function signatureForIdentity(email) {
+    const acct = state.currentAccount;
+    if (!acct) return '';
+    const perIdentity = acct.identitySignatures || {};
+    const key = (email || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(perIdentity, key)) {
+        return perIdentity[key] || '';
+    }
+    return acct.signature || '';
+}
+
+// Swap ONLY the signature block: replace the tracked old block with the new
+// one. If the user edited or deleted the old block, their edit wins and this
+// is a no-op; with no old block the new one is appended. Pure — returns the
+// new body.
+function swapComposeSignature(body, oldSig, newSig) {
+    const oldBlock = sigBlock(oldSig);
+    const newBlock = sigBlock(newSig);
+    if (oldBlock === newBlock) return body;
+    if (!oldBlock) return body + newBlock;
+    const at = body.lastIndexOf(oldBlock);
+    if (at === -1) return body;
+    return body.slice(0, at) + newBlock + body.slice(at + oldBlock.length);
+}
+
+// Mobile flavor of desktop's applyComposeSignatureForFrom: same semantics,
+// mobile's element accessors. Called on the From <select> change, from
+// clearComposeFields after the From default is set, and from
+// autoSelectFromAddress — never from draft restore, whose saved body must
+// round-trip untouched.
+function applyComposeSignatureForFrom() {
+    const body = composeEl('compose-body');
+    if (!body) return;
+    const fromEmail = composeEl('compose-from')?.value || state.identities[0]?.email || '';
+    const newSig = signatureForIdentity(fromEmail);
+    const prevSig = state.composeSignature ?? (state.currentAccount?.signature || '');
+    if (prevSig === newSig) return;
+    const wasPristine = body.value === state.composeBaseline;
+    body.value = swapComposeSignature(body.value, prevSig, newSig);
+    if (wasPristine) state.composeBaseline = body.value;
+    state.composeSignature = newSig;
+}
+
+// Plain-text signature, prefilled into a fresh compose body. Mirrors
+// desktop's composeSignaturePrefill: clearComposeFields is the single choke
+// point for new/reply/forward (all three call it first), so prefilling here
+// covers all of them uniformly. Never re-injected at send time —
 // sendComposedEmail sends exactly what's left in the textarea after the user
-// edits/deletes freely. Per-account, not per-identity — there's no compose-
-// from account switch to worry about (accounts can't change mid-compose).
+// edits/deletes freely. Prefill is account-level; per-identity swaps happen
+// in applyComposeSignatureForFrom once the From identity is known (zqrn).
 function composeSignaturePrefill() {
     const sig = state.currentAccount?.signature;
     return sig ? `\n\n-- \n${sig}` : '';
@@ -2011,6 +2073,9 @@ function clearComposeFields() {
     // Dirty-check baseline: cancelCompose compares against this exact
     // string, so an untouched signature prefill doesn't read as a draft.
     state.composeBaseline = body.value;
+    // The prefill is the account-level signature; track it so the per-
+    // identity swap knows which block it planted (kata zqrn).
+    state.composeSignature = state.currentAccount?.signature || '';
     body.setSelectionRange(0, 0);
     autosizeComposeBody();
     const quote = composeEl('compose-quote');
@@ -2021,6 +2086,9 @@ function clearComposeFields() {
     hideDiscardBar();
     state.replyContext = null;
     if (state.identities.length) composeEl('compose-from').value = state.identities[0].email;
+    // The default identity may carry its own signature — swap it in while
+    // the body is still pristine (kata zqrn).
+    applyComposeSignatureForFrom();
     clearPendingAttachments();
 }
 
@@ -3664,6 +3732,8 @@ document.getElementById('compose-attach-btn').addEventListener('click', () => {
     composeEl('compose-file-input').click();
 });
 document.getElementById('compose-file-input').addEventListener('change', handleAttachmentFileSelect);
+// From identity change → swap the signature block in place (kata zqrn).
+document.getElementById('compose-from').addEventListener('change', applyComposeSignatureForFrom);
 document.getElementById('compose-attachments-list').addEventListener('click', handleComposeAttachmentListClick);
 
 // Detail attachments: delegated so re-renders (a fresh innerHTML per email)
