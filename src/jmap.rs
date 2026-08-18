@@ -33,6 +33,11 @@ pub(crate) struct JmapSessionResponse {
     pub download_url: Option<String>,
     #[serde(default)]
     pub primary_accounts: HashMap<String, String>,
+    /// RFC 8620 §2: the authenticated user's username (their email). OAuth
+    /// sessions start without one (the config has no username to vouch for
+    /// pre-authorize) and discover it here on connect.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 /// Recursive MIME body structure part
@@ -217,6 +222,26 @@ impl JmapSession {
         self.auth_header = format!("Bearer {api_token}");
         self.caldav_auth_header = basic_auth_header(&self.username, app_password);
     }
+
+    /// Build a session from a Fastmail OAuth access token (kata ngzw). One
+    /// bearer serves both protocols: Fastmail accepts the OAuth token at
+    /// `api.fastmail.com` (JMAP) AND `caldav.fastmail.com` (CalDAV), unlike
+    /// api-tokens (JMAP-only) — so no app password is involved. `username`
+    /// may be empty on the first authorize; `connect` fills it from the
+    /// JMAP session response.
+    pub fn new_oauth(username: &str, access_token: &str) -> Self {
+        let mut s = Self::new(username, access_token, None);
+        s.caldav_auth_header = s.auth_header.clone();
+        s
+    }
+
+    /// Swap in a refreshed OAuth access token, in place on the live session
+    /// (the OAuth analog of `set_credentials`) — both headers rotate to the
+    /// same new bearer.
+    pub fn set_oauth_access_token(&mut self, access_token: &str) {
+        self.auth_header = format!("Bearer {access_token}");
+        self.caldav_auth_header = self.auth_header.clone();
+    }
 }
 
 /// `Basic <base64(username:app_password)>` for CalDAV, or empty when no app
@@ -263,6 +288,15 @@ pub async fn connect(s: &mut JmapSession) -> Result<(), Error> {
         .primary_accounts
         .get("urn:ietf:params:jmap:mail")
         .cloned();
+
+    // OAuth sessions connect before knowing who the user is; the session
+    // object is authoritative. A configured username (api-token mode) is
+    // canonical and never overwritten.
+    if s.username.is_empty()
+        && let Some(username) = session.username
+    {
+        s.username = username;
+    }
 
     debug_assert!(s.api_url.is_some(), "JMAP session must have apiUrl");
     debug_assert!(s.account_id.is_some(), "JMAP session must have accountId");

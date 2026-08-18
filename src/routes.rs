@@ -4531,6 +4531,7 @@ mod tests {
                     username: format!("{id}@example.com"),
                     api_token: "tok".into(),
                     app_password: None,
+                    auth: accounts::FastmailAuthMode::ApiToken,
                     signature: None,
                 },
             );

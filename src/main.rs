@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use supervillain::{
     accounts::{self, AccountConfig},
-    gmail, jmap, outlook, platform,
+    gmail, jmap, oauth, outlook, platform,
     platform::{FsTokenStore, TokenStore},
     prefetch, provider,
     provider::ProviderSession,
@@ -141,6 +141,7 @@ async fn main() {
     prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
     reminders::spawn_daemon(state.clone());
     scheduled_send::spawn_daemon(state.clone());
+    accounts::spawn_fastmail_token_refresher(state.clone());
 
     let app = routes::router(state).layer(routes::compression_layer());
 
@@ -223,6 +224,28 @@ async fn load_session(
         });
     }
     match account {
+        AccountConfig::Fastmail {
+            auth: accounts::FastmailAuthMode::Oauth,
+            ..
+        } => {
+            // OAuth mode: rebuild from stored tokens (refreshing first if
+            // stale). Missing tokens surface the same Authorize affordance
+            // as Outlook/Gmail — never a blocking browser flow at startup.
+            let session = oauth::load_fastmail_oauth_session(name, token_store)
+                .await
+                .map_err(|e| AccountError {
+                    account: name.into(),
+                    provider: "fastmail".into(),
+                    error: e.to_string(),
+                })?;
+            tracing::info!(
+                "[{name}] Connected Fastmail (OAuth) as {}, {} mailboxes",
+                session.username,
+                session.mailbox_cache.len()
+            );
+            Ok(ProviderSession::Fastmail(Box::new(session)))
+        }
+
         AccountConfig::Fastmail {
             username,
             api_token,
