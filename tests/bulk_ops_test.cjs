@@ -473,6 +473,7 @@ test('pakx: rendered rows carry the selection marker and the bar shows the count
         extractFunction(APP_JS, 'function escapeAttr('),
         extractFunction(APP_JS, 'function visibleRows('),
         extractFunction(APP_JS, 'function renderBulkBar('),
+        extractFunction(APP_JS, 'function renderTriageProgress('),
         extractFunction(APP_JS, 'function renderEmailList('),
         'return renderEmailList;',
     ].join('\n');
@@ -511,6 +512,7 @@ test('pakx perf: renderEmailList with 1,000 emails / 500 selected stays under 15
         extractFunction(APP_JS, 'function escapeAttr('),
         extractFunction(APP_JS, 'function visibleRows('),
         extractFunction(APP_JS, 'function renderBulkBar('),
+        extractFunction(APP_JS, 'function renderTriageProgress('),
         extractFunction(APP_JS, 'function renderEmailList('),
         'return renderEmailList;',
     ].join('\n');

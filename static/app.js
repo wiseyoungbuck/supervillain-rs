@@ -1046,9 +1046,10 @@ function selectAccount(account) {
     state.currentSplit = 'all';
     state.splits = [];
     state.splitCounts = {};
-    // Bulk selection is per-context (kata pakx).
+    // Bulk selection and triage are per-context (kata pakx/5np4).
     state.bulkSelected.clear();
     state.bulkAnchorId = null;
+    state.triage = null;
     // Sort order is session-only (kata 09ef), reset to the default on
     // every account switch — same treatment as currentSplit above.
     state.sortOrder = 'date_desc';
@@ -1680,6 +1681,102 @@ async function bulkToggleUnread() {
     }
 }
 
+// Triage mode — Get-Me-To-Zero (kata 5np4). Walks the unread emails one at
+// a time in detail view: a snapshot queue of unread ids is taken on entry
+// (list order), each action settles then advances to the next queued id
+// still present, and exhausting the queue lands on the zero state. The
+// flow's keys live in handleNormalModeKey's triage block; removals caused
+// by fall-through bindings (remind, unsubscribe) advance via goToNextEmail.
+
+function enterTriage() {
+    if (state.triage || state.view !== 'list') return;
+    const queue = state.emails.filter(e => e.isUnread).map(e => e.id);
+    if (!queue.length) {
+        showStatus('Inbox zero — nothing unread here', 'success');
+        return;
+    }
+    state.triage = { queue, index: 0, total: queue.length };
+    renderTriageProgress();
+    triageOpen(queue[0]);
+}
+
+function exitTriage() {
+    if (!state.triage) return;
+    state.triage = null;
+    renderTriageProgress();
+    showView('list');
+    renderEmailList();
+    showStatus('Triage ended', 'info');
+}
+
+function triageOpen(id) {
+    state.selectedIndex = visibleRowIndexForEmailId(id);
+    loadEmailDetail(id);
+}
+
+function triageAdvance() {
+    const t = state.triage;
+    if (!t) return;
+    // Advance to the next queued id still present in the list — an id can
+    // vanish outside the flow's own actions (another tab, a refill replace).
+    let next = t.index + 1;
+    while (next < t.queue.length && !state.emails.some(e => e.id === t.queue[next])) {
+        next++;
+    }
+    if (next >= t.queue.length) {
+        triageComplete();
+        return;
+    }
+    t.index = next;
+    renderTriageProgress();
+    triageOpen(t.queue[next]);
+}
+
+function triageComplete() {
+    state.triage = null;
+    renderTriageProgress();
+    showView('list');
+    renderEmailList();
+    showStatus('Inbox zero — triage complete', 'success');
+}
+
+async function triageAction(type) {
+    const t = state.triage;
+    if (!t) return;
+    const id = t.queue[t.index];
+    // Settle before advancing: a failed action reverts the removal
+    // (emailAction's catch puts the email back) and the flow must STAY on
+    // the failed email so the user can retry or skip — never advance past
+    // a lost action.
+    await emailAction(type, id);
+    if (!state.triage) return; // exited mid-flight
+    if (state.emails.some(e => e.id === id)) return; // reverted — stay
+    triageAdvance();
+}
+
+async function triageKeepUnread() {
+    const t = state.triage;
+    if (!t) return;
+    const id = t.queue[t.index];
+    const email = state.emails.find(e => e.id === id);
+    // Opening the email marked it read; keep-unread flips it back through
+    // the same toggle the single 'u' uses, then moves on. A failed toggle
+    // reverts itself (toggleUnread's catch) — still advance: nothing was
+    // removed, the email just stays read in place.
+    if (email && !email.isUnread) {
+        await toggleUnread(id);
+    }
+    if (!state.triage) return;
+    triageAdvance();
+}
+
+function renderTriageProgress() {
+    if (!els.triageProgress) return;
+    const t = state.triage;
+    els.triageProgress.classList.toggle('hidden', !t);
+    els.triageProgress.textContent = t ? `TRIAGE ${t.index + 1}/${t.total}` : '';
+}
+
 async function bulkToggleFlag() {
     const ids = bulkIds();
     if (!ids.length) return;
@@ -1711,7 +1808,11 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     const label = mode === 'regardless' ? 'regardless' : 'if no reply';
     pushUndo('reminded', emailId, removedEmail, removedIndex, { mode, wakeAt });
     removeEmailFromList(emailId);
-    if (state.view === 'detail') showView('list');
+    // In triage (kata 5np4) a remind is an action like any other — advance
+    // to the next queued unread instead of dropping back to the list.
+    if (state.view === 'detail') {
+        if (state.triage) triageAdvance(); else showView('list');
+    }
     showStatus(`Reminded ${label} until ${new Date(wakeAt).toLocaleString()}`, 'success');
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
         Notification.requestPermission().catch(() => {});
@@ -3352,9 +3453,11 @@ function renderInviteChip(email) {
 }
 
 function renderEmailList() {
-    // Bulk-selection bar (kata pakx): every list draw syncs it, so the
-    // context-switch paths that clear the selection hide it for free.
+    // Bulk-selection bar (kata pakx) and triage progress (kata 5np4): every
+    // list draw syncs them, so the context-switch paths that clear either
+    // hide their UI for free.
     renderBulkBar();
+    renderTriageProgress();
     if (state.currentMailbox?.role === 'reminders') {
         renderReminderList();
         return;
@@ -3703,10 +3806,12 @@ function selectMailbox(mailbox) {
     state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
-    // Bulk selection is per-context (kata pakx); plain state mutation so the
-    // extraction-based test harnesses need no new injected dependency.
+    // Bulk selection and triage are per-context (kata pakx/5np4); plain
+    // state mutations so the extraction-based test harnesses need no new
+    // injected dependency.
     state.bulkSelected.clear();
     state.bulkAnchorId = null;
+    state.triage = null;
     // No cache wipe: splitListCache keys include (account, mailbox, split,
     // starred, search), so switching mailbox simply changes which entry
     // loadEmails looks up. The cached snapshot for the new mailbox (if any)
@@ -4956,6 +5061,18 @@ function handleNormalModeKey(e) {
         }
     }
 
+    // Triage mode (kata 5np4): while walking the unread queue in detail,
+    // the flow keys act on the CURRENT queue email and auto-advance. Every
+    // other key falls through to the normal detail bindings; removals they
+    // cause (remind, unsubscribe) advance via the goToNextEmail hook.
+    if (state.triage && state.view === 'detail') {
+        if (key === 'e') { triageAction('archive'); e.preventDefault(); return; }
+        if (key === '#') { triageAction('trash'); e.preventDefault(); return; }
+        if (key === 'u') { triageKeepUnread(); e.preventDefault(); return; }
+        if (key === 'j') { triageAdvance(); e.preventDefault(); return; }
+        if (key === 'Escape' || key === 'q' || key === 'T') { exitTriage(); e.preventDefault(); return; }
+    }
+
     switch (key) {
         // Page scrolling in detail view
         case ' ':
@@ -5060,6 +5177,11 @@ function handleNormalModeKey(e) {
             break;
         case 'X':
             rangeBulkSelect();
+            break;
+        case 'T':
+            // Get-Me-To-Zero (kata 5np4): enter from the list; while the
+            // flow runs, the triage block above owns T as the exit key.
+            if (state.view === 'list') enterTriage();
             break;
 
         // RSVP shortcuts
@@ -5318,6 +5440,12 @@ function actionSelected(type) {
 }
 
 function goToNextEmail() {
+    // Triage mode (kata 5np4): a removal-driven advance goes to the next
+    // unread in the triage queue, not the next visible row.
+    if (state.triage) {
+        triageAdvance();
+        return;
+    }
     // emailAction already removed the current email from state.emails, so the
     // next VISIBLE row at the same index is the one to advance to (kata 64z6 —
     // auto-advance walks visibleRows, not the flat list, so a collapsed thread
