@@ -2680,6 +2680,9 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -2853,6 +2856,9 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -3170,6 +3176,9 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
         })
     }
 

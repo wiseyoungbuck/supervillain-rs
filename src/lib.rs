@@ -14,6 +14,7 @@ pub mod provider_utils;
 pub mod rate_limit;
 pub mod reminders;
 pub mod routes;
+pub mod scheduled_send;
 pub mod search;
 pub mod splits;
 pub mod theme;

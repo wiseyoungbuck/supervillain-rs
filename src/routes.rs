@@ -538,6 +538,9 @@ struct SendEmailBody {
     from_address: Option<String>,
     #[serde(default)]
     attachments: Vec<Attachment>,
+    /// Deferred-send instant (kata vj6k/acag): a future value queues the
+    /// send instead of dispatching it; absent/past sends immediately.
+    send_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -2142,11 +2145,33 @@ async fn send_email_handler(
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: body.attachments,
+        send_at: None,
         calendar_ics: None,
     };
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
     Ok(send_success_response(result))
+}
+
+// --- Deferred sends (kata vj6k Undo Send + kata acag Send Later) ------------
+
+/// List the account's queued deferred sends, soonest first.
+async fn list_scheduled_sends(
+    State(_state): State<Arc<AppState>>,
+    Query(_params): Query<AccountParam>,
+) -> Result<Json<serde_json::Value>, Error> {
+    Err(Error::Internal("scheduled sends not implemented".into()))
+}
+
+/// Cancel a queued deferred send. Returns the removed record (submission
+/// included) so the client can restore the draft; 404 when the id is
+/// unknown — including "already dispatched", which is exactly what an
+/// Undo click after the window closes should surface.
+async fn cancel_scheduled_send(
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+) -> Result<Json<serde_json::Value>, Error> {
+    Err(Error::Internal("scheduled sends not implemented".into()))
 }
 
 // --- Persistent drafts (kata wm57) -----------------------------------------
@@ -2165,6 +2190,7 @@ fn draft_submission(body: DraftBody) -> EmailSubmission {
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: Vec::new(),
+        send_at: None,
         calendar_ics: None,
     }
 }
@@ -3067,6 +3093,7 @@ async fn send_invite_handler(
         in_reply_to: None,
         references: None,
         attachments: body.attachments,
+        send_at: None,
         calendar_ics: Some(ics),
     };
 
@@ -4503,6 +4530,19 @@ mod tests {
             ))),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join(format!(
+                    // Unique per call for the same reason as the reminders
+                    // path above: enqueue/cancel tests trigger save().
+                    "supervillain-test-scheduled-sends-{}-{}.json",
+                    std::process::id(),
+                    {
+                        static N: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    }
+                )),
+            ),
         }
     }
 
@@ -4592,6 +4632,336 @@ mod tests {
                 .is_none(),
             "records for accounts gone from the config are dropped"
         );
+    }
+
+    // =========================================================================
+    // Deferred sends (kata vj6k Undo Send + kata acag Send Later)
+    // =========================================================================
+
+    /// Loopback JMAP endpoint answering every call with a successful
+    /// Email/set + EmailSubmission/set pair, counting requests so tests can
+    /// assert exactly how many dispatches reached the provider. Same
+    /// no-mocking-framework pattern as rate_limit.rs / jmap.rs.
+    async fn spawn_mock_jmap(hits: std::sync::Arc<std::sync::atomic::AtomicU32>) -> String {
+        use axum::routing::post as axum_post;
+        let app = Router::new().route(
+            "/jmap",
+            axum_post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "methodResponses": [
+                            ["Email/set", {"created": {"draft": {"id": "M123"}}}, "0"],
+                            ["EmailSubmission/set",
+                             {"created": {"send": {"id": "S1", "emailId": "M123"}}}, "1"]
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jmap")
+    }
+
+    /// A Fastmail session pre-seeded so `jmap::send_email` needs no discovery
+    /// round-trips: identity resolved, drafts/sent mailboxes cached. With
+    /// `api_url: None` any dispatch attempt fails `NotConnected` — used to
+    /// prove a code path did NOT touch the provider.
+    fn mock_fastmail_session(api_url: Option<String>) -> SessionLock {
+        let mut jmap = crate::jmap::JmapSession::new("known@example.com", "tok", None);
+        jmap.api_url = api_url;
+        jmap.account_id = Some("acc1".into());
+        jmap.identity_id = Some("ident1".into());
+        for (role, id) in [("drafts", "MB-drafts"), ("sent", "MB-sent")] {
+            jmap.mailbox_cache.insert(
+                role.into(),
+                Mailbox {
+                    id: id.into(),
+                    name: role.into(),
+                    role: Some(role.into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            );
+        }
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::provider::ProviderSession::Fastmail(Box::new(jmap)),
+        ))
+    }
+
+    fn queued_send(
+        id: &str,
+        account: &str,
+        send_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::scheduled_send::ScheduledSend {
+        crate::scheduled_send::ScheduledSend {
+            id: id.into(),
+            account_id: account.into(),
+            from_addr: "known@example.com".into(),
+            send_at,
+            queued_at: send_at - chrono::Duration::minutes(1),
+            submission: EmailSubmission {
+                to: vec!["dest@example.com".into()],
+                cc: Vec::new(),
+                subject: format!("subject-{id}"),
+                text_body: "body".into(),
+                bcc: None,
+                html_body: None,
+                in_reply_to: None,
+                references: None,
+                attachments: Vec::new(),
+                calendar_ics: None,
+                send_at: Some(send_at),
+            },
+            attempts: 0,
+        }
+    }
+
+    fn send_body(send_at: Option<chrono::DateTime<chrono::Utc>>) -> SendEmailBody {
+        SendEmailBody {
+            to: vec!["dest@example.com".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "deferred hello".into(),
+            body: "see you in the future".into(),
+            html_body: None,
+            in_reply_to: None,
+            from_address: None,
+            attachments: Vec::new(),
+            send_at,
+        }
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_with_future_send_at_queues_instead_of_dispatching() {
+        // The observable Undo Send / Send Later contract: a future send_at
+        // must queue and return without any provider round-trip. The session
+        // has api_url: None, so an attempted dispatch would error — a
+        // success response proves the deferral happened.
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(None));
+        let send_at = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let response = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(Some(send_at))),
+        )
+        .await
+        .expect("future send_at must queue, not dispatch")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["scheduled"], serde_json::json!(true));
+        let id = body["id"].as_str().expect("queued id in response");
+        let record = state
+            .scheduled_sends
+            .get(id)
+            .expect("record must be durable in the queue");
+        assert_eq!(record.account_id, "known");
+        assert_eq!(record.submission.subject, "deferred hello");
+        assert_eq!(record.send_at, send_at);
+    }
+
+    #[tokio::test]
+    async fn send_with_past_send_at_dispatches_immediately() {
+        // A stale send_at (clock skew, an Undo window that already elapsed
+        // client-side) must not park the email in the queue for up to a
+        // full daemon tick — it goes out now, on the request path.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let send_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let response = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(Some(send_at))),
+        )
+        .await
+        .expect("past send_at must send immediately")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "immediate path must reach the provider exactly once"
+        );
+        assert!(
+            state.scheduled_sends.records().is_empty(),
+            "nothing may be queued for a past send_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_before_due_returns_submission_and_prevents_dispatch() {
+        // vj6k's core promise: cancelling inside the window means the email
+        // never leaves. The response carries the submission so the client
+        // can restore the draft (server restores nothing).
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let due = chrono::Utc::now() + chrono::Duration::seconds(15);
+        state
+            .scheduled_sends
+            .insert(queued_send("undo-1", "known", due));
+
+        let response = cancel_scheduled_send(State(state.clone()), Path("undo-1".into()))
+            .await
+            .expect("cancel inside the window must succeed");
+        let body = serde_json::to_value(response.0.clone()).unwrap();
+        assert_eq!(body["submission"]["subject"], "subject-undo-1");
+        assert!(state.scheduled_sends.records().is_empty());
+
+        // Even a tick well past the original due time dispatches nothing.
+        let dispatched = crate::scheduled_send::tick_scheduled_send_daemon(
+            &state,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+        assert!(dispatched.is_empty(), "cancelled send must never dispatch");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider must never see a cancelled send"
+        );
+
+        let err = cancel_scheduled_send(State(state), Path("undo-1".into()))
+            .await
+            .expect_err("second cancel must 404 — the record is gone");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_daemon_dispatches_due_exactly_once() {
+        // acag's core promise: the email actually departs once due — and
+        // only once. The second tick proves no double-dispatch.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let now = chrono::Utc::now();
+        state.scheduled_sends.insert(queued_send(
+            "due-1",
+            "known",
+            now - chrono::Duration::seconds(30),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "future-1",
+            "known",
+            now + chrono::Duration::hours(8),
+        ));
+
+        let dispatched = crate::scheduled_send::tick_scheduled_send_daemon(&state, now).await;
+        assert_eq!(dispatched.len(), 1, "exactly the due record dispatches");
+        assert_eq!(dispatched[0].id, "due-1");
+        assert_eq!(dispatched[0].email_id.as_deref(), Some("M123"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            state.scheduled_sends.get("due-1").is_none(),
+            "dispatched record must leave the queue"
+        );
+        assert!(
+            state.scheduled_sends.get("future-1").is_some(),
+            "not-yet-due record must stay queued"
+        );
+
+        let again = crate::scheduled_send::tick_scheduled_send_daemon(&state, now).await;
+        assert!(again.is_empty(), "a second tick must not re-dispatch");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no double-dispatch: provider hit count must not grow"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_daemon_keeps_disconnected_drops_removed_accounts() {
+        // Same tick policy as the reminders daemon (roborev 443): configured
+        // but session-less (OAuth pending) keeps its queued send; an account
+        // removed from the config drops it.
+        let state = Arc::new(test_state(&["known"], "known"));
+        let due = chrono::Utc::now() - chrono::Duration::minutes(5);
+        state
+            .scheduled_sends
+            .insert(queued_send("keep", "known", due));
+        state
+            .scheduled_sends
+            .insert(queued_send("drop", "removed-account", due));
+        crate::scheduled_send::tick_scheduled_send_daemon(&state, chrono::Utc::now()).await;
+        assert!(
+            state.scheduled_sends.get("keep").is_some(),
+            "configured-but-disconnected account must keep its queued send"
+        );
+        assert!(
+            state.scheduled_sends.get("drop").is_none(),
+            "queued sends for accounts gone from the config are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_sends_returns_account_records_soonest_first() {
+        let state = Arc::new(test_state(&["known", "other"], "known"));
+        let now = chrono::Utc::now();
+        state.scheduled_sends.insert(queued_send(
+            "second",
+            "known",
+            now + chrono::Duration::hours(2),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "first",
+            "known",
+            now + chrono::Duration::hours(1),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "foreign",
+            "other",
+            now + chrono::Duration::hours(1),
+        ));
+        let response = list_scheduled_sends(State(state), Query(AccountParam { account: None }))
+            .await
+            .expect("listing must succeed");
+        let body = serde_json::to_value(response.0).unwrap();
+        let ids: Vec<_> = body
+            .as_array()
+            .expect("a JSON array of queued sends")
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["first", "second"]);
     }
 
     #[tokio::test]

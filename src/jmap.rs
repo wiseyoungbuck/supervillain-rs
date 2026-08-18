@@ -4248,6 +4248,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         }
     }
@@ -4273,6 +4274,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-456");
@@ -4292,6 +4294,7 @@ END:VCALENDAR";
             in_reply_to: Some("<msg-123@example.com>".into()),
             references: Some(vec!["<msg-123@example.com>".into()]),
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-789");
@@ -4335,6 +4338,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "a@b.com", "mb");
@@ -4988,6 +4992,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -5222,6 +5227,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(
                 "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\n\
                  SUMMARY:Réunion d'équipe\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -5558,6 +5564,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(rsvp_ics.clone()),
         };
 
@@ -5749,6 +5756,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(ics.clone()),
         };
 
@@ -5909,6 +5917,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: Some(
                 "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
                  SUMMARY:Team Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -6451,6 +6460,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -6479,6 +6489,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -6521,6 +6532,7 @@ END:VCALENDAR";
                     size: 100,
                 },
             ],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");

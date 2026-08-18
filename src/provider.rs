@@ -611,6 +611,7 @@ pub async fn rsvp(
                 in_reply_to: None,
                 references: None,
                 attachments: vec![],
+                send_at: None,
                 calendar_ics: Some(rsvp_ics),
             };
 
@@ -822,6 +823,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         }
     }

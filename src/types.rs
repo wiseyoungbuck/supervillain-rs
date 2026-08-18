@@ -62,7 +62,7 @@ impl Email {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmailSubmission {
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -76,6 +76,13 @@ pub struct EmailSubmission {
     pub attachments: Vec<Attachment>,
     #[serde(skip)]
     pub calendar_ics: Option<String>,
+    /// When present and in the future, the send is deferred: the server
+    /// queues the submission (`src/scheduled_send.rs`) and the daemon
+    /// dispatches it at/after this instant. `None` (or a past instant)
+    /// means send immediately. Serves both Undo Send (short client-chosen
+    /// delay, kata vj6k) and Send Later (explicit pick, kata acag).
+    #[serde(default)]
+    pub send_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +109,7 @@ pub struct Identity {
 // Attachment types
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     pub blob_id: String,
     pub name: String,
@@ -483,6 +490,8 @@ pub struct AppState {
     pub reminders: crate::reminders::ReminderStore,
     /// Global sidecar containing Reminder Settings defaults.
     pub reminder_settings_path: PathBuf,
+    /// Durable deferred-send queue (Undo Send + Send Later, kata vj6k/acag).
+    pub scheduled_sends: crate::scheduled_send::ScheduledSendStore,
 }
 
 impl AppState {
@@ -614,6 +623,7 @@ mod tests {
             in_reply_to: Some("msg-123".into()),
             references: Some(vec!["msg-100".into(), "msg-123".into()]),
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
@@ -634,6 +644,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();

@@ -7,7 +7,7 @@ use supervillain::{
     platform::{FsTokenStore, TokenStore},
     prefetch, provider,
     provider::ProviderSession,
-    reminders, routes, splits, timezone,
+    reminders, routes, scheduled_send, splits, timezone,
     types::{AccountError, AccountRegistry, AppState, SessionLock},
 };
 
@@ -29,6 +29,7 @@ async fn main() {
     let prefetch_cache_path = config_dir.join("supervillain/prefetch-cache.json");
     let reminders_path = config_dir.join("supervillain/reminders.json");
     let reminder_settings_path = config_dir.join("supervillain/reminder-settings.json");
+    let scheduled_sends_path = config_dir.join("supervillain/scheduled-sends.json");
 
     platform::init_tracing();
 
@@ -128,6 +129,7 @@ async fn main() {
         prefetch_cache_path,
         reminders: reminders::ReminderStore::load(&reminders_path),
         reminder_settings_path,
+        scheduled_sends: scheduled_send::ScheduledSendStore::load(&scheduled_sends_path),
     });
 
     // Kick off the background prefetch warmer. The first pass starts
