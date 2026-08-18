@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod calendar;
+pub mod contacts;
 pub mod error;
 pub mod glob;
 pub mod gmail;
