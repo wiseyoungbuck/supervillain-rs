@@ -1027,6 +1027,9 @@ function selectAccount(account) {
     state.currentSplit = 'all';
     state.splits = [];
     state.splitCounts = {};
+    // Bulk selection is per-context (kata pakx).
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
     // Sort order is session-only (kata 09ef), reset to the default on
     // every account switch — same treatment as currentSplit above.
     state.sortOrder = 'date_desc';
@@ -1183,6 +1186,9 @@ function invalidateSplitListCache() {
 
 function selectSplit(splitId) {
     state.currentSplit = splitId;
+    // Bulk selection is per-context (kata pakx).
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
     renderSplitTabs();
     // loadEmails now renders from splitListCache instantly when a hit exists,
     // then refreshes in the background.
@@ -1389,14 +1395,20 @@ function renderMovePickerList() {
 }
 
 function openMovePicker(emailId = getSelectedEmailId()) {
-    if (!emailId || state.mailboxes.length === 0) return;
-    state.moveEmailId = emailId;
+    // With a bulk selection (kata pakx) the picker moves the whole batch;
+    // otherwise the single selected/open email (kata e993).
+    const bulk = bulkIds();
+    if ((!emailId && !bulk.length) || state.mailboxes.length === 0) return;
+    state.moveEmailId = bulk.length ? null : emailId;
     state.movePickerOpen = true;
     state.movePickerIndex = 0;
     const isGmail = state.currentAccount?.provider === 'gmail';
+    const title = bulk.length
+        ? `${isGmail ? 'Label' : 'Move'} ${bulk.length} selected`
+        : (isGmail ? 'Move to label' : 'Move to folder');
     els.moveModal.innerHTML = `
         <div class="modal-content move-content">
-            <h3>${isGmail ? 'Move to label' : 'Move to folder'}</h3>
+            <h3>${title}</h3>
             <input id="move-filter" type="text" placeholder="Type to filter…" autocomplete="off">
             <div id="move-picker-list"></div>
             <div class="modal-hint">↑↓ selects · Enter moves · Esc cancels</div>
@@ -1440,9 +1452,14 @@ function closeMovePicker() {
 }
 
 function confirmMovePicker(mailbox) {
+    const bulk = bulkIds();
     const id = state.moveEmailId;
     closeMovePicker();
-    moveEmailTo(id, mailbox);
+    if (bulk.length) {
+        bulkMove(mailbox);
+    } else {
+        moveEmailTo(id, mailbox);
+    }
 }
 
 async function moveEmailTo(emailId, mailbox) {
@@ -1474,6 +1491,197 @@ async function moveEmailTo(emailId, mailbox) {
         }
         adjustSplitCounts(+1);
         showStatus(`Move failed: ${err.message}`, 'error');
+    }
+}
+
+// Bulk selection (kata pakx). Selection is a Set of email IDS (not row
+// indexes — rows shift as emails settle), list-view only, cleared on any
+// context switch. Batch actions go over the EXISTING per-email endpoints;
+// one undo entry covers a whole batch.
+
+function bulkIds() {
+    // Ids may have left state.emails since they were selected (settled
+    // elsewhere, list replaced) — act only on those still present, in list
+    // order. Detail view acts on the open email, never the selection.
+    if (state.view !== 'list' || state.bulkSelected.size === 0) return [];
+    return state.emails.filter(e => state.bulkSelected.has(e.id)).map(e => e.id);
+}
+
+function toggleBulkSelect() {
+    if (state.view !== 'list') return;
+    const row = visibleRows()[state.selectedIndex];
+    if (!row) return;
+    // A collapsed thread row selects its newest member — the same email the
+    // single-row actions act on (kata 64z6 v1, no bulk thread actions).
+    if (state.bulkSelected.has(row.emailId)) {
+        state.bulkSelected.delete(row.emailId);
+    } else {
+        state.bulkSelected.add(row.emailId);
+    }
+    state.bulkAnchorId = row.emailId;
+    renderEmailList();
+}
+
+function rangeBulkSelect() {
+    if (state.view !== 'list') return;
+    const rows = visibleRows();
+    const cursor = state.selectedIndex;
+    if (!rows[cursor]) return;
+    let anchor = rows.findIndex(r => r.emailId === state.bulkAnchorId);
+    if (anchor === -1) anchor = cursor;
+    const [from, to] = anchor <= cursor ? [anchor, cursor] : [cursor, anchor];
+    for (let i = from; i <= to; i++) {
+        state.bulkSelected.add(rows[i].emailId);
+    }
+    state.bulkAnchorId = rows[cursor].emailId;
+    renderEmailList();
+}
+
+function selectAllVisible() {
+    if (state.view !== 'list') return;
+    visibleRows().forEach(row => state.bulkSelected.add(row.emailId));
+    renderEmailList();
+}
+
+function clearBulkSelection({ render = true } = {}) {
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
+    if (render) renderEmailList();
+}
+
+function renderBulkBar() {
+    if (!els.bulkBar) return;
+    const count = state.bulkSelected.size;
+    els.bulkBar.classList.toggle('hidden', count === 0);
+    els.bulkBar.textContent = count === 0 ? ''
+        : `${count} selected — e archive · # trash · u read/unread · s star · v move · Esc clear`;
+}
+
+function pushBulkUndo(action, entries) {
+    state.undoStack.push({
+        action,
+        entries,
+        sourceMailboxId: state.currentMailbox?.id,
+        timestamp: Date.now(),
+    });
+    const verb = action === 'bulk-trashed' ? 'trashed'
+        : action === 'bulk-moved' ? 'moved'
+        : 'archived';
+    els.undoMessage.textContent = `${entries.length} emails ${verb}`;
+    els.undoToast.classList.remove('hidden');
+    setTimeout(() => {
+        els.undoToast.classList.add('hidden');
+    }, 5000);
+}
+
+async function bulkRemoveAndSend(undoAction, label, post) {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    // Record each email's pre-removal position, in list order, so a batch
+    // undo (or a partial-failure revert) can splice them back exactly:
+    // ascending-order splices reconstruct the original array.
+    const entries = [];
+    state.emails.forEach((email, index) => {
+        if (idSet.has(email.id)) entries.push({ emailId: email.id, emailData: email, insertIndex: index });
+    });
+    pushBulkUndo(undoAction, entries);
+    clearBulkSelection({ render: false });
+    removeEmailsFromList(e => !idSet.has(e.id), entries.length);
+    showStatus(`${label} ${entries.length} emails`, 'success');
+
+    const results = await Promise.allSettled(entries.map(entry => post(entry.emailId)));
+    const failed = new Set();
+    results.forEach((result, i) => {
+        if (result.status === 'rejected') failed.add(entries[i].emailId);
+    });
+    // Release suppression for the whole batch: settled ids are server truth
+    // now; failed ids are reverted right below, with no mutation in flight
+    // (roborev 471/472 discipline).
+    for (const entry of entries) refillSuppressedIds.delete(entry.emailId);
+    if (failed.size) {
+        for (const entry of entries) {
+            if (!failed.has(entry.emailId)) continue;
+            state.emails.splice(Math.min(entry.insertIndex, state.emails.length), 0, entry.emailData);
+        }
+        // The undo entry must only restore rows that actually left.
+        const undoItem = state.undoStack[state.undoStack.length - 1];
+        if (undoItem && undoItem.entries === entries) {
+            undoItem.entries = entries.filter(entry => !failed.has(entry.emailId));
+            if (!undoItem.entries.length) state.undoStack.pop();
+        }
+        adjustSplitCounts(+failed.size);
+        invalidateSplitListCache();
+        renderEmailList();
+        showStatus(`${label} ${entries.length - failed.size} of ${entries.length} — ${failed.size} failed`, 'error');
+    }
+    loadSplitCounts(); // resync with server truth
+}
+
+function bulkEmailAction(type) {
+    return bulkRemoveAndSend(
+        type === 'archive' ? 'bulk-archived' : 'bulk-trashed',
+        type === 'archive' ? 'Archived' : 'Trashed',
+        id => api('POST', `/emails/${id}/${type}`),
+    );
+}
+
+function bulkMove(mailbox) {
+    return bulkRemoveAndSend(
+        'bulk-moved',
+        'Moved',
+        id => api('POST', `/emails/${id}/move`, { mailbox_id: mailbox.id }),
+    );
+}
+
+async function bulkToggleUnread() {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    // Mirror the single 'u': each selected email flips relative to its OWN
+    // state, optimistically, with a per-email revert on failure. The
+    // selection survives — read-state changes don't remove rows.
+    const flips = ids.map(id => {
+        const email = state.emails.find(e => e.id === id);
+        const wasUnread = email.isUnread;
+        email.isUnread = !wasUnread;
+        return { email, wasUnread };
+    });
+    renderEmailList();
+    const results = await Promise.allSettled(flips.map(({ email, wasUnread }) =>
+        api('POST', `/emails/${email.id}/${wasUnread ? 'mark-read' : 'mark-unread'}`)));
+    let reverted = 0;
+    results.forEach((result, i) => {
+        if (result.status !== 'rejected') return;
+        flips[i].email.isUnread = flips[i].wasUnread;
+        reverted++;
+    });
+    if (reverted) {
+        renderEmailList();
+        showStatus(`Failed to toggle read on ${reverted} emails`, 'error');
+    }
+}
+
+async function bulkToggleFlag() {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    // Same shape as bulkToggleUnread, over the single toggle-flag endpoint.
+    const flips = ids.map(id => {
+        const email = state.emails.find(e => e.id === id);
+        email.isFlagged = !email.isFlagged;
+        return email;
+    });
+    renderEmailList();
+    const results = await Promise.allSettled(flips.map(email =>
+        api('POST', `/emails/${email.id}/toggle-flag`)));
+    let reverted = 0;
+    results.forEach((result, i) => {
+        if (result.status !== 'rejected') return;
+        flips[i].isFlagged = !flips[i].isFlagged;
+        reverted++;
+    });
+    if (reverted) {
+        renderEmailList();
+        showStatus(`Failed to toggle star on ${reverted} emails`, 'error');
     }
 }
 
@@ -3086,6 +3294,9 @@ function renderInviteChip(email) {
 }
 
 function renderEmailList() {
+    // Bulk-selection bar (kata pakx): every list draw syncs it, so the
+    // context-switch paths that clear the selection hide it for free.
+    renderBulkBar();
     if (state.currentMailbox?.role === 'reminders') {
         renderReminderList();
         return;
@@ -3124,7 +3335,8 @@ function renderEmailList() {
             }
         }
         const rowClass = `email-row${idx === state.selectedIndex ? ' selected' : ''}${row.unread ? ' unread' : ''}`
-            + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`;
+            + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`
+            + `${state.bulkSelected.has(row.emailId) ? ' bulk-selected' : ''}`;
         // Collapsed/expanded thread header carries a clickable count badge; a
         // click on it toggles expansion instead of opening the message.
         const countBadge = isThread
@@ -3268,6 +3480,10 @@ function selectMailbox(mailbox) {
     state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
+    // Bulk selection is per-context (kata pakx); plain state mutation so the
+    // extraction-based test harnesses need no new injected dependency.
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
     // No cache wipe: splitListCache keys include (account, mailbox, split,
     // starred, search), so switching mailbox simply changes which entry
     // loadEmails looks up. The cached snapshot for the new mailbox (if any)
@@ -4529,7 +4745,11 @@ function handleNormalModeKey(e) {
             break;
         case 'Escape':
         case 'q':
-            if (state.view === 'detail') {
+            if (key === 'Escape' && state.view === 'list' && state.bulkSelected.size) {
+                // Bulk selection active (kata pakx): Escape clears it; 'q'
+                // stays inert in list view as before.
+                clearBulkSelection();
+            } else if (state.view === 'detail') {
                 showView('list');
             } else if (state.view === 'compose') {
                 // Cancel-with-keep: persist the last edits, then leave the
@@ -4585,6 +4805,12 @@ function handleNormalModeKey(e) {
             // handled inside openMovePicker.
             openMovePicker();
             e.preventDefault();
+            break;
+        case 'x':
+            toggleBulkSelect();
+            break;
+        case 'X':
+            rangeBulkSelect();
             break;
 
         // RSVP shortcuts
@@ -4827,6 +5053,12 @@ function getSelectedEmailId() {
 }
 
 function actionSelected(type) {
+    // An active bulk selection (kata pakx) captures the action for the whole
+    // batch — the same entry point serves the e/# keys and the palette.
+    if (bulkIds().length) {
+        bulkEmailAction(type);
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) {
         emailAction(type, id);
@@ -4861,11 +5093,19 @@ function goToNextEmail() {
 }
 
 function toggleUnreadSelected() {
+    if (bulkIds().length) {
+        bulkToggleUnread();
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) toggleUnread(id);
 }
 
 function toggleFlagSelected() {
+    if (bulkIds().length) {
+        bulkToggleFlag();
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) toggleFlag(id);
 }
@@ -6255,49 +6495,62 @@ async function performUndo() {
     els.undoToast.classList.add('hidden');
     showStatus('Undone', 'success');
 
-    // Optimistic: re-insert the email into the list immediately. insertIndex is
-    // a state.emails (DATA) position — correct for restoring sort order — but
-    // selection must land on the re-inserted email's VISIBLE row, which under
-    // grouping is not that flat index (kata 64z6).
-    if (item.emailData) {
-        refillSuppressedIds.delete(item.emailId);
-        const idx = Math.min(item.insertIndex, state.emails.length);
-        state.emails.splice(idx, 0, item.emailData);
+    // Bulk items (kata pakx) carry entries[] in original list order; single
+    // items keep the flat shape. Normalize so one path restores both.
+    const entries = item.entries
+        || [{ emailId: item.emailId, emailData: item.emailData, insertIndex: item.insertIndex }];
+
+    // Optimistic: re-insert each email into the list immediately. insertIndex
+    // is a state.emails (DATA) position — correct for restoring sort order —
+    // but selection must land on a re-inserted email's VISIBLE row, which
+    // under grouping is not that flat index (kata 64z6). Ascending-order
+    // splices reconstruct the exact pre-removal positions for a batch.
+    let restored = false;
+    for (const entry of entries) {
+        if (!entry.emailData) continue;
+        refillSuppressedIds.delete(entry.emailId);
+        const idx = Math.min(entry.insertIndex, state.emails.length);
+        state.emails.splice(idx, 0, entry.emailData);
         // Guarantee the id is registered even in the edge case where its thread
         // was never grouped; extend is idempotent per id.
-        extendThreadGroups([item.emailData]);
-        state.selectedIndex = visibleRowIndexForEmailId(item.emailId);
+        extendThreadGroups([entry.emailData]);
+        restored = true;
+    }
+    if (restored) {
+        state.selectedIndex = visibleRowIndexForEmailId(entries[0].emailId);
         invalidateSplitListCache();
         renderEmailList();
-
     }
-    adjustSplitCounts(+1);
+    adjustSplitCounts(+entries.length);
 
     try {
         if (item.action === 'reminded') {
             await api('POST', `/emails/${item.emailId}/cancel-reminder`);
             loadReminders({ skipNotify: true });
         } else {
-            // 'moved' items carry their source mailbox (kata e993) and
-            // restore there; archive/trash items have no source and fall
+            // 'moved'/bulk items carry their source mailbox (kata e993/pakx)
+            // and restore there; archive/trash items have no source and fall
             // back to the inbox, as before.
             const target = state.mailboxes.find(m => m.id === item.sourceMailboxId)
                 || state.mailboxes.find(m => m.role === 'inbox');
             if (target) {
-                await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: target.id });
+                for (const entry of entries) {
+                    await api('POST', `/emails/${entry.emailId}/move`, { mailbox_id: target.id });
+                }
             }
         }
         loadSplitCounts(); // resync with server truth
     } catch (err) {
-        // Revert: remove the email we optimistically re-inserted. This
+        // Revert: remove the emails we optimistically re-inserted. This
         // removal syncs BACK to server truth (the move failed, so the
         // email stayed archived) — it is not an optimistic removal with a
         // mutation in flight, so the suppression removeEmailsFromList just
         // registered must be released immediately or the id stays hidden
         // from every list load for the rest of the session (roborev 472).
-        if (item.emailData) {
-            removeEmailFromList(item.emailId);
-            refillSuppressedIds.delete(item.emailId);
+        for (const entry of entries) {
+            if (!entry.emailData) continue;
+            removeEmailFromList(entry.emailId);
+            refillSuppressedIds.delete(entry.emailId);
         }
         showStatus('Undo failed', 'error');
     }
