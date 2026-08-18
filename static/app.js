@@ -85,6 +85,7 @@ const state = {
     wizardCache: null,  // populated at init() once freshWizCache is defined
     timezone: null,           // { primary, display, system, system_changed, use_system, ... }
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
+    sendUndo: null,           // { id, deadline, timerId } — active Undo Send countdown (kata vj6k)
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -238,6 +239,10 @@ function init() {
     els.splitHint = document.getElementById('split-hint');
     els.remindModal = document.getElementById('remind-modal');
     els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
+    els.sendUndoToast = document.getElementById('send-undo-toast');
+    els.sendUndoMessage = document.getElementById('send-undo-message');
+    els.sendUndoButton = document.getElementById('send-undo-button');
+    els.sendLaterModal = document.getElementById('send-later-modal');
     els.calendarEvent = document.getElementById('calendar-event');
     els.calTitle = document.getElementById('cal-title');
     els.calDatetime = document.getElementById('cal-datetime');
@@ -370,6 +375,7 @@ function init() {
     });
     els.clearAllFilters.addEventListener('click', clearAllFilters);
     els.undoButton.addEventListener('click', performUndo);
+    els.sendUndoButton.addEventListener('click', cancelPendingSend);
     els.splitCancel.addEventListener('click', closeSplitModal);
     document.getElementById('remind-cancel')?.addEventListener('click', closeRemindPicker);
     document.getElementById('remind-confirm')?.addEventListener('click', confirmRemindPicker);
@@ -4065,6 +4071,12 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Send Later picker / Scheduled list owns Enter and Escape (kata acag).
+    if (!els.sendLaterModal.classList.contains('hidden')) {
+        handleSendLaterPickerKey(e);
+        return;
+    }
+
     // Reminder Settings modal owns its form fields and Escape.
     if (!els.reminderSettingsModal.classList.contains('hidden')) {
         if (e.key === 'Escape') {
@@ -5621,6 +5633,7 @@ function commandsForView(view) {
                 cmds.push({ name: `Switch Account: ${label}`, desc: `Switch to ${label}`, shortcut: i < 9 ? String(i + 1) : '', action: `switch-account:${acct.id}` });
             });
             cmds.push({ name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' });
+            cmds.push({ name: 'Scheduled Sends', desc: 'View and cancel queued sends', shortcut: '', action: 'scheduled-sends' });
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -5634,6 +5647,8 @@ function commandsForView(view) {
             // deletion and deliver persistence (roborev 375, Medium).
             return [
                 { name: 'Send', desc: 'Send email', shortcut: '\u2318\u23ce', action: 'send' },
+                { name: 'Send Later', desc: 'Schedule this email to send at a chosen time', shortcut: '\u2318\u21e7L', action: 'send-later' },
+                { name: 'Scheduled Sends', desc: 'View and cancel queued sends', shortcut: '', action: 'scheduled-sends' },
                 { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'close-draft' },
                 { name: 'Attach', desc: 'Attach a file', shortcut: 'a', action: 'attach' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
@@ -5702,6 +5717,8 @@ function executeCommand(action) {
         // path (Esc, here named escapeCompose), and the attachment picker
         // ('a' / Ctrl+Shift+A). No new handlers.
         case 'send': sendEmail(); break;
+        case 'send-later': openSendLaterPicker(); break;
+        case 'scheduled-sends': openScheduledSends(); break;
         case 'close-draft': escapeCompose(); break;
         case 'attach': els.composeFileInput.click(); break;
         // RSVP (kata sefy): the detail palette offers these only behind the

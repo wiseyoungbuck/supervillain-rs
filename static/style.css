@@ -2418,3 +2418,80 @@ body:not(.light-theme) .compose-quote a * {
     font-size: 12.5px;
 }
 .wiz-default-row input[type=checkbox] { accent-color: var(--accent); }
+
+/* Undo Send toast (kata vj6k) — same shell as #undo-toast */
+#send-undo-toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    z-index: 1000;
+}
+
+#send-undo-toast.hidden {
+    display: none;
+}
+
+#send-undo-button {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+
+/* Send Later picker / Scheduled list (kata acag) — same overlay shell as
+   #remind-modal (kept as its own appended block for seam discipline) */
+#send-later-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+
+#send-later-modal.hidden {
+    display: none;
+}
+
+.scheduled-send-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 50vh;
+    overflow-y: auto;
+    margin: 12px 0;
+}
+
+.scheduled-send-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.scheduled-send-subject {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.scheduled-send-time {
+    color: var(--fg-muted);
+    font-size: 12.5px;
+}
+
+.scheduled-send-empty {
+    color: var(--fg-muted);
+    margin: 12px 0;
+}
