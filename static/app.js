@@ -1350,6 +1350,129 @@ function confirmRemindPicker() {
     confirmRemindAt(resolveReminderInput());
 }
 
+// Move to Folder / Apply Label picker (kata e993, Superhuman 'v'/'l').
+// Same modal pattern as the Remind Me picker above: markup built on open,
+// keys handled by a dedicated handler behind a handleKeyDown early-return.
+// Gmail's "folders" are labels server-side (provider::move_to_mailbox maps
+// either way), so the picker lists the same state.mailboxes for every
+// provider — only the wording differs.
+
+function movePickerMailboxes(query = '') {
+    // Every mailbox except the one the list is showing — moving an email to
+    // where it already is is a no-op.
+    const q = query.toLowerCase();
+    return state.mailboxes.filter(m =>
+        m.id !== state.currentMailbox?.id && m.name.toLowerCase().includes(q));
+}
+
+function renderMovePickerList() {
+    const query = document.getElementById('move-filter')?.value || '';
+    const matches = movePickerMailboxes(query);
+    state.movePickerIndex = Math.max(0, Math.min(state.movePickerIndex, matches.length - 1));
+    const listEl = document.getElementById('move-picker-list');
+    if (!listEl) return;
+    // Names and ids are user-controlled (shared/delegated mailboxes, kata
+    // 1p0d/fhtz) — escape at the innerHTML boundary, text vs attribute.
+    listEl.innerHTML = matches.map((m, idx) =>
+        `<div class="move-picker-item ${idx === state.movePickerIndex ? 'selected' : ''}" data-id="${escapeAttr(m.id)}">${escapeHtml(m.name)}</div>`
+    ).join('');
+    listEl.querySelectorAll('.move-picker-item').forEach(el => {
+        el.addEventListener('click', () => {
+            const mailbox = state.mailboxes.find(m => m.id === el.dataset.id);
+            if (mailbox) confirmMovePicker(mailbox);
+        });
+    });
+}
+
+function openMovePicker(emailId = getSelectedEmailId()) {
+    if (!emailId || state.mailboxes.length === 0) return;
+    state.moveEmailId = emailId;
+    state.movePickerOpen = true;
+    state.movePickerIndex = 0;
+    const isGmail = state.currentAccount?.provider === 'gmail';
+    els.moveModal.innerHTML = `
+        <div class="modal-content move-content">
+            <h3>${isGmail ? 'Move to label' : 'Move to folder'}</h3>
+            <input id="move-filter" type="text" placeholder="Type to filter…" autocomplete="off">
+            <div id="move-picker-list"></div>
+            <div class="modal-hint">↑↓ selects · Enter moves · Esc cancels</div>
+        </div>`;
+    els.moveModal.classList.remove('hidden');
+    const filter = document.getElementById('move-filter');
+    filter?.addEventListener('input', () => {
+        state.movePickerIndex = 0;
+        renderMovePickerList();
+    });
+    renderMovePickerList();
+    filter?.focus();
+}
+
+function handleMovePickerKey(e) {
+    if (e.key === 'Escape') {
+        closeMovePicker();
+        e.preventDefault();
+    } else if (e.key === 'ArrowDown') {
+        state.movePickerIndex++;
+        renderMovePickerList(); // render clamps against the filtered set
+        e.preventDefault();
+    } else if (e.key === 'ArrowUp') {
+        state.movePickerIndex = Math.max(0, state.movePickerIndex - 1);
+        renderMovePickerList();
+        e.preventDefault();
+    } else if (e.key === 'Enter') {
+        const query = document.getElementById('move-filter')?.value || '';
+        const target = movePickerMailboxes(query)[state.movePickerIndex];
+        if (target) confirmMovePicker(target);
+        e.preventDefault();
+    }
+    // Every other key falls through to the filter input.
+}
+
+function closeMovePicker() {
+    state.movePickerOpen = false;
+    state.moveEmailId = null;
+    els.moveModal.classList.add('hidden');
+    setMode('normal');
+}
+
+function confirmMovePicker(mailbox) {
+    const id = state.moveEmailId;
+    closeMovePicker();
+    moveEmailTo(id, mailbox);
+}
+
+async function moveEmailTo(emailId, mailbox) {
+    // Mirrors emailAction's optimistic-removal + failure-revert shape,
+    // including the suppression release on both settle and revert
+    // (roborev 471/472 discipline).
+    const removedEmail = state.emails.find(e => e.id === emailId);
+    const removedIndex = state.emails.indexOf(removedEmail);
+    pushUndo('moved', emailId, removedEmail, removedIndex, null, state.currentMailbox?.id);
+    removeEmailFromList(emailId);
+    showStatus(`Moved to ${mailbox.name}`, 'success');
+
+    if (state.view === 'detail') {
+        goToNextEmail();
+    }
+
+    try {
+        await api('POST', `/emails/${emailId}/move`, { mailbox_id: mailbox.id });
+        refillSuppressedIds.delete(emailId);
+        loadSplitCounts(); // resync with server truth
+    } catch (err) {
+        // Revert: re-insert the email and remove the stale undo entry.
+        state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
+        if (removedEmail) {
+            state.emails.splice(removedIndex, 0, removedEmail);
+            invalidateSplitListCache();
+            renderEmailList();
+        }
+        adjustSplitCounts(+1);
+        showStatus(`Move failed: ${err.message}`, 'error');
+    }
+}
+
 async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     if (!emailId) return;
     const removedEmail = state.emails.find(email => email.id === emailId);
@@ -4444,6 +4567,14 @@ function handleNormalModeKey(e) {
         case 'z':
             performUndo();
             break;
+        case 'v':
+        case 'l':
+            // Move to Folder / Apply Label picker (kata e993): both
+            // Superhuman keys open the same picker; provider wording is
+            // handled inside openMovePicker.
+            openMovePicker();
+            e.preventDefault();
+            break;
 
         // RSVP shortcuts
         case 'y':
@@ -6080,11 +6211,12 @@ async function deleteSplit(splitId) {
 
 // Undo
 
-function pushUndo(action, emailId, emailData, insertIndex, reminder = null) {
-    state.undoStack.push({ action, emailId, emailData, insertIndex, reminder, timestamp: Date.now() });
+function pushUndo(action, emailId, emailData, insertIndex, reminder = null, sourceMailboxId = null) {
+    state.undoStack.push({ action, emailId, emailData, insertIndex, reminder, sourceMailboxId, timestamp: Date.now() });
 
     // Show toast
     els.undoMessage.textContent = action === 'archived' ? 'Email archived'
+        : action === 'moved' ? 'Email moved'
         : action === 'reminded'
             ? `Reminded ${reminder?.mode === 'regardless' ? 'regardless' : 'if no reply'} until ${new Date(reminder?.wakeAt).toLocaleString()}`
             : 'Email trashed';
@@ -6126,9 +6258,13 @@ async function performUndo() {
             await api('POST', `/emails/${item.emailId}/cancel-reminder`);
             loadReminders({ skipNotify: true });
         } else {
-            const inbox = state.mailboxes.find(m => m.role === 'inbox');
-            if (inbox) {
-                await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
+            // 'moved' items carry their source mailbox (kata e993) and
+            // restore there; archive/trash items have no source and fall
+            // back to the inbox, as before.
+            const target = state.mailboxes.find(m => m.id === item.sourceMailboxId)
+                || state.mailboxes.find(m => m.role === 'inbox');
+            if (target) {
+                await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: target.id });
             }
         }
         loadSplitCounts(); // resync with server truth
