@@ -3660,4 +3660,303 @@ api-token = tok
             "the deleted account must stay deleted — no resurrection via the update path"
         );
     }
+
+    // =========================================================================
+    // Fastmail OAuth mode (kata ngzw)
+    // =========================================================================
+
+    fn fastmail_oauth(username: &str) -> AccountConfig {
+        AccountConfig::Fastmail {
+            username: username.into(),
+            api_token: String::new(),
+            app_password: None,
+            auth: FastmailAuthMode::Oauth,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn parse_fastmail_oauth_section_without_api_token() {
+        let content = "[fm]\nprovider = fastmail\nauth = oauth\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                username,
+                api_token,
+                auth,
+                ..
+            } => {
+                assert_eq!(username, "u@fm.com");
+                assert!(api_token.is_empty());
+                assert_eq!(*auth, FastmailAuthMode::Oauth);
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fastmail_oauth_round_trips_through_ini() {
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), fastmail_oauth("u@fm.com"));
+        let cfg = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        assert!(s.contains("auth = oauth"), "serialized: {s}");
+        assert!(
+            !s.contains("api-token"),
+            "no misleading empty api-token line: {s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty());
+        assert_eq!(parsed.accounts, cfg.accounts);
+    }
+
+    #[test]
+    fn legacy_fastmail_section_parses_as_api_token_mode() {
+        // No `auth` key → api-token mode, exactly as before this field existed.
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\napi-token = tok\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty());
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail { auth, api_token, .. } => {
+                assert_eq!(*auth, FastmailAuthMode::ApiToken);
+                assert_eq!(api_token, "tok");
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_fastmail_section_still_requires_api_token() {
+        // In api-token mode a missing api-token is still a parse error —
+        // the oauth mode must not silently loosen the legacy contract.
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("api-token"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fastmail_auth_mode() {
+        let content = "[fm]\nprovider = fastmail\nauth = magic\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("auth"), "reason: {}", errors[0].reason);
+    }
+
+    #[test]
+    fn validate_fastmail_oauth_allows_empty_api_token() {
+        assert!(validate_account(&fastmail_oauth("u@fm.com"), "fm").is_ok());
+    }
+
+    #[test]
+    fn validate_fastmail_oauth_allows_empty_username_before_first_authorize() {
+        // Like Outlook's optional email: the username is discovered from the
+        // JMAP session at first authorize.
+        assert!(validate_account(&fastmail_oauth(""), "fm").is_ok());
+    }
+
+    #[test]
+    fn validate_fastmail_api_token_mode_still_requires_token() {
+        let acct = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: String::new(),
+            app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            signature: None,
+        };
+        let errs = validate_account(&acct, "fm").unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e.field, FieldId::ApiToken)));
+    }
+
+    #[test]
+    fn merge_secrets_preserves_api_token_across_mode_switch_to_oauth() {
+        // Switching an existing account to oauth mode keeps the stored
+        // api-token as the documented fallback (reverting is a mode flip,
+        // not a re-paste).
+        let existing = fastmail("u@fm.com", "tok-1");
+        let incoming = fastmail_oauth("u@fm.com");
+        match merge_secrets(&existing, incoming) {
+            AccountConfig::Fastmail { api_token, auth, .. } => {
+                assert_eq!(api_token, "tok-1");
+                assert_eq!(auth, FastmailAuthMode::Oauth);
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_email_from_session_populates_fastmail_oauth_username() {
+        let updated =
+            update_email_from_session(fastmail_oauth(""), Some("discovered@fm.com".into()));
+        match updated {
+            AccountConfig::Fastmail { username, .. } => {
+                assert_eq!(username, "discovered@fm.com");
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    // ---- Refresh daemon tick (loopback token endpoint, no mock framework) ----
+
+    async fn spawn_token_endpoint(status: u16, body: &'static str) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/token",
+            post(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/token")
+    }
+
+    /// Registry with one oauth-mode Fastmail account and a live session
+    /// holding `access` as its current bearer.
+    fn oauth_registry(access: &str) -> AccountRegistry {
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".to_string(), fastmail_oauth("u@fm.com"));
+        reg.sessions.insert(
+            "fm".to_string(),
+            SessionLock::new(tokio::sync::RwLock::new(ProviderSession::Fastmail(
+                Box::new(crate::jmap::JmapSession::new_oauth("u@fm.com", access)),
+            ))),
+        );
+        reg.default_account = "fm".to_string();
+        reg
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_rotates_tokens_and_updates_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-old".into(),
+                    // Within the refresh margin → due.
+                    token_expiry: chrono::Utc::now() + chrono::Duration::seconds(60),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        let token_url = spawn_token_endpoint(
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":3600}"#,
+        )
+        .await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        // Rotate-on-refresh persisted: old refresh token MUST be replaced.
+        let stored = state.token_store.load("fm").expect("tokens still stored");
+        assert_eq!(stored.access_token, "at-new");
+        assert_eq!(stored.refresh_token, "rt-new");
+        assert!(stored.token_expiry > chrono::Utc::now() + chrono::Duration::seconds(3000));
+
+        // Live session picked up the new bearer on both headers.
+        let reg = state.accounts.read().await;
+        let session = reg.sessions.get("fm").unwrap().read().await;
+        match &*session {
+            ProviderSession::Fastmail(s) => {
+                assert_eq!(s.auth_header, "Bearer at-new");
+                assert_eq!(s.caldav_auth_header, "Bearer at-new");
+            }
+            _ => panic!("expected fastmail session"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_skips_accounts_not_yet_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-old".into(),
+                    token_expiry: chrono::Utc::now() + chrono::Duration::seconds(3600),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        // Endpoint would fail the test's intent if hit; a 500 makes any
+        // accidental request visible as a changed token file.
+        let token_url = spawn_token_endpoint(500, "should not be called").await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        let stored = state.token_store.load("fm").expect("tokens untouched");
+        assert_eq!(stored.access_token, "at-old");
+        assert_eq!(stored.refresh_token, "rt-old");
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_invalid_grant_clears_tokens_and_surfaces_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-dead".into(),
+                    token_expiry: chrono::Utc::now() - chrono::Duration::seconds(10),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        let token_url = spawn_token_endpoint(400, r#"{"error":"invalid_grant"}"#).await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        // Irrecoverable: tokens cleared, session dropped (authStatus →
+        // pending, UI shows Authorize), banner explains the recovery path.
+        assert!(state.token_store.load("fm").is_none());
+        let reg = state.accounts.read().await;
+        assert!(!reg.sessions.contains_key("fm"));
+        drop(reg);
+        let errors = state.account_errors.read().await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.account == "fm" && e.error.contains("Authorize")),
+            "expected a re-authorize banner, got {errors:?}"
+        );
+    }
 }

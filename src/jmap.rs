@@ -3545,6 +3545,35 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    // --- Fastmail OAuth session headers (kata ngzw) ---
+
+    #[test]
+    fn oauth_session_uses_one_bearer_for_jmap_and_caldav() {
+        // Fastmail's OAuth bearer is accepted at both api.fastmail.com and
+        // caldav.fastmail.com — one credential drives both protocols.
+        let s = JmapSession::new_oauth("u@fastmail.com", "oauth-tok-1");
+        assert_eq!(s.auth_header, "Bearer oauth-tok-1");
+        assert_eq!(s.caldav_auth_header, "Bearer oauth-tok-1");
+        assert_eq!(s.username, "u@fastmail.com");
+    }
+
+    #[test]
+    fn set_oauth_access_token_rotates_both_headers() {
+        let mut s = JmapSession::new_oauth("u@fastmail.com", "oauth-tok-1");
+        s.set_oauth_access_token("oauth-tok-2");
+        assert_eq!(s.auth_header, "Bearer oauth-tok-2");
+        assert_eq!(s.caldav_auth_header, "Bearer oauth-tok-2");
+    }
+
+    #[test]
+    fn api_token_session_still_uses_basic_for_caldav() {
+        // Legacy credential pair must keep working unchanged: api-token
+        // Bearer for JMAP, app-password Basic for CalDAV.
+        let s = JmapSession::new("u@fastmail.com", "api-tok", Some("app-pass"));
+        assert_eq!(s.auth_header, "Bearer api-tok");
+        assert!(s.caldav_auth_header.starts_with("Basic "));
+    }
+
     // --- find_calendar_blob_id tests ---
 
     #[test]
