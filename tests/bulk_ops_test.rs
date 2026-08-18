@@ -17,7 +17,9 @@ use std::process::Command;
 #[test]
 fn bulk_ops_behavior_tests_pass() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let test_js: PathBuf = [manifest_dir, "tests", "bulk_ops_test.cjs"].iter().collect();
+    let test_js: PathBuf = [manifest_dir, "tests", "bulk_ops_test.cjs"]
+        .iter()
+        .collect();
     assert!(
         test_js.exists(),
         "tests/bulk_ops_test.cjs must exist (next to this file)"
