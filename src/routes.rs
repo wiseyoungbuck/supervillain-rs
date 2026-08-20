@@ -142,7 +142,60 @@ pub fn compression_layer() -> tower_http::compression::CompressionLayer {
     CompressionLayer::new().gzip(true).no_br().no_deflate()
 }
 
+/// Header `tailscale serve` injects identifying the authenticated tailnet
+/// peer at the proxy hop (kata g926). HTTP header lookups are already
+/// case-insensitive by name; this constant is lowercase for readability
+/// only, not correctness.
+const TS_USER_LOGIN_HEADER: &str = "tailscale-user-login";
+
+/// True when the presented header satisfies `required`. `required` is the
+/// resolved `SUPERVILLAIN_REQUIRE_TS_USER` (`None` unless an operator opted
+/// in) — `None` always passes, so this whole gate is a no-op by default.
+///
+/// Honest caveat, stated once here and again in the README ("Serving over
+/// the tailnet (HTTPS)"): `Tailscale-User-Login` is trusted verbatim from
+/// the request headers. `tailscale serve` sets it for *proxied* tailnet
+/// peers, but any *local* process — anything that can already reach the
+/// loopback bind — can set the same header itself. This check therefore
+/// gates proxied tailnet peers, not local ones; local processes already have
+/// loopback access regardless of this check.
+fn ts_user_allowed(required: Option<&str>, header: Option<&str>) -> bool {
+    let Some(required) = required else {
+        return true;
+    };
+    match header {
+        Some(actual) => actual.eq_ignore_ascii_case(required),
+        None => false,
+    }
+}
+
+/// The single `middleware::from_fn_with_state` layer wiring `ts_user_allowed`
+/// into every request (kata g926) — see [`router`]. Replies with a short
+/// plain-text 403 rather than the JSON error envelope other routes use:
+/// this sits in front of the static asset routes too, so it can't assume a
+/// JSON-consuming client.
+async fn require_ts_user_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let header = req
+        .headers()
+        .get(TS_USER_LOGIN_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if ts_user_allowed(state.require_ts_user.as_deref(), header) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "Forbidden: Tailscale-User-Login mismatch\n",
+        )
+            .into_response()
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    let ts_gate_state = state.clone();
     Router::new()
         .merge(accounts::router())
         .route("/api/accounts", get(list_accounts))
@@ -250,6 +303,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/icon-180.png", get(icon_180))
         .route("/mobile/icon-192.png", get(icon_192))
         .route("/mobile/icon-512.png", get(icon_512))
+        // Wraps every route above, static assets included — see
+        // require_ts_user_middleware and the AppState field doc (kata g926).
+        .layer(axum::middleware::from_fn_with_state(
+            ts_gate_state,
+            require_ts_user_middleware,
+        ))
 }
 
 // Restrictive CSP for the app shell: defense-in-depth so that any future
@@ -4866,7 +4925,80 @@ mod tests {
             // A configured base so the send-path tests exercise injection;
             // sends without an html_body stay untracked either way.
             tracking_base: Some("https://track.example.com".into()),
+            // Off by default, like the real startup path when
+            // SUPERVILLAIN_REQUIRE_TS_USER is unset; individual tests opt in
+            // by overriding this field (see ts_user_* tests, kata g926).
+            require_ts_user: None,
         }
+    }
+
+    // ---- opt-in Tailscale identity gate (kata g926) ----
+    //
+    // Behavioral, at the HTTP boundary: build the real router with a state
+    // whose `require_ts_user` is set directly (no env var, no races — see
+    // main.rs's `require_ts_user` for the env → Option<String> resolution,
+    // covered by its own small test). `/api/build-id` is the target route:
+    // it needs no account/session setup and always 200s when reached, so a
+    // non-200 unambiguously means the gate fired.
+
+    fn ts_request(header: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri("/api/build-id");
+        if let Some(v) = header {
+            builder = builder.header("Tailscale-User-Login", v);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ts_gate_off_by_default_no_header_passes() {
+        let state = Arc::new(test_state(&[], ""));
+        let response = router(state).oneshot(ts_request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ts_gate_matching_header_passes() {
+        let mut s = test_state(&[], "");
+        s.require_ts_user = Some("alice@example.com".into());
+        let state = Arc::new(s);
+        let response = router(state)
+            .oneshot(ts_request(Some("alice@example.com")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ts_gate_missing_header_is_forbidden() {
+        let mut s = test_state(&[], "");
+        s.require_ts_user = Some("alice@example.com".into());
+        let state = Arc::new(s);
+        let response = router(state).oneshot(ts_request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ts_gate_wrong_login_is_forbidden() {
+        let mut s = test_state(&[], "");
+        s.require_ts_user = Some("alice@example.com".into());
+        let state = Arc::new(s);
+        let response = router(state)
+            .oneshot(ts_request(Some("mallory@example.com")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ts_gate_case_insensitive_match_passes() {
+        let mut s = test_state(&[], "");
+        s.require_ts_user = Some("alice@example.com".into());
+        let state = Arc::new(s);
+        let response = router(state)
+            .oneshot(ts_request(Some("Alice@Example.COM")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

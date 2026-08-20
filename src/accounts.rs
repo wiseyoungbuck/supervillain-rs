@@ -3076,6 +3076,7 @@ api-token = tok
                 std::env::temp_dir().join("supervillain-test-tracking.json"),
             ),
             tracking_base: None,
+            require_ts_user: None,
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -3256,6 +3257,7 @@ api-token = tok
                 std::env::temp_dir().join("supervillain-test-tracking.json"),
             ),
             tracking_base: None,
+            require_ts_user: None,
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -3586,6 +3588,7 @@ api-token = tok
                 std::env::temp_dir().join("supervillain-test-tracking.json"),
             ),
             tracking_base: None,
+            require_ts_user: None,
         })
     }
 
