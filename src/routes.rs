@@ -11291,6 +11291,72 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn attendee_resolution_matches_wildcard_identity_domain() {
+        // Fastmail models catch-all domains as wildcard identities — the
+        // live /api/identities returns "*@mattcoburn.ai", not an enumerable
+        // address list — so pattern entries must match any local part on
+        // that domain.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "anything@mattcoburn.ai"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "anything@mattcoburn.ai"]);
+        assert_eq!(
+            determine_attendee_email(
+                &email,
+                &event,
+                &user_addrs(&["matt.coburn@aristoi.ai", "*@mattcoburn.ai"]),
+            ),
+            "anything@mattcoburn.ai"
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_recognizes_wildcard_alias_invite() {
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "hello@mattgpt.ai"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com", "hello@mattgpt.ai"]);
+        event.attendees[0].status = "ACCEPTED".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@mattgpt.ai"]),
+            None,
+        );
+        assert!(
+            fields.is_invite_to_me,
+            "catch-all domain invite must be recognized as to-me"
+        );
+        assert_eq!(
+            fields.status.as_deref(),
+            Some("NEEDS-ACTION"),
+            "status must come from the wildcard-matched attendee, not the first guest"
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_must_not_match_other_domains_or_organizer() {
+        // "*@mattgpt.ai" must not swallow lookalike domains, and a wildcard
+        // in the list must not hide a genuinely foreign organizer's invite.
+        let email = test_email_with_recipients(vec!["me@mattgpt.ai"], vec![]);
+        let event = test_calendar_event(vec!["me@mattgpt.ai"]);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@notmattgpt.ai"]),
+            None,
+        );
+        // me@mattgpt.ai is NOT covered by *@notmattgpt.ai: resolution falls
+        // through to the historical single-recipient alias heuristic.
+        let resolution = attendee_email_for_event(
+            &email,
+            &event,
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@notmattgpt.ai"]),
+        )
+        .expect("recipient attendee still resolves via the alias heuristic");
+        assert_eq!(resolution.email, "me@mattgpt.ai");
+        assert!(fields.is_invite_to_me, "single-alias heuristic unchanged");
+    }
+
+    #[test]
     fn invite_list_fields_hide_request_organized_by_users_alias() {
         // A REQUEST the user organized from an alias identity must not offer
         // RSVP buttons back to themselves.
