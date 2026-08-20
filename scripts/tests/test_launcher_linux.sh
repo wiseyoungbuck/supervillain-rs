@@ -6,6 +6,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+ORIG_PATH="$PATH"
 
 setup() {
     TMP="$(mktemp -d)"
@@ -19,10 +20,24 @@ printf 'xdg-open %s\n' "$@" > "$LAUNCH_ARGS_FILE"
 STUB
     chmod +x "$BIN/xdg-open"
 
-    # Scope PATH to the stub bin plus a minimal system path so command -v
-    # lookups don't find the host's real omarchy-launch-or-focus-webapp or
-    # xdg-open when a stub for either is intentionally absent.
-    export PATH="$BIN:/usr/bin:/bin"
+    # Scope PATH to the stub bin plus symlinks to the few real tools the
+    # test needs, so command -v can't find the host's real
+    # omarchy-launch-or-focus-webapp or xdg-open when a stub for either is
+    # intentionally absent. /usr/bin must NOT be on this PATH: Omarchy 4.0
+    # packages every omarchy-* binary there, and finding the real webapp
+    # launcher opens an actual browser that inherits our pipes and hangs
+    # `cargo test` (scripts_test) until the browser exits.
+    # Load-bearing allowlist: any external command a test body or the
+    # sourced launcher runs before its SOURCE_ONLY short-circuit must be
+    # added here, or it fails with a bare "command not found". Tools used
+    # only while PATH is unrestricted (mktemp, ln in setup; everything in
+    # teardown after the ORIG_PATH restore) don't need entries.
+    local sysbin="$TMP/sysbin" tool
+    mkdir -p "$sysbin"
+    for tool in bash cat chmod mkdir rm; do
+        ln -s "$(command -v "$tool")" "$sysbin/$tool"
+    done
+    export PATH="$BIN:$sysbin"
     export LAUNCH_ARGS_FILE="$TMP/launch_args"
     export HOME="$TMP/home"
     mkdir -p "$HOME"
@@ -32,8 +47,12 @@ STUB
 }
 
 teardown() {
-    rm -rf "$TMP"
+    export PATH="$ORIG_PATH"
+    [[ -z "${TMP:-}" ]] || rm -rf "$TMP"
 }
+# run_test tears down per test; this trap covers a set -e abort mid-test,
+# so PATH is restored and $TMP removed even then (roborev 530).
+trap teardown EXIT
 
 install_omarchy_stub() {
     cat > "$BIN/omarchy-launch-or-focus-webapp" <<'STUB'

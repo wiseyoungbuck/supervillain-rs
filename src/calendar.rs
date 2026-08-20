@@ -1,11 +1,18 @@
 use crate::types::{Attendee, CalendarEvent, RsvpStatus};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
 
-static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
+// Anchored to the `;` parameter delimiter so vendor lookalikes such as
+// X-PARTSTAT never satisfy the replace path (roborev 537 #1) — on an
+// ATTENDEE line the real PARTSTAT param always follows a `;`. RFC 5545
+// names are case-insensitive (roborev 538 #1), hence `(?i)`.
+static PARTSTAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i);PARTSTAT=\w[\w-]*").unwrap());
 
 /// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
 /// STORED DESCRIPTION we didn't expect to be HTML (see
@@ -861,22 +868,70 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
     let raw_ics = unfold_lines(raw_ics);
     let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
     let email_lower = attendee_email.to_lowercase();
+    // The address must be the property VALUE — everything after the first
+    // colon outside double quotes — not a substring anywhere on the line
+    // (roborev 537 #2, 538 #2): a bare `contains` also hits attendees whose
+    // address merely starts with this one (matt@x.ai vs
+    // matt@x.ai.example.com) and the user's address quoted inside another
+    // attendee's DELEGATED-FROM/SENT-BY param. The value must end at the
+    // line end or a non-address character.
+    let needle = format!("mailto:{email_lower}");
+    let value_is_attendee = |trimmed: &str| {
+        let mut in_quotes = false;
+        let mut value_start = None;
+        for (index, c) in trimmed.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                ':' if !in_quotes => {
+                    value_start = Some(index + 1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(start) = value_start else {
+            return false;
+        };
+        let value = trimmed[start..].to_lowercase();
+        let Some(rest) = value.strip_prefix(&needle) else {
+            return false;
+        };
+        match rest.chars().next() {
+            None => true,
+            Some(next) => !next.is_ascii_alphanumeric() && !matches!(next, '.' | '-' | '_'),
+        }
+    };
 
     // Split on \n but preserve \r if present to keep original line endings
     raw_ics
         .split('\n')
         .map(|line| {
             let trimmed = line.trim_end_matches('\r');
-            if trimmed.starts_with("ATTENDEE")
+            // RFC 5545 names are case-insensitive (roborev 538 #1): match the
+            // property name without assuming casing, and keep the original
+            // name bytes when inserting.
+            let is_attendee_prop = trimmed.is_char_boundary(8)
                 && trimmed
-                    .to_lowercase()
-                    .contains(&format!("mailto:{email_lower}"))
+                    .get(..8)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"));
+            if is_attendee_prop
+                && (trimmed[8..].starts_with(';') || trimmed[8..].starts_with(':'))
+                && value_is_attendee(trimmed)
             {
-                let updated = PARTSTAT_RE.replace(trimmed, new_partstat.as_str());
+                let updated = if PARTSTAT_RE.is_match(trimmed) {
+                    PARTSTAT_RE
+                        .replace(trimmed, format!(";{new_partstat}"))
+                        .into_owned()
+                } else {
+                    // RFC 5545 §3.2.12: no PARTSTAT param means NEEDS-ACTION,
+                    // and real invites do omit it — a replace-only update
+                    // would silently drop the RSVP from the stored copy.
+                    format!("{};{new_partstat}{}", &trimmed[..8], &trimmed[8..])
+                };
                 if line.ends_with('\r') {
                     format!("{updated}\r")
                 } else {
-                    updated.to_string()
+                    updated
                 }
             } else {
                 line.to_string()
@@ -1263,6 +1318,634 @@ pub fn strip_method(ics: &str) -> String {
 // =============================================================================
 // Tests
 // =============================================================================
+
+// =============================================================================
+// Range events (kata j6e4)
+// =============================================================================
+
+/// One normalized event occurrence inside a queried time range — the wire
+/// shape the day/week peek view renders. Unlike [`CalendarEvent`] (a parsed
+/// iTIP invitation), a `RangeEvent` is an *occurrence*: a recurring VEVENT
+/// expands to one `RangeEvent` per instance that overlaps the window.
+///
+/// All-day occurrences (`all_day: true`) carry their DATE values as midnight
+/// UTC (matching `parse_ics_datetime_property`'s DATE handling); the client
+/// renders them as dates, not instants. `account` is filled by the route
+/// handler — the parser leaves it empty.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeEvent {
+    pub uid: String,
+    pub summary: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub all_day: bool,
+    pub location: Option<String>,
+    pub account: String,
+}
+
+/// Parse a set of raw ICS calendar objects (one CalDAV resource each — a
+/// resource may hold several VEVENTs: a recurrence master plus
+/// RECURRENCE-ID overrides) and return every occurrence overlapping
+/// `[range_start, range_end)`, sorted by start time.
+///
+/// Overlap uses CalDAV time-range semantics (RFC 4791 §9.9): an occurrence
+/// matches when `start < range_end && end > range_start`, or — for
+/// zero-length occurrences — `start` lies within the window.
+///
+/// Recurrence support is deliberately scoped to the simple RRULEs real
+/// invites use: FREQ=DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, COUNT,
+/// UNTIL, BYDAY (weekly only), plus EXDATE and RECURRENCE-ID overrides.
+/// Out of scope (occurrences from such rules follow the plain FREQ cycle or
+/// are dropped): RDATE, BYSETPOS, BYMONTH/BYMONTHDAY/BYYEARDAY modifiers,
+/// the DURATION property, and WKST. Timed expansions iterate in
+/// `primary_tz` wall-clock so a weekly 09:00 meeting stays 09:00 across
+/// the user's DST transitions; MONTHLY pins DTSTART's day-of-month and
+/// skips months without it; YEARLY pins month+day.
+pub fn events_in_range(
+    ics_objects: &[String],
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+    primary_tz: Tz,
+) -> Vec<RangeEvent> {
+    let mut masters: Vec<RangeVevent> = Vec::new();
+    let mut overrides: Vec<RangeVevent> = Vec::new();
+    for obj in ics_objects {
+        let data = obj.trim();
+        if !data.contains("BEGIN:VCALENDAR") {
+            continue;
+        }
+        let tz_offsets = parse_vtimezone_offsets(data);
+        for block in vevent_blocks(data) {
+            let Some(ev) = parse_range_vevent(block, &tz_offsets, primary_tz) else {
+                continue;
+            };
+            if ev.recurrence_id.is_some() {
+                overrides.push(ev);
+            } else {
+                masters.push(ev);
+            }
+        }
+    }
+
+    // An override VEVENT (same UID + RECURRENCE-ID) replaces the master's
+    // occurrence at the RECURRENCE-ID instant — suppress that instant here,
+    // emit the override's own DTSTART below.
+    let suppressed: BTreeSet<(&str, DateTime<Utc>)> = overrides
+        .iter()
+        .filter_map(|o| o.recurrence_id.map(|r| (o.uid.as_str(), r)))
+        .collect();
+
+    let mut out: Vec<RangeEvent> = Vec::new();
+    for ev in &masters {
+        if ev.cancelled {
+            continue;
+        }
+        let duration = range_event_duration(ev);
+        let starts = match &ev.rrule {
+            Some(rule) => expand_rule_starts(ev, rule, range_end, primary_tz),
+            None => vec![ev.dtstart],
+        };
+        for s in starts {
+            if suppressed.contains(&(ev.uid.as_str(), s)) || ev.exdates.contains(&s) {
+                continue;
+            }
+            push_if_overlapping(&mut out, ev, s, s + duration, range_start, range_end);
+        }
+    }
+    for ov in &overrides {
+        if ov.cancelled {
+            continue;
+        }
+        let duration = range_event_duration(ov);
+        push_if_overlapping(
+            &mut out,
+            ov,
+            ov.dtstart,
+            ov.dtstart + duration,
+            range_start,
+            range_end,
+        );
+    }
+    out.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.cmp(&b.uid)));
+    out
+}
+
+/// A VEVENT as parsed for range queries — just enough structure to expand
+/// occurrences. `dtstart`/`dtend` are resolved instants; `all_day` mirrors
+/// DTSTART's VALUE=DATE flag.
+struct RangeVevent {
+    uid: String,
+    summary: String,
+    location: Option<String>,
+    dtstart: DateTime<Utc>,
+    dtend: Option<DateTime<Utc>>,
+    all_day: bool,
+    rrule: Option<Rrule>,
+    exdates: Vec<DateTime<Utc>>,
+    recurrence_id: Option<DateTime<Utc>>,
+    cancelled: bool,
+}
+
+enum RruleFreq {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+struct Rrule {
+    freq: RruleFreq,
+    interval: u32,
+    count: Option<u32>,
+    until: Option<DateTime<Utc>>,
+    /// Weekly BYDAY weekdays, sorted Monday-first so per-cycle candidates
+    /// ascend. Empty = recur on DTSTART's weekday.
+    byday: Vec<chrono::Weekday>,
+}
+
+/// Recurrence-cycle cap: ~54 years of a daily rule. An event recurring since
+/// long before the window truncates there rather than looping unbounded on a
+/// pathological rule; real calendars sit far under this.
+const MAX_EXPANSION_CYCLES: i64 = 20_000;
+
+fn range_event_duration(ev: &RangeVevent) -> chrono::Duration {
+    match ev.dtend {
+        Some(e) => e - ev.dtstart,
+        // RFC 5545 §3.6.1: DTSTART DATE with no DTEND spans one day;
+        // a timed event with no DTEND has zero duration.
+        None if ev.all_day => chrono::Duration::days(1),
+        None => chrono::Duration::zero(),
+    }
+}
+
+/// CalDAV time-range overlap (RFC 4791 §9.9): half-open window, with the
+/// zero-length special case included when its instant lies in the window.
+fn range_overlaps(
+    s: DateTime<Utc>,
+    e: DateTime<Utc>,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> bool {
+    if s == e {
+        s >= range_start && s < range_end
+    } else {
+        s < range_end && e > range_start
+    }
+}
+
+fn push_if_overlapping(
+    out: &mut Vec<RangeEvent>,
+    ev: &RangeVevent,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) {
+    if !range_overlaps(start, end, range_start, range_end) {
+        return;
+    }
+    out.push(RangeEvent {
+        uid: ev.uid.clone(),
+        summary: ev.summary.clone(),
+        start,
+        end,
+        all_day: ev.all_day,
+        location: ev.location.clone(),
+        account: String::new(),
+    });
+}
+
+/// Successive `BEGIN:VEVENT … END:VEVENT` blocks. Same anchored-END scoping
+/// as `parse_ics` (kata 4ycd): each END search starts after its BEGIN.
+fn vevent_blocks(data: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut rest = data;
+    while let Some(start) = rest.find("BEGIN:VEVENT") {
+        let after = &rest[start..];
+        let Some(end) = after.find("END:VEVENT") else {
+            break;
+        };
+        let end = end + "END:VEVENT".len();
+        blocks.push(&after[..end]);
+        rest = &after[end..];
+    }
+    blocks
+}
+
+/// Whether property `name` in the unfolded VEVENT text carries a DATE (not
+/// DATE-TIME) value — the same detection `parse_ics_datetime_property` uses.
+fn property_is_date_only(text: &str, name: &str) -> bool {
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        let (params, value) = if let Some(v) = rest.strip_prefix(':') {
+            ("", v)
+        } else if rest.starts_with(';') {
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
+            (&rest[1..colon], &rest[colon + 1..])
+        } else {
+            continue;
+        };
+        let date_only = (params.contains("VALUE=DATE") && !params.contains("VALUE=DATE-TIME"))
+            || value.trim().len() == 8;
+        return date_only;
+    }
+    false
+}
+
+/// Every EXDATE instant in the VEVENT. EXDATE may repeat and each line may
+/// carry several comma-separated values; each value is re-wrapped as a
+/// single-value property line so TZID/UTC/floating/DATE resolution stays in
+/// `parse_ics_datetime_property`.
+fn parse_exdates(
+    unfolded: &str,
+    tz_offsets: &HashMap<String, FixedOffset>,
+    primary_tz: Tz,
+) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    for line in unfolded.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix("EXDATE") else {
+            continue;
+        };
+        let (params, values) = if let Some(v) = rest.strip_prefix(':') {
+            ("", v)
+        } else if rest.starts_with(';') {
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
+            (&rest[1..colon], &rest[colon + 1..])
+        } else {
+            continue;
+        };
+        for value in values.split(',') {
+            let synth = if params.is_empty() {
+                format!("EXDATE:{value}")
+            } else {
+                format!("EXDATE;{params}:{value}")
+            };
+            if let Some(dt) = parse_ics_datetime_property(&synth, "EXDATE", tz_offsets, primary_tz)
+            {
+                out.push(dt);
+            }
+        }
+    }
+    out
+}
+
+fn parse_range_vevent(
+    block: &str,
+    tz_offsets: &HashMap<String, FixedOffset>,
+    primary_tz: Tz,
+) -> Option<RangeVevent> {
+    let unfolded = unfold_lines(block);
+    let uid = extract_property(&unfolded, "UID")?;
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", tz_offsets, primary_tz)?;
+    Some(RangeVevent {
+        uid,
+        summary: extract_property(&unfolded, "SUMMARY").unwrap_or_default(),
+        location: extract_property(&unfolded, "LOCATION"),
+        dtstart,
+        dtend: parse_ics_datetime_property(&unfolded, "DTEND", tz_offsets, primary_tz),
+        all_day: property_is_date_only(&unfolded, "DTSTART"),
+        rrule: extract_property(&unfolded, "RRULE").and_then(|v| parse_rrule(&v, primary_tz)),
+        exdates: parse_exdates(&unfolded, tz_offsets, primary_tz),
+        recurrence_id: parse_ics_datetime_property(
+            &unfolded,
+            "RECURRENCE-ID",
+            tz_offsets,
+            primary_tz,
+        ),
+        cancelled: extract_property(&unfolded, "STATUS").as_deref() == Some("CANCELLED"),
+    })
+}
+
+fn parse_rrule_weekday(s: &str) -> Option<chrono::Weekday> {
+    // Ordinal-prefixed BYDAY entries ("2MO") are out of scope — dropped, not
+    // misread as plain weekdays.
+    match s.trim() {
+        "MO" => Some(chrono::Weekday::Mon),
+        "TU" => Some(chrono::Weekday::Tue),
+        "WE" => Some(chrono::Weekday::Wed),
+        "TH" => Some(chrono::Weekday::Thu),
+        "FR" => Some(chrono::Weekday::Fri),
+        "SA" => Some(chrono::Weekday::Sat),
+        "SU" => Some(chrono::Weekday::Sun),
+        _ => None,
+    }
+}
+
+/// UNTIL is inclusive (RFC 5545 §3.3.10). A DATE value covers its whole day;
+/// a DATE-TIME is UTC when `Z`-suffixed, else interpreted in `primary_tz`
+/// (matching the floating-time policy of `parse_ics_datetime_property`).
+fn parse_rrule_until(v: &str, primary_tz: Tz) -> Option<DateTime<Utc>> {
+    let v = v.trim();
+    if v.len() == 8 {
+        let date = NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;
+        let dt = NaiveDateTime::new(date, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+    if let Some(stripped) = v.strip_suffix('Z') {
+        let dt = NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S").ok()?;
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+    let dt = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
+    Some(resolve_local_datetime_lenient(&primary_tz, dt)?.with_timezone(&Utc))
+}
+
+/// Parse an RRULE value into the supported subset. `None` for unsupported
+/// FREQ values (SECONDLY/MINUTELY/HOURLY) — the event then contributes only
+/// its DTSTART occurrence, never a wrong expansion. Unsupported modifiers
+/// (BYSETPOS, BYMONTH, RDATE lives elsewhere, …) are ignored; see
+/// [`events_in_range`] for the documented scope.
+fn parse_rrule(value: &str, primary_tz: Tz) -> Option<Rrule> {
+    let mut freq = None;
+    let mut interval = 1u32;
+    let mut count = None;
+    let mut until = None;
+    let mut byday: Vec<chrono::Weekday> = Vec::new();
+    for part in value.split(';') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        match k.trim().to_ascii_uppercase().as_str() {
+            "FREQ" => {
+                freq = match v.trim().to_ascii_uppercase().as_str() {
+                    "DAILY" => Some(RruleFreq::Daily),
+                    "WEEKLY" => Some(RruleFreq::Weekly),
+                    "MONTHLY" => Some(RruleFreq::Monthly),
+                    "YEARLY" => Some(RruleFreq::Yearly),
+                    _ => return None,
+                }
+            }
+            "INTERVAL" => interval = v.trim().parse().unwrap_or(1),
+            "COUNT" => count = v.trim().parse().ok(),
+            "UNTIL" => until = parse_rrule_until(v, primary_tz),
+            "BYDAY" => byday = v.split(',').filter_map(parse_rrule_weekday).collect(),
+            _ => {}
+        }
+    }
+    byday.sort_by_key(|w| w.num_days_from_monday());
+    byday.dedup();
+    freq.map(|freq| Rrule {
+        freq,
+        interval,
+        count,
+        until,
+        byday,
+    })
+}
+
+/// Candidate wall-clock starts for recurrence cycle `k` (already multiplied
+/// by INTERVAL), ascending. Monthly/yearly may yield none when the pinned
+/// day doesn't exist in the cycle's month (Jan 31 → February); skipped
+/// cycles produce no occurrence and consume no COUNT (RFC 5545 §3.8.5.3).
+fn cycle_candidates(base: NaiveDateTime, rule: &Rrule, offset: i64) -> Vec<NaiveDateTime> {
+    match rule.freq {
+        RruleFreq::Daily => vec![base + chrono::Duration::days(offset)],
+        RruleFreq::Weekly if rule.byday.is_empty() => {
+            vec![base + chrono::Duration::weeks(offset)]
+        }
+        RruleFreq::Weekly => {
+            let monday = base.date()
+                - chrono::Duration::days(base.date().weekday().num_days_from_monday() as i64);
+            let week = monday + chrono::Duration::weeks(offset);
+            rule.byday
+                .iter()
+                .map(|wd| {
+                    (week + chrono::Duration::days(wd.num_days_from_monday() as i64))
+                        .and_time(base.time())
+                })
+                .collect()
+        }
+        RruleFreq::Monthly => {
+            let months = base.date().year() as i64 * 12 + base.date().month0() as i64 + offset;
+            NaiveDate::from_ymd_opt(
+                (months.div_euclid(12)) as i32,
+                months.rem_euclid(12) as u32 + 1,
+                base.date().day(),
+            )
+            .map(|d| d.and_time(base.time()))
+            .into_iter()
+            .collect()
+        }
+        RruleFreq::Yearly => NaiveDate::from_ymd_opt(
+            base.date().year() + offset as i32,
+            base.date().month(),
+            base.date().day(),
+        )
+        .map(|d| d.and_time(base.time()))
+        .into_iter()
+        .collect(),
+    }
+}
+
+/// Expand a rule into ascending occurrence starts from DTSTART up to (not
+/// including) `range_end`, honoring COUNT and UNTIL. Occurrences before the
+/// query window are generated too — they consume COUNT, and a long
+/// occurrence starting before the window can still overlap it; the caller
+/// filters by overlap.
+///
+/// Timed rules iterate in `primary_tz` wall-clock (a weekly 09:00 stays
+/// 09:00 across the user's DST changes); all-day rules iterate in date
+/// space on their midnight-UTC anchors.
+fn expand_rule_starts(
+    ev: &RangeVevent,
+    rule: &Rrule,
+    range_end: DateTime<Utc>,
+    primary_tz: Tz,
+) -> Vec<DateTime<Utc>> {
+    let base_wall = if ev.all_day {
+        ev.dtstart.naive_utc()
+    } else {
+        ev.dtstart.with_timezone(&primary_tz).naive_local()
+    };
+    let to_utc = |naive: NaiveDateTime| -> Option<DateTime<Utc>> {
+        if ev.all_day {
+            Some(DateTime::from_naive_utc_and_offset(naive, Utc))
+        } else {
+            resolve_local_datetime_lenient(&primary_tz, naive).map(|d| d.with_timezone(&Utc))
+        }
+    };
+
+    let interval = rule.interval.max(1) as i64;
+    let mut out = Vec::new();
+    let mut produced: u32 = 0;
+    for k in 0..MAX_EXPANSION_CYCLES {
+        for cand in cycle_candidates(base_wall, rule, k * interval) {
+            if cand < base_wall {
+                continue;
+            }
+            let Some(utc) = to_utc(cand) else { continue };
+            if rule.until.is_some_and(|until| utc > until) || utc >= range_end {
+                return out;
+            }
+            out.push(utc);
+            produced += 1;
+            if rule.count.is_some_and(|c| produced >= c) {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+// =============================================================================
+// Free-slot computation (kata mtqp)
+// =============================================================================
+
+/// One shareable free slot, `[start, end)` in UTC. Serialized camelCase for
+/// the client (compose-side "Share Availability" insertion, later wave).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeSlot {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// Constraints for [`free_slots`]. Working hours are wall-clock times in the
+/// user's primary timezone, applied to every day of the window (weekday
+/// filtering, if wanted, is the caller's window to shape).
+#[derive(Debug, Clone)]
+pub struct FreeSlotOptions {
+    /// Exact length of every emitted slot, in minutes. `0` yields no slots.
+    pub slot_minutes: u32,
+    /// Padding added before and after every busy block, in minutes.
+    pub buffer_minutes: u32,
+    /// Daily availability start (primary-timezone wall clock).
+    pub work_start: NaiveTime,
+    /// Daily availability end (exclusive). Must be after `work_start`; days
+    /// where it isn't produce nothing.
+    pub work_end: NaiveTime,
+}
+
+/// Compute free slots in `[window_start, window_end)` given busy occurrences
+/// (the [`events_in_range`] output) and constraints. Pure: no network, no
+/// clock reads — past slots are the caller's to trim.
+///
+/// Semantics: busy blocks are padded by `buffer_minutes` and merged; all-day
+/// occurrences (midnight-UTC date anchors) block their full *local* days in
+/// `primary_tz`. What remains of each day's working hours inside the window
+/// is chopped into consecutive `slot_minutes` slots from the start of each
+/// free gap; remainders shorter than a slot are dropped. Slots are returned
+/// sorted and non-overlapping.
+pub fn free_slots(
+    busy: &[RangeEvent],
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    primary_tz: Tz,
+    opts: &FreeSlotOptions,
+) -> Vec<FreeSlot> {
+    if opts.slot_minutes == 0 || opts.work_end <= opts.work_start || window_end <= window_start {
+        return Vec::new();
+    }
+    let slot_len = chrono::Duration::minutes(opts.slot_minutes as i64);
+    let buffer = chrono::Duration::minutes(opts.buffer_minutes as i64);
+    let local_midnight = |d: NaiveDate| -> Option<DateTime<Utc>> {
+        resolve_local_datetime_lenient(&primary_tz, d.and_time(NaiveTime::MIN))
+            .map(|x| x.with_timezone(&Utc))
+    };
+
+    // Busy intervals in UTC, buffered; all-day anchors (naive dates at
+    // midnight UTC) become the *local* day(s) they actually block.
+    let mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = busy
+        .iter()
+        .filter_map(|e| {
+            let (s, end) = if e.all_day {
+                let first = e.start.naive_utc().date();
+                let mut last = e.end.naive_utc().date();
+                if last <= first {
+                    last = first + chrono::Duration::days(1);
+                }
+                (local_midnight(first)?, local_midnight(last)?)
+            } else {
+                (e.start, e.end.max(e.start))
+            };
+            let (s, end) = (s - buffer, end + buffer);
+            (end > window_start && s < window_end).then_some((s, end))
+        })
+        .collect();
+    intervals.sort_by_key(|iv| iv.0);
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    for iv in intervals {
+        match merged.last_mut() {
+            Some(last) if iv.0 <= last.1 => last.1 = last.1.max(iv.1),
+            _ => merged.push(iv),
+        }
+    }
+
+    // Per local day: working hours ∩ window, minus merged busy, chopped
+    // into slots.
+    let mut out = Vec::new();
+    let first_day = window_start.with_timezone(&primary_tz).date_naive();
+    let last_day = window_end.with_timezone(&primary_tz).date_naive();
+    let mut day = first_day;
+    while day <= last_day {
+        let seg = resolve_local_datetime_lenient(&primary_tz, day.and_time(opts.work_start))
+            .zip(resolve_local_datetime_lenient(
+                &primary_tz,
+                day.and_time(opts.work_end),
+            ))
+            .map(|(s, e)| {
+                (
+                    s.with_timezone(&Utc).max(window_start),
+                    e.with_timezone(&Utc).min(window_end),
+                )
+            });
+        if let Some((seg_start, seg_end)) = seg
+            && seg_end > seg_start
+        {
+            emit_segment_slots(&mut out, seg_start, seg_end, &merged, slot_len);
+        }
+        day += chrono::Duration::days(1);
+    }
+    out
+}
+
+/// Chop the free gaps of one working segment (busy intervals subtracted)
+/// into consecutive `slot_len` slots. `merged` is sorted and disjoint, so
+/// gaps come out in order.
+fn emit_segment_slots(
+    out: &mut Vec<FreeSlot>,
+    seg_start: DateTime<Utc>,
+    seg_end: DateTime<Utc>,
+    merged: &[(DateTime<Utc>, DateTime<Utc>)],
+    slot_len: chrono::Duration,
+) {
+    let mut cursor = seg_start;
+    let idx = merged.partition_point(|iv| iv.1 <= seg_start);
+    for iv in &merged[idx..] {
+        if iv.0 >= seg_end {
+            break;
+        }
+        emit_gap_slots(out, cursor, iv.0.min(seg_end), slot_len);
+        cursor = cursor.max(iv.1);
+        if cursor >= seg_end {
+            return;
+        }
+    }
+    emit_gap_slots(out, cursor, seg_end, slot_len);
+}
+
+fn emit_gap_slots(
+    out: &mut Vec<FreeSlot>,
+    mut start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    slot_len: chrono::Duration,
+) {
+    while start + slot_len <= end {
+        out.push(FreeSlot {
+            start,
+            end: start + slot_len,
+        });
+        start += slot_len;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2027,6 +2710,160 @@ END:VCALENDAR";
                 );
             }
         }
+    }
+
+    #[test]
+    fn update_partstat_inserts_param_when_attendee_line_has_none() {
+        // RFC 5545 §3.2.12: an ATTENDEE with no PARTSTAT param defaults to
+        // NEEDS-ACTION, and real-world invites do omit it. A replace-only
+        // update silently no-ops on such a line, so the RSVP never reaches
+        // the stored calendar copy — the "Maybe doesn't update my calendar"
+        // symptom with nothing in the logs.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n\
+                   ATTENDEE;CN=Matt;RSVP=TRUE:mailto:matt@mattcoburn.ai\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("PARTSTAT=TENTATIVE"),
+            "PARTSTAT must be inserted when the invite omitted it: {line}"
+        );
+        assert!(
+            line.contains("CN=Matt") && line.contains("RSVP=TRUE"),
+            "existing params must survive the insertion: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_insertion_only_touches_attendee_properties() {
+        // The insertion path must not fire on non-ATTENDEE lines that happen
+        // to mention the address (ORGANIZER, X-props, DESCRIPTION).
+        let ics = "ORGANIZER:mailto:matt@mattgpt.ai\r\n\
+                   DESCRIPTION:contact mailto:matt@mattgpt.ai\r\n\
+                   ATTENDEE:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("ORGANIZER:mailto:matt@mattgpt.ai"),
+            "ORGANIZER must be untouched: {result}"
+        );
+        assert!(
+            result.contains("DESCRIPTION:contact mailto:matt@mattgpt.ai"),
+            "DESCRIPTION must be untouched: {result}"
+        );
+        assert!(
+            result.contains("ATTENDEE;PARTSTAT=TENTATIVE:mailto:matt@mattgpt.ai"),
+            "the bare ATTENDEE must gain the param: {result}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_ignores_x_partstat_lookalike_param() {
+        // roborev 537 #1: an unanchored PARTSTAT match rewrites vendor
+        // params like X-PARTSTAT and then skips the insertion branch — the
+        // line ends up with no real PARTSTAT at all.
+        let ics = "ATTENDEE;X-PARTSTAT=FOO:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("X-PARTSTAT=FOO"),
+            "the vendor param must be untouched: {line}"
+        );
+        assert!(
+            line.contains(";PARTSTAT=TENTATIVE"),
+            "a real PARTSTAT param must be inserted alongside it: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_requires_full_address_match_not_prefix() {
+        // roborev 537 #2: a bare substring check lets one attendee's address
+        // that prefixes another's update both lines.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai.example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        let longer = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattgpt.ai.example.com"))
+            .expect("prefix-colliding line must survive");
+        assert!(
+            longer.contains("PARTSTAT=NEEDS-ACTION"),
+            "the prefix-colliding attendee must be untouched: {longer}"
+        );
+        let exact = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattgpt.ai"))
+            .expect("exact line must survive");
+        assert!(
+            exact.contains("PARTSTAT=TENTATIVE"),
+            "the exact attendee must be updated: {exact}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_replaces_lowercase_param_without_doubling() {
+        // roborev 538 #1: RFC 5545 names are case-insensitive. A lowercase
+        // `partstat=` must be replaced — not left in place while a second,
+        // conflicting PARTSTAT gets inserted (invalid ICS).
+        let ics = "attendee;partstat=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.to_lowercase().contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert_eq!(
+            line.to_uppercase().matches("PARTSTAT=").count(),
+            1,
+            "exactly one PARTSTAT param — never a conflicting pair: {line}"
+        );
+        assert!(
+            line.to_uppercase().contains("PARTSTAT=TENTATIVE"),
+            "the lowercase param must be updated: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_ignores_address_inside_quoted_param_value() {
+        // roborev 538 #2: the user's address appearing in another attendee's
+        // DELEGATED-FROM/SENT-BY quoted param must not rewrite that line —
+        // only the line whose VALUE is the user's mailto.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:matt@mattcoburn.ai\":mailto:delegate@example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let delegate = result
+            .lines()
+            .find(|l| l.contains("mailto:delegate@example.com"))
+            .expect("delegate line must survive");
+        assert!(
+            delegate.contains("PARTSTAT=NEEDS-ACTION"),
+            "the delegate's own PARTSTAT must be untouched: {delegate}"
+        );
+        let own = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattcoburn.ai"))
+            .expect("own line must survive");
+        assert!(
+            own.contains("PARTSTAT=TENTATIVE"),
+            "the user's own line must be updated: {own}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_matches_alias_domain_attendee_case_insensitively() {
+        // Invites addressed to a Fastmail-managed alias domain arrive with
+        // whatever casing the organizer's client used; the swap must still
+        // find the line.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:Matt@MattGPT.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("PARTSTAT=TENTATIVE"),
+            "alias attendee must be updated regardless of casing: {result}"
+        );
     }
 
     #[test]
@@ -3635,5 +4472,428 @@ END:VCALENDAR";
                 "smuggled mailto must not become a standalone ATTENDEE line"
             );
         }
+    }
+
+    // --- events_in_range (kata j6e4) ---
+
+    const RANGE_MIXED: &str = include_str!("../tests/fixtures/range_mixed.ics");
+    const RANGE_RECURRING: &str = include_str!("../tests/fixtures/range_recurring.ics");
+    const RANGE_DAILY: &str = include_str!("../tests/fixtures/range_daily.ics");
+    const RANGE_ALLDAY_WEEKLY: &str = include_str!("../tests/fixtures/range_allday_weekly.ics");
+
+    fn range_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// The fixtures' query window: Mon 2026-08-17 .. Mon 2026-08-24 (UTC).
+    fn week_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        (range_utc(2026, 8, 17, 0, 0), range_utc(2026, 8, 24, 0, 0))
+    }
+
+    #[test]
+    fn range_mixed_fixture_filters_and_sorts() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_MIXED.to_string()], start, end, chrono_tz::UTC);
+        let uids: Vec<&str> = events.iter().map(|e| e.uid.as_str()).collect();
+        // Out-of-window and STATUS:CANCELLED events are excluded; the event
+        // straddling the window start is included; results sort by start.
+        assert_eq!(
+            uids,
+            ["straddle-1@fixture", "timed-1@fixture", "allday-1@fixture"],
+            "{events:?}"
+        );
+        assert_eq!(events[0].start, range_utc(2026, 8, 16, 23, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 17, 1, 0));
+        let timed = &events[1];
+        assert!(!timed.all_day);
+        assert_eq!(timed.summary, "Standup review");
+        assert_eq!(timed.location.as_deref(), Some("Room 1"));
+        assert_eq!(timed.start, range_utc(2026, 8, 19, 10, 0));
+        assert_eq!(timed.end, range_utc(2026, 8, 19, 11, 0));
+        let allday = &events[2];
+        assert!(allday.all_day);
+        assert_eq!(allday.start, range_utc(2026, 8, 20, 0, 0));
+        assert_eq!(allday.end, range_utc(2026, 8, 21, 0, 0));
+    }
+
+    #[test]
+    fn range_daily_count_rule_counts_pre_window_occurrences() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_DAILY.to_string()], start, end, chrono_tz::UTC);
+        // FREQ=DAILY;COUNT=5 from Aug 15: occurrences 15–19; the two before
+        // the window still consume COUNT, so the window sees 17, 18, 19.
+        let starts: Vec<_> = events.iter().map(|e| e.start).collect();
+        assert_eq!(
+            starts,
+            [
+                range_utc(2026, 8, 17, 8, 0),
+                range_utc(2026, 8, 18, 8, 0),
+                range_utc(2026, 8, 19, 8, 0),
+            ],
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.uid == "daily-1@fixture" && !e.all_day)
+        );
+        assert_eq!(events[0].end, range_utc(2026, 8, 17, 8, 30));
+    }
+
+    #[test]
+    fn range_weekly_byday_exdate_and_override() {
+        let (start, end) = week_window();
+        let events = events_in_range(&[RANGE_RECURRING.to_string()], start, end, chrono_tz::UTC);
+        // MO,WE weekly at 09:00 Europe/London (08:00 UTC in August): the
+        // Wed 19th instance is EXDATE'd; the Mon 17th instance is replaced
+        // by its RECURRENCE-ID override, moved to 14:00 London.
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e.uid, "rec-1@fixture");
+        assert_eq!(e.summary, "Weekly sync (moved)");
+        assert!(!e.all_day);
+        assert_eq!(e.start, range_utc(2026, 8, 17, 13, 0));
+        assert_eq!(e.end, range_utc(2026, 8, 17, 13, 30));
+    }
+
+    #[test]
+    fn range_weekly_until_stops_expansion() {
+        // Window entirely after UNTIL=20260831T230000Z: nothing recurs.
+        let events = events_in_range(
+            &[RANGE_RECURRING.to_string()],
+            range_utc(2026, 9, 1, 0, 0),
+            range_utc(2026, 9, 30, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn range_allday_weekly_recurs_on_dates() {
+        let (start, end) = week_window();
+        let events = events_in_range(
+            &[RANGE_ALLDAY_WEEKLY.to_string()],
+            start,
+            end,
+            chrono_tz::UTC,
+        );
+        // Weekly all-day from Thu 2026-08-06 → Thu 2026-08-20 in the window.
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].all_day);
+        assert_eq!(events[0].start, range_utc(2026, 8, 20, 0, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 21, 0, 0));
+    }
+
+    #[test]
+    fn range_allday_without_dtend_spans_one_day() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:ad@fixture\n\
+                   DTSTART;VALUE=DATE:20260818\nSUMMARY:Anniversary\n\
+                   END:VEVENT\nEND:VCALENDAR"
+            .to_string();
+        let (start, end) = week_window();
+        let events = events_in_range(&[ics], start, end, chrono_tz::UTC);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].all_day);
+        assert_eq!(events[0].start, range_utc(2026, 8, 18, 0, 0));
+        assert_eq!(events[0].end, range_utc(2026, 8, 19, 0, 0));
+    }
+
+    #[test]
+    fn range_monthly_on_day_31_skips_short_months() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:m31@fixture\n\
+                   DTSTART:20260131T120000Z\nDTEND:20260131T130000Z\n\
+                   RRULE:FREQ=MONTHLY\nSUMMARY:Payday\nEND:VEVENT\nEND:VCALENDAR"
+            .to_string();
+        let feb = events_in_range(
+            std::slice::from_ref(&ics),
+            range_utc(2026, 2, 1, 0, 0),
+            range_utc(2026, 3, 1, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert!(feb.is_empty(), "no Feb 31st exists: {feb:?}");
+        let mar = events_in_range(
+            &[ics],
+            range_utc(2026, 3, 1, 0, 0),
+            range_utc(2026, 4, 1, 0, 0),
+            chrono_tz::UTC,
+        );
+        assert_eq!(mar.len(), 1, "{mar:?}");
+        assert_eq!(mar[0].start, range_utc(2026, 3, 31, 12, 0));
+    }
+
+    #[test]
+    fn range_merges_multiple_ics_objects_sorted() {
+        let (start, end) = week_window();
+        let events = events_in_range(
+            &[RANGE_DAILY.to_string(), RANGE_MIXED.to_string()],
+            start,
+            end,
+            chrono_tz::UTC,
+        );
+        assert_eq!(events.len(), 6, "3 daily + 3 mixed: {events:?}");
+        let starts: Vec<_> = events.iter().map(|e| e.start).collect();
+        let mut sorted = starts.clone();
+        sorted.sort();
+        assert_eq!(starts, sorted, "merged results must sort by start");
+    }
+
+    #[test]
+    fn range_parse_1000_events_within_budget() {
+        // Perf budget (kata j6e4 / plan table): parse + normalize a
+        // 1,000-event range in < 100ms. CI-tolerant (~5x local headroom),
+        // synthetic data, no network — modeled on rate_limit.rs's timing
+        // asserts.
+        let objects: Vec<String> = (0..1000)
+            .map(|i| {
+                let day = 17 + (i % 7);
+                let hour = i % 23;
+                format!(
+                    "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:perf-{i}@fixture\n\
+                     DTSTART:202608{day:02}T{hour:02}0000Z\n\
+                     DTEND:202608{day:02}T{hour:02}3000Z\n\
+                     SUMMARY:Perf event {i}\nLOCATION:Nowhere {i}\n\
+                     END:VEVENT\nEND:VCALENDAR"
+                )
+            })
+            .collect();
+        let (start, end) = week_window();
+        let started = std::time::Instant::now();
+        let events = events_in_range(&objects, start, end, chrono_tz::UTC);
+        let elapsed = started.elapsed();
+        assert_eq!(events.len(), 1000);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "1,000-event range parse took {elapsed:?} (budget 100ms)"
+        );
+    }
+
+    // --- free_slots (kata mtqp) ---
+
+    fn busy_block(uid: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> RangeEvent {
+        RangeEvent {
+            uid: uid.into(),
+            summary: String::new(),
+            start,
+            end,
+            all_day: false,
+            location: None,
+            account: String::new(),
+        }
+    }
+
+    fn slot_opts(slot: u32, buffer: u32, ws: (u32, u32), we: (u32, u32)) -> FreeSlotOptions {
+        FreeSlotOptions {
+            slot_minutes: slot,
+            buffer_minutes: buffer,
+            work_start: NaiveTime::from_hms_opt(ws.0, ws.1, 0).unwrap(),
+            work_end: NaiveTime::from_hms_opt(we.0, we.1, 0).unwrap(),
+        }
+    }
+
+    fn slot(s: DateTime<Utc>, e: DateTime<Utc>) -> FreeSlot {
+        FreeSlot { start: s, end: e }
+    }
+
+    #[test]
+    fn free_slots_empty_calendar_fills_working_hours() {
+        // Tue 2026-08-18, 09:00–17:00 UTC, hour slots, no events → 8 slots.
+        let day_start = range_utc(2026, 8, 18, 0, 0);
+        let day_end = range_utc(2026, 8, 19, 0, 0);
+        let slots = free_slots(
+            &[],
+            day_start,
+            day_end,
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 8, "{slots:?}");
+        assert_eq!(
+            slots[0],
+            slot(range_utc(2026, 8, 18, 9, 0), range_utc(2026, 8, 18, 10, 0))
+        );
+        assert_eq!(
+            slots[7],
+            slot(range_utc(2026, 8, 18, 16, 0), range_utc(2026, 8, 18, 17, 0))
+        );
+    }
+
+    #[test]
+    fn free_slots_overlapping_busy_blocks_merge() {
+        // 10:00–11:00 and 10:30–11:30 merge: free 09:00–10:00, 11:30–17:00.
+        let busy = [
+            busy_block(
+                "a",
+                range_utc(2026, 8, 18, 10, 0),
+                range_utc(2026, 8, 18, 11, 0),
+            ),
+            busy_block(
+                "b",
+                range_utc(2026, 8, 18, 10, 30),
+                range_utc(2026, 8, 18, 11, 30),
+            ),
+        ];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(30, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 2 + 11, "{slots:?}");
+        assert_eq!(slots[1].end, range_utc(2026, 8, 18, 10, 0));
+        assert_eq!(
+            slots[2].start,
+            range_utc(2026, 8, 18, 11, 30),
+            "first slot after the merged block must start at 11:30"
+        );
+        assert!(
+            slots.windows(2).all(|w| w[0].end <= w[1].start),
+            "slots must be sorted and non-overlapping: {slots:?}"
+        );
+    }
+
+    #[test]
+    fn free_slots_buffer_pads_busy_blocks() {
+        // 12:00–13:00 with 15-min buffer blocks 11:45–13:15; hour slots from
+        // gap starts: 09:00–11:00 (2, remainder 45min dropped), 13:15–16:15
+        // (3, remainder dropped).
+        let busy = [busy_block(
+            "a",
+            range_utc(2026, 8, 18, 12, 0),
+            range_utc(2026, 8, 18, 13, 0),
+        )];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 15, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 2 + 3, "{slots:?}");
+        assert_eq!(slots[1].end, range_utc(2026, 8, 18, 11, 0));
+        assert_eq!(slots[2].start, range_utc(2026, 8, 18, 13, 15));
+        assert_eq!(slots[4].end, range_utc(2026, 8, 18, 16, 15));
+    }
+
+    #[test]
+    fn free_slots_allday_event_blocks_local_day() {
+        // All-day Tue 2026-08-18 (midnight-UTC anchors) in New York: blocks
+        // the local Tuesday, so Tue working hours (13:00–21:00 UTC in EDT)
+        // vanish and Wednesday's survive.
+        let allday = RangeEvent {
+            uid: "ad".into(),
+            summary: String::new(),
+            start: range_utc(2026, 8, 18, 0, 0),
+            end: range_utc(2026, 8, 19, 0, 0),
+            all_day: true,
+            location: None,
+            account: String::new(),
+        };
+        let slots = free_slots(
+            &[allday],
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 20, 0, 0),
+            chrono_tz::America::New_York,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        // Tue's working hours vanish entirely; Wed keeps its full 09:00–17:00
+        // EDT (the window's Thu-00:00-UTC end is Wed 20:00 EDT, past work
+        // end), so 8 hour-slots survive.
+        assert_eq!(slots.len(), 8, "{slots:?}");
+        assert_eq!(
+            slots[0].start,
+            range_utc(2026, 8, 19, 13, 0),
+            "first free slot must be Wednesday 09:00 EDT"
+        );
+    }
+
+    #[test]
+    fn free_slots_busy_across_midnight_clips_both_days() {
+        // Busy Tue 16:00 → Wed 10:00: Tue keeps 09:00–16:00, Wed 10:00–17:00.
+        let busy = [busy_block(
+            "overnight",
+            range_utc(2026, 8, 18, 16, 0),
+            range_utc(2026, 8, 19, 10, 0),
+        )];
+        let slots = free_slots(
+            &busy,
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 20, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 7 + 7, "{slots:?}");
+        assert_eq!(slots[6].end, range_utc(2026, 8, 18, 16, 0));
+        assert_eq!(slots[7].start, range_utc(2026, 8, 19, 10, 0));
+    }
+
+    #[test]
+    fn free_slots_window_clamps_partial_day() {
+        // Window opens mid-morning: first slot starts at the window, not 09:00.
+        let slots = free_slots(
+            &[],
+            range_utc(2026, 8, 18, 11, 0),
+            range_utc(2026, 8, 18, 14, 0),
+            chrono_tz::UTC,
+            &slot_opts(60, 0, (9, 0), (17, 0)),
+        );
+        assert_eq!(slots.len(), 3, "{slots:?}");
+        assert_eq!(slots[0].start, range_utc(2026, 8, 18, 11, 0));
+        assert_eq!(slots[2].end, range_utc(2026, 8, 18, 14, 0));
+    }
+
+    #[test]
+    fn free_slots_zero_slot_minutes_yields_nothing() {
+        let slots = free_slots(
+            &[],
+            range_utc(2026, 8, 18, 0, 0),
+            range_utc(2026, 8, 19, 0, 0),
+            chrono_tz::UTC,
+            &slot_opts(0, 0, (9, 0), (17, 0)),
+        );
+        assert!(slots.is_empty(), "{slots:?}");
+    }
+
+    #[test]
+    fn free_slots_5000_events_4_weeks_within_budget() {
+        // Perf budget (kata mtqp / plan table): 5,000 events × 4-week window
+        // < 50ms. CI-tolerant, synthetic data, no network — modeled on
+        // rate_limit.rs's timing asserts.
+        let window_start = range_utc(2026, 8, 3, 0, 0);
+        let window_end = range_utc(2026, 8, 31, 0, 0);
+        // Heavily-overlapping mornings (every 5-min offset 09:00–12:55, each
+        // 30 min long) on every day; afternoons stay free. Merged+buffered
+        // the mornings cover 08:55–13:30, leaving 13:30–17:00 = 7 half-hour
+        // slots per day × 28 days.
+        let busy: Vec<RangeEvent> = (0..5000)
+            .map(|i| {
+                let start = window_start
+                    + chrono::Duration::days(i % 28)
+                    + chrono::Duration::minutes(9 * 60 + (i % 48) * 5);
+                busy_block(
+                    &format!("perf-{i}"),
+                    start,
+                    start + chrono::Duration::minutes(30),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let slots = free_slots(
+            &busy,
+            window_start,
+            window_end,
+            chrono_tz::UTC,
+            &slot_opts(30, 5, (9, 0), (17, 0)),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(slots.len(), 7 * 28, "{} slots", slots.len());
+        assert!(
+            slots.windows(2).all(|w| w[0].end <= w[1].start),
+            "slots must be sorted and non-overlapping"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "5,000-event free-slot computation took {elapsed:?} (budget 50ms)"
+        );
     }
 }

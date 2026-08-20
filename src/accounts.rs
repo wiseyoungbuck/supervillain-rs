@@ -27,8 +27,14 @@ use std::path::{Path, PathBuf};
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum AccountConfig {
     Fastmail {
+        /// Canonical in api-token mode; may be empty in oauth mode until
+        /// the first authorize discovers it from the JMAP session object.
+        #[serde(default)]
         username: String,
-        #[serde(rename = "api-token")]
+        /// Required in api-token mode; empty means "not configured" in
+        /// oauth mode (kept when present so switching back is a mode flip,
+        /// not a re-paste).
+        #[serde(rename = "api-token", default)]
         api_token: String,
         /// Fastmail **app password** for CalDAV / CardDAV / IMAP / SMTP — the
         /// credential CalDAV actually accepts (HTTP Basic auth). This is a
@@ -40,6 +46,18 @@ pub enum AccountConfig {
         /// `Error::CalendarAuthUnconfigured` instead of failing silently.
         #[serde(rename = "app-password", default)]
         app_password: Option<String>,
+        /// Which credential mode this account uses at session build; absent
+        /// in legacy configs → api-token. Two concrete modes on one
+        /// account, not an auth-strategy abstraction (kata ngzw).
+        #[serde(default)]
+        auth: FastmailAuthMode,
+        /// Per-identity signature overrides (kata zqrn): lowercased identity
+        /// email → plain-text signature. INI: one `signature.<email> = …`
+        /// line per entry. An entry that is present but EMPTY means "this
+        /// identity signs nothing" (overriding `signature`); an absent entry
+        /// falls back to the account-level `signature`.
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         /// Per-account plain-text signature, prefilled into compose (never
         /// re-injected at send time). `None`/empty both mean "no signature" —
         /// see `AccountConfig::signature()`.
@@ -51,6 +69,9 @@ pub enum AccountConfig {
         client_id: String,
         #[serde(default)]
         email: Option<String>,
+        /// See the Fastmail variant's field of the same name (kata zqrn).
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         #[serde(default)]
         signature: Option<String>,
     },
@@ -61,9 +82,31 @@ pub enum AccountConfig {
         client_secret: String,
         #[serde(default)]
         email: Option<String>,
+        /// See the Fastmail variant's field of the same name (kata zqrn).
+        #[serde(rename = "identity-signatures", default)]
+        identity_signatures: BTreeMap<String, String>,
         #[serde(default)]
         signature: Option<String>,
     },
+}
+
+/// How a Fastmail account authenticates (kata ngzw).
+///
+/// Same provider key either way — switching mode is an in-place Settings
+/// edit (plus Authorize for oauth), not a delete/re-add.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FastmailAuthMode {
+    /// Legacy credential pair: api-token (Bearer, JMAP-only) + optional
+    /// app-password (Basic, CalDAV). Stays as the documented fallback —
+    /// e.g. Fastmail Basic plan has no CalDAV, and some users prefer app
+    /// passwords.
+    #[default]
+    ApiToken,
+    /// Sign in with Fastmail: one OAuth bearer for both JMAP and CalDAV;
+    /// the refresh token lives in the tokens dir (mode 0600), rotated on
+    /// every refresh.
+    Oauth,
 }
 
 impl AccountConfig {
@@ -76,11 +119,12 @@ impl AccountConfig {
     }
 
     /// The email address the config alone can vouch for, before any session
-    /// exists. Fastmail's username is canonical; OAuth providers may not know
-    /// it until the first authorize populates `email`.
+    /// exists. Fastmail's username is canonical when set; OAuth flows
+    /// (Outlook, Gmail, oauth-mode Fastmail) may not know it until the
+    /// first authorize populates it.
     pub fn configured_email(&self) -> Option<&str> {
         match self {
-            Self::Fastmail { username, .. } => Some(username),
+            Self::Fastmail { username, .. } => Some(username.as_str()).filter(|u| !u.is_empty()),
             Self::Outlook { email, .. } | Self::Gmail { email, .. } => email.as_deref(),
         }
     }
@@ -90,6 +134,25 @@ impl AccountConfig {
         match self {
             Self::Outlook { client_id, .. } | Self::Gmail { client_id, .. } => Some(client_id),
             Self::Fastmail { .. } => None,
+        }
+    }
+
+    /// Per-identity signature overrides, common to every provider (kata
+    /// zqrn). Keys are lowercased identity emails.
+    pub fn identity_signatures(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Fastmail {
+                identity_signatures,
+                ..
+            }
+            | Self::Outlook {
+                identity_signatures,
+                ..
+            }
+            | Self::Gmail {
+                identity_signatures,
+                ..
+            } => identity_signatures,
         }
     }
 
@@ -338,19 +401,53 @@ fn account_from_props(
     // normalizes an empty string to `None`, so a hand-edited `signature = `
     // (empty value) round-trips as "no signature" same as an omitted key.
     let signature = props.get("signature").map(|s| unescape_ini_multiline(s));
+    // Per-identity overrides (kata zqrn): every `signature.<email>` key.
+    // Keys are lowercased so lookups by identity email can't miss on case;
+    // empty values are KEPT (explicit "this identity signs nothing").
+    let identity_signatures: BTreeMap<String, String> = props
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("signature.")
+                .map(|email| (email.to_ascii_lowercase(), unescape_ini_multiline(v)))
+        })
+        .collect();
     match provider {
-        "fastmail" => Ok(AccountConfig::Fastmail {
-            username: require("username")?,
-            api_token: require("api-token")?,
-            // Optional: legacy configs predate this field. Empty/absent →
-            // None; calendar writes surface CalendarAuthUnconfigured on
-            // first use instead of crashing at load.
-            app_password: props
-                .get("app-password")
-                .map(|s| unescape_ini_multiline(s))
-                .filter(|s| !s.is_empty()),
-            signature,
-        }),
+        "fastmail" => {
+            let auth = match props.get("auth").map(String::as_str) {
+                None | Some("api-token") => FastmailAuthMode::ApiToken,
+                Some("oauth") => FastmailAuthMode::Oauth,
+                Some(other) => {
+                    return Err(format!(
+                        "invalid auth mode `{other}` (expected `oauth` or `api-token`)"
+                    ));
+                }
+            };
+            // In api-token mode the legacy contract holds: username and
+            // api-token are required. In oauth mode both are discovered /
+            // stored elsewhere (username from the JMAP session at first
+            // authorize, tokens in the tokens dir), so absent is fine.
+            let (username, api_token) = match auth {
+                FastmailAuthMode::ApiToken => (require("username")?, require("api-token")?),
+                FastmailAuthMode::Oauth => (
+                    props.get("username").cloned().unwrap_or_default(),
+                    props.get("api-token").cloned().unwrap_or_default(),
+                ),
+            };
+            Ok(AccountConfig::Fastmail {
+                username,
+                api_token,
+                // Optional: legacy configs predate this field. Empty/absent →
+                // None; calendar writes surface CalendarAuthUnconfigured on
+                // first use instead of crashing at load.
+                app_password: props
+                    .get("app-password")
+                    .map(|s| unescape_ini_multiline(s))
+                    .filter(|s| !s.is_empty()),
+                auth,
+                identity_signatures,
+                signature,
+            })
+        }
         "outlook" => Ok(AccountConfig::Outlook {
             client_id: require("client-id")?,
             // Accept `username` as a synonym for `email` so configs predating
@@ -360,12 +457,14 @@ fn account_from_props(
                 .get("email")
                 .or_else(|| props.get("username"))
                 .cloned(),
+            identity_signatures,
             signature,
         }),
         "gmail" => Ok(AccountConfig::Gmail {
             client_id: require("client-id")?,
             client_secret: require("client-secret")?,
             email: props.get("email").cloned(),
+            identity_signatures,
             signature,
         }),
         other => Err(format!("unknown provider `{other}`")),
@@ -404,10 +503,23 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
             username,
             api_token,
             app_password,
+            auth,
             ..
         } => {
-            lines.push(format!("username = {username}"));
-            lines.push(format!("api-token = {api_token}"));
+            // Omitted in api-token mode so legacy configs round-trip
+            // byte-stable.
+            if *auth == FastmailAuthMode::Oauth {
+                lines.push("auth = oauth".to_string());
+            }
+            // Empty username/api-token only occur in oauth mode (pre-first-
+            // authorize / no fallback token); omit the lines rather than
+            // writing values the parser's api-token mode would reject.
+            if !username.is_empty() {
+                lines.push(format!("username = {username}"));
+            }
+            if !api_token.is_empty() {
+                lines.push(format!("api-token = {api_token}"));
+            }
             // Omit the line entirely when unset so a round-trip through a
             // config without an app password is byte-stable, and so the file
             // doesn't carry a misleading empty `app-password =`.
@@ -440,6 +552,12 @@ fn account_to_ini_lines(name: &str, acct: &AccountConfig) -> Vec<String> {
     // the normalizing accessor rather than duplicated in each match arm.
     if let Some(sig) = acct.signature() {
         lines.push(format!("signature = {}", escape_ini_multiline(sig)));
+    }
+    // Per-identity overrides (kata zqrn), one line per entry. Empty values
+    // are deliberately written out — `signature.x = ` means "identity x
+    // signs nothing", which is different from having no entry at all.
+    for (email, sig) in acct.identity_signatures() {
+        lines.push(format!("signature.{email} = {}", escape_ini_multiline(sig)));
     }
     lines
 }
@@ -591,6 +709,7 @@ pub enum FieldId {
     ClientId,
     ClientSecret,
     Email,
+    IdentitySignatures,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -746,22 +865,45 @@ pub fn validate_account(cfg: &AccountConfig, name: &str) -> Result<(), Vec<Field
     if let Err(e) = validate_section_name(name) {
         errs.push(FieldError::new(FieldId::Name, e));
     }
+    // Per-identity signature keys must be identity emails (kata zqrn) — a
+    // typo'd key would silently never match any From address.
+    for email in cfg.identity_signatures().keys() {
+        if validate_email(email).is_err() {
+            errs.push(FieldError::new(
+                FieldId::IdentitySignatures,
+                format!("identity signature key '{email}' is not a valid email"),
+            ));
+        }
+    }
     match cfg {
         AccountConfig::Fastmail {
             username,
             api_token,
+            auth,
             ..
-        } => {
-            if let Err(e) = validate_email(username) {
-                errs.push(FieldError::new(FieldId::Username, e));
+        } => match auth {
+            FastmailAuthMode::ApiToken => {
+                if let Err(e) = validate_email(username) {
+                    errs.push(FieldError::new(FieldId::Username, e));
+                }
+                if api_token.trim().is_empty() {
+                    errs.push(FieldError::new(
+                        FieldId::ApiToken,
+                        "api-token must not be empty",
+                    ));
+                }
             }
-            if api_token.trim().is_empty() {
-                errs.push(FieldError::new(
-                    FieldId::ApiToken,
-                    "api-token must not be empty",
-                ));
+            FastmailAuthMode::Oauth => {
+                // No credential fields to validate — the OAuth flow supplies
+                // everything. Username is optional pre-authorize (discovered
+                // from the JMAP session), but must be well-formed if given.
+                if !username.is_empty()
+                    && let Err(e) = validate_email(username)
+                {
+                    errs.push(FieldError::new(FieldId::Username, e));
+                }
             }
-        }
+        },
         AccountConfig::Outlook {
             client_id, email, ..
         } => {
@@ -909,6 +1051,8 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 username,
                 api_token: incoming,
                 app_password: incoming_app,
+                auth,
+                identity_signatures,
                 signature,
             },
         ) => AccountConfig::Fastmail {
@@ -926,6 +1070,8 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
             } else {
                 old_app.clone()
             },
+            auth,
+            identity_signatures,
             signature,
         },
         (
@@ -936,6 +1082,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 client_id,
                 client_secret: incoming,
                 email,
+                identity_signatures,
                 signature,
             },
         ) => AccountConfig::Gmail {
@@ -946,6 +1093,7 @@ pub fn merge_secrets(existing: &AccountConfig, new: AccountConfig) -> AccountCon
                 incoming
             },
             email,
+            identity_signatures,
             signature,
         },
         (_, new) => new,
@@ -999,6 +1147,7 @@ pub fn wire_account_list(
                 "authStatus": if session.is_some() { "ok" } else { "pending" },
                 "clientId": acct.oauth_client_id(),
                 "signature": acct.signature(),
+                "identitySignatures": acct.identity_signatures(),
             })
         })
         .collect()
@@ -1113,7 +1262,9 @@ fn account_response(
     let provider = acct.provider_str().to_string();
     let email = match (acct, session) {
         (_, Some(s)) => Some(s.username().to_string()),
-        (AccountConfig::Fastmail { username, .. }, None) => Some(username.clone()),
+        (AccountConfig::Fastmail { username, .. }, None) => {
+            Some(username.clone()).filter(|u| !u.is_empty())
+        }
         (AccountConfig::Outlook { email, .. }, None) => email.clone(),
         (AccountConfig::Gmail { email, .. }, None) => email.clone(),
     };
@@ -1243,6 +1394,15 @@ async fn upsert_account(
     if is_new {
         match &incoming {
             AccountConfig::Fastmail {
+                auth: FastmailAuthMode::Oauth,
+                ..
+            } => {
+                // Same shape as Outlook/Gmail: no credentials to connect
+                // with yet — the account is created pending, and the
+                // Authorize button runs the browser flow.
+                needs_auth = true;
+            }
+            AccountConfig::Fastmail {
                 username,
                 api_token,
                 app_password,
@@ -1343,6 +1503,9 @@ async fn upsert_account(
             username,
             api_token,
             app_password,
+            // OAuth-mode sessions hold a bearer minted by the token flow,
+            // not anything from these config fields — nothing to recompute.
+            auth: FastmailAuthMode::ApiToken,
             ..
         } = &cfg
     {
@@ -1481,11 +1644,20 @@ async fn authorize_account(
             .ok_or_else(|| Error::NotFound(format!("account '{id}' not found")))?
     };
 
-    // Fast-fail Fastmail BEFORE claiming the global slot — better error
-    // surface than wrapping it in "authorization failed: ...".
-    if matches!(account, AccountConfig::Fastmail { .. }) {
+    // Fast-fail api-token-mode Fastmail BEFORE claiming the global slot —
+    // better error surface than wrapping it in "authorization failed: ...".
+    // (Oauth-mode Fastmail proceeds like Outlook/Gmail.)
+    if matches!(
+        account,
+        AccountConfig::Fastmail {
+            auth: FastmailAuthMode::ApiToken,
+            ..
+        }
+    ) {
         return Err(Error::BadRequest(
-            "Fastmail does not use OAuth — update credentials via POST /api/accounts/{id}".into(),
+            "This Fastmail account uses api-token auth — update credentials via \
+             POST /api/accounts/{id}, or set auth = oauth to use Sign in with Fastmail"
+                .into(),
         ));
     }
 
@@ -1576,15 +1748,34 @@ async fn install_authorized_session(
 }
 
 /// Pure helper: copy the session's email into the AccountConfig (OAuth
-/// providers only; Fastmail's username is canonical from config).
+/// flows only; an api-token Fastmail username is canonical from config).
 pub fn update_email_from_session(
     account: AccountConfig,
     email_from_session: Option<String>,
 ) -> AccountConfig {
     match (account, email_from_session) {
         (
+            AccountConfig::Fastmail {
+                api_token,
+                app_password,
+                auth: FastmailAuthMode::Oauth,
+                identity_signatures,
+                signature,
+                ..
+            },
+            Some(email),
+        ) => AccountConfig::Fastmail {
+            username: email,
+            api_token,
+            app_password,
+            auth: FastmailAuthMode::Oauth,
+            identity_signatures,
+            signature,
+        },
+        (
             AccountConfig::Outlook {
                 client_id,
+                identity_signatures,
                 signature,
                 ..
             },
@@ -1592,12 +1783,14 @@ pub fn update_email_from_session(
         ) => AccountConfig::Outlook {
             client_id,
             email: Some(email),
+            identity_signatures,
             signature,
         },
         (
             AccountConfig::Gmail {
                 client_id,
                 client_secret,
+                identity_signatures,
                 signature,
                 ..
             },
@@ -1606,6 +1799,7 @@ pub fn update_email_from_session(
             client_id,
             client_secret,
             email: Some(email),
+            identity_signatures,
             signature,
         },
         (other, _) => other,
@@ -1619,10 +1813,22 @@ async fn run_authorize(
 ) -> Result<ProviderSession, String> {
     let tokens_dir = &state.tokens_dir;
     match account {
+        AccountConfig::Fastmail {
+            auth: FastmailAuthMode::Oauth,
+            ..
+        } => {
+            let client_id = crate::oauth::fastmail_client_id()
+                .ok_or_else(|| crate::oauth::FASTMAIL_CLIENT_ID_HELP.to_string())?;
+            let session =
+                crate::oauth::fastmail_oauth_flow(&client_id, state.token_store.clone(), id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            Ok(ProviderSession::Fastmail(Box::new(session)))
+        }
         AccountConfig::Fastmail { .. } => {
-            // Unreachable: `authorize_account` fast-fails Fastmail before
-            // reaching here. Keep the arm exhaustive for the compiler.
-            Err("Fastmail does not use OAuth".into())
+            // Unreachable: `authorize_account` fast-fails api-token-mode
+            // Fastmail before reaching here. Keep the arm exhaustive.
+            Err("Fastmail api-token accounts do not use OAuth".into())
         }
         AccountConfig::Outlook { client_id, .. } => {
             let token_path = token_file_path(tokens_dir, id);
@@ -1646,6 +1852,157 @@ async fn run_authorize(
 }
 
 // =============================================================================
+// Fastmail OAuth token refresh daemon (kata ngzw)
+// =============================================================================
+
+/// Spawn the background refresher: every 60s, refresh any oauth-mode
+/// Fastmail account whose access token expires within the margin, rotate
+/// the stored refresh token, and swap the fresh bearer into the live
+/// session in place (the same live-update mechanism as the m5yp
+/// `set_credentials` path).
+///
+/// Proactive rather than per-request (Outlook/Gmail's `ensure_token`)
+/// because `JmapSession`'s auth headers are plain strings read
+/// synchronously at ~40 call sites — a per-request refresh would mean
+/// rewriting all of them. The 300s margin against a 60s tick makes an
+/// expiry landing mid-request rare.
+pub fn spawn_fastmail_token_refresher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to create HTTP client");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let client_id = crate::oauth::fastmail_client_id();
+            fastmail_token_refresh_tick(
+                &state,
+                &client,
+                crate::oauth::FASTMAIL_TOKEN_URL,
+                client_id.as_deref(),
+            )
+            .await;
+        }
+    });
+}
+
+/// One refresher pass. Parameterized on the token endpoint and client id so
+/// tests can drive it against a loopback recorder (same pattern as
+/// outlook's `ensure_token_at`).
+pub async fn fastmail_token_refresh_tick(
+    state: &AppState,
+    client: &reqwest::Client,
+    token_url: &str,
+    client_id: Option<&str>,
+) {
+    let ids: Vec<String> = {
+        let reg = state.accounts.read().await;
+        reg.account_configs
+            .iter()
+            .filter(|(_, a)| {
+                matches!(
+                    a,
+                    AccountConfig::Fastmail {
+                        auth: FastmailAuthMode::Oauth,
+                        ..
+                    }
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if ids.is_empty() {
+        return;
+    }
+
+    let expiries: Vec<(String, chrono::DateTime<chrono::Utc>)> = ids
+        .iter()
+        .filter_map(|id| {
+            state
+                .token_store
+                .load(id)
+                .map(|t| (id.clone(), t.token_expiry))
+        })
+        .collect();
+    let due = crate::oauth::due_for_refresh(
+        &expiries,
+        chrono::Utc::now(),
+        chrono::Duration::seconds(crate::oauth::FASTMAIL_REFRESH_MARGIN_SECS),
+    );
+    if due.is_empty() {
+        return;
+    }
+    let Some(client_id) = client_id else {
+        tracing::warn!(
+            "Fastmail OAuth tokens due for refresh but no client id is configured \
+             (set {})",
+            crate::oauth::FASTMAIL_CLIENT_ID_ENV
+        );
+        return;
+    };
+
+    for id in due {
+        let Some(mut tokens) = state.token_store.load(&id) else {
+            continue;
+        };
+        match crate::oauth::fastmail_refresh_at(client, token_url, client_id, &tokens.refresh_token)
+            .await
+        {
+            Ok(resp) => {
+                crate::oauth::apply_rotated_tokens(&mut tokens, &resp, chrono::Utc::now());
+                // Persist first (rotate-on-refresh: the old refresh token
+                // is already dead server-side), but update the live session
+                // even if the disk write failed — the running process can
+                // still work off the in-memory bearer until then.
+                if let Err(e) = state.token_store.save(&id, &tokens) {
+                    tracing::warn!("[{id}] failed to persist rotated Fastmail tokens: {e}");
+                }
+                // Clone the SessionLock and drop the registry read guard
+                // before awaiting the session write lock (roborev 376 #3
+                // discipline — never hold the registry read across a
+                // session lock await).
+                let lock = state.accounts.read().await.sessions.get(&id).cloned();
+                if let Some(lock) = lock {
+                    let mut session = lock.write().await;
+                    if let ProviderSession::Fastmail(s) = &mut *session {
+                        s.set_oauth_access_token(&tokens.access_token);
+                    }
+                }
+                tracing::info!("[{id}] refreshed Fastmail OAuth token");
+            }
+            Err(crate::oauth::FastmailRefreshError::InvalidGrant(detail)) => {
+                // Irrecoverable (revoked, or an old rotated token was
+                // replayed): clear tokens and drop the session so
+                // authStatus goes pending and the UI offers Authorize —
+                // same recovery as Outlook kata 0ch3.
+                if let Err(e) = state.token_store.delete(&id) {
+                    tracing::warn!("[{id}] failed to delete dead Fastmail tokens: {e}");
+                }
+                state.accounts.write().await.sessions.remove(&id);
+                push_error_if_absent(
+                    state,
+                    AccountError {
+                        account: id.clone(),
+                        provider: "fastmail".into(),
+                        error: format!(
+                            "Fastmail authorization expired or revoked — open Settings \
+                             and click Authorize to reconnect. {detail}"
+                        ),
+                    },
+                )
+                .await;
+                tracing::warn!("[{id}] Fastmail refresh token invalid; cleared stored tokens");
+            }
+            Err(crate::oauth::FastmailRefreshError::Other(e)) => {
+                // Transient (network, 5xx) — the margin gives several more
+                // ticks to succeed before the access token lapses.
+                tracing::warn!("[{id}] Fastmail token refresh failed (will retry): {e}");
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1658,6 +2015,8 @@ mod tests {
             username: username.into(),
             api_token: token.into(),
             app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -1665,6 +2024,7 @@ mod tests {
         AccountConfig::Outlook {
             client_id: client_id.into(),
             email: email.map(String::from),
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -1673,6 +2033,7 @@ mod tests {
             client_id: client_id.into(),
             client_secret: secret.into(),
             email: email.map(String::from),
+            identity_signatures: BTreeMap::new(),
             signature: None,
         }
     }
@@ -1745,6 +2106,8 @@ mod tests {
                 username: "alice@fm.com".into(),
                 api_token: "fmu1-tok".into(),
                 app_password: Some("ap-pass-123".into()),
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: None,
             },
         );
@@ -1778,6 +2141,8 @@ mod tests {
                         username: "alice@fm.com".into(),
                         api_token: "fmu1-tok".into(),
                         app_password: None,
+                        auth: FastmailAuthMode::ApiToken,
+                        identity_signatures: BTreeMap::new(),
                         signature: None,
                     },
                 );
@@ -1827,12 +2192,16 @@ mod tests {
             username: "alice@fm.com".into(),
             api_token: "fmu1-tok".into(),
             app_password: Some("old-pass".into()),
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let incoming_keep = AccountConfig::Fastmail {
             username: "alice@fm.com".into(),
             api_token: String::new(),
             app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let merged_keep = merge_secrets(&existing, incoming_keep);
@@ -1851,6 +2220,8 @@ mod tests {
             username: "alice@fm.com".into(),
             api_token: String::new(),
             app_password: Some("new-pass".into()),
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let merged_replace = merge_secrets(&existing, incoming_replace);
@@ -1879,6 +2250,8 @@ mod tests {
                 username: "alice@fm.com".into(),
                 api_token: "tok".into(),
                 app_password: None,
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Best,\nAlice\nAcme Inc.".into()),
             },
         );
@@ -1889,6 +2262,7 @@ mod tests {
                 client_id: "cid".into(),
                 client_secret: "cs".into(),
                 email: Some("bob@gmail.com".into()),
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Sent from my phone".into()),
             },
         );
@@ -1969,6 +2343,8 @@ mod tests {
                     username: "u@fm.com".into(),
                     api_token: "tok".into(),
                     app_password: None,
+                    auth: FastmailAuthMode::ApiToken,
+                    identity_signatures: BTreeMap::new(),
                     signature: Some(sig.into()),
                 },
             );
@@ -2023,6 +2399,8 @@ mod tests {
                     username: "u@fm.com".into(),
                     api_token: "tok".into(),
                     app_password: None,
+                    auth: FastmailAuthMode::ApiToken,
+                    identity_signatures: BTreeMap::new(),
                     signature: Some(sig.into()),
                 },
             );
@@ -2048,6 +2426,8 @@ mod tests {
             username: "u@fm.com".into(),
             api_token: "tok".into(),
             app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: Some(String::new()),
         };
         assert_eq!(acct.signature(), None);
@@ -2354,9 +2734,14 @@ api-token = tok
         let bad = serde_json::json!({"provider": "yahoo", "username": "u@y.com"});
         assert!(serde_json::from_value::<AccountConfig>(bad).is_err());
 
-        // Missing required Fastmail fields → fails.
+        // Missing api-token: deserializes (oauth-mode bodies legitimately
+        // omit it — the field is serde-default since kata ngzw), but the
+        // handler's validate_account still rejects it in api-token mode,
+        // now with a per-field error instead of an opaque 422.
         let missing = serde_json::json!({"provider": "fastmail", "username": "u@fm.com"});
-        assert!(serde_json::from_value::<AccountConfig>(missing).is_err());
+        let parsed: AccountConfig = serde_json::from_value(missing).unwrap();
+        let errs = validate_account(&parsed, "fm").unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e.field, FieldId::ApiToken)));
 
         // Good Fastmail payload → parses.
         let good = serde_json::json!({
@@ -2495,6 +2880,8 @@ api-token = tok
                 username: "u@fm.com".into(),
                 api_token: "tok".into(),
                 app_password: None,
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("Best,\nAlice".into()),
             },
         );
@@ -2516,6 +2903,8 @@ api-token = tok
                 username: "u@fm.com".into(),
                 api_token: "tok".into(),
                 app_password: None,
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some(String::new()),
             },
         );
@@ -2680,6 +3069,13 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -2853,6 +3249,13 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -2860,6 +3263,8 @@ api-token = tok
             // Empty api-token: merge_secrets must preserve the existing one.
             api_token: String::new(),
             app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: Some("Cheers,\nBob".into()),
         };
 
@@ -2951,6 +3356,8 @@ api-token = tok
             username: "u@fm.com".into(),
             api_token: String::new(),
             app_password: Some("new-app-pass".into()),
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
@@ -3045,6 +3452,8 @@ api-token = tok
             username: "new@fm.com".into(),
             api_token: String::new(),
             app_password: Some("app-pass".into()),
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         let _ = upsert_account(State(state.clone()), AxumPath("fm".into()), Json(incoming))
@@ -3170,6 +3579,13 @@ api-token = tok
             ),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join("supervillain-test-scheduled-sends.json"),
+            ),
+            tracking: crate::tracking::TrackingStore::new(
+                std::env::temp_dir().join("supervillain-test-tracking.json"),
+            ),
+            tracking_base: None,
         })
     }
 
@@ -3548,6 +3964,8 @@ api-token = tok
                 username: "u@fm.com".into(),
                 api_token: String::new(), // empty => "keep whatever is current"
                 app_password: None,
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("from-A".into()),
             };
             upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
@@ -3563,6 +3981,8 @@ api-token = tok
             username: "u@fm.com".into(),
             api_token: "secret-from-B".into(),
             app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
             signature: None,
         };
         upsert_account(
@@ -3624,6 +4044,8 @@ api-token = tok
                 username: "u@fm.com".into(),
                 api_token: String::new(), // empty => "keep whatever is current"
                 app_password: None,
+                auth: FastmailAuthMode::ApiToken,
+                identity_signatures: BTreeMap::new(),
                 signature: Some("from-A".into()),
             };
             upsert_account(State(state_a), AxumPath("fm".into()), Json(incoming)).await
@@ -3649,6 +4071,427 @@ api-token = tok
         assert!(
             !reg.account_configs.contains_key("fm"),
             "the deleted account must stay deleted — no resurrection via the update path"
+        );
+    }
+
+    // =========================================================================
+    // Fastmail OAuth mode (kata ngzw)
+    // =========================================================================
+
+    fn fastmail_oauth(username: &str) -> AccountConfig {
+        AccountConfig::Fastmail {
+            username: username.into(),
+            api_token: String::new(),
+            app_password: None,
+            auth: FastmailAuthMode::Oauth,
+            identity_signatures: BTreeMap::new(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn parse_fastmail_oauth_section_without_api_token() {
+        let content = "[fm]\nprovider = fastmail\nauth = oauth\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                username,
+                api_token,
+                auth,
+                ..
+            } => {
+                assert_eq!(username, "u@fm.com");
+                assert!(api_token.is_empty());
+                assert_eq!(*auth, FastmailAuthMode::Oauth);
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fastmail_oauth_round_trips_through_ini() {
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), fastmail_oauth("u@fm.com"));
+        let cfg = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        assert!(s.contains("auth = oauth"), "serialized: {s}");
+        assert!(
+            !s.contains("api-token"),
+            "no misleading empty api-token line: {s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty());
+        assert_eq!(parsed.accounts, cfg.accounts);
+    }
+
+    #[test]
+    fn legacy_fastmail_section_parses_as_api_token_mode() {
+        // No `auth` key → api-token mode, exactly as before this field existed.
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\napi-token = tok\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty());
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                auth, api_token, ..
+            } => {
+                assert_eq!(*auth, FastmailAuthMode::ApiToken);
+                assert_eq!(api_token, "tok");
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_fastmail_section_still_requires_api_token() {
+        // In api-token mode a missing api-token is still a parse error —
+        // the oauth mode must not silently loosen the legacy contract.
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("api-token"));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fastmail_auth_mode() {
+        let content = "[fm]\nprovider = fastmail\nauth = magic\nusername = u@fm.com\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(cfg.accounts.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].reason.contains("auth"),
+            "reason: {}",
+            errors[0].reason
+        );
+    }
+
+    #[test]
+    fn validate_fastmail_oauth_allows_empty_api_token() {
+        assert!(validate_account(&fastmail_oauth("u@fm.com"), "fm").is_ok());
+    }
+
+    #[test]
+    fn validate_fastmail_oauth_allows_empty_username_before_first_authorize() {
+        // Like Outlook's optional email: the username is discovered from the
+        // JMAP session at first authorize.
+        assert!(validate_account(&fastmail_oauth(""), "fm").is_ok());
+    }
+
+    #[test]
+    fn validate_fastmail_api_token_mode_still_requires_token() {
+        let acct = AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: String::new(),
+            app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: BTreeMap::new(),
+            signature: None,
+        };
+        let errs = validate_account(&acct, "fm").unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e.field, FieldId::ApiToken)));
+    }
+
+    #[test]
+    fn merge_secrets_preserves_api_token_across_mode_switch_to_oauth() {
+        // Switching an existing account to oauth mode keeps the stored
+        // api-token as the documented fallback (reverting is a mode flip,
+        // not a re-paste).
+        let existing = fastmail("u@fm.com", "tok-1");
+        let incoming = fastmail_oauth("u@fm.com");
+        match merge_secrets(&existing, incoming) {
+            AccountConfig::Fastmail {
+                api_token, auth, ..
+            } => {
+                assert_eq!(api_token, "tok-1");
+                assert_eq!(auth, FastmailAuthMode::Oauth);
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_email_from_session_populates_fastmail_oauth_username() {
+        let updated =
+            update_email_from_session(fastmail_oauth(""), Some("discovered@fm.com".into()));
+        match updated {
+            AccountConfig::Fastmail { username, .. } => {
+                assert_eq!(username, "discovered@fm.com");
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    // ---- Refresh daemon tick (loopback token endpoint, no mock framework) ----
+
+    async fn spawn_token_endpoint(status: u16, body: &'static str) -> String {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/token",
+            post(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/token")
+    }
+
+    /// Registry with one oauth-mode Fastmail account and a live session
+    /// holding `access` as its current bearer.
+    fn oauth_registry(access: &str) -> AccountRegistry {
+        let mut reg = empty_registry();
+        reg.account_configs
+            .insert("fm".to_string(), fastmail_oauth("u@fm.com"));
+        reg.sessions.insert(
+            "fm".to_string(),
+            SessionLock::new(tokio::sync::RwLock::new(ProviderSession::Fastmail(
+                Box::new(crate::jmap::JmapSession::new_oauth("u@fm.com", access)),
+            ))),
+        );
+        reg.default_account = "fm".to_string();
+        reg
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_rotates_tokens_and_updates_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-old".into(),
+                    // Within the refresh margin → due.
+                    token_expiry: chrono::Utc::now() + chrono::Duration::seconds(60),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        let token_url = spawn_token_endpoint(
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":3600}"#,
+        )
+        .await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        // Rotate-on-refresh persisted: old refresh token MUST be replaced.
+        let stored = state.token_store.load("fm").expect("tokens still stored");
+        assert_eq!(stored.access_token, "at-new");
+        assert_eq!(stored.refresh_token, "rt-new");
+        assert!(stored.token_expiry > chrono::Utc::now() + chrono::Duration::seconds(3000));
+
+        // Live session picked up the new bearer on both headers.
+        let reg = state.accounts.read().await;
+        let session = reg.sessions.get("fm").unwrap().read().await;
+        match &*session {
+            ProviderSession::Fastmail(s) => {
+                assert_eq!(s.auth_header, "Bearer at-new");
+                assert_eq!(s.caldav_auth_header, "Bearer at-new");
+            }
+            _ => panic!("expected fastmail session"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_skips_accounts_not_yet_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-old".into(),
+                    token_expiry: chrono::Utc::now() + chrono::Duration::seconds(3600),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        // Endpoint would fail the test's intent if hit; a 500 makes any
+        // accidental request visible as a changed token file.
+        let token_url = spawn_token_endpoint(500, "should not be called").await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        let stored = state.token_store.load("fm").expect("tokens untouched");
+        assert_eq!(stored.access_token, "at-old");
+        assert_eq!(stored.refresh_token, "rt-old");
+    }
+
+    #[tokio::test]
+    async fn refresh_tick_invalid_grant_clears_tokens_and_surfaces_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_app_state(
+            oauth_registry("at-old"),
+            dir.path().join("config"),
+            dir.path().join("tokens"),
+        );
+        state
+            .token_store
+            .save(
+                "fm",
+                &crate::platform::Tokens {
+                    access_token: "at-old".into(),
+                    refresh_token: "rt-dead".into(),
+                    token_expiry: chrono::Utc::now() - chrono::Duration::seconds(10),
+                    email: "u@fm.com".into(),
+                },
+            )
+            .unwrap();
+        let token_url = spawn_token_endpoint(400, r#"{"error":"invalid_grant"}"#).await;
+
+        let client = reqwest::Client::new();
+        fastmail_token_refresh_tick(&state, &client, &token_url, Some("cid-1")).await;
+
+        // Irrecoverable: tokens cleared, session dropped (authStatus →
+        // pending, UI shows Authorize), banner explains the recovery path.
+        assert!(state.token_store.load("fm").is_none());
+        let reg = state.accounts.read().await;
+        assert!(!reg.sessions.contains_key("fm"));
+        drop(reg);
+        let errors = state.account_errors.read().await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.account == "fm" && e.error.contains("Authorize")),
+            "expected a re-authorize banner, got {errors:?}"
+        );
+    }
+
+    // =========================================================================
+    // Per-identity signatures (kata zqrn)
+    // =========================================================================
+
+    fn fastmail_with_idsigs(sigs: &[(&str, &str)], account_sig: Option<&str>) -> AccountConfig {
+        AccountConfig::Fastmail {
+            username: "u@fm.com".into(),
+            api_token: "tok".into(),
+            app_password: None,
+            auth: FastmailAuthMode::ApiToken,
+            identity_signatures: sigs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            signature: account_sig.map(String::from),
+        }
+    }
+
+    #[test]
+    fn parse_identity_signature_keys_into_lowercased_map() {
+        let content = "[fm]\nprovider = fastmail\nusername = u@fm.com\napi-token = tok\n\
+                       signature = Acct\nsignature.Jane@Ex.com = Hi\\nJane\n";
+        let (cfg, errors) = parse_config_str(content);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        match cfg.accounts.get("fm").unwrap() {
+            AccountConfig::Fastmail {
+                identity_signatures,
+                signature,
+                ..
+            } => {
+                assert_eq!(signature.as_deref(), Some("Acct"));
+                assert_eq!(
+                    identity_signatures.get("jane@ex.com").map(String::as_str),
+                    Some("Hi\nJane"),
+                    "identity keys must be lowercased and values unescaped: {identity_signatures:?}"
+                );
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_signatures_round_trip_including_explicit_empty() {
+        // An explicit empty entry means "this identity signs nothing" — it
+        // overrides the account signature and must survive a round trip.
+        let acct = fastmail_with_idsigs(
+            &[("jane@ex.com", "Hi\nJane"), ("noreply@ex.com", "")],
+            Some("Acct sig"),
+        );
+        let mut accounts = BTreeMap::new();
+        accounts.insert("fm".to_string(), acct);
+        let cfg = ConfigFile {
+            default_account: Some("fm".into()),
+            accounts,
+        };
+        let s = serialize_config(&cfg);
+        assert!(
+            s.contains("signature.jane@ex.com = Hi\\nJane"),
+            "serialized: {s}"
+        );
+        let (parsed, errors) = parse_config_str(&s);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(parsed.accounts, cfg.accounts);
+    }
+
+    #[test]
+    fn wire_account_list_exposes_identity_signatures() {
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "fm".to_string(),
+            fastmail_with_idsigs(&[("jane@ex.com", "Jane sig")], Some("Acct")),
+        );
+        let live = std::collections::HashMap::new();
+        let list = wire_account_list(&configs, &live, "fm");
+        assert_eq!(
+            list[0]["identitySignatures"]["jane@ex.com"], "Jane sig",
+            "wire: {list:?}"
+        );
+    }
+
+    #[test]
+    fn merge_secrets_carries_incoming_identity_signatures() {
+        let existing = fastmail_with_idsigs(&[("old@ex.com", "Old")], Some("Acct"));
+        let incoming = fastmail_with_idsigs(&[("new@ex.com", "New")], Some("Acct"));
+        match merge_secrets(&existing, incoming) {
+            AccountConfig::Fastmail {
+                identity_signatures,
+                ..
+            } => {
+                assert_eq!(
+                    identity_signatures.get("new@ex.com").map(String::as_str),
+                    Some("New")
+                );
+                assert!(
+                    !identity_signatures.contains_key("old@ex.com"),
+                    "identity signatures are not secrets — incoming replaces, like signature"
+                );
+            }
+            other => panic!("expected fastmail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_email_identity_signature_key() {
+        let acct = fastmail_with_idsigs(&[("not-an-email", "x")], None);
+        let errs = validate_account(&acct, "fm").unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("identity")),
+            "expected an identity-signature key error, got {errs:?}"
         );
     }
 }

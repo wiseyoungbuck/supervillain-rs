@@ -33,6 +33,11 @@ pub(crate) struct JmapSessionResponse {
     pub download_url: Option<String>,
     #[serde(default)]
     pub primary_accounts: HashMap<String, String>,
+    /// RFC 8620 §2: the authenticated user's username (their email). OAuth
+    /// sessions start without one (the config has no username to vouch for
+    /// pre-authorize) and discover it here on connect.
+    #[serde(default)]
+    pub username: Option<String>,
 }
 
 /// Recursive MIME body structure part
@@ -217,6 +222,26 @@ impl JmapSession {
         self.auth_header = format!("Bearer {api_token}");
         self.caldav_auth_header = basic_auth_header(&self.username, app_password);
     }
+
+    /// Build a session from a Fastmail OAuth access token (kata ngzw). One
+    /// bearer serves both protocols: Fastmail accepts the OAuth token at
+    /// `api.fastmail.com` (JMAP) AND `caldav.fastmail.com` (CalDAV), unlike
+    /// api-tokens (JMAP-only) — so no app password is involved. `username`
+    /// may be empty on the first authorize; `connect` fills it from the
+    /// JMAP session response.
+    pub fn new_oauth(username: &str, access_token: &str) -> Self {
+        let mut s = Self::new(username, access_token, None);
+        s.caldav_auth_header = s.auth_header.clone();
+        s
+    }
+
+    /// Swap in a refreshed OAuth access token, in place on the live session
+    /// (the OAuth analog of `set_credentials`) — both headers rotate to the
+    /// same new bearer.
+    pub fn set_oauth_access_token(&mut self, access_token: &str) {
+        self.auth_header = format!("Bearer {access_token}");
+        self.caldav_auth_header = self.auth_header.clone();
+    }
 }
 
 /// `Basic <base64(username:app_password)>` for CalDAV, or empty when no app
@@ -263,6 +288,15 @@ pub async fn connect(s: &mut JmapSession) -> Result<(), Error> {
         .primary_accounts
         .get("urn:ietf:params:jmap:mail")
         .cloned();
+
+    // OAuth sessions connect before knowing who the user is; the session
+    // object is authoritative. A configured username (api-token mode) is
+    // canonical and never overwritten.
+    if s.username.is_empty()
+        && let Some(username) = session.username
+    {
+        s.username = username;
+    }
 
     debug_assert!(s.api_url.is_some(), "JMAP session must have apiUrl");
     debug_assert!(s.account_id.is_some(), "JMAP session must have accountId");
@@ -448,9 +482,15 @@ pub async fn get_identity_for_email(
     email: &str,
 ) -> Result<Option<String>, Error> {
     let identities = get_identities(s).await?;
+    // Exact identity first (the exact pass is deliberately separate from
+    // `matches_address` so specificity wins); a catch-all wildcard identity
+    // ("*@domain", Fastmail's model for managed alias domains) covers the
+    // rest of its domain's local parts. Should Fastmail ever return several
+    // wildcards for one domain, JMAP list order breaks the tie.
     let found = identities
         .iter()
         .find(|i| i.email.eq_ignore_ascii_case(email))
+        .or_else(|| identities.iter().find(|i| i.matches_address(email)))
         .map(|i| i.id.clone());
     Ok(found)
 }
@@ -3155,6 +3195,71 @@ fn attendee_status_from_ics(
         .map(|a| a.status.clone())
 }
 
+/// Fetch the raw ICS payload of every event overlapping `[start, end)` from
+/// the default calendar collection, via a CalDAV `calendar-query` REPORT
+/// with a time-range filter (RFC 4791 §7.8.1). One `String` per calendar
+/// resource — a resource may contain several VEVENTs (recurrence master +
+/// overrides); `calendar::events_in_range` does the normalization.
+///
+/// READ-ONLY by design: the REPORT addresses the resolved default collection
+/// (never the schedule-inbox) and issues no PUT/DELETE — writes against
+/// Fastmail scheduling collections have iTIP side effects (kata 8gn5).
+pub async fn get_calendar_ics_in_range(
+    s: &JmapSession,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error> {
+    // Missing app password → named error, no HTTP (kata m5yp).
+    let auth = require_caldav_auth(s)?;
+    // Resolved collection URL (cached) — never /Default/ (kata wybm).
+    let collection = resolve_calendar_collection(s, auth).await?;
+    let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y%m%dT%H%M%SZ").to_string();
+    let query = format!(
+        r#"<?xml version="1.0" encoding="utf-8" ?>
+<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop><D:getetag/><C:calendar-data/></D:prop>
+  <C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">
+    <C:time-range start="{}" end="{}"/>
+  </C:comp-filter></C:comp-filter></C:filter>
+</C:calendar-query>"#,
+        fmt(start),
+        fmt(end)
+    );
+
+    let resp = s
+        .client
+        .request(
+            reqwest::Method::from_bytes(b"REPORT").expect("REPORT is a valid method"),
+            &collection,
+        )
+        .header("Authorization", auth)
+        .header("Depth", "1")
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(query)
+        .send()
+        .await?;
+    let status = resp.status();
+    // 404: the discovered collection vanished mid-session — no events, not
+    // a hard failure (the next discovery re-resolves).
+    if status.as_u16() == 404 {
+        return Ok(Vec::new());
+    }
+    if status.as_u16() != 207 {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(caldav_failure("REPORT", &collection, status, &body));
+    }
+    let xml = resp.text().await?;
+    // Response blocks without calendar-data (the collection's own row) are
+    // skipped silently.
+    Ok(RESPONSE_RE
+        .find_iter(&xml)
+        .filter_map(|m| {
+            let data = xml_unescape_text(&element_text(&CALENDAR_DATA_RE.captures(m.as_str())?[1]));
+            (!data.trim().is_empty()).then_some(data)
+        })
+        .collect())
+}
+
 /// UUID v4 generation using /dev/urandom for proper randomness.
 #[cfg(test)]
 fn uuid_v4() -> String {
@@ -3478,6 +3583,35 @@ mod tests {
 
     fn deser_bs(json: serde_json::Value) -> BodyStructurePart {
         serde_json::from_value(json).unwrap()
+    }
+
+    // --- Fastmail OAuth session headers (kata ngzw) ---
+
+    #[test]
+    fn oauth_session_uses_one_bearer_for_jmap_and_caldav() {
+        // Fastmail's OAuth bearer is accepted at both api.fastmail.com and
+        // caldav.fastmail.com — one credential drives both protocols.
+        let s = JmapSession::new_oauth("u@fastmail.com", "oauth-tok-1");
+        assert_eq!(s.auth_header, "Bearer oauth-tok-1");
+        assert_eq!(s.caldav_auth_header, "Bearer oauth-tok-1");
+        assert_eq!(s.username, "u@fastmail.com");
+    }
+
+    #[test]
+    fn set_oauth_access_token_rotates_both_headers() {
+        let mut s = JmapSession::new_oauth("u@fastmail.com", "oauth-tok-1");
+        s.set_oauth_access_token("oauth-tok-2");
+        assert_eq!(s.auth_header, "Bearer oauth-tok-2");
+        assert_eq!(s.caldav_auth_header, "Bearer oauth-tok-2");
+    }
+
+    #[test]
+    fn api_token_session_still_uses_basic_for_caldav() {
+        // Legacy credential pair must keep working unchanged: api-token
+        // Bearer for JMAP, app-password Basic for CalDAV.
+        let s = JmapSession::new("u@fastmail.com", "api-tok", Some("app-pass"));
+        assert_eq!(s.auth_header, "Bearer api-tok");
+        assert!(s.caldav_auth_header.starts_with("Basic "));
     }
 
     // --- find_calendar_blob_id tests ---
@@ -4217,6 +4351,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         }
     }
@@ -4242,6 +4377,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-456");
@@ -4261,6 +4397,7 @@ END:VCALENDAR";
             in_reply_to: Some("<msg-123@example.com>".into()),
             references: Some(vec!["<msg-123@example.com>".into()]),
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts-789");
@@ -4304,6 +4441,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "a@b.com", "mb");
@@ -4957,6 +5095,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -5191,6 +5330,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(
                 "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\n\
                  SUMMARY:Réunion d'équipe\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -5527,6 +5667,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(rsvp_ics.clone()),
         };
 
@@ -5718,6 +5859,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(ics.clone()),
         };
 
@@ -5878,6 +6020,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: Some(
                 "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n\
                  SUMMARY:Team Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
@@ -6012,6 +6155,128 @@ END:VCALENDAR";
         assert!(
             rcpt.iter().any(|r| r["email"] == "observer@example.com"),
             "envelope rcptTo must include the cc recipient: {rcpt:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_resolves_alias_identity_for_from_address() {
+        // An iTIP REPLY for an invite addressed to an alias on another
+        // Fastmail-managed domain must go out under that alias's identity —
+        // matched case-insensitively against the cached identity list, not
+        // silently downgraded to the default identity.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        s.identities = Some(vec![
+            Identity {
+                id: "ident1".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+            },
+            Identity {
+                id: "ident-alias".into(),
+                email: "Matt@MattGPT.ai".into(),
+                name: "Matt".into(),
+            },
+        ]);
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        send_email(&mut s, &sub, "matt@mattgpt.ai", None)
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body["methodCalls"][1][1]["create"]["send"]["identityId"], "ident-alias",
+            "the submission must carry the alias's identityId: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_lookup_prefers_exact_match_then_wildcard_domain() {
+        // The live account models catch-all domains as wildcard identities
+        // ("*@mattgpt.ai") alongside exact ones ("contact@mattgpt.ai").
+        // Exact wins for its own address; anything else on the domain falls
+        // back to the wildcard; foreign domains resolve to nothing.
+        let mut s = JmapSession::new("matt.coburn@aristoi.ai", "token", None);
+        s.identities = Some(vec![
+            Identity {
+                id: "ident-exact".into(),
+                email: "contact@mattgpt.ai".into(),
+                name: "Contact".into(),
+            },
+            Identity {
+                id: "ident-wild".into(),
+                email: "*@mattgpt.ai".into(),
+                name: "mattgpt.ai".into(),
+            },
+        ]);
+        assert_eq!(
+            get_identity_for_email(&mut s, "Contact@MattGPT.ai")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ident-exact"),
+            "exact identity must win over the domain wildcard"
+        );
+        assert_eq!(
+            get_identity_for_email(&mut s, "hello@mattgpt.ai")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ident-wild"),
+            "any other local part on the domain must fall back to the wildcard"
+        );
+        assert_eq!(
+            get_identity_for_email(&mut s, "hello@notmattgpt.ai")
+                .await
+                .unwrap(),
+            None,
+            "a lookalike domain must not match the wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_resolves_wildcard_identity_for_alias_from_address() {
+        // The iTIP REPLY for an invite addressed to a catch-all alias must
+        // ride the wildcard identity, not the default one.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        s.identities = Some(vec![
+            Identity {
+                id: "ident1".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+            },
+            Identity {
+                id: "ident-wild".into(),
+                email: "*@mattcoburn.ai".into(),
+                name: "mattcoburn.ai".into(),
+            },
+        ]);
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        send_email(&mut s, &sub, "anything@mattcoburn.ai", None)
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body["methodCalls"][1][1]["create"]["send"]["identityId"], "ident-wild",
+            "the submission must carry the wildcard identity's id: {body}"
         );
     }
 
@@ -6420,6 +6685,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -6448,6 +6714,7 @@ END:VCALENDAR";
             in_reply_to: None,
             references: None,
             attachments: vec![pdf_attachment()],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -6490,6 +6757,7 @@ END:VCALENDAR";
                     size: 100,
                 },
             ],
+            send_at: None,
             calendar_ics: None,
         };
         let draft = build_draft_email(&sub, "alice@example.com", "mb-drafts");
@@ -8053,6 +8321,92 @@ END:VCALENDAR";
         assert!(
             calls.lock().unwrap().is_empty(),
             "cached mailbox must avoid a second create/fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_report_is_read_only_and_time_bounded() {
+        use chrono::TimeZone;
+        // Two events overlapping the window, as Cyrus would return them.
+        let multistatus = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+ <D:response>
+  <D:href>/dav/calendars/user/u/coll/ev1.ics</D:href>
+  <D:propstat><D:prop><D:getetag>"a"</D:getetag>
+   <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ev1@fixture
+DTSTART:20260818T100000Z
+DTEND:20260818T110000Z
+SUMMARY:First
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+ <D:response>
+  <D:href>/dav/calendars/user/u/coll/ev2.ics</D:href>
+  <D:propstat><D:prop><D:getetag>"b"</D:getetag>
+   <C:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ev2@fixture
+DTSTART:20260819T100000Z
+DTEND:20260819T110000Z
+SUMMARY:Second
+END:VEVENT
+END:VCALENDAR</C:calendar-data></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+ </D:response>
+</D:multistatus>"#
+            .to_string();
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, _path| {
+            if method == "REPORT" {
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    multistatus.clone().into_bytes(),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, Vec::new())
+            }
+        })
+        .await;
+
+        let mut s = JmapSession::new("u@aristoi.test", "token", Some("app-pass"));
+        s.caldav_base = base.clone();
+        s.caldav_collection_url
+            .set(DiscoveredCalendars {
+                default_collection: format!("{base}/dav/calendars/user/u/coll"),
+                schedule_inbox: Some(format!("{base}/dav/calendars/user/u/Inbox")),
+            })
+            .expect("prefill discovery");
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 8, 17, 0, 0, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2026, 8, 24, 0, 0, 0).unwrap();
+        let ics = get_calendar_ics_in_range(&s, start, end)
+            .await
+            .expect("range query");
+        assert_eq!(ics.len(), 2, "{ics:?}");
+        assert!(ics[0].contains("UID:ev1@fixture"), "{}", ics[0]);
+        assert!(ics[1].contains("UID:ev2@fixture"), "{}", ics[1]);
+
+        let rec = recorded.lock().unwrap().clone();
+        assert_eq!(rec.len(), 1, "exactly one request expected: {rec:?}");
+        let req = &rec[0];
+        assert_eq!(req.method, "REPORT");
+        assert_eq!(
+            req.path, "/dav/calendars/user/u/coll",
+            "REPORT must address the default collection, never the schedule-inbox"
+        );
+        assert_eq!(req.header("depth"), Some("1"));
+        let body = String::from_utf8(req.body.clone()).unwrap();
+        assert!(
+            body.contains(r#"time-range start="20260817T000000Z" end="20260824T000000Z""#),
+            "REPORT body must carry the UTC time-range filter: {body}"
+        );
+        assert!(body.contains("calendar-data"), "{body}");
+        assert!(
+            rec.iter()
+                .all(|r| r.method != "PUT" && r.method != "DELETE"),
+            "range query must be read-only: {rec:?}"
         );
     }
 }

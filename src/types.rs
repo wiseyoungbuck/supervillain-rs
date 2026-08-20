@@ -62,7 +62,7 @@ impl Email {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmailSubmission {
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -76,6 +76,13 @@ pub struct EmailSubmission {
     pub attachments: Vec<Attachment>,
     #[serde(skip)]
     pub calendar_ics: Option<String>,
+    /// When present and in the future, the send is deferred: the server
+    /// queues the submission (`src/scheduled_send.rs`) and the daemon
+    /// dispatches it at/after this instant. `None` (or a past instant)
+    /// means send immediately. Serves both Undo Send (short client-chosen
+    /// delay, kata vj6k) and Send Later (explicit pick, kata acag).
+    #[serde(default)]
+    pub send_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,11 +105,33 @@ pub struct Identity {
     pub name: String,
 }
 
+/// Whether `address` is covered by an identity address `pattern`. Fastmail
+/// models catch-all domains as wildcard identities (`*@domain`) rather than
+/// enumerable addresses; everything else is an exact (case-insensitive)
+/// address. Only a leading `*@` is a wildcard — no other globbing.
+pub fn address_matches_pattern(address: &str, pattern: &str) -> bool {
+    if pattern.eq_ignore_ascii_case(address) {
+        return true;
+    }
+    pattern.strip_prefix("*@").is_some_and(|domain| {
+        address
+            .rsplit_once('@')
+            .is_some_and(|(_, address_domain)| address_domain.eq_ignore_ascii_case(domain))
+    })
+}
+
+impl Identity {
+    /// Whether this identity can send/receive as `address`.
+    pub fn matches_address(&self, address: &str) -> bool {
+        address_matches_pattern(address, &self.email)
+    }
+}
+
 // =============================================================================
 // Attachment types
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     pub blob_id: String,
     pub name: String,
@@ -483,6 +512,14 @@ pub struct AppState {
     pub reminders: crate::reminders::ReminderStore,
     /// Global sidecar containing Reminder Settings defaults.
     pub reminder_settings_path: PathBuf,
+    /// Durable deferred-send queue (Undo Send + Send Later, kata vj6k/acag).
+    pub scheduled_sends: crate::scheduled_send::ScheduledSendStore,
+    /// Durable open-tracking records (kata e2h4).
+    pub tracking: crate::tracking::TrackingStore,
+    /// Publicly reachable base URL for the tracking pixel
+    /// (`SUPERVILLAIN_TRACKING_BASE`). `None` disables tracking entirely —
+    /// no pixel is injected and nothing is recorded.
+    pub tracking_base: Option<String>,
 }
 
 impl AppState {
@@ -614,6 +651,7 @@ mod tests {
             in_reply_to: Some("msg-123".into()),
             references: Some(vec!["msg-100".into(), "msg-123".into()]),
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();
@@ -634,6 +672,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         };
         let json = serde_json::to_string(&sub).unwrap();

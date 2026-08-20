@@ -85,6 +85,24 @@ const state = {
     wizardCache: null,  // populated at init() once freshWizCache is defined
     timezone: null,           // { primary, display, system, system_changed, use_system, ... }
     tzZones: [],              // cached list of IANA names from /api/timezone/zones
+    sendUndo: null,           // { id, deadline, timerId } — active Undo Send countdown (kata vj6k)
+    movePickerOpen: false,    // Move to Folder picker (kata e993)
+    moveEmailId: null,        // email the open move picker acts on
+    movePickerIndex: 0,       // selected row in the move picker list
+    bulkSelected: new Set(),  // bulk selection: email IDS, list view (kata pakx)
+    bulkAnchorId: null,       // last-toggled id, the Shift+X range anchor
+    // Contact insights cache (kata wcsg): `${accountId}:${email}` →
+    // aggregated history from /api/contacts/insights. Account-prefixed keys
+    // follow the contactIndex isolation convention.
+    contactInsights: new Map(),
+    // AI assist availability (kata 6rhw): {enabled, model} from
+    // GET /api/ai/status; null until the boot probe resolves.
+    ai: null,
+    // Calendar peek (kata j6e4): the C-key day/week pane. anchor is the local
+    // 'YYYY-MM-DD' day the view is centered on; events holds the fetched
+    // RangeEvents for the visible window.
+    calendarPeek: { visible: false, mode: 'day', anchor: null, events: [], loading: false, error: null },
+    triage: null,             // { queue, index, total } — Get-Me-To-Zero flow (kata 5np4)
 };
 
 // Simple cache: email id -> full email object with body. Bounded FIFO
@@ -203,6 +221,8 @@ function init() {
     els.emailSubject = document.getElementById('email-subject');
     els.emailMeta = document.getElementById('email-meta');
     els.emailBody = document.getElementById('email-body');
+    els.contactSidebar = document.getElementById('contact-sidebar');
+    els.aiSummary = document.getElementById('ai-summary');
     els.composeView = document.getElementById('compose-view');
     els.composeFrom = document.getElementById('compose-from');
     els.composeTo = document.getElementById('compose-to');
@@ -237,7 +257,14 @@ function init() {
     els.splitPatternField = document.getElementById('split-pattern-field');
     els.splitHint = document.getElementById('split-hint');
     els.remindModal = document.getElementById('remind-modal');
+    els.moveModal = document.getElementById('move-modal');
+    els.bulkBar = document.getElementById('bulk-bar');
+    els.triageProgress = document.getElementById('triage-progress');
     els.reminderSettingsModal = document.getElementById('reminder-settings-modal');
+    els.sendUndoToast = document.getElementById('send-undo-toast');
+    els.sendUndoMessage = document.getElementById('send-undo-message');
+    els.sendUndoButton = document.getElementById('send-undo-button');
+    els.sendLaterModal = document.getElementById('send-later-modal');
     els.calendarEvent = document.getElementById('calendar-event');
     els.calTitle = document.getElementById('cal-title');
     els.calDatetime = document.getElementById('cal-datetime');
@@ -302,6 +329,8 @@ function init() {
     els.acctDelete = document.getElementById('acct-delete');
     els.acctConfirmDelete = document.getElementById('acct-confirm-delete');
     els.acctFormError = document.getElementById('acct-form-error');
+    els.calendarPeek = document.getElementById('calendar-peek');
+    els.availModal = document.getElementById('avail-modal');
     // Event listeners
     if (els.starredItem) {
         els.starredItem.addEventListener('click', toggleStarredOnly);
@@ -370,6 +399,7 @@ function init() {
     });
     els.clearAllFilters.addEventListener('click', clearAllFilters);
     els.undoButton.addEventListener('click', performUndo);
+    els.sendUndoButton.addEventListener('click', cancelPendingSend);
     els.splitCancel.addEventListener('click', closeSplitModal);
     document.getElementById('remind-cancel')?.addEventListener('click', closeRemindPicker);
     document.getElementById('remind-confirm')?.addEventListener('click', confirmRemindPicker);
@@ -384,6 +414,8 @@ function init() {
     els.composeAttachmentsList.addEventListener('click', handleAttachmentListClick);
     setupComposeDragDrop();
     els.composeBody.addEventListener('paste', handleComposePaste);
+    // From identity change → swap the signature block in place (kata zqrn).
+    els.composeFrom.addEventListener('change', applyComposeSignatureForFrom);
 
     // Single delegated click handler for email list — never re-bound, survives innerHTML updates
     els.emailList.addEventListener('click', (e) => {
@@ -591,6 +623,7 @@ function init() {
     // Load data
     loadTheme();
     loadAccounts();
+    loadAiStatus();
     // Wake notifications are server-side; poll the shared reminder table so
     // a browser open on any device notices a daemon wake without a websocket.
     setInterval(() => { if (state.currentAccount) loadReminders(); }, 30_000);
@@ -1017,6 +1050,10 @@ function selectAccount(account) {
     state.currentSplit = 'all';
     state.splits = [];
     state.splitCounts = {};
+    // Bulk selection and triage are per-context (kata pakx/5np4).
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
+    state.triage = null;
     // Sort order is session-only (kata 09ef), reset to the default on
     // every account switch — same treatment as currentSplit above.
     state.sortOrder = 'date_desc';
@@ -1173,6 +1210,9 @@ function invalidateSplitListCache() {
 
 function selectSplit(splitId) {
     state.currentSplit = splitId;
+    // Bulk selection is per-context (kata pakx).
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
     renderSplitTabs();
     // loadEmails now renders from splitListCache instantly when a hit exists,
     // then refreshes in the background.
@@ -1297,6 +1337,14 @@ function closeRemindPicker() {
 function resolveReminderInput() {
     const natural = document.getElementById('remind-natural')?.value.trim();
     const typed = document.getElementById('remind-datetime')?.value;
+    return resolveTimeInput(natural, typed);
+}
+
+// Shared natural/explicit time vocabulary for the Remind Me and Send Later
+// pickers (kata acag): an explicit datetime-local wins; otherwise the same
+// small phrase set the pickers advertise (3H/3D/1MO, tomorrow 3pm, in N
+// hours/days). Returns null when nothing parses.
+function resolveTimeInput(natural, typed) {
     if (typed) return new Date(typed);
     if (!natural) return null;
     const upper = natural.toUpperCase();
@@ -1336,6 +1384,427 @@ function confirmRemindPicker() {
     confirmRemindAt(resolveReminderInput());
 }
 
+// Move to Folder / Apply Label picker (kata e993, Superhuman 'v'/'l').
+// Same modal pattern as the Remind Me picker above: markup built on open,
+// keys handled by a dedicated handler behind a handleKeyDown early-return.
+// Gmail's "folders" are labels server-side (provider::move_to_mailbox maps
+// either way), so the picker lists the same state.mailboxes for every
+// provider — only the wording differs.
+
+function movePickerMailboxes(query = '') {
+    // Every mailbox except the one the list is showing — moving an email to
+    // where it already is is a no-op.
+    const q = query.toLowerCase();
+    return state.mailboxes.filter(m =>
+        m.id !== state.currentMailbox?.id && m.name.toLowerCase().includes(q));
+}
+
+function renderMovePickerList() {
+    const query = document.getElementById('move-filter')?.value || '';
+    const matches = movePickerMailboxes(query);
+    state.movePickerIndex = Math.max(0, Math.min(state.movePickerIndex, matches.length - 1));
+    const listEl = document.getElementById('move-picker-list');
+    if (!listEl) return;
+    // Names and ids are user-controlled (shared/delegated mailboxes, kata
+    // 1p0d/fhtz) — escape at the innerHTML boundary, text vs attribute.
+    listEl.innerHTML = matches.map((m, idx) =>
+        `<div class="move-picker-item ${idx === state.movePickerIndex ? 'selected' : ''}" data-id="${escapeAttr(m.id)}">${escapeHtml(m.name)}</div>`
+    ).join('');
+    listEl.querySelectorAll('.move-picker-item').forEach(el => {
+        el.addEventListener('click', () => {
+            const mailbox = state.mailboxes.find(m => m.id === el.dataset.id);
+            if (mailbox) confirmMovePicker(mailbox);
+        });
+    });
+}
+
+function openMovePicker(emailId = getSelectedEmailId()) {
+    // With a bulk selection (kata pakx) the picker moves the whole batch;
+    // otherwise the single selected/open email (kata e993).
+    const bulk = bulkIds();
+    if ((!emailId && !bulk.length) || state.mailboxes.length === 0) return;
+    state.moveEmailId = bulk.length ? null : emailId;
+    state.movePickerOpen = true;
+    state.movePickerIndex = 0;
+    const isGmail = state.currentAccount?.provider === 'gmail';
+    const title = bulk.length
+        ? `${isGmail ? 'Label' : 'Move'} ${bulk.length} selected`
+        : (isGmail ? 'Move to label' : 'Move to folder');
+    els.moveModal.innerHTML = `
+        <div class="modal-content move-content">
+            <h3>${title}</h3>
+            <input id="move-filter" type="text" placeholder="Type to filter…" autocomplete="off">
+            <div id="move-picker-list"></div>
+            <div class="modal-hint">↑↓ selects · Enter moves · Esc cancels</div>
+        </div>`;
+    els.moveModal.classList.remove('hidden');
+    const filter = document.getElementById('move-filter');
+    filter?.addEventListener('input', () => {
+        state.movePickerIndex = 0;
+        renderMovePickerList();
+    });
+    renderMovePickerList();
+    filter?.focus();
+}
+
+function handleMovePickerKey(e) {
+    if (e.key === 'Escape') {
+        closeMovePicker();
+        e.preventDefault();
+    } else if (e.key === 'ArrowDown') {
+        state.movePickerIndex++;
+        renderMovePickerList(); // render clamps against the filtered set
+        e.preventDefault();
+    } else if (e.key === 'ArrowUp') {
+        state.movePickerIndex = Math.max(0, state.movePickerIndex - 1);
+        renderMovePickerList();
+        e.preventDefault();
+    } else if (e.key === 'Enter') {
+        const query = document.getElementById('move-filter')?.value || '';
+        const target = movePickerMailboxes(query)[state.movePickerIndex];
+        if (target) confirmMovePicker(target);
+        e.preventDefault();
+    }
+    // Every other key falls through to the filter input.
+}
+
+function closeMovePicker() {
+    state.movePickerOpen = false;
+    state.moveEmailId = null;
+    els.moveModal.classList.add('hidden');
+    setMode('normal');
+}
+
+function confirmMovePicker(mailbox) {
+    const bulk = bulkIds();
+    const id = state.moveEmailId;
+    closeMovePicker();
+    if (bulk.length) {
+        bulkMove(mailbox);
+    } else {
+        moveEmailTo(id, mailbox);
+    }
+}
+
+async function moveEmailTo(emailId, mailbox) {
+    // Mirrors emailAction's optimistic-removal + failure-revert shape,
+    // including the suppression release on both settle and revert
+    // (roborev 471/472 discipline).
+    const removedEmail = state.emails.find(e => e.id === emailId);
+    const removedIndex = state.emails.indexOf(removedEmail);
+    pushUndo('moved', emailId, removedEmail, removedIndex, null, state.currentMailbox?.id);
+    removeEmailFromList(emailId);
+    showStatus(`Moved to ${mailbox.name}`, 'success');
+
+    if (state.view === 'detail') {
+        goToNextEmail();
+    }
+
+    try {
+        await api('POST', `/emails/${emailId}/move`, { mailbox_id: mailbox.id });
+        refillSuppressedIds.delete(emailId);
+        loadSplitCounts(); // resync with server truth
+    } catch (err) {
+        // Revert: re-insert the email and remove the stale undo entry.
+        state.undoStack.pop();
+        refillSuppressedIds.delete(emailId);
+        if (removedEmail) {
+            state.emails.splice(removedIndex, 0, removedEmail);
+            invalidateSplitListCache();
+            renderEmailList();
+        }
+        adjustSplitCounts(+1);
+        showStatus(`Move failed: ${err.message}`, 'error');
+    }
+}
+
+// Bulk selection (kata pakx). Selection is a Set of email IDS (not row
+// indexes — rows shift as emails settle), list-view only, cleared on any
+// context switch. Batch actions go over the EXISTING per-email endpoints;
+// one undo entry covers a whole batch.
+
+function bulkIds() {
+    // Ids may have left state.emails since they were selected (settled
+    // elsewhere, list replaced) — act only on those still present, in list
+    // order. Detail view acts on the open email, never the selection.
+    if (state.view !== 'list' || state.bulkSelected.size === 0) return [];
+    return state.emails.filter(e => state.bulkSelected.has(e.id)).map(e => e.id);
+}
+
+function toggleBulkSelect() {
+    if (state.view !== 'list') return;
+    const row = visibleRows()[state.selectedIndex];
+    if (!row) return;
+    // A collapsed thread row selects its newest member — the same email the
+    // single-row actions act on (kata 64z6 v1, no bulk thread actions).
+    if (state.bulkSelected.has(row.emailId)) {
+        state.bulkSelected.delete(row.emailId);
+    } else {
+        state.bulkSelected.add(row.emailId);
+    }
+    state.bulkAnchorId = row.emailId;
+    renderEmailList();
+}
+
+function rangeBulkSelect() {
+    if (state.view !== 'list') return;
+    const rows = visibleRows();
+    const cursor = state.selectedIndex;
+    if (!rows[cursor]) return;
+    let anchor = rows.findIndex(r => r.emailId === state.bulkAnchorId);
+    if (anchor === -1) anchor = cursor;
+    const [from, to] = anchor <= cursor ? [anchor, cursor] : [cursor, anchor];
+    for (let i = from; i <= to; i++) {
+        state.bulkSelected.add(rows[i].emailId);
+    }
+    state.bulkAnchorId = rows[cursor].emailId;
+    renderEmailList();
+}
+
+function selectAllVisible() {
+    if (state.view !== 'list') return;
+    visibleRows().forEach(row => state.bulkSelected.add(row.emailId));
+    renderEmailList();
+}
+
+function clearBulkSelection({ render = true } = {}) {
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
+    if (render) renderEmailList();
+}
+
+function renderBulkBar() {
+    if (!els.bulkBar) return;
+    const count = state.bulkSelected.size;
+    els.bulkBar.classList.toggle('hidden', count === 0);
+    els.bulkBar.textContent = count === 0 ? ''
+        : `${count} selected — e archive · # trash · u read/unread · s star · v move · Esc clear`;
+}
+
+function pushBulkUndo(action, entries) {
+    state.undoStack.push({
+        action,
+        entries,
+        sourceMailboxId: state.currentMailbox?.id,
+        timestamp: Date.now(),
+    });
+    const verb = action === 'bulk-trashed' ? 'trashed'
+        : action === 'bulk-moved' ? 'moved'
+        : 'archived';
+    els.undoMessage.textContent = `${entries.length} emails ${verb}`;
+    els.undoToast.classList.remove('hidden');
+    setTimeout(() => {
+        els.undoToast.classList.add('hidden');
+    }, 5000);
+}
+
+async function bulkRemoveAndSend(undoAction, label, post) {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    // Record each email's pre-removal position, in list order, so a batch
+    // undo (or a partial-failure revert) can splice them back exactly:
+    // ascending-order splices reconstruct the original array.
+    const entries = [];
+    state.emails.forEach((email, index) => {
+        if (idSet.has(email.id)) entries.push({ emailId: email.id, emailData: email, insertIndex: index });
+    });
+    pushBulkUndo(undoAction, entries);
+    clearBulkSelection({ render: false });
+    removeEmailsFromList(e => !idSet.has(e.id), entries.length);
+    showStatus(`${label} ${entries.length} emails`, 'success');
+
+    const results = await Promise.allSettled(entries.map(entry => post(entry.emailId)));
+    const failed = new Set();
+    results.forEach((result, i) => {
+        if (result.status === 'rejected') failed.add(entries[i].emailId);
+    });
+    // Release suppression for the whole batch: settled ids are server truth
+    // now; failed ids are reverted right below, with no mutation in flight
+    // (roborev 471/472 discipline).
+    for (const entry of entries) refillSuppressedIds.delete(entry.emailId);
+    if (failed.size) {
+        for (const entry of entries) {
+            if (!failed.has(entry.emailId)) continue;
+            state.emails.splice(Math.min(entry.insertIndex, state.emails.length), 0, entry.emailData);
+        }
+        // The undo entry must only restore rows that actually left.
+        const undoItem = state.undoStack[state.undoStack.length - 1];
+        if (undoItem && undoItem.entries === entries) {
+            undoItem.entries = entries.filter(entry => !failed.has(entry.emailId));
+            if (!undoItem.entries.length) state.undoStack.pop();
+        }
+        adjustSplitCounts(+failed.size);
+        invalidateSplitListCache();
+        renderEmailList();
+        showStatus(`${label} ${entries.length - failed.size} of ${entries.length} — ${failed.size} failed`, 'error');
+    }
+    loadSplitCounts(); // resync with server truth
+}
+
+function bulkEmailAction(type) {
+    return bulkRemoveAndSend(
+        type === 'archive' ? 'bulk-archived' : 'bulk-trashed',
+        type === 'archive' ? 'Archived' : 'Trashed',
+        id => api('POST', `/emails/${id}/${type}`),
+    );
+}
+
+function bulkMove(mailbox) {
+    return bulkRemoveAndSend(
+        'bulk-moved',
+        'Moved',
+        id => api('POST', `/emails/${id}/move`, { mailbox_id: mailbox.id }),
+    );
+}
+
+async function bulkToggleUnread() {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    // Mirror the single 'u': each selected email flips relative to its OWN
+    // state, optimistically, with a per-email revert on failure. The
+    // selection survives — read-state changes don't remove rows.
+    const flips = ids.map(id => {
+        const email = state.emails.find(e => e.id === id);
+        const wasUnread = email.isUnread;
+        email.isUnread = !wasUnread;
+        return { email, wasUnread };
+    });
+    renderEmailList();
+    const results = await Promise.allSettled(flips.map(({ email, wasUnread }) =>
+        api('POST', `/emails/${email.id}/${wasUnread ? 'mark-read' : 'mark-unread'}`)));
+    let reverted = 0;
+    results.forEach((result, i) => {
+        if (result.status !== 'rejected') return;
+        flips[i].email.isUnread = flips[i].wasUnread;
+        reverted++;
+    });
+    if (reverted) {
+        renderEmailList();
+        showStatus(`Failed to toggle read on ${reverted} emails`, 'error');
+    }
+}
+
+// Triage mode — Get-Me-To-Zero (kata 5np4). Walks the unread emails one at
+// a time in detail view: a snapshot queue of unread ids is taken on entry
+// (list order), each action settles then advances to the next queued id
+// still present, and exhausting the queue lands on the zero state. The
+// flow's keys live in handleNormalModeKey's triage block; removals caused
+// by fall-through bindings (remind, unsubscribe) advance via goToNextEmail.
+
+function enterTriage() {
+    if (state.triage || state.view !== 'list') return;
+    const queue = state.emails.filter(e => e.isUnread).map(e => e.id);
+    if (!queue.length) {
+        showStatus('Inbox zero — nothing unread here', 'success');
+        return;
+    }
+    state.triage = { queue, index: 0, total: queue.length };
+    renderTriageProgress();
+    triageOpen(queue[0]);
+}
+
+function exitTriage() {
+    if (!state.triage) return;
+    state.triage = null;
+    renderTriageProgress();
+    showView('list');
+    renderEmailList();
+    showStatus('Triage ended', 'info');
+}
+
+function triageOpen(id) {
+    state.selectedIndex = visibleRowIndexForEmailId(id);
+    loadEmailDetail(id);
+}
+
+function triageAdvance() {
+    const t = state.triage;
+    if (!t) return;
+    // Advance to the next queued id still present in the list — an id can
+    // vanish outside the flow's own actions (another tab, a refill replace).
+    let next = t.index + 1;
+    while (next < t.queue.length && !state.emails.some(e => e.id === t.queue[next])) {
+        next++;
+    }
+    if (next >= t.queue.length) {
+        triageComplete();
+        return;
+    }
+    t.index = next;
+    renderTriageProgress();
+    triageOpen(t.queue[next]);
+}
+
+function triageComplete() {
+    state.triage = null;
+    renderTriageProgress();
+    showView('list');
+    renderEmailList();
+    showStatus('Inbox zero — triage complete', 'success');
+}
+
+async function triageAction(type) {
+    const t = state.triage;
+    if (!t) return;
+    const id = t.queue[t.index];
+    // Settle before advancing: a failed action reverts the removal
+    // (emailAction's catch puts the email back) and the flow must STAY on
+    // the failed email so the user can retry or skip — never advance past
+    // a lost action.
+    await emailAction(type, id);
+    if (!state.triage) return; // exited mid-flight
+    if (state.emails.some(e => e.id === id)) return; // reverted — stay
+    triageAdvance();
+}
+
+async function triageKeepUnread() {
+    const t = state.triage;
+    if (!t) return;
+    const id = t.queue[t.index];
+    const email = state.emails.find(e => e.id === id);
+    // Opening the email marked it read; keep-unread flips it back through
+    // the same toggle the single 'u' uses, then moves on. A failed toggle
+    // reverts itself (toggleUnread's catch) — still advance: nothing was
+    // removed, the email just stays read in place.
+    if (email && !email.isUnread) {
+        await toggleUnread(id);
+    }
+    if (!state.triage) return;
+    triageAdvance();
+}
+
+function renderTriageProgress() {
+    if (!els.triageProgress) return;
+    const t = state.triage;
+    els.triageProgress.classList.toggle('hidden', !t);
+    els.triageProgress.textContent = t ? `TRIAGE ${t.index + 1}/${t.total}` : '';
+}
+
+async function bulkToggleFlag() {
+    const ids = bulkIds();
+    if (!ids.length) return;
+    // Same shape as bulkToggleUnread, over the single toggle-flag endpoint.
+    const flips = ids.map(id => {
+        const email = state.emails.find(e => e.id === id);
+        email.isFlagged = !email.isFlagged;
+        return email;
+    });
+    renderEmailList();
+    const results = await Promise.allSettled(flips.map(email =>
+        api('POST', `/emails/${email.id}/toggle-flag`)));
+    let reverted = 0;
+    results.forEach((result, i) => {
+        if (result.status !== 'rejected') return;
+        flips[i].isFlagged = !flips[i].isFlagged;
+        reverted++;
+    });
+    if (reverted) {
+        renderEmailList();
+        showStatus(`Failed to toggle star on ${reverted} emails`, 'error');
+    }
+}
+
 async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     if (!emailId) return;
     const removedEmail = state.emails.find(email => email.id === emailId);
@@ -1343,7 +1812,11 @@ async function remindEmail(emailId, wakeAt, mode = 'if-no-reply') {
     const label = mode === 'regardless' ? 'regardless' : 'if no reply';
     pushUndo('reminded', emailId, removedEmail, removedIndex, { mode, wakeAt });
     removeEmailFromList(emailId);
-    if (state.view === 'detail') showView('list');
+    // In triage (kata 5np4) a remind is an action like any other — advance
+    // to the next queued unread instead of dropping back to the list.
+    if (state.view === 'detail') {
+        if (state.triage) triageAdvance(); else showView('list');
+    }
     showStatus(`Reminded ${label} until ${new Date(wakeAt).toLocaleString()}`, 'success');
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
         Notification.requestPermission().catch(() => {});
@@ -2225,6 +2698,234 @@ async function toggleFlag(emailId) {
 // editor: silent data loss.
 let sendingSession = null;
 
+// The Send Later picker's hand-off to the send path (kata acag): set just
+// before sendEmail(), snapshotted and cleared at the top of doSendEmail so
+// it can never leak onto a later unrelated send. A module slot (not a
+// parameter) because the `await doSendEmail()` call shape is contract-pinned.
+let sendLaterAt = null;
+
+// Undo Send window in seconds (kata vj6k). localStorage-configurable
+// ('undoSendDelaySecs'); unset/garbage falls back to 10, clamped to 0–60.
+// 0 disables the window entirely — sends go out immediately, as before.
+function undoSendDelaySecs() {
+    const raw = localStorage.getItem('undoSendDelaySecs');
+    if (raw === null || raw === '') return 10;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return 10;
+    return Math.min(Math.max(n, 0), 60);
+}
+
+// Countdown toast for a deferred send (kata vj6k). Single-slot: a newer
+// deferred send replaces the toast; the older one simply departs on
+// schedule. The interval only repaints the countdown — expiry is the
+// server's daemon dispatching the queued record, not a client action.
+function showSendUndoToast(id, deadline) {
+    clearSendUndoToast();
+    const update = () => {
+        const secs = Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / 1000));
+        els.sendUndoMessage.textContent = `Sending in ${secs}s`;
+        if (secs <= 0) clearSendUndoToast();
+    };
+    state.sendUndo = { id, deadline, timerId: setInterval(update, 250) };
+    update();
+    els.sendUndoToast.classList.remove('hidden');
+}
+
+function clearSendUndoToast() {
+    if (state.sendUndo) clearInterval(state.sendUndo.timerId);
+    state.sendUndo = null;
+    els.sendUndoToast.classList.add('hidden');
+}
+
+// The toast's Undo click: race the daemon for the queued record.
+async function cancelPendingSend() {
+    const pending = state.sendUndo;
+    if (!pending) return;
+    clearSendUndoToast();
+    await cancelScheduledSend(pending.id);
+}
+
+// Cancel a queued deferred send and restore its draft. Shared by the undo
+// toast and the Scheduled list. A 404 means the daemon already dispatched
+// it — exactly what an Undo click after the window closes should surface.
+async function cancelScheduledSend(id) {
+    try {
+        const record = await api('DELETE', `/scheduled-sends/${id}`);
+        restoreComposeFromScheduledSend(record);
+        showStatus('Send cancelled — draft restored', 'success');
+    } catch (err) {
+        showStatus(err.status === 404
+            ? 'Too late — already sent'
+            : 'Cancel failed: ' + err.message, 'error');
+    }
+}
+
+// Rebuild the compose surface from a cancelled queue record. The quote text
+// was already merged into text_body at send time, so the restored draft is
+// plain-text with the quote inline (same fidelity caveat as server drafts,
+// kata wm57); in_reply_to keeps the threading. Attachment blobs were never
+// consumed (the send didn't dispatch), so their upload ids re-arm as ready.
+function restoreComposeFromScheduledSend(record) {
+    const sub = record.submission || {};
+    clearCompose();
+    els.composeTo.value = (sub.to || []).join(', ');
+    els.composeCc.value = (sub.cc || []).join(', ');
+    els.composeSubject.value = sub.subject || '';
+    els.composeBody.value = sub.text_body || '';
+    if (els.composeFrom && record.from_addr) els.composeFrom.value = record.from_addr;
+    state.replyContext = sub.in_reply_to
+        ? { inReplyTo: sub.in_reply_to, quotedText: null, quotedHtml: null }
+        : null;
+    state.pendingAttachments = (sub.attachments || []).map(a => ({
+        blob_id: a.blob_id, name: a.name, mime_type: a.mime_type, size: a.size,
+        status: 'ready',
+    }));
+    renderComposeAttachments();
+    showView('compose');
+}
+
+// --- Send Later picker + Scheduled list (kata acag) -------------------------
+// Modeled on the Remind Me picker: same modal shell, same quick options,
+// same natural-language vocabulary (via resolveTimeInput). Confirming hands
+// the picked instant to the send path through sendLaterAt.
+
+function openSendLaterPicker() {
+    if (state.view !== 'compose') return;
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Send Later</h3>
+            <div class="remind-quick-options">
+                <button type="button" data-send-later-quick="hour">In 1 hour</button>
+                <button type="button" data-send-later-quick="later">Later today</button>
+                <button type="button" data-send-later-quick="tomorrow">Tomorrow 8am</button>
+                <button type="button" data-send-later-quick="week">Next week 8am</button>
+            </div>
+            <label>Type a time (tomorrow 3pm, next week, 3H/3D/1MO)</label>
+            <input id="send-later-natural" type="text" placeholder="tomorrow 9am" autocomplete="off">
+            <label>Or choose a date &amp; time</label>
+            <input id="send-later-datetime" type="datetime-local">
+            <div class="modal-hint">Enter schedules · Esc cancels</div>
+            <div class="modal-buttons"><button id="send-later-cancel" type="button">Cancel</button><button id="send-later-confirm" type="button">Schedule</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    els.sendLaterModal.querySelectorAll('[data-send-later-quick]').forEach(button => {
+        button.addEventListener('click', () => {
+            confirmSendLaterAt(reminderQuickDate(button.dataset.sendLaterQuick));
+        });
+    });
+    document.getElementById('send-later-cancel').addEventListener('click', closeSendLaterPicker);
+    document.getElementById('send-later-confirm').addEventListener('click', confirmSendLaterPicker);
+    els.sendLaterModal.querySelector('#send-later-natural').focus();
+}
+
+function closeSendLaterPicker() {
+    els.sendLaterModal.classList.add('hidden');
+    els.sendLaterModal.innerHTML = '';
+}
+
+function handleSendLaterPickerKey(e) {
+    if (e.key === 'Escape') {
+        closeSendLaterPicker();
+        e.preventDefault();
+    } else if (e.key === 'Enter' && document.getElementById('send-later-confirm')) {
+        confirmSendLaterPicker();
+        e.preventDefault();
+    }
+}
+
+function resolveSendLaterInput() {
+    const natural = document.getElementById('send-later-natural')?.value.trim();
+    const typed = document.getElementById('send-later-datetime')?.value;
+    return resolveTimeInput(natural, typed);
+}
+
+function confirmSendLaterPicker() {
+    confirmSendLaterAt(resolveSendLaterInput());
+}
+
+function confirmSendLaterAt(date) {
+    if (!date || Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+        showStatus('Choose a future send time', 'error');
+        return;
+    }
+    closeSendLaterPicker();
+    sendLaterAt = date;
+    sendEmail();
+}
+
+// --- Read statuses (kata e2h4) ----------------------------------------------
+// Minimal by design: a palette-opened list in the shared modal shell,
+// sourced from /api/tracking/status. Joining statuses onto the Sent
+// list/detail rows belongs to those regions' owners.
+
+function readStatusRows(records) {
+    return records.map(r => {
+        const opens = (r.opens || []).length;
+        const detail = opens
+            ? `Opened ${opens}× · last ${new Date(r.opens[opens - 1]).toLocaleString()}`
+            : 'Not opened';
+        return `
+        <div class="scheduled-send-row">
+            <span class="scheduled-send-subject">${escapeHtml(r.subject || '(no subject)')} → ${escapeHtml((r.recipients || []).join(', '))}</span>
+            <span class="scheduled-send-time">${escapeHtml(detail)}</span>
+        </div>`;
+    }).join('');
+}
+
+async function openReadStatuses() {
+    let records;
+    try {
+        records = await api('GET', '/tracking/status');
+    } catch (err) {
+        showStatus('Failed to load read statuses: ' + err.message, 'error');
+        return;
+    }
+    const rows = readStatusRows(records);
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Read Statuses</h3>
+            <div class="scheduled-send-list">${rows || '<div class="scheduled-send-empty">No tracked sends</div>'}</div>
+            <div class="modal-hint">Esc closes · opens record only when the tracking base is configured</div>
+            <div class="modal-buttons"><button id="read-statuses-close" type="button">Close</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    document.getElementById('read-statuses-close').addEventListener('click', closeSendLaterPicker);
+}
+
+// The Scheduled list: every queued send for the current account, soonest
+// first (server order), each cancelable back into a compose draft. Reuses
+// the Send Later modal shell — only one can be open at a time.
+async function openScheduledSends() {
+    let records;
+    try {
+        records = await api('GET', '/scheduled-sends');
+    } catch (err) {
+        showStatus('Failed to load scheduled sends: ' + err.message, 'error');
+        return;
+    }
+    const rows = records.map(r => `
+        <div class="scheduled-send-row">
+            <span class="scheduled-send-subject">${escapeHtml(r.submission?.subject || '(no subject)')}</span>
+            <span class="scheduled-send-time">${escapeHtml(new Date(r.send_at).toLocaleString())}</span>
+            <button type="button" data-cancel-scheduled="${escapeAttr(r.id)}">Cancel</button>
+        </div>`).join('');
+    els.sendLaterModal.innerHTML = `
+        <div class="modal-content remind-content">
+            <h3>Scheduled</h3>
+            <div class="scheduled-send-list">${rows || '<div class="scheduled-send-empty">Nothing scheduled</div>'}</div>
+            <div class="modal-hint">Esc closes</div>
+            <div class="modal-buttons"><button id="scheduled-sends-close" type="button">Close</button></div>
+        </div>`;
+    els.sendLaterModal.classList.remove('hidden');
+    document.getElementById('scheduled-sends-close').addEventListener('click', closeSendLaterPicker);
+    els.sendLaterModal.querySelectorAll('[data-cancel-scheduled]').forEach(button => {
+        button.addEventListener('click', () => {
+            closeSendLaterPicker();
+            cancelScheduledSend(button.dataset.cancelScheduled);
+        });
+    });
+}
+
 // Lock the compose surface while ITS send is in flight (roborev 321): the
 // payload is snapshotted at send initiation (see doSendEmail), so anything
 // typed after Ctrl+Enter would be silently discarded — the session-scoped
@@ -2288,6 +2989,10 @@ async function doSendEmail() {
     // (see sendingSession) blocks this compose's new saves from running
     // until the send settles.
     cancelAutosave();
+    // Snapshot the Send Later hand-off with the rest of the payload and
+    // clear the slot: it belongs to THIS send only (kata acag).
+    const sendAt = sendLaterAt;
+    sendLaterAt = null;
     // Snapshot EVERYTHING the send posts — and the session token its
     // completion gates compare against — synchronously, before the settle
     // await below can yield (roborev 320). That await can block >3s, and the
@@ -2445,8 +3150,16 @@ async function doSendEmail() {
         return;
     }
 
+    // Deferred send (kata vj6k/acag): an explicit Send Later time wins over
+    // the Undo Send window; a zero window keeps today's immediate send.
+    // Invites never defer — the queue cannot carry calendar_ics — which is
+    // why this sits below the invite path.
+    const delaySecs = undoSendDelaySecs();
+    const deferUntil = sendAt
+        || (delaySecs > 0 ? new Date(Date.now() + delaySecs * 1000) : null);
+
     try {
-        await api('POST', '/emails/send', {
+        const resp = await api('POST', '/emails/send', {
             to,
             cc,
             subject,
@@ -2455,8 +3168,17 @@ async function doSendEmail() {
             in_reply_to: inReplyTo,
             from_address: fromAddress,
             attachments: readyAttachments.length ? readyAttachments : undefined,
+            send_at: deferUntil ? deferUntil.toISOString() : undefined,
         });
-        showStatus('Sent!', 'success');
+        if (resp?.scheduled) {
+            if (sendAt) {
+                showStatus(`Scheduled for ${deferUntil.toLocaleString()}`, 'success');
+            } else {
+                showSendUndoToast(resp.id, deferUntil);
+            }
+        } else {
+            showStatus('Sent!', 'success');
+        }
         // Same shape as the invite path above: captured-id delete unless a
         // newer session recaptured the id (see the comment there),
         // clear/navigate only while this send still owns the compose.
@@ -2735,6 +3457,11 @@ function renderInviteChip(email) {
 }
 
 function renderEmailList() {
+    // Bulk-selection bar (kata pakx) and triage progress (kata 5np4): every
+    // list draw syncs them, so the context-switch paths that clear either
+    // hide their UI for free.
+    renderBulkBar();
+    renderTriageProgress();
     if (state.currentMailbox?.role === 'reminders') {
         renderReminderList();
         return;
@@ -2773,7 +3500,8 @@ function renderEmailList() {
             }
         }
         const rowClass = `email-row${idx === state.selectedIndex ? ' selected' : ''}${row.unread ? ' unread' : ''}`
-            + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`;
+            + `${isThread ? ' email-row-thread' : ''}${isMember ? ' email-row-member' : ''}`
+            + `${state.bulkSelected.has(row.emailId) ? ' bulk-selected' : ''}`;
         // Collapsed/expanded thread header carries a clickable count badge; a
         // click on it toggles expansion instead of opening the message.
         const countBadge = isThread
@@ -2849,6 +3577,171 @@ function renderEmailDetail() {
         els.emailBody.innerHTML = linkifyText(e.textBody || '(no content)');
         els.emailBody.classList.remove('html-content');
     }
+
+    // AI summary is on-demand (palette) and per-email — never let a previous
+    // email's summary linger under a new message (kata 6rhw).
+    if (els.aiSummary) {
+        els.aiSummary.classList.add('hidden');
+        els.aiSummary.innerHTML = '';
+    }
+
+    renderContactSidebar();
+}
+
+// ============================================================================
+// Contact insights sidebar (kata wcsg) — sender history next to an open
+// email. Data comes pre-aggregated from GET /api/contacts/insights (counts
+// both directions, first contact, recent threads); this layer only fetches,
+// caches per account+contact, and renders.
+// ============================================================================
+
+// Pure HTML builder — insights → sidebar markup. null renders the loading
+// state. Everything user-controlled (names, subjects) is escaped at this
+// innerHTML boundary.
+function contactSidebarHtml(insights) {
+    if (!insights) {
+        return '<div class="contact-sidebar-loading">Loading contact history…</div>';
+    }
+    const name = escapeHtml(insights.name || '');
+    const email = escapeHtml(insights.email || '');
+    const received = insights.messagesFrom || 0;
+    const sent = insights.messagesTo || 0;
+    const header = `
+        <div class="contact-sidebar-header">
+            ${name ? `<div class="contact-sidebar-name">${name}</div>` : ''}
+            <div class="contact-sidebar-email">${email}</div>
+        </div>`;
+    if (received + sent === 0) {
+        return header + '<div class="contact-sidebar-empty">No previous history</div>';
+    }
+    const first = insights.firstContact
+        ? new Date(insights.firstContact).toLocaleDateString()
+        : '';
+    const threads = (insights.recentThreads || []).map(t => `
+        <div class="contact-thread">
+            <div class="contact-thread-subject">${escapeHtml(t.subject || '(no subject)')}</div>
+            <div class="contact-thread-date">${t.direction === 'to' ? '→ ' : ''}${new Date(t.receivedAt).toLocaleDateString()}</div>
+        </div>`).join('');
+    return `${header}
+        <div class="contact-sidebar-stats">
+            <div>${received}${received >= 100 ? '+' : ''} received · ${sent}${sent >= 100 ? '+' : ''} sent</div>
+            ${first ? `<div>First contact: ${first}</div>` : ''}
+        </div>
+        ${threads ? `<div class="contact-sidebar-section">Recent threads</div>${threads}` : ''}`;
+}
+
+// Fetch-with-cache. Keyed per account + lowercased contact so an account
+// switch never surfaces another account's history (contactIndex convention).
+// Failures degrade to null — the sidebar is enrichment, never load-bearing.
+async function loadContactInsights(email) {
+    const accountId = state.currentAccount?.id;
+    if (!email || !accountId) return null;
+    const key = `${accountId}:${email.toLowerCase()}`;
+    const cached = state.contactInsights.get(key);
+    if (cached) return cached;
+    try {
+        const insights = await api('GET', `/contacts/insights?email=${encodeURIComponent(email)}`);
+        state.contactInsights.set(key, insights);
+        return insights;
+    } catch (err) {
+        console.warn('Contact insights fetch failed:', err);
+        return null;
+    }
+}
+
+// ============================================================================
+// AI assist (kata 6rhw) — summarize the open email and draft replies via the
+// server's Claude endpoints. Optional: every entry point gates on
+// state.ai.enabled (GET /api/ai/status), so without an ANTHROPIC_API_KEY the
+// feature is invisible, never broken.
+// ============================================================================
+
+// Fetched once at boot. A failed fetch means "disabled", not an error.
+async function loadAiStatus() {
+    try {
+        state.ai = await api('GET', '/ai/status');
+    } catch (err) {
+        console.warn('AI status fetch failed:', err);
+        state.ai = { enabled: false };
+    }
+}
+
+// Pure HTML builder for the summary panel: {status: 'loading'|'done'|'error',
+// text}. Summary text and error messages are escaped at this innerHTML
+// boundary (the model's output is untrusted content like any other).
+function aiSummaryHtml(s) {
+    if (!s || s.status === 'loading') {
+        return '<div class="ai-summary-loading">Summarizing with Claude…</div>';
+    }
+    if (s.status === 'error') {
+        return `<div class="ai-summary-error">AI summary failed: ${escapeHtml(s.text || 'unknown error')}</div>`;
+    }
+    return `
+        <div class="ai-summary-label">AI summary</div>
+        <div class="ai-summary-text">${escapeHtml(s.text || '')}</div>`;
+}
+
+// Palette "AI: Summarize" — paints loading into the panel, calls the server,
+// re-paints. A stale guard drops the response if the user opened a different
+// email while Claude was thinking.
+async function summarizeCurrentEmail() {
+    const panel = els.aiSummary;
+    if (!panel) return;
+    if (!state.ai?.enabled || !state.currentEmail) {
+        panel.classList.add('hidden');
+        return;
+    }
+    const emailId = state.currentEmail.id;
+    panel.classList.remove('hidden');
+    panel.innerHTML = aiSummaryHtml({ status: 'loading' });
+    try {
+        const resp = await api('POST', '/ai/summarize', { emailId });
+        if (state.currentEmail?.id !== emailId) return;
+        panel.innerHTML = aiSummaryHtml({ status: 'done', text: resp.summary || '' });
+    } catch (err) {
+        console.warn('AI summarize failed:', err);
+        if (state.currentEmail?.id !== emailId) return;
+        panel.innerHTML = aiSummaryHtml({ status: 'error', text: err.message || String(err) });
+    }
+}
+
+// Palette "AI: Draft Reply" — draft FIRST, open compose only on success (a
+// failed draft must never strand the user in an empty compose view).
+async function aiDraftReply() {
+    if (!state.ai?.enabled || !state.currentEmail) return;
+    showStatus('Drafting reply with Claude…');
+    let resp;
+    try {
+        resp = await api('POST', '/ai/draft', { emailId: state.currentEmail.id });
+    } catch (err) {
+        console.warn('AI draft failed:', err);
+        showStatus(`AI draft failed: ${err.message || err}`, 'error');
+        return;
+    }
+    startReply(false);
+    els.composeBody.value = resp.draft || '';
+    showStatus('Draft inserted — review before sending');
+}
+
+// Orchestrator: paint loading (or cache), fetch, re-paint — unless the user
+// has moved on to a different sender while the fetch was in flight.
+async function renderContactSidebar() {
+    const sidebar = els.contactSidebar;
+    if (!sidebar) return;
+    const sender = state.currentEmail?.from?.[0]?.email;
+    if (!sender) {
+        sidebar.classList.add('hidden');
+        return;
+    }
+    sidebar.classList.remove('hidden');
+    sidebar.innerHTML = contactSidebarHtml(null);
+    const insights = await loadContactInsights(sender);
+    if (state.currentEmail?.from?.[0]?.email !== sender) return;
+    if (!insights) {
+        sidebar.classList.add('hidden');
+        return;
+    }
+    sidebar.innerHTML = contactSidebarHtml(insights);
 }
 
 function renderCommandPalette() {
@@ -2917,6 +3810,12 @@ function selectMailbox(mailbox) {
     state.searchTokens = [];
     state.currentSplit = mailbox.role === 'inbox' ? 'all' : null;
     state.splitCounts = {};
+    // Bulk selection and triage are per-context (kata pakx/5np4); plain
+    // state mutations so the extraction-based test harnesses need no new
+    // injected dependency.
+    state.bulkSelected.clear();
+    state.bulkAnchorId = null;
+    state.triage = null;
     // No cache wipe: splitListCache keys include (account, mailbox, split,
     // starred, search), so switching mailbox simply changes which entry
     // loadEmails looks up. The cached snapshot for the new mailbox (if any)
@@ -3847,6 +4746,12 @@ function handleKeyDown(e) {
         return;
     }
 
+    // Send Later picker / Scheduled list owns Enter and Escape (kata acag).
+    if (!els.sendLaterModal.classList.contains('hidden')) {
+        handleSendLaterPickerKey(e);
+        return;
+    }
+
     // Reminder Settings modal owns its form fields and Escape.
     if (!els.reminderSettingsModal.classList.contains('hidden')) {
         if (e.key === 'Escape') {
@@ -3865,6 +4770,39 @@ function handleKeyDown(e) {
             saveSplit();
             e.preventDefault();
         }
+        return;
+    }
+
+    // Move picker owns its keys; unhandled keys reach the filter input
+    // natively (kata e993).
+    if (!els.moveModal.classList.contains('hidden')) {
+        handleMovePickerKey(e);
+        return;
+    }
+
+    // Calendar peek (kata j6e4): while open the peek owns only its own nav
+    // keys (d/w/[/]/Esc/C, see handleCalendarPeekKey) and lets everything
+    // else fall through so list navigation keeps working alongside it.
+    // C toggles it from list/detail normal mode.
+    if (state.calendarPeek.visible && handleCalendarPeekKey(e)) {
+        return;
+    }
+    if (state.mode === 'normal' && !e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'C'
+        && (state.view === 'list' || state.view === 'detail')) {
+        toggleCalendarPeek();
+        e.preventDefault();
+        return;
+    }
+
+    // Share Availability picker (kata mtqp): while open it owns Enter/Esc;
+    // Ctrl+Shift+H opens it from compose (both modes).
+    if (!els.availModal.classList.contains('hidden')) {
+        handleAvailPickerKey(e);
+        return;
+    }
+    if (state.view === 'compose' && (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'h') {
+        openAvailabilityPicker();
+        e.preventDefault();
         return;
     }
 
@@ -3947,6 +4885,10 @@ function handleKeyDown(e) {
             e.preventDefault();
         } else if (e.key === 'A' && e.ctrlKey && e.shiftKey) {
             els.composeFileInput.click();
+            e.preventDefault();
+        } else if (e.key === 'L' && (e.ctrlKey || e.metaKey) && e.shiftKey) {
+            // Send Later (kata acag) — Superhuman's Cmd+Shift+L.
+            openSendLaterPicker();
             e.preventDefault();
         }
         return;
@@ -4123,6 +5065,18 @@ function handleNormalModeKey(e) {
         }
     }
 
+    // Triage mode (kata 5np4): while walking the unread queue in detail,
+    // the flow keys act on the CURRENT queue email and auto-advance. Every
+    // other key falls through to the normal detail bindings; removals they
+    // cause (remind, unsubscribe) advance via the goToNextEmail hook.
+    if (state.triage && state.view === 'detail') {
+        if (key === 'e') { triageAction('archive'); e.preventDefault(); return; }
+        if (key === '#') { triageAction('trash'); e.preventDefault(); return; }
+        if (key === 'u') { triageKeepUnread(); e.preventDefault(); return; }
+        if (key === 'j') { triageAdvance(); e.preventDefault(); return; }
+        if (key === 'Escape' || key === 'q' || key === 'T') { exitTriage(); e.preventDefault(); return; }
+    }
+
     switch (key) {
         // Page scrolling in detail view
         case ' ':
@@ -4161,7 +5115,11 @@ function handleNormalModeKey(e) {
             break;
         case 'Escape':
         case 'q':
-            if (state.view === 'detail') {
+            if (key === 'Escape' && state.view === 'list' && state.bulkSelected.size) {
+                // Bulk selection active (kata pakx): Escape clears it; 'q'
+                // stays inert in list view as before.
+                clearBulkSelection();
+            } else if (state.view === 'detail') {
                 showView('list');
             } else if (state.view === 'compose') {
                 // Cancel-with-keep: persist the last edits, then leave the
@@ -4209,6 +5167,25 @@ function handleNormalModeKey(e) {
             break;
         case 'z':
             performUndo();
+            break;
+        case 'v':
+        case 'l':
+            // Move to Folder / Apply Label picker (kata e993): both
+            // Superhuman keys open the same picker; provider wording is
+            // handled inside openMovePicker.
+            openMovePicker();
+            e.preventDefault();
+            break;
+        case 'x':
+            toggleBulkSelect();
+            break;
+        case 'X':
+            rangeBulkSelect();
+            break;
+        case 'T':
+            // Get-Me-To-Zero (kata 5np4): enter from the list; while the
+            // flow runs, the triage block above owns T as the exit key.
+            if (state.view === 'list') enterTriage();
             break;
 
         // RSVP shortcuts
@@ -4451,6 +5428,12 @@ function getSelectedEmailId() {
 }
 
 function actionSelected(type) {
+    // An active bulk selection (kata pakx) captures the action for the whole
+    // batch — the same entry point serves the e/# keys and the palette.
+    if (bulkIds().length) {
+        bulkEmailAction(type);
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) {
         emailAction(type, id);
@@ -4461,6 +5444,12 @@ function actionSelected(type) {
 }
 
 function goToNextEmail() {
+    // Triage mode (kata 5np4): a removal-driven advance goes to the next
+    // unread in the triage queue, not the next visible row.
+    if (state.triage) {
+        triageAdvance();
+        return;
+    }
     // emailAction already removed the current email from state.emails, so the
     // next VISIBLE row at the same index is the one to advance to (kata 64z6 —
     // auto-advance walks visibleRows, not the flat list, so a collapsed thread
@@ -4485,11 +5474,19 @@ function goToNextEmail() {
 }
 
 function toggleUnreadSelected() {
+    if (bulkIds().length) {
+        bulkToggleUnread();
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) toggleUnread(id);
 }
 
 function toggleFlagSelected() {
+    if (bulkIds().length) {
+        bulkToggleFlag();
+        return;
+    }
     const id = getSelectedEmailId();
     if (id) toggleFlag(id);
 }
@@ -4665,13 +5662,72 @@ function startForward() {
     showView('compose');
 }
 
-// Per-account plain-text signature, prefilled into a fresh compose body.
-// clearCompose is the single choke point for new/reply/forward (all three
-// call it before anything else), so prefilling here covers all of them
-// uniformly. Never re-injected at send time — sendEmail sends exactly
-// what's left in the textarea after the user edits/deletes freely. The
-// account is per-account, not per-identity: switching compose-from does
-// NOT swap this (accounts can't be switched mid-compose anyway).
+// ============================================================================
+// Per-identity signatures (kata zqrn). The three helpers below are verbatim
+// desktop/mobile twins (1v8z one-file guardrail: mobile duplicates them) —
+// identity_signature_test.cjs pins them byte-identical; change both or
+// neither.
+// ============================================================================
+
+// The exact block composeSignaturePrefill plants: RFC-3676 style delimiter
+// plus the signature. Empty signature → empty block.
+function sigBlock(sig) {
+    return sig ? `\n\n-- \n${sig}` : '';
+}
+
+// Signature for one From identity: the per-identity override when an entry
+// exists (an EMPTY entry means "this identity signs nothing" and does not
+// fall through), else the account-level signature.
+function signatureForIdentity(email) {
+    const acct = state.currentAccount;
+    if (!acct) return '';
+    const perIdentity = acct.identitySignatures || {};
+    const key = (email || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(perIdentity, key)) {
+        return perIdentity[key] || '';
+    }
+    return acct.signature || '';
+}
+
+// Swap ONLY the signature block: replace the tracked old block with the new
+// one. If the user edited or deleted the old block, their edit wins and this
+// is a no-op; with no old block the new one is appended. Pure — returns the
+// new body.
+function swapComposeSignature(body, oldSig, newSig) {
+    const oldBlock = sigBlock(oldSig);
+    const newBlock = sigBlock(newSig);
+    if (oldBlock === newBlock) return body;
+    if (!oldBlock) return body + newBlock;
+    const at = body.lastIndexOf(oldBlock);
+    if (at === -1) return body;
+    return body.slice(0, at) + newBlock + body.slice(at + oldBlock.length);
+}
+
+// Re-resolve the signature for the current compose-From identity and swap it
+// into the body. Called on the From <select> change, from clearCompose after
+// the From default is set, and from autoSelectFromAddress — never from the
+// draft-restore paths, whose saved body must round-trip untouched. A
+// pristine body drags the dirty-check baseline along so an unedited compose
+// doesn't start autosaving just because the signature swapped.
+function applyComposeSignatureForFrom() {
+    if (!els.composeBody) return;
+    const fromEmail = els.composeFrom?.value || state.identities[0]?.email || '';
+    const newSig = signatureForIdentity(fromEmail);
+    const prevSig = state.composeSignature ?? (state.currentAccount?.signature || '');
+    if (prevSig === newSig) return;
+    const wasPristine = els.composeBody.value === state.composeBaseline;
+    els.composeBody.value = swapComposeSignature(els.composeBody.value, prevSig, newSig);
+    if (wasPristine) state.composeBaseline = els.composeBody.value;
+    state.composeSignature = newSig;
+}
+
+// Plain-text signature, prefilled into a fresh compose body. clearCompose is
+// the single choke point for new/reply/forward (all three call it before
+// anything else), so prefilling here covers all of them uniformly. Never
+// re-injected at send time — sendEmail sends exactly what's left in the
+// textarea after the user edits/deletes freely. Prefill is account-level;
+// per-identity swaps happen in applyComposeSignatureForFrom once the From
+// identity is known (kata zqrn).
 function composeSignaturePrefill() {
     const sig = state.currentAccount?.signature;
     return sig ? `\n\n-- \n${sig}` : '';
@@ -4712,12 +5768,18 @@ function clearCompose() {
     // Dirty-check baseline: composeDirty compares the body against this exact
     // string, so an untouched signature prefill isn't autosaved as a draft.
     state.composeBaseline = els.composeBody.value;
+    // The prefill is the account-level signature; track it so the per-
+    // identity swap knows which block it planted (kata zqrn).
+    state.composeSignature = state.currentAccount?.signature || '';
     els.composeBody.setSelectionRange(0, 0);
     els.composeQuote.innerHTML = '';
     els.composeQuote.classList.add('hidden');
     if (els.composeFrom && state.identities.length) {
         els.composeFrom.value = state.identities[0].email;
     }
+    // The default identity may carry its own signature — swap it in while
+    // the body is still pristine (kata zqrn).
+    applyComposeSignatureForFrom();
     state.replyContext = null;
     // Clear pending attachments and abort any in-progress uploads
     for (const att of state.pendingAttachments) {
@@ -5199,6 +6261,9 @@ function autoSelectFromAddress(email) {
             for (const id of state.identities) {
                 if (id.email.toLowerCase() === addr) {
                     els.composeFrom.value = id.email;
+                    // Programmatic select fires no 'change' event — swap the
+                    // signature for the matched identity here (kata zqrn).
+                    applyComposeSignatureForFrom();
                     return;
                 }
             }
@@ -5282,6 +6347,14 @@ function commandsForView(view) {
                     { name: 'Tentative', desc: 'RSVP tentative', shortcut: 'm', action: 'rsvp-tentative' },
                 );
             }
+            // AI assist (kata 6rhw): offered only when the server reports a
+            // configured ANTHROPIC_API_KEY — hidden, not broken, without one.
+            if (state.ai?.enabled) {
+                cmds.push(
+                    { name: 'AI: Summarize', desc: 'Summarize this email with Claude', shortcut: '', action: 'ai-summarize' },
+                    { name: 'AI: Draft Reply', desc: 'Draft a reply with Claude', shortcut: '', action: 'ai-draft-reply' },
+                );
+            }
             // Global tail (Superhuman Rule #5: most commands available from
             // everywhere), ranked below the view-native ones.
             cmds.push(
@@ -5295,6 +6368,36 @@ function commandsForView(view) {
                 { name: 'Add Account', desc: 'Connect a new mailbox', shortcut: '', action: 'add-account' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
             );
+            // map4: existing functionality newly reachable from the palette.
+            // Every action calls the SAME function its keybinding/click path
+            // calls, and every gate mirrors that path's own no-op condition
+            // so the palette never offers a command that would do nothing.
+            cmds.push({ name: 'Unsubscribe & Archive All', desc: 'Unsubscribe from this sender and archive all their emails', shortcut: 'U', action: 'unsubscribe' });
+            if (state.undoStack.length) {
+                cmds.push({ name: 'Undo', desc: 'Undo the last archive, trash, or reminder', shortcut: 'z', action: 'undo' });
+            }
+            if (state.mailboxes.some(m => m.role === 'drafts')) {
+                cmds.push({ name: 'Go to Drafts', desc: 'Switch to drafts', shortcut: '', action: 'go-drafts' });
+            }
+            if (state.mailboxes.some(m => m.role === 'sent')) {
+                cmds.push({ name: 'Go to Sent', desc: 'Switch to sent', shortcut: '', action: 'go-sent' });
+            }
+            if (state.mailboxes.some(m => m.role === 'spam')) {
+                cmds.push({ name: 'Go to Spam', desc: 'Switch to spam', shortcut: '', action: 'go-spam' });
+            }
+            state.accounts.forEach((acct, i) => {
+                const label = acct.email || acct.id;
+                cmds.push({ name: `Switch Account: ${label}`, desc: `Switch to ${label}`, shortcut: i < 9 ? String(i + 1) : '', action: `switch-account:${acct.id}` });
+            });
+            cmds.push(
+                { name: 'Back to List', desc: 'Return to the email list', shortcut: 'q', action: 'back-to-list' },
+                { name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' },
+            );
+            // e993: the open email is the selection; only mailboxes gate it.
+            if (state.mailboxes.length) {
+                cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
+            }
+            cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
         }
         case 'list': {
@@ -5333,7 +6436,79 @@ function commandsForView(view) {
                     action: `delete-split:${split.id}`,
                 });
             });
+            // map4: existing functionality newly reachable from the palette.
+            // Every action calls the SAME function its keybinding/click path
+            // calls, and every gate mirrors that path's own no-op condition
+            // so the palette never offers a command that would do nothing.
+            if (visibleRows()[state.selectedIndex]) {
+                cmds.push({ name: 'Unsubscribe & Archive All', desc: 'Unsubscribe from this sender and archive all their emails', shortcut: 'U', action: 'unsubscribe' });
+            }
+            if (state.undoStack.length) {
+                cmds.push({ name: 'Undo', desc: 'Undo the last archive, trash, or reminder', shortcut: 'z', action: 'undo' });
+            }
+            if (state.currentMailbox) {
+                cmds.push(
+                    { name: 'Toggle Starred Only', desc: 'Show only starred emails', shortcut: '', action: 'toggle-starred' },
+                    { name: 'Toggle Sort Order', desc: 'Newest/oldest first (Gmail sorts oldest-first per fetched page only)', shortcut: '', action: 'toggle-sort' },
+                );
+            }
+            if (state.mailboxes.some(m => m.role === 'drafts')) {
+                cmds.push({ name: 'Go to Drafts', desc: 'Switch to drafts', shortcut: '', action: 'go-drafts' });
+            }
+            if (state.mailboxes.some(m => m.role === 'sent')) {
+                cmds.push({ name: 'Go to Sent', desc: 'Switch to sent', shortcut: '', action: 'go-sent' });
+            }
+            if (state.mailboxes.some(m => m.role === 'spam')) {
+                cmds.push({ name: 'Go to Spam', desc: 'Switch to spam', shortcut: '', action: 'go-spam' });
+            }
+            // Split navigation mirrors cycleSplit/selectSplitByIndex's own
+            // gate (inbox + at least one split) — outside it they no-op.
+            if (state.currentMailbox?.role === 'inbox' && state.splits.length > 0) {
+                cmds.push(
+                    { name: 'Next Split', desc: 'Cycle to the next split tab', shortcut: 'Tab', action: 'next-split' },
+                    { name: 'Previous Split', desc: 'Cycle to the previous split tab', shortcut: 'Shift+Tab', action: 'prev-split' },
+                );
+                state.splits.forEach(split => {
+                    cmds.push({ name: `Go to Split: ${split.name}`, desc: `Switch to the "${split.name}" split`, shortcut: '', action: `go-split:${split.id}` });
+                });
+            }
+            state.accounts.forEach((acct, i) => {
+                const label = acct.email || acct.id;
+                cmds.push({ name: `Switch Account: ${label}`, desc: `Switch to ${label}`, shortcut: i < 9 ? String(i + 1) : '', action: `switch-account:${acct.id}` });
+            });
+            cmds.push({ name: 'Open Settings', desc: 'Open the settings screen', shortcut: 'g s', action: 'open-settings' });
+            cmds.push({ name: 'Scheduled Sends', desc: 'View and cancel queued sends', shortcut: '', action: 'scheduled-sends' });
+            // e993: needs a selection to act on and mailboxes to move to.
+            if (visibleRows()[state.selectedIndex] && state.mailboxes.length) {
+                cmds.push({ name: 'Move to Folder…', desc: 'File this email in a folder or label', shortcut: 'v', action: 'move-to' });
+            }
+            // pakx: Select All whenever rows exist; the batch commands only
+            // while a selection is active. Each calls the same function the
+            // e/#/u/s/v keys route to when a selection is live.
+            if (visibleRows().length) {
+                cmds.push({ name: 'Select All in View', desc: 'Select every visible email', shortcut: '', action: 'select-all' });
+            }
+            const nSelected = bulkIds().length;
+            if (nSelected) {
+                cmds.push(
+                    { name: `Archive ${nSelected} Selected`, desc: 'Archive every selected email', shortcut: 'e', action: 'bulk-archive' },
+                    { name: `Trash ${nSelected} Selected`, desc: 'Move every selected email to trash', shortcut: '#', action: 'bulk-trash' },
+                    { name: `Toggle Read on ${nSelected} Selected`, desc: 'Flip read/unread on every selected email', shortcut: 'u', action: 'bulk-unread' },
+                    { name: `Star ${nSelected} Selected`, desc: 'Toggle star on every selected email', shortcut: 's', action: 'bulk-flag' },
+                );
+                if (state.mailboxes.length) {
+                    cmds.push({ name: `Move ${nSelected} Selected…`, desc: 'File every selected email in a folder or label', shortcut: 'v', action: 'bulk-move' });
+                }
+                cmds.push({ name: 'Clear Selection', desc: 'Deselect all emails', shortcut: 'Esc', action: 'bulk-clear' });
+            }
+            cmds.push({ name: 'Read Statuses', desc: 'Open tracking for sent email (needs the tracking base configured)', shortcut: '', action: 'read-statuses' });
+            // 5np4: Get-Me-To-Zero — only when something is unread, so the
+            // palette never offers a flow that would end before it starts.
+            if (state.emails.some(e => e.isUnread)) {
+                cmds.push({ name: 'Triage Mode', desc: 'Walk unread emails one at a time to inbox zero', shortcut: 'T', action: 'triage' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
+            cmds.push({ name: 'Calendar Peek', desc: 'Toggle the day/week calendar pane', shortcut: 'C', action: 'calendar-peek' });
             return cmds;
         }
         case 'compose':
@@ -5346,9 +6521,12 @@ function commandsForView(view) {
             // deletion and deliver persistence (roborev 375, Medium).
             return [
                 { name: 'Send', desc: 'Send email', shortcut: '\u2318\u23ce', action: 'send' },
+                { name: 'Send Later', desc: 'Schedule this email to send at a chosen time', shortcut: '\u2318\u21e7L', action: 'send-later' },
+                { name: 'Scheduled Sends', desc: 'View and cancel queued sends', shortcut: '', action: 'scheduled-sends' },
                 { name: 'Close Draft', desc: 'Keep draft saved and return to list', shortcut: 'Esc', action: 'close-draft' },
                 { name: 'Attach', desc: 'Attach a file', shortcut: 'a', action: 'attach' },
                 { name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' },
+                { name: 'Share Availability', desc: 'Insert free time slots from your calendar', shortcut: '\u2303\u21e7H', action: 'share-availability' },
             ];
         case 'settings': {
             // Settings is a low-action surface: account management + Help only.
@@ -5365,6 +6543,13 @@ function commandsForView(view) {
                     action: `remove-account:${acct.id}`,
                 });
             });
+            // map4: Timezone Settings is the Reminder Settings sibling; Set
+            // Default Account mirrors the settings Shift+D keybinding's gate
+            // (handleSettingsNormalKey acts only with a selected account).
+            cmds.push({ name: 'Timezone Settings', desc: 'Primary and additional timezones', shortcut: '', action: 'timezone-settings' });
+            if (state.selectedAccountId) {
+                cmds.push({ name: 'Set Default Account', desc: 'Make the selected account the default', shortcut: 'D', action: 'set-default-account' });
+            }
             cmds.push({ name: 'Help', desc: 'Show shortcuts', shortcut: '?', action: 'help' });
             return cmds;
         }
@@ -5407,6 +6592,9 @@ function executeCommand(action) {
         // path (Esc, here named escapeCompose), and the attachment picker
         // ('a' / Ctrl+Shift+A). No new handlers.
         case 'send': sendEmail(); break;
+        case 'send-later': openSendLaterPicker(); break;
+        case 'scheduled-sends': openScheduledSends(); break;
+        case 'read-statuses': openReadStatuses(); break;
         case 'close-draft': escapeCompose(); break;
         case 'attach': els.composeFileInput.click(); break;
         // RSVP (kata sefy): the detail palette offers these only behind the
@@ -5414,6 +6602,10 @@ function executeCommand(action) {
         case 'rsvp-accept': rsvpToEvent('ACCEPTED'); break;
         case 'rsvp-decline': rsvpToEvent('DECLINED'); break;
         case 'rsvp-tentative': rsvpToEvent('TENTATIVE'); break;
+        // AI assist (kata 6rhw): palette-only entry points, gated in
+        // commandsForView on state.ai.enabled.
+        case 'ai-summarize': summarizeCurrentEmail(); break;
+        case 'ai-draft-reply': aiDraftReply(); break;
         case 'search': openSearch(); break;
         case 'toggle-unread': toggleUnreadSelected(); break;
         case 'toggle-flag': toggleFlagSelected(); break;
@@ -5446,6 +6638,54 @@ function executeCommand(action) {
         case 'reminder-settings':
             openReminderSettings();
             break;
+        // map4: each case calls the SAME function the keybinding/click path
+        // calls (kata sefy invariant). The dynamic switch-account:/go-split:
+        // prefixes are handled in the default branch below, next to
+        // delete-split:/remove-account:.
+        case 'undo': performUndo(); break;
+        case 'unsubscribe': unsubscribeAndArchiveAll(); break;
+        case 'open-settings': openSettings(); break;
+        case 'back-to-list': showView('list'); break;
+        case 'toggle-starred': toggleStarredOnly(); break;
+        case 'toggle-sort': toggleSortOrder(); break;
+        case 'next-split': cycleSplit(1); break;
+        case 'prev-split': cycleSplit(-1); break;
+        case 'go-drafts': {
+            const drafts = state.mailboxes.find(m => m.role === 'drafts');
+            if (drafts) selectMailbox(drafts);
+            break;
+        }
+        case 'go-sent': {
+            const sent = state.mailboxes.find(m => m.role === 'sent');
+            if (sent) selectMailbox(sent);
+            break;
+        }
+        case 'go-spam': {
+            const spam = state.mailboxes.find(m => m.role === 'spam');
+            if (spam) selectMailbox(spam);
+            break;
+        }
+        case 'set-default-account':
+            if (state.selectedAccountId) setDefaultAccount(state.selectedAccountId);
+            break;
+        case 'timezone-settings':
+            // No dedicated open function exists — the timezone section lives
+            // on the settings screen; land there and bring it into view.
+            openSettings();
+            document.getElementById('timezone-settings')?.scrollIntoView({ block: 'start' });
+            break;
+        case 'move-to': openMovePicker(); break;
+        // pakx: batch commands converge on the same functions the keys use.
+        case 'select-all': selectAllVisible(); break;
+        case 'bulk-archive': bulkEmailAction('archive'); break;
+        case 'bulk-trash': bulkEmailAction('trash'); break;
+        case 'bulk-unread': bulkToggleUnread(); break;
+        case 'bulk-flag': bulkToggleFlag(); break;
+        case 'bulk-move': openMovePicker(); break;
+        case 'bulk-clear': clearBulkSelection(); break;
+        case 'calendar-peek': toggleCalendarPeek(); break;
+        case 'share-availability': openAvailabilityPicker(); break;
+        case 'triage': enterTriage(); break;
         default:
             // Handle dynamic delete-split commands
             if (action.startsWith('delete-split:')) {
@@ -5454,6 +6694,19 @@ function executeCommand(action) {
             } else if (action.startsWith('remove-account:')) {
                 const id = action.slice('remove-account:'.length);
                 removeAccountById(id);
+            } else if (action.startsWith('switch-account:')) {
+                const id = action.slice('switch-account:'.length);
+                const acct = state.accounts.find(a => a.id === id);
+                if (acct) {
+                    selectAccount(acct);
+                    showStatus(`Switched to ${acct.email}`, 'success');
+                }
+            } else if (action.startsWith('go-split:')) {
+                // selectSplitByIndex is the Ctrl+1-9 path; its index 0 is
+                // the 'all' tab, so splits start at 1.
+                const id = action.slice('go-split:'.length);
+                const idx = state.splits.findIndex(s => s.id === id);
+                if (idx !== -1) selectSplitByIndex(idx + 1);
             }
             break;
     }
@@ -5719,11 +6972,12 @@ async function deleteSplit(splitId) {
 
 // Undo
 
-function pushUndo(action, emailId, emailData, insertIndex, reminder = null) {
-    state.undoStack.push({ action, emailId, emailData, insertIndex, reminder, timestamp: Date.now() });
+function pushUndo(action, emailId, emailData, insertIndex, reminder = null, sourceMailboxId = null) {
+    state.undoStack.push({ action, emailId, emailData, insertIndex, reminder, sourceMailboxId, timestamp: Date.now() });
 
     // Show toast
     els.undoMessage.textContent = action === 'archived' ? 'Email archived'
+        : action === 'moved' ? 'Email moved'
         : action === 'reminded'
             ? `Reminded ${reminder?.mode === 'regardless' ? 'regardless' : 'if no reply'} until ${new Date(reminder?.wakeAt).toLocaleString()}`
             : 'Email trashed';
@@ -5742,45 +6996,62 @@ async function performUndo() {
     els.undoToast.classList.add('hidden');
     showStatus('Undone', 'success');
 
-    // Optimistic: re-insert the email into the list immediately. insertIndex is
-    // a state.emails (DATA) position — correct for restoring sort order — but
-    // selection must land on the re-inserted email's VISIBLE row, which under
-    // grouping is not that flat index (kata 64z6).
-    if (item.emailData) {
-        refillSuppressedIds.delete(item.emailId);
-        const idx = Math.min(item.insertIndex, state.emails.length);
-        state.emails.splice(idx, 0, item.emailData);
+    // Bulk items (kata pakx) carry entries[] in original list order; single
+    // items keep the flat shape. Normalize so one path restores both.
+    const entries = item.entries
+        || [{ emailId: item.emailId, emailData: item.emailData, insertIndex: item.insertIndex }];
+
+    // Optimistic: re-insert each email into the list immediately. insertIndex
+    // is a state.emails (DATA) position — correct for restoring sort order —
+    // but selection must land on a re-inserted email's VISIBLE row, which
+    // under grouping is not that flat index (kata 64z6). Ascending-order
+    // splices reconstruct the exact pre-removal positions for a batch.
+    let restored = false;
+    for (const entry of entries) {
+        if (!entry.emailData) continue;
+        refillSuppressedIds.delete(entry.emailId);
+        const idx = Math.min(entry.insertIndex, state.emails.length);
+        state.emails.splice(idx, 0, entry.emailData);
         // Guarantee the id is registered even in the edge case where its thread
         // was never grouped; extend is idempotent per id.
-        extendThreadGroups([item.emailData]);
-        state.selectedIndex = visibleRowIndexForEmailId(item.emailId);
+        extendThreadGroups([entry.emailData]);
+        restored = true;
+    }
+    if (restored) {
+        state.selectedIndex = visibleRowIndexForEmailId(entries[0].emailId);
         invalidateSplitListCache();
         renderEmailList();
-
     }
-    adjustSplitCounts(+1);
+    adjustSplitCounts(+entries.length);
 
     try {
         if (item.action === 'reminded') {
             await api('POST', `/emails/${item.emailId}/cancel-reminder`);
             loadReminders({ skipNotify: true });
         } else {
-            const inbox = state.mailboxes.find(m => m.role === 'inbox');
-            if (inbox) {
-                await api('POST', `/emails/${item.emailId}/move`, { mailbox_id: inbox.id });
+            // 'moved'/bulk items carry their source mailbox (kata e993/pakx)
+            // and restore there; archive/trash items have no source and fall
+            // back to the inbox, as before.
+            const target = state.mailboxes.find(m => m.id === item.sourceMailboxId)
+                || state.mailboxes.find(m => m.role === 'inbox');
+            if (target) {
+                for (const entry of entries) {
+                    await api('POST', `/emails/${entry.emailId}/move`, { mailbox_id: target.id });
+                }
             }
         }
         loadSplitCounts(); // resync with server truth
     } catch (err) {
-        // Revert: remove the email we optimistically re-inserted. This
+        // Revert: remove the emails we optimistically re-inserted. This
         // removal syncs BACK to server truth (the move failed, so the
         // email stayed archived) — it is not an optimistic removal with a
         // mutation in flight, so the suppression removeEmailsFromList just
         // registered must be released immediately or the id stays hidden
         // from every list load for the rest of the session (roborev 472).
-        if (item.emailData) {
-            removeEmailFromList(item.emailId);
-            refillSuppressedIds.delete(item.emailId);
+        for (const entry of entries) {
+            if (!entry.emailData) continue;
+            removeEmailFromList(entry.emailId);
+            refillSuppressedIds.delete(entry.emailId);
         }
         showStatus('Undo failed', 'error');
     }
@@ -6991,6 +8262,366 @@ async function rsvpToEvent(status) {
             showAccountErrors(state.accountErrors);
         }
         showStatus('Failed to send RSVP: ' + err.message, 'error');
+    }
+}
+
+// =============================================================================
+// Calendar peek (kata j6e4) — Superhuman's C-key day/week view alongside email
+// =============================================================================
+
+// Local YYYY-MM-DD of a Date — the peek's day-column key.
+function peekDayKey(date) {
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    return `${date.getFullYear()}-${m}-${d}`;
+}
+
+// Local HH:MM (24h) label for a timed event block.
+function peekTimeLabel(date) {
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+// Pure render of the peek grid: events (GET /api/calendar/events camelCase
+// RangeEvents) + mode ('day' | 'week') + anchor day ('YYYY-MM-DD') → HTML.
+// No state, no clock reads, no DOM — tests drive it directly
+// (tests/calendar_peek_test.cjs). Week columns are Monday-first. All-day
+// events use their UTC date anchors verbatim (the server emits midnight-UTC
+// dates) and chip every covered day; timed events land on their LOCAL start
+// day as absolutely-positioned blocks on the hour grid, sized via the
+// --peek-start/--peek-dur minute variables and clamped to their day.
+function calendarPeekHtml(events, mode, anchorDay) {
+    const [ay, am, ad] = anchorDay.split('-').map(Number);
+    const anchor = new Date(ay, am - 1, ad);
+    const first = new Date(anchor);
+    if (mode === 'week') {
+        first.setDate(first.getDate() - ((first.getDay() + 6) % 7));
+    }
+    const days = Array.from({ length: mode === 'week' ? 7 : 1 }, (_, i) => {
+        const d = new Date(first);
+        d.setDate(first.getDate() + i);
+        return d;
+    });
+
+    const allDayByDay = new Map();
+    const timedByDay = new Map();
+    const bucket = (map, key, entry) => {
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(entry);
+    };
+    for (const ev of events) {
+        if (ev.allDay) {
+            // Cover [start, end) in date space; a defensive end<=start chips
+            // just the start day. Capped at the 62-day range the API allows.
+            const endKey = ev.end.slice(0, 10);
+            const day = new Date(`${ev.start.slice(0, 10)}T00:00:00`);
+            let key = peekDayKey(day);
+            let hops = 0;
+            do {
+                bucket(allDayByDay, key, ev);
+                day.setDate(day.getDate() + 1);
+                key = peekDayKey(day);
+                hops += 1;
+            } while (key < endKey && hops < 62);
+        } else {
+            const start = new Date(ev.start);
+            const startMin = start.getHours() * 60 + start.getMinutes();
+            const rawDur = Math.round((new Date(ev.end) - start) / 60000);
+            const dur = Math.min(Math.max(rawDur, 0), 1440 - startMin);
+            bucket(timedByDay, peekDayKey(start), { ev, startMin, dur });
+        }
+    }
+
+    const headFmt = { weekday: 'short', month: 'short', day: 'numeric' };
+    const cols = days.map((d) => {
+        const key = peekDayKey(d);
+        const chips = (allDayByDay.get(key) || []).map((ev) =>
+            `<div class="peek-event peek-event-allday" data-uid="${escapeAttr(ev.uid)}" title="${escapeAttr(ev.summary)}">${escapeHtml(ev.summary)}</div>`
+        ).join('');
+        const blocks = (timedByDay.get(key) || [])
+            .sort((a, b) => a.startMin - b.startMin)
+            .map(({ ev, startMin, dur }) =>
+                `<div class="peek-event" data-uid="${escapeAttr(ev.uid)}" style="--peek-start:${startMin};--peek-dur:${dur};" title="${escapeAttr(ev.summary)}">` +
+                `<span class="peek-event-time">${peekTimeLabel(new Date(ev.start))}</span> ` +
+                `<span class="peek-event-title">${escapeHtml(ev.summary)}</span></div>`
+            ).join('');
+        return `<div class="peek-day" data-day="${escapeAttr(key)}">` +
+            `<div class="peek-day-head">${escapeHtml(d.toLocaleDateString(undefined, headFmt))}</div>` +
+            `<div class="peek-allday">${chips}</div>` +
+            `<div class="peek-timed">${blocks}</div></div>`;
+    }).join('');
+
+    const hours = Array.from({ length: 24 }, (_, h) =>
+        `<div class="peek-hour-label">${String(h).padStart(2, '0')}:00</div>`
+    ).join('');
+    const rangeLabel = mode === 'week'
+        ? `${days[0].toLocaleDateString(undefined, headFmt)} – ${days[6].toLocaleDateString(undefined, headFmt)}`
+        : days[0].toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    return `<div class="peek-head">` +
+        `<span class="peek-head-title">Calendar</span>` +
+        `<span class="peek-head-range">${escapeHtml(rangeLabel)}</span>` +
+        `<span class="peek-head-hint">d day · w week · [ ] move · Esc close</span></div>` +
+        `<div class="peek-grid" data-mode="${escapeAttr(mode)}">` +
+        `<div class="peek-hours"><div class="peek-hours-spacer-head"></div><div class="peek-hours-spacer-allday"></div>` +
+        `<div class="peek-hour-rail">${hours}</div></div>${cols}</div>`;
+}
+
+// Guards a stale in-flight fetch from clobbering a newer one after rapid
+// d/w/[/] presses — only the latest sequence number may write state.
+let peekLoadSeq = 0;
+
+function toggleCalendarPeek() {
+    if (state.calendarPeek.visible) {
+        closeCalendarPeek();
+        return;
+    }
+    state.calendarPeek.visible = true;
+    // Reopen always lands on today — a stale anchor from a past session
+    // reads as "my calendar is empty".
+    state.calendarPeek.anchor = peekDayKey(new Date());
+    els.calendarPeek.classList.remove('hidden');
+    loadCalendarPeek();
+}
+
+function closeCalendarPeek() {
+    state.calendarPeek.visible = false;
+    els.calendarPeek.classList.add('hidden');
+}
+
+// The peek's visible local-day window as UTC instants for the range query.
+function peekWindow() {
+    const [y, m, d] = state.calendarPeek.anchor.split('-').map(Number);
+    const start = new Date(y, m - 1, d);
+    if (state.calendarPeek.mode === 'week') {
+        start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+    }
+    const end = new Date(start);
+    end.setDate(start.getDate() + (state.calendarPeek.mode === 'week' ? 7 : 1));
+    return { start, end };
+}
+
+async function loadCalendarPeek() {
+    const peek = state.calendarPeek;
+    const { start, end } = peekWindow();
+    const seq = ++peekLoadSeq;
+    peek.loading = true;
+    peek.error = null;
+    renderCalendarPeek();
+    try {
+        const resp = await api(
+            'GET',
+            `/calendar/events?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`
+        );
+        if (seq !== peekLoadSeq) return;
+        peek.events = resp.events || [];
+        // Per-account errors: surface the first (rare; the rest are in the
+        // server log) without blanking the events that did load.
+        peek.error = (resp.errors || [])[0] || null;
+    } catch (err) {
+        if (seq !== peekLoadSeq) return;
+        peek.events = [];
+        peek.error = err.message;
+    }
+    peek.loading = false;
+    renderCalendarPeek();
+}
+
+function renderCalendarPeek() {
+    const peek = state.calendarPeek;
+    const status = peek.loading
+        ? '<div class="peek-status">Loading…</div>'
+        : peek.error
+            ? `<div class="peek-status peek-status-error">${escapeHtml(peek.error)}</div>`
+            : '';
+    els.calendarPeek.innerHTML = status + calendarPeekHtml(peek.events, peek.mode, peek.anchor);
+    // Scroll the hour grid to the working morning so the default view isn't
+    // anchored at midnight.
+    const grid = els.calendarPeek.querySelector('.peek-grid');
+    if (grid) grid.scrollTop = 7 * 40;
+}
+
+// Keys the open peek owns. Returns true when consumed so handleKeyDown's
+// early-return chain stops; everything unhandled falls through and the list
+// keeps its j/k/o navigation while the peek is up.
+function handleCalendarPeekKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    const peek = state.calendarPeek;
+    switch (e.key) {
+        case 'Escape':
+        case 'C':
+            closeCalendarPeek();
+            break;
+        case 'd':
+        case 'w': {
+            const mode = e.key === 'd' ? 'day' : 'week';
+            if (peek.mode !== mode) {
+                peek.mode = mode;
+                loadCalendarPeek();
+            }
+            break;
+        }
+        case '[':
+        case ']': {
+            const step = (peek.mode === 'week' ? 7 : 1) * (e.key === '[' ? -1 : 1);
+            const [y, m, d] = peek.anchor.split('-').map(Number);
+            const anchor = new Date(y, m - 1, d);
+            anchor.setDate(anchor.getDate() + step);
+            peek.anchor = peekDayKey(anchor);
+            loadCalendarPeek();
+            break;
+        }
+        default:
+            return false;
+    }
+    e.preventDefault();
+    return true;
+}
+
+// =============================================================================
+// Share Availability (kata mtqp) — insert free time slots into compose
+// =============================================================================
+
+// Build the text block inserted into the compose body from a
+// /api/calendar/free-slots response. Pure: no state, no clock reads —
+// tests drive it directly (tests/share_availability_test.cjs). Contiguous
+// slots merge into ranges; ranges group per local day; an empty slot list
+// yields '' so the caller can show a status instead of inserting nothing.
+// Day labels are pinned to en-US: this text is pasted into outgoing mail,
+// where a stable format beats tracking the sender's UI locale.
+function availabilityText(slots, tzLabel) {
+    if (!slots.length) return '';
+    const ranges = [];
+    for (const s of slots) {
+        const startMs = Date.parse(s.start);
+        const endMs = Date.parse(s.end);
+        const last = ranges[ranges.length - 1];
+        if (last && last.endMs === startMs) {
+            last.endMs = endMs;
+        } else {
+            ranges.push({ startMs, endMs });
+        }
+    }
+    const dayLabels = [];
+    const byDay = new Map();
+    for (const r of ranges) {
+        const start = new Date(r.startMs);
+        const label = start.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        if (!byDay.has(label)) {
+            byDay.set(label, []);
+            dayLabels.push(label);
+        }
+        byDay.get(label).push(`${peekTimeLabel(start)}–${peekTimeLabel(new Date(r.endMs))}`);
+    }
+    const lines = dayLabels.map((label) => `- ${label}: ${byDay.get(label).join(', ')}`);
+    const footer = tzLabel ? `\n\n(times in ${tzLabel})` : '';
+    return `Would any of these times work?\n\n${lines.join('\n')}${footer}`;
+}
+
+// Splice `text` into `value` at the selection, returning the new value and
+// caret. Pure counterpart of insertIntoComposeBody.
+function insertAtCursor(value, selStart, selEnd, text) {
+    return {
+        value: value.slice(0, selStart) + text + value.slice(selEnd),
+        caret: selStart + text.length,
+    };
+}
+
+// Insert into the compose BODY only — the send path (doSendEmail & friends)
+// is never touched; the inserted availability block travels as ordinary
+// body text. The input dispatch feeds the same autosave/resize listeners a
+// keystroke would.
+function insertIntoComposeBody(text) {
+    const body = els.composeBody;
+    const selStart = body.selectionStart ?? body.value.length;
+    const selEnd = body.selectionEnd ?? body.value.length;
+    const { value, caret } = insertAtCursor(body.value, selStart, selEnd, text);
+    body.value = value;
+    body.selectionStart = body.selectionEnd = caret;
+    body.dispatchEvent(new Event('input', { bubbles: true }));
+    body.focus();
+}
+
+function openAvailabilityPicker() {
+    if (state.view !== 'compose') return;
+    els.availModal.innerHTML = `
+        <div class="modal-content avail-content">
+            <h3>Share Availability</h3>
+            <div class="modal-field">
+                <label for="avail-days">Window:</label>
+                <select id="avail-days">
+                    <option value="1">Today</option>
+                    <option value="3" selected>Next 3 days</option>
+                    <option value="7">Next 7 days</option>
+                </select>
+            </div>
+            <div class="modal-field">
+                <label for="avail-slot">Slot length:</label>
+                <select id="avail-slot">
+                    <option value="30" selected>30 minutes</option>
+                    <option value="60">1 hour</option>
+                </select>
+            </div>
+            <div id="avail-status" class="modal-hint" role="status"></div>
+            <div class="modal-hint">Enter inserts &middot; Esc cancels</div>
+            <div class="modal-buttons"><button id="avail-cancel" type="button">Cancel</button><button id="avail-insert" type="button">Insert times</button></div>
+        </div>`;
+    els.availModal.classList.remove('hidden');
+    document.getElementById('avail-cancel').addEventListener('click', closeAvailabilityPicker);
+    document.getElementById('avail-insert').addEventListener('click', confirmAvailabilityPicker);
+    document.getElementById('avail-days').focus();
+}
+
+function closeAvailabilityPicker() {
+    els.availModal.classList.add('hidden');
+    els.composeBody.focus();
+}
+
+function availabilityStatus(message, isError) {
+    const status = document.getElementById('avail-status');
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle('avail-status-error', Boolean(isError));
+}
+
+async function confirmAvailabilityPicker() {
+    const days = parseInt(document.getElementById('avail-days')?.value, 10) || 3;
+    const slot = parseInt(document.getElementById('avail-slot')?.value, 10) || 30;
+    // From the next half-hour boundary (offered slots sit on the grid and
+    // never in the past) through local midnight N days out.
+    const now = new Date();
+    const start = new Date(Math.ceil(now.getTime() / 1_800_000) * 1_800_000);
+    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + days);
+    if (end <= start) {
+        availabilityStatus('That window is already over — pick a longer one.', true);
+        return;
+    }
+    availabilityStatus('Finding free times…', false);
+    try {
+        const resp = await api(
+            'GET',
+            `/calendar/free-slots?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}&slot=${slot}`
+        );
+        const tzLabel = state.timezone?.primary
+            || Intl.DateTimeFormat().resolvedOptions().timeZone
+            || '';
+        const text = availabilityText(resp.slots || [], tzLabel);
+        if (!text) {
+            availabilityStatus((resp.errors || [])[0] || 'No free times found in this window.', true);
+            return;
+        }
+        insertIntoComposeBody(text);
+        closeAvailabilityPicker();
+    } catch (err) {
+        availabilityStatus(err.message, true);
+    }
+}
+
+function handleAvailPickerKey(e) {
+    if (e.key === 'Escape') {
+        closeAvailabilityPicker();
+        e.preventDefault();
+    } else if (e.key === 'Enter') {
+        confirmAvailabilityPicker();
+        e.preventDefault();
     }
 }
 

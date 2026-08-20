@@ -201,7 +201,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/timezone/zones", get(list_timezones))
         .route("/api/calendar/invite", post(send_invite_handler))
+        .route("/api/calendar/events", get(calendar_events_range))
+        .route("/api/calendar/free-slots", get(calendar_free_slots))
         .route("/api/build-id", get(build_id))
+        .route("/api/scheduled-sends", get(list_scheduled_sends))
+        .route(
+            "/api/scheduled-sends/{id}",
+            axum::routing::delete(cancel_scheduled_send),
+        )
+        .route(
+            "/api/contacts/insights",
+            get(crate::contacts::contact_insights),
+        )
+        .route("/api/ai/status", get(crate::ai::ai_status_handler))
+        .route("/api/ai/summarize", post(crate::ai::ai_summarize))
+        .route("/api/ai/draft", post(crate::ai::ai_draft))
+        .route("/api/tracking/status", get(tracking_status))
+        .route("/t/{filename}", get(tracking_pixel))
         .with_state(state)
         .route("/", get(index_html))
         .route("/index.html", get(index_html))
@@ -537,6 +553,9 @@ struct SendEmailBody {
     from_address: Option<String>,
     #[serde(default)]
     attachments: Vec<Attachment>,
+    /// Deferred-send instant (kata vj6k/acag): a future value queues the
+    /// send instead of dispatching it; absent/past sends immediately.
+    send_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -589,7 +608,10 @@ fn ensure_known_account(reg: &AccountRegistry, id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn resolve_session(state: &AppState, account: Option<&str>) -> Result<SessionLock, Error> {
+pub(crate) async fn resolve_session(
+    state: &AppState,
+    account: Option<&str>,
+) -> Result<SessionLock, Error> {
     let reg = state.accounts.read().await;
     let key = account.unwrap_or(&reg.default_account);
     reg.sessions
@@ -681,32 +703,30 @@ async fn list_identities(
     Ok(Json(serde_json::json!(identities)))
 }
 
+/// CSS from the first candidate theme dir that holds a usable theme.
+fn first_theme_css(theme_dirs: &[std::path::PathBuf]) -> Option<String> {
+    theme_dirs
+        .iter()
+        .find_map(|dir| theme::css_for_theme_dir(dir))
+}
+
 async fn get_theme() -> impl IntoResponse {
-    let theme_dir = dirs_next::config_dir()
-        .unwrap_or_default()
-        .join("omarchy/current/theme");
+    // Omarchy 4.0 renders the active theme under XDG state; 3.x used XDG
+    // config. Check the 4.0 location first, then fall back.
+    let theme_dirs = [
+        dirs_next::state_dir()
+            .unwrap_or_default()
+            .join("omarchy/current/theme"),
+        dirs_next::config_dir()
+            .unwrap_or_default()
+            .join("omarchy/current/theme"),
+    ];
 
-    // Both sources mirror the terminal palette, and terminal palettes reuse
-    // slots (Everforest: color0 == color8, selection-bg == foreground), which
-    // yields text painted in the color of the surface under it. Repair at the
-    // serve point so every theme stays readable (kata: black-on-black labels).
-
-    // 1. Prefer supervillain.css (template-generated for colors.toml themes)
-    if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
-        && !css.is_empty()
-    {
-        let css = theme::sanitize_theme_css(&css);
+    if let Some(css) = first_theme_css(&theme_dirs) {
         return (StatusCode::OK, [("content-type", "text/css")], css);
     }
 
-    // 2. Parse terminal color config (ghostty.conf → alacritty.toml)
-    if let Some(colors) = theme::load_from_theme_dir(&theme_dir) {
-        let is_light = theme::is_light_theme(&theme_dir);
-        let css = theme::sanitize_theme_css(&theme::generate_theme_css(&colors, is_light));
-        return (StatusCode::OK, [("content-type", "text/css")], css);
-    }
-
-    // 3. No theme available — base CSS defaults apply
+    // No theme available — base CSS defaults apply
     (
         StatusCode::OK,
         [("content-type", "text/css")],
@@ -782,10 +802,34 @@ struct AttendeeResolution {
     plausibly_user: bool,
 }
 
+/// Merge the login username with the account's sending identities into the
+/// list of address patterns that all mean "this user" — exact addresses or
+/// Fastmail catch-all wildcards ("*@domain"), matched via
+/// `types::address_matches_pattern`. Fastmail aliases on other
+/// managed domains (e.g. @mattcoburn.ai, @mattgpt.ai) are separate JMAP
+/// identities, and invites addressed to them must resolve to the alias, not
+/// the login address. The username stays first — callers use it as the
+/// fallback when no attendee matches.
+fn merge_user_addresses(username: &str, identities: &[crate::types::Identity]) -> Vec<String> {
+    let mut addresses = vec![username.to_string()];
+    for identity in identities {
+        if identity.email.is_empty() {
+            continue;
+        }
+        if !addresses
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&identity.email))
+        {
+            addresses.push(identity.email.clone());
+        }
+    }
+    addresses
+}
+
 fn attendee_email_for_event(
     email: &Email,
     event: &CalendarEvent,
-    fallback: &str,
+    user_addresses: &[String],
 ) -> Option<AttendeeResolution> {
     let recipients: Vec<&EmailAddress> = email.to.iter().chain(email.cc.iter()).collect();
     let is_attendee = |address: &str| {
@@ -794,12 +838,22 @@ fn attendee_email_for_event(
             .iter()
             .any(|attendee| attendee.email.eq_ignore_ascii_case(address))
     };
+    // "Is this address the user" — any of the login username or the
+    // account's sending identities, so invites addressed to aliases on other
+    // Fastmail-managed domains resolve to the alias, not another guest.
+    // Entries may be wildcard patterns ("*@mattcoburn.ai") — Fastmail's
+    // model for catch-all domains.
+    let is_user = |address: &str| {
+        user_addresses
+            .iter()
+            .any(|known| crate::types::address_matches_pattern(address, known))
+    };
 
     // Multi-guest invites routinely put every attendee in To. Prefer the
-    // account address rather than borrowing the first guest's PARTSTAT.
+    // account's own address rather than borrowing the first guest's PARTSTAT.
     if let Some(address) = recipients
         .iter()
-        .find(|address| address.email.eq_ignore_ascii_case(fallback) && is_attendee(&address.email))
+        .find(|address| is_user(&address.email) && is_attendee(&address.email))
     {
         return Some(AttendeeResolution {
             email: address.email.clone(),
@@ -809,30 +863,31 @@ fn attendee_email_for_event(
 
     // Bcc delivery can omit the account from To/Cc even though the ICS names
     // it explicitly. That attendee identity is still stronger evidence than
-    // another guest's earlier recipient position.
-    if let Some(attendee) = event
-        .attendees
-        .iter()
-        .find(|attendee| attendee.email.eq_ignore_ascii_case(fallback))
-    {
+    // another guest's earlier recipient position. Addresses earlier in
+    // `user_addresses` win (the login username is first).
+    if let Some(attendee) = user_addresses.iter().find_map(|known| {
+        event
+            .attendees
+            .iter()
+            .find(|attendee| crate::types::address_matches_pattern(&attendee.email, known))
+    }) {
         return Some(AttendeeResolution {
             email: attendee.email.clone(),
             plausibly_user: true,
         });
     }
 
-    // Keep the historical first To/Cc attendee heuristic for aliases and the
-    // RSVP fallback, but be conservative when deciding whether to show a list
-    // chip. One attendee-addressed recipient with no explicit account address
-    // is plausibly an alias. Multiple matching guests are ambiguous, while an
-    // explicit account recipient absent from ATTENDEE is an FYI copy.
+    // Keep the historical first To/Cc attendee heuristic for unknown aliases
+    // and the RSVP fallback, but be conservative when deciding whether to
+    // show a list chip. One attendee-addressed recipient with no explicit
+    // account address is plausibly an alias. Multiple matching guests are
+    // ambiguous, while an explicit account recipient absent from ATTENDEE is
+    // an FYI copy.
     if let Some(address) = recipients
         .iter()
         .find(|address| is_attendee(&address.email))
     {
-        let username_is_recipient = recipients
-            .iter()
-            .any(|recipient| recipient.email.eq_ignore_ascii_case(fallback));
+        let username_is_recipient = recipients.iter().any(|recipient| is_user(&recipient.email));
         let matching_attendees: std::collections::HashSet<String> = recipients
             .iter()
             .filter(|recipient| is_attendee(&recipient.email))
@@ -864,7 +919,7 @@ fn canonical_invite_status(status: &str) -> String {
 fn invite_list_fields(
     email: &Email,
     event: Option<&CalendarEvent>,
-    username: &str,
+    user_addresses: &[String],
     stored: Option<&CalendarEvent>,
 ) -> InviteListFields {
     let Some(event) = event else {
@@ -875,11 +930,16 @@ fn invite_list_fields(
         method: Some(method.clone()),
         ..InviteListFields::default()
     };
-    if method != "REQUEST" || event.organizer_email.eq_ignore_ascii_case(username) {
+    // Organizer check spans every identity: a REQUEST the user sent from an
+    // alias must not render RSVP buttons back at them.
+    let organized_by_user = user_addresses
+        .iter()
+        .any(|known| crate::types::address_matches_pattern(&event.organizer_email, known));
+    if method != "REQUEST" || organized_by_user {
         return fields;
     }
 
-    let Some(attendee) = attendee_email_for_event(email, event, username) else {
+    let Some(attendee) = attendee_email_for_event(email, event, user_addresses) else {
         return fields;
     };
     if !attendee.plausibly_user {
@@ -962,6 +1022,19 @@ async fn invite_fields_for_list(
         let session = session_lock.read().await;
         session.username().to_string()
     };
+    // Cache-only identity lookup: this function's contract is zero extra
+    // provider requests on a warm list (see the split/refresh cache tests),
+    // so no live fetch on a miss. The warmer and /api/identities keep the
+    // cache hot; a cold miss degrades to the login address, the pre-alias
+    // behavior.
+    let user_addresses = merge_user_addresses(
+        &username,
+        &state
+            .prefetch
+            .get_identities(account_id)
+            .await
+            .unwrap_or_default(),
+    );
     let primary_tz = configured_primary_tz(state);
     let events: Vec<Option<CalendarEvent>> = emails
         .iter()
@@ -975,7 +1048,7 @@ async fn invite_fields_for_list(
     let mut fields: Vec<InviteListFields> = emails
         .iter()
         .zip(events.iter())
-        .map(|(email, event)| invite_list_fields(email, event.as_ref(), &username, None))
+        .map(|(email, event)| invite_list_fields(email, event.as_ref(), &user_addresses, None))
         .collect();
 
     // A disk-restored stale snapshot exists specifically for instant first
@@ -996,7 +1069,7 @@ async fn invite_fields_for_list(
                 fields[index] = invite_list_fields(
                     &emails[index],
                     events[index].as_ref(),
-                    &username,
+                    &user_addresses,
                     stored.as_ref(),
                 );
             }
@@ -1041,7 +1114,7 @@ async fn invite_fields_for_list(
                     fields[index] = invite_list_fields(
                         &emails[index],
                         events[index].as_ref(),
-                        &username,
+                        &user_addresses,
                         stored.as_ref(),
                     );
                 }
@@ -1603,7 +1676,19 @@ async fn get_email(
         // Set user_rsvp_status from the (now-merged) attendee list — but not on
         // an Update, where the response was intentionally reset to None.
         if event.method == "REQUEST" && !event.is_update {
-            let attendee_email = determine_attendee_email(email, &event, session.username());
+            // Cache-only identity lookup: a session read guard is held here,
+            // so a miss must NOT try to write-lock the session for a live
+            // fetch (deadlock). The warmer and /api/identities keep the cache
+            // hot; a cold miss degrades to the login address.
+            let user_addresses = merge_user_addresses(
+                session.username(),
+                &state
+                    .prefetch
+                    .get_identities(&account_key)
+                    .await
+                    .unwrap_or_default(),
+            );
+            let attendee_email = determine_attendee_email(email, &event, &user_addresses);
             if let Some(att) = event
                 .attendees
                 .iter()
@@ -2129,7 +2214,7 @@ async fn send_email_handler(
         .unwrap_or(session.username())
         .to_string();
 
-    let submission = EmailSubmission {
+    let mut submission = EmailSubmission {
         to: body.to,
         cc: body.cc,
         subject: body.subject,
@@ -2143,11 +2228,136 @@ async fn send_email_handler(
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: body.attachments,
+        send_at: body.send_at,
         calendar_ics: None,
     };
 
+    // Open tracking (kata e2h4): pixel the HTML body ONCE, here, so the
+    // immediate path and the deferred path (whose daemon dispatches the
+    // stored submission untouched) share the same recorded token. Inert
+    // without a configured public base; text-only sends stay untracked.
+    // Runs after the sanitizer so ammonia can't eat the pixel.
+    if let Some(base) = state.tracking_base.as_deref()
+        && submission.html_body.is_some()
+    {
+        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+        crate::tracking::track_outgoing(&state.tracking, base, &account_id, &mut submission)?;
+    }
+
+    // Deferred send (kata vj6k/acag): a future send_at queues the submission
+    // for the daemon instead of dispatching. A past/absent send_at sends on
+    // the request path — a stale Undo window must not park mail for a tick.
+    if let Some(send_at) = submission.send_at
+        && send_at > chrono::Utc::now()
+    {
+        drop(session);
+        let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+        let record = crate::scheduled_send::ScheduledSend {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_id,
+            from_addr,
+            send_at,
+            queued_at: chrono::Utc::now(),
+            submission,
+            attempts: 0,
+        };
+        state.scheduled_sends.insert(record.clone());
+        state.scheduled_sends.save()?;
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "scheduled": true,
+            "id": record.id,
+            "sendAt": record.send_at,
+        })));
+    }
+
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
+    // Join the provider's message id onto the tracking record so the client
+    // can map read statuses onto the Sent list (kata e2h4).
+    if let (Some(token), Some(email_id)) = (
+        submission
+            .html_body
+            .as_deref()
+            .and_then(crate::tracking::extract_token),
+        result.as_deref(),
+    ) && state.tracking.set_email_id(&token, email_id)
+        && let Err(error) = state.tracking.save()
+    {
+        tracing::warn!("Failed to persist tracking email id: {error}");
+    }
     Ok(send_success_response(result))
+}
+
+// --- Deferred sends (kata vj6k Undo Send + kata acag Send Later) ------------
+
+/// List the account's queued deferred sends, soonest first.
+async fn list_scheduled_sends(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+) -> Result<Json<serde_json::Value>, Error> {
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let records = state.scheduled_sends.records_for_account(&account_id);
+    Ok(Json(serde_json::to_value(records)?))
+}
+
+/// Cancel a queued deferred send. Returns the removed record (submission
+/// included) so the client can restore the draft; 404 when the id is
+/// unknown — including "already dispatched", which is exactly what an
+/// Undo click after the window closes should surface.
+async fn cancel_scheduled_send(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, Error> {
+    let Some(record) = state.scheduled_sends.remove(&id) else {
+        return Err(Error::NotFound(format!("no scheduled send '{id}'")));
+    };
+    state.scheduled_sends.save()?;
+    Ok(Json(serde_json::to_value(record)?))
+}
+
+// --- Open tracking (kata e2h4) ----------------------------------------------
+
+/// 1×1 transparent GIF89a — the classic 43-byte tracking pixel.
+const TRACKING_GIF: [u8; 43] = [
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+];
+
+/// Public pixel route (`/t/{token}.gif`, deliberately outside `/api`): serve
+/// the 1×1 gif unconditionally — a 404 or slow path would leak token
+/// validity to whoever probes — and record an open event for known tokens.
+/// no-store so a re-open re-fetches instead of hitting the client cache.
+async fn tracking_pixel(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> impl IntoResponse {
+    if let Some(token) = filename.strip_suffix(".gif")
+        && state.tracking.record_open(token, chrono::Utc::now())
+        && let Err(error) = state.tracking.save()
+    {
+        tracing::warn!("Failed to persist tracked open: {error}");
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "image/gif"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, private, max-age=0",
+            ),
+        ],
+        TRACKING_GIF,
+    )
+}
+
+/// Read statuses for the account's tracked sends, most recent first.
+async fn tracking_status(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AccountParam>,
+) -> Result<Json<serde_json::Value>, Error> {
+    let account_id = resolve_account_id(&state, params.account.as_deref()).await?;
+    let records = state.tracking.records_for_account(&account_id);
+    Ok(Json(serde_json::to_value(records)?))
 }
 
 // --- Persistent drafts (kata wm57) -----------------------------------------
@@ -2166,6 +2376,7 @@ fn draft_submission(body: DraftBody) -> EmailSubmission {
         in_reply_to: body.in_reply_to,
         references: None,
         attachments: Vec::new(),
+        send_at: None,
         calendar_ics: None,
     }
 }
@@ -2268,10 +2479,14 @@ async fn upload_blob(
     })))
 }
 
-fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str) -> String {
-    attendee_email_for_event(email, event, fallback)
+fn determine_attendee_email(
+    email: &Email,
+    event: &CalendarEvent,
+    user_addresses: &[String],
+) -> String {
+    attendee_email_for_event(email, event, user_addresses)
         .map(|attendee| attendee.email)
-        .unwrap_or_else(|| fallback.to_string())
+        .unwrap_or_else(|| user_addresses.first().cloned().unwrap_or_default())
 }
 
 /// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
@@ -2318,6 +2533,33 @@ async fn surface_caldav_spawn_failure(
     }
 }
 
+/// Identities for the RSVP click's attendee resolution. Prefetch cache
+/// first — Gmail's `get_identities` is an uncached HTTP round-trip and the
+/// account's session write guard is held by the caller (roborev 535 #1).
+/// Only a cache miss pays the live fetch, done through the caller's held
+/// guard (no second lock — a `resolve_session` re-lock here would deadlock),
+/// and the result backfills the cache. Best-effort: a fetch failure degrades
+/// to no extra identities, i.e. login-address-only resolution.
+async fn rsvp_identities(
+    state: &AppState,
+    account_id: &str,
+    session: &mut provider::ProviderSession,
+) -> Vec<crate::types::Identity> {
+    match state.prefetch.get_identities(account_id).await {
+        Some(cached) => cached,
+        None => match provider::get_identities(session).await {
+            Ok(live) => {
+                state
+                    .prefetch
+                    .set_identities(account_id, live.clone())
+                    .await;
+                live
+            }
+            Err(_) => Vec::new(),
+        },
+    }
+}
+
 async fn rsvp(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
@@ -2350,7 +2592,9 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-        determine_attendee_email(email, &event, session_guard.username())
+        let identities = rsvp_identities(&state, &account_id, &mut session_guard).await;
+        let user_addresses = merge_user_addresses(session_guard.username(), &identities);
+        determine_attendee_email(email, &event, &user_addresses)
     };
 
     // Serialize against `get_email`'s background invite-update overwrite for
@@ -3068,11 +3312,175 @@ async fn send_invite_handler(
         in_reply_to: None,
         references: None,
         attachments: body.attachments,
+        send_at: None,
         calendar_ics: Some(ics),
     };
 
     let result = provider::send_email(&mut session, &submission, &from_addr, None).await?;
     Ok(send_success_response(result))
+}
+
+#[derive(Deserialize)]
+struct CalendarRangeParams {
+    start: String,
+    end: String,
+}
+
+/// The peek view asks for a day or a week; anything past this is a client
+/// bug that would balloon the CalDAV REPORT responses.
+const MAX_CALENDAR_RANGE_DAYS: i64 = 62;
+
+/// GET /api/calendar/events?start=<RFC3339>&end=<RFC3339> — normalized event
+/// occurrences overlapping `[start, end)` across every configured account,
+/// sorted by start, for the day/week peek view (kata j6e4). Accounts whose
+/// provider has no range support (Outlook/Gmail, out of scope) or no CalDAV
+/// credentials are skipped; other per-account failures are reported in
+/// `errors` so one broken account doesn't blank the whole view.
+async fn calendar_events_range(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CalendarRangeParams>,
+) -> Result<impl IntoResponse, Error> {
+    let (start, end) = parse_calendar_range(&params.start, &params.end)?;
+    let (events, errors) = collect_range_events(&state, start, end).await;
+    Ok(Json(
+        serde_json::json!({ "events": events, "errors": errors }),
+    ))
+}
+
+/// Parse and validate a `?start=<RFC3339>&end=<RFC3339>` window shared by
+/// the calendar range endpoints.
+fn parse_calendar_range(
+    start: &str,
+    end: &str,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), Error> {
+    let parse_bound = |label: &str, v: &str| {
+        chrono::DateTime::parse_from_rfc3339(v)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .map_err(|e| Error::BadRequest(format!("invalid {label} '{v}': {e}")))
+    };
+    let start = parse_bound("start", start)?;
+    let end = parse_bound("end", end)?;
+    if end <= start {
+        return Err(Error::BadRequest("end must be after start".into()));
+    }
+    if end - start > chrono::Duration::days(MAX_CALENDAR_RANGE_DAYS) {
+        return Err(Error::BadRequest(format!(
+            "range too large (max {MAX_CALENDAR_RANGE_DAYS} days)"
+        )));
+    }
+    Ok((start, end))
+}
+
+/// Normalized occurrences overlapping `[start, end)` across every configured
+/// account, sorted by start, plus per-account error strings. Accounts whose
+/// provider has no range support or no CalDAV credentials are skipped.
+async fn collect_range_events(
+    state: &AppState,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> (Vec<calendar::RangeEvent>, Vec<String>) {
+    let primary_tz = configured_primary_tz(state);
+
+    // Snapshot the session locks so the registry lock is not held across
+    // network I/O.
+    let sessions: Vec<(String, SessionLock)> = {
+        let reg = state.accounts.read().await;
+        reg.sessions
+            .iter()
+            .map(|(name, lock)| (name.clone(), lock.clone()))
+            .collect()
+    };
+
+    let mut events: Vec<calendar::RangeEvent> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (name, lock) in sessions {
+        let session = lock.read().await;
+        match provider::get_calendar_ics_in_range(&session, start, end).await {
+            Ok(Some(objects)) => {
+                for mut ev in calendar::events_in_range(&objects, start, end, primary_tz) {
+                    ev.account = name.clone();
+                    events.push(ev);
+                }
+            }
+            // Provider without range support: documented out of scope.
+            Ok(None) => {}
+            // No CalDAV app password: not a calendar-enabled account.
+            Err(Error::CalendarAuthUnconfigured) => {}
+            Err(e) => {
+                tracing::warn!("calendar range query failed for account {name}: {e}");
+                errors.push(format!("{name}: calendar query failed"));
+            }
+        }
+    }
+    events.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.uid.cmp(&b.uid)));
+    (events, errors)
+}
+
+#[derive(Deserialize)]
+struct FreeSlotsParams {
+    start: String,
+    end: String,
+    /// Slot length in minutes (default 30).
+    slot: Option<u32>,
+    /// Padding around busy blocks in minutes (default 0).
+    buffer: Option<u32>,
+    /// Daily availability start, `HH:MM` primary-timezone wall clock
+    /// (default 09:00).
+    work_start: Option<String>,
+    /// Daily availability end, `HH:MM` (default 17:00).
+    work_end: Option<String>,
+}
+
+/// GET /api/calendar/free-slots?start=&end=[&slot=30&buffer=0&work_start=09:00
+/// &work_end=17:00] — free slots in the window for Share Availability
+/// (kata mtqp): busy occurrences from every account (the /api/calendar/events
+/// plumbing) fed through `calendar::free_slots`.
+async fn calendar_free_slots(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FreeSlotsParams>,
+) -> Result<impl IntoResponse, Error> {
+    let (start, end) = parse_calendar_range(&params.start, &params.end)?;
+    let slot_minutes = params.slot.unwrap_or(30);
+    if !(5..=480).contains(&slot_minutes) {
+        return Err(Error::BadRequest("slot must be 5–480 minutes".into()));
+    }
+    let buffer_minutes = params.buffer.unwrap_or(0);
+    if buffer_minutes > 120 {
+        return Err(Error::BadRequest(
+            "buffer must be at most 120 minutes".into(),
+        ));
+    }
+    let parse_wall = |label: &str, v: Option<&str>, default: (u32, u32)| {
+        let Some(v) = v else {
+            return Ok(chrono::NaiveTime::from_hms_opt(default.0, default.1, 0).unwrap());
+        };
+        chrono::NaiveTime::parse_from_str(v, "%H:%M")
+            .map_err(|e| Error::BadRequest(format!("invalid {label} '{v}': {e}")))
+    };
+    let work_start = parse_wall("work_start", params.work_start.as_deref(), (9, 0))?;
+    let work_end = parse_wall("work_end", params.work_end.as_deref(), (17, 0))?;
+    if work_end <= work_start {
+        return Err(Error::BadRequest(
+            "work_end must be after work_start".into(),
+        ));
+    }
+
+    let (busy, errors) = collect_range_events(&state, start, end).await;
+    let slots = calendar::free_slots(
+        &busy,
+        start,
+        end,
+        configured_primary_tz(&state),
+        &calendar::FreeSlotOptions {
+            slot_minutes,
+            buffer_minutes,
+            work_start,
+            work_end,
+        },
+    );
+    Ok(Json(
+        serde_json::json!({ "slots": slots, "errors": errors }),
+    ))
 }
 
 #[cfg(test)]
@@ -4094,7 +4502,7 @@ mod tests {
         );
         assert!(
             API_JS.contains(
-                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders)"
+                "/(emails|mailboxes|identities|splits|upload|split-counts|calendar|drafts|reminders|scheduled-sends|contacts|ai|tracking)"
             ),
             "allowlist regex must enumerate account-scoped path prefixes"
         );
@@ -4393,6 +4801,8 @@ mod tests {
                     username: format!("{id}@example.com"),
                     api_token: "tok".into(),
                     app_password: None,
+                    auth: accounts::FastmailAuthMode::ApiToken,
+                    identity_signatures: std::collections::BTreeMap::new(),
                     signature: None,
                 },
             );
@@ -4430,6 +4840,32 @@ mod tests {
             ))),
             reminder_settings_path: std::env::temp_dir()
                 .join("supervillain-test-reminder-settings.json"),
+            scheduled_sends: crate::scheduled_send::ScheduledSendStore::new(
+                std::env::temp_dir().join(format!(
+                    // Unique per call for the same reason as the reminders
+                    // path above: enqueue/cancel tests trigger save().
+                    "supervillain-test-scheduled-sends-{}-{}.json",
+                    std::process::id(),
+                    {
+                        static N: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    }
+                )),
+            ),
+            tracking: crate::tracking::TrackingStore::new(std::env::temp_dir().join(format!(
+                // Unique per call: open/send tests trigger save().
+                "supervillain-test-tracking-{}-{}.json",
+                std::process::id(),
+                {
+                    static T: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    T.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+            ))),
+            // A configured base so the send-path tests exercise injection;
+            // sends without an html_body stay untracked either way.
+            tracking_base: Some("https://track.example.com".into()),
         }
     }
 
@@ -4518,6 +4954,622 @@ mod tests {
                 .get("removed-account", "email-removed-account")
                 .is_none(),
             "records for accounts gone from the config are dropped"
+        );
+    }
+
+    // =========================================================================
+    // Deferred sends (kata vj6k Undo Send + kata acag Send Later)
+    // =========================================================================
+
+    /// Loopback JMAP endpoint answering every call with a successful
+    /// Email/set + EmailSubmission/set pair, counting requests so tests can
+    /// assert exactly how many dispatches reached the provider. Same
+    /// no-mocking-framework pattern as rate_limit.rs / jmap.rs.
+    async fn spawn_mock_jmap(hits: std::sync::Arc<std::sync::atomic::AtomicU32>) -> String {
+        use axum::routing::post as axum_post;
+        let app = Router::new().route(
+            "/jmap",
+            axum_post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "methodResponses": [
+                            ["Email/set", {"created": {"draft": {"id": "M123"}}}, "0"],
+                            ["EmailSubmission/set",
+                             {"created": {"send": {"id": "S1", "emailId": "M123"}}}, "1"]
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jmap")
+    }
+
+    /// A Fastmail session pre-seeded so `jmap::send_email` needs no discovery
+    /// round-trips: identity resolved, drafts/sent mailboxes cached. With
+    /// `api_url: None` any dispatch attempt fails `NotConnected` — used to
+    /// prove a code path did NOT touch the provider.
+    fn mock_fastmail_session(api_url: Option<String>) -> SessionLock {
+        let mut jmap = crate::jmap::JmapSession::new("known@example.com", "tok", None);
+        jmap.api_url = api_url;
+        jmap.account_id = Some("acc1".into());
+        jmap.identity_id = Some("ident1".into());
+        for (role, id) in [("drafts", "MB-drafts"), ("sent", "MB-sent")] {
+            jmap.mailbox_cache.insert(
+                role.into(),
+                Mailbox {
+                    id: id.into(),
+                    name: role.into(),
+                    role: Some(role.into()),
+                    total_emails: 0,
+                    unread_emails: 0,
+                    parent_id: None,
+                },
+            );
+        }
+        std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::provider::ProviderSession::Fastmail(Box::new(jmap)),
+        ))
+    }
+
+    fn queued_send(
+        id: &str,
+        account: &str,
+        send_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::scheduled_send::ScheduledSend {
+        crate::scheduled_send::ScheduledSend {
+            id: id.into(),
+            account_id: account.into(),
+            from_addr: "known@example.com".into(),
+            send_at,
+            queued_at: send_at - chrono::Duration::minutes(1),
+            submission: EmailSubmission {
+                to: vec!["dest@example.com".into()],
+                cc: Vec::new(),
+                subject: format!("subject-{id}"),
+                text_body: "body".into(),
+                bcc: None,
+                html_body: None,
+                in_reply_to: None,
+                references: None,
+                attachments: Vec::new(),
+                calendar_ics: None,
+                send_at: Some(send_at),
+            },
+            attempts: 0,
+        }
+    }
+
+    fn send_body(send_at: Option<chrono::DateTime<chrono::Utc>>) -> SendEmailBody {
+        SendEmailBody {
+            to: vec!["dest@example.com".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "deferred hello".into(),
+            body: "see you in the future".into(),
+            html_body: None,
+            in_reply_to: None,
+            from_address: None,
+            attachments: Vec::new(),
+            send_at,
+        }
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_with_future_send_at_queues_instead_of_dispatching() {
+        // The observable Undo Send / Send Later contract: a future send_at
+        // must queue and return without any provider round-trip. The session
+        // has api_url: None, so an attempted dispatch would error — a
+        // success response proves the deferral happened.
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(None));
+        let send_at = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let response = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(Some(send_at))),
+        )
+        .await
+        .expect("future send_at must queue, not dispatch")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["scheduled"], serde_json::json!(true));
+        let id = body["id"].as_str().expect("queued id in response");
+        let record = state
+            .scheduled_sends
+            .get(id)
+            .expect("record must be durable in the queue");
+        assert_eq!(record.account_id, "known");
+        assert_eq!(record.submission.subject, "deferred hello");
+        assert_eq!(record.send_at, send_at);
+    }
+
+    #[tokio::test]
+    async fn send_with_past_send_at_dispatches_immediately() {
+        // A stale send_at (clock skew, an Undo window that already elapsed
+        // client-side) must not park the email in the queue for up to a
+        // full daemon tick — it goes out now, on the request path.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let send_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let response = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(Some(send_at))),
+        )
+        .await
+        .expect("past send_at must send immediately")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "immediate path must reach the provider exactly once"
+        );
+        assert!(
+            state.scheduled_sends.records().is_empty(),
+            "nothing may be queued for a past send_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_before_due_returns_submission_and_prevents_dispatch() {
+        // vj6k's core promise: cancelling inside the window means the email
+        // never leaves. The response carries the submission so the client
+        // can restore the draft (server restores nothing).
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let due = chrono::Utc::now() + chrono::Duration::seconds(15);
+        state
+            .scheduled_sends
+            .insert(queued_send("undo-1", "known", due));
+
+        let response = cancel_scheduled_send(State(state.clone()), Path("undo-1".into()))
+            .await
+            .expect("cancel inside the window must succeed");
+        let body = serde_json::to_value(response.0.clone()).unwrap();
+        assert_eq!(body["submission"]["subject"], "subject-undo-1");
+        assert!(state.scheduled_sends.records().is_empty());
+
+        // Even a tick well past the original due time dispatches nothing.
+        let dispatched = crate::scheduled_send::tick_scheduled_send_daemon(
+            &state,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await;
+        assert!(dispatched.is_empty(), "cancelled send must never dispatch");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider must never see a cancelled send"
+        );
+
+        let err = cancel_scheduled_send(State(state), Path("undo-1".into()))
+            .await
+            .expect_err("second cancel must 404 — the record is gone");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_daemon_dispatches_due_exactly_once() {
+        // acag's core promise: the email actually departs once due — and
+        // only once. The second tick proves no double-dispatch.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = spawn_mock_jmap(hits.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let now = chrono::Utc::now();
+        state.scheduled_sends.insert(queued_send(
+            "due-1",
+            "known",
+            now - chrono::Duration::seconds(30),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "future-1",
+            "known",
+            now + chrono::Duration::hours(8),
+        ));
+
+        let dispatched = crate::scheduled_send::tick_scheduled_send_daemon(&state, now).await;
+        assert_eq!(dispatched.len(), 1, "exactly the due record dispatches");
+        assert_eq!(dispatched[0].id, "due-1");
+        assert_eq!(dispatched[0].email_id.as_deref(), Some("M123"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            state.scheduled_sends.get("due-1").is_none(),
+            "dispatched record must leave the queue"
+        );
+        assert!(
+            state.scheduled_sends.get("future-1").is_some(),
+            "not-yet-due record must stay queued"
+        );
+
+        let again = crate::scheduled_send::tick_scheduled_send_daemon(&state, now).await;
+        assert!(again.is_empty(), "a second tick must not re-dispatch");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no double-dispatch: provider hit count must not grow"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_send_daemon_keeps_disconnected_drops_removed_accounts() {
+        // Same tick policy as the reminders daemon (roborev 443): configured
+        // but session-less (OAuth pending) keeps its queued send; an account
+        // removed from the config drops it.
+        let state = Arc::new(test_state(&["known"], "known"));
+        let due = chrono::Utc::now() - chrono::Duration::minutes(5);
+        state
+            .scheduled_sends
+            .insert(queued_send("keep", "known", due));
+        state
+            .scheduled_sends
+            .insert(queued_send("drop", "removed-account", due));
+        crate::scheduled_send::tick_scheduled_send_daemon(&state, chrono::Utc::now()).await;
+        assert!(
+            state.scheduled_sends.get("keep").is_some(),
+            "configured-but-disconnected account must keep its queued send"
+        );
+        assert!(
+            state.scheduled_sends.get("drop").is_none(),
+            "queued sends for accounts gone from the config are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_scheduled_sends_returns_account_records_soonest_first() {
+        let state = Arc::new(test_state(&["known", "other"], "known"));
+        let now = chrono::Utc::now();
+        state.scheduled_sends.insert(queued_send(
+            "second",
+            "known",
+            now + chrono::Duration::hours(2),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "first",
+            "known",
+            now + chrono::Duration::hours(1),
+        ));
+        state.scheduled_sends.insert(queued_send(
+            "foreign",
+            "other",
+            now + chrono::Duration::hours(1),
+        ));
+        let response = list_scheduled_sends(State(state), Query(AccountParam { account: None }))
+            .await
+            .expect("listing must succeed");
+        let body = serde_json::to_value(response.0).unwrap();
+        let ids: Vec<_> = body
+            .as_array()
+            .expect("a JSON array of queued sends")
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["first", "second"]);
+    }
+
+    // =========================================================================
+    // Open tracking (kata e2h4)
+    // =========================================================================
+
+    /// Like `spawn_mock_jmap`, but also captures every JMAP request payload
+    /// so tests can assert what actually went to the provider (the pixel
+    /// must be IN the outgoing mail, not merely in a store).
+    async fn spawn_capturing_jmap(
+        payloads: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> String {
+        use axum::routing::post as axum_post;
+        let app = Router::new().route(
+            "/jmap",
+            axum_post(move |Json(payload): Json<serde_json::Value>| {
+                let payloads = payloads.clone();
+                async move {
+                    payloads.lock().unwrap().push(payload);
+                    Json(serde_json::json!({
+                        "methodResponses": [
+                            ["Email/set", {"created": {"draft": {"id": "M123"}}}, "0"],
+                            ["EmailSubmission/set",
+                             {"created": {"send": {"id": "S1", "emailId": "M123"}}}, "1"]
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jmap")
+    }
+
+    fn html_send_body(send_at: Option<chrono::DateTime<chrono::Utc>>) -> SendEmailBody {
+        SendEmailBody {
+            html_body: Some("<p>rich hello</p>".into()),
+            ..send_body(send_at)
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_send_carries_a_recorded_pixel_to_the_provider() {
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let _ = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+
+        let records = state.tracking.records_for_account("known");
+        assert_eq!(records.len(), 1, "one tracked record per send");
+        let record = &records[0];
+        assert_eq!(record.subject, "deferred hello");
+        assert!(record.recipients.contains(&"dest@example.com".to_string()));
+        assert_eq!(
+            record.email_id.as_deref(),
+            Some("M123"),
+            "the provider's message id must attach after dispatch"
+        );
+        let sent = serde_json::to_string(&payloads.lock().unwrap()[0]).unwrap();
+        assert!(
+            sent.contains(&format!("/t/{}.gif", record.token)),
+            "the outgoing mail must carry the recorded token's pixel"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_when_no_base_or_no_html() {
+        // No public base configured → no pixel even for HTML sends; and a
+        // text-only send is never tracked even with a base.
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let mut bare = test_state(&["known"], "known");
+        bare.tracking_base = None;
+        let state = Arc::new(bare);
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url.clone())));
+        let _ = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+        assert!(state.tracking.records().is_empty());
+        assert!(
+            !serde_json::to_string(&payloads.lock().unwrap()[0])
+                .unwrap()
+                .contains("/t/"),
+            "no pixel without a configured public base"
+        );
+
+        let tracked = Arc::new(test_state(&["known"], "known"));
+        tracked
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let _ = send_email_handler(
+            State(tracked.clone()),
+            Query(AccountParam { account: None }),
+            Json(send_body(None)),
+        )
+        .await
+        .expect("send must succeed")
+        .into_response();
+        assert!(
+            tracked.tracking.records().is_empty(),
+            "text-only sends are never tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_tracked_send_keeps_one_pixel_through_daemon_dispatch() {
+        // Enqueue injects; the daemon dispatches the already-pixeled body.
+        // Exactly one pixel must reach the provider and the record must gain
+        // the provider's message id — never a second pixel or record.
+        let payloads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = spawn_capturing_jmap(payloads.clone()).await;
+        let state = Arc::new(test_state(&["known"], "known"));
+        state
+            .accounts
+            .write()
+            .await
+            .sessions
+            .insert("known".into(), mock_fastmail_session(Some(url)));
+        let send_at = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let _ = send_email_handler(
+            State(state.clone()),
+            Query(AccountParam { account: None }),
+            Json(html_send_body(Some(send_at))),
+        )
+        .await
+        .expect("deferred send must queue")
+        .into_response();
+
+        let queued = state.scheduled_sends.records();
+        assert_eq!(queued.len(), 1);
+        let html = queued[0].submission.html_body.clone().unwrap();
+        let token = crate::tracking::extract_token(&html)
+            .expect("the queued body must already carry the pixel");
+        assert_eq!(html.matches("/t/").count(), 1);
+        let record = state.tracking.get(&token).expect("recorded at enqueue");
+        assert_eq!(record.email_id, None, "no message id before dispatch");
+
+        crate::scheduled_send::tick_scheduled_send_daemon(
+            &state,
+            send_at + chrono::Duration::seconds(1),
+        )
+        .await;
+        let sent = serde_json::to_string(&payloads.lock().unwrap()[0]).unwrap();
+        assert_eq!(
+            sent.matches(&format!("/t/{token}.gif")).count(),
+            1,
+            "exactly one pixel reaches the provider on daemon dispatch"
+        );
+        assert_eq!(state.tracking.records().len(), 1, "still one record");
+        assert_eq!(
+            state.tracking.get(&token).unwrap().email_id.as_deref(),
+            Some("M123"),
+            "dispatch must attach the provider's message id"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_pixel_serves_the_gif_and_records_each_open() {
+        let state = Arc::new(test_state(&["known"], "known"));
+        state.tracking.insert(crate::tracking::TrackedSend {
+            token: "0123456789abcdef0123456789abcdef".into(),
+            account_id: "known".into(),
+            email_id: Some("M123".into()),
+            subject: "tracked".into(),
+            recipients: vec!["dest@example.com".into()],
+            sent_at: chrono::Utc::now(),
+            opens: vec![],
+        });
+        for expected_opens in [1usize, 2] {
+            let response = tracking_pixel(
+                State(state.clone()),
+                Path("0123456789abcdef0123456789abcdef.gif".into()),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("image/gif")
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.starts_with(b"GIF89a"), "a real gif must come back");
+            assert_eq!(
+                state
+                    .tracking
+                    .get("0123456789abcdef0123456789abcdef")
+                    .unwrap()
+                    .opens
+                    .len(),
+                expected_opens,
+                "each fetch is one open event"
+            );
+        }
+
+        // Unknown token: identical response, nothing recorded — validity
+        // must not leak to whoever probes the public route.
+        let response = tracking_pixel(
+            State(state.clone()),
+            Path("ffffffffffffffffffffffffffffffff.gif".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"GIF89a"));
+        assert_eq!(state.tracking.records().len(), 1, "no phantom records");
+    }
+
+    #[tokio::test]
+    async fn tracking_status_lists_the_accounts_records_newest_first() {
+        let state = Arc::new(test_state(&["known", "other"], "known"));
+        let now = chrono::Utc::now();
+        for (token_char, account, subject, age_mins) in [
+            ("a", "known", "older", 20i64),
+            ("b", "known", "newer", 5),
+            ("c", "other", "foreign", 1),
+        ] {
+            state.tracking.insert(crate::tracking::TrackedSend {
+                token: token_char.repeat(32),
+                account_id: account.into(),
+                email_id: None,
+                subject: subject.into(),
+                recipients: vec![],
+                sent_at: now - chrono::Duration::minutes(age_mins),
+                opens: if subject == "newer" {
+                    vec![now]
+                } else {
+                    vec![]
+                },
+            });
+        }
+        let response = tracking_status(State(state), Query(AccountParam { account: None }))
+            .await
+            .expect("listing must succeed");
+        let body = serde_json::to_value(response.0).unwrap();
+        let rows = body.as_array().expect("a JSON array");
+        let subjects: Vec<_> = rows
+            .iter()
+            .map(|r| r["subject"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["newer", "older"],
+            "account-scoped, newest first"
+        );
+        assert_eq!(
+            rows[0]["opens"].as_array().unwrap().len(),
+            1,
+            "open events ride along for the client"
         );
     }
 
@@ -8187,6 +9239,32 @@ mod tests {
     }
 
     #[test]
+    fn theme_dir_precedence_state_wins_then_config() {
+        // Omarchy 4.0 (XDG state) must win over the 3.x location (XDG
+        // config), and the 3.x location must still serve when the 4.0 dir
+        // is absent (roborev 530 #2).
+        let state = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("supervillain.css"),
+            ":root { --bg: #3d3021; }",
+        )
+        .unwrap();
+        let dirs = [state.path().to_path_buf(), config.path().to_path_buf()];
+
+        assert!(first_theme_css(&dirs).unwrap().contains("#3d3021"));
+
+        std::fs::write(
+            state.path().join("supervillain.css"),
+            ":root { --bg: #1d2021; }",
+        )
+        .unwrap();
+        assert!(first_theme_css(&dirs).unwrap().contains("#1d2021"));
+
+        assert!(first_theme_css(&[]).is_none());
+    }
+
+    #[test]
     fn theme_fallback_generates_css_from_ghostty() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -9819,6 +10897,10 @@ white   = '#fdf6e3'
     // determine_attendee_email tests
     // =========================================================================
 
+    fn user_addrs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|address| address.to_string()).collect()
+    }
+
     fn test_email_with_recipients(to: Vec<&str>, cc: Vec<&str>) -> Email {
         Email {
             id: "test-id".into(),
@@ -9888,7 +10970,12 @@ white   = '#fdf6e3'
     fn invite_list_fields_require_request_to_matching_attendee() {
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert_eq!(
             fields,
             InviteListFields {
@@ -9901,11 +10988,25 @@ white   = '#fdf6e3'
 
         let mut reply = event.clone();
         reply.method = "REPLY".into();
-        assert!(!invite_list_fields(&email, Some(&reply), "bob@example.com", None).is_invite_to_me);
+        assert!(
+            !invite_list_fields(
+                &email,
+                Some(&reply),
+                &user_addrs(&["bob@example.com"]),
+                None
+            )
+            .is_invite_to_me
+        );
 
         let not_to_me = test_calendar_event(vec!["carol@example.com"]);
         assert!(
-            !invite_list_fields(&email, Some(&not_to_me), "bob@example.com", None).is_invite_to_me
+            !invite_list_fields(
+                &email,
+                Some(&not_to_me),
+                &user_addrs(&["bob@example.com"]),
+                None
+            )
+            .is_invite_to_me
         );
     }
 
@@ -9949,7 +11050,12 @@ white   = '#fdf6e3'
         event.attendees[1].status = "NEEDS-ACTION".into();
         event.attendees[2].status = "DECLINED".into();
 
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert!(fields.is_invite_to_me);
         assert_eq!(
             fields.status.as_deref(),
@@ -9965,7 +11071,12 @@ white   = '#fdf6e3'
         let mut event = test_calendar_event(vec!["alice@example.com"]);
         event.attendees[0].status = "ACCEPTED".into();
 
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert!(
             !fields.is_invite_to_me,
             "an FYI recipient must not inherit another guest's actionable chip"
@@ -9977,7 +11088,12 @@ white   = '#fdf6e3'
     fn invite_list_fields_accepts_unambiguous_account_alias() {
         let email = test_email_with_recipients(vec!["alias@example.com"], vec![]);
         let event = test_calendar_event(vec!["alias@example.com"]);
-        let fields = invite_list_fields(&email, Some(&event), "primary@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["primary@example.com"]),
+            None,
+        );
         assert!(fields.is_invite_to_me);
     }
 
@@ -10019,7 +11135,12 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let mut event = test_calendar_event(vec!["bob@example.com"]);
         event.organizer_email = "bob@example.com".into();
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert_eq!(fields.method.as_deref(), Some("REQUEST"));
         assert!(!fields.is_invite_to_me);
         assert!(fields.status.is_none());
@@ -10031,7 +11152,12 @@ white   = '#fdf6e3'
         let incoming = test_calendar_event(vec!["bob@example.com"]);
         let mut stored = incoming.clone();
         stored.attendees[0].status = "ACCEPTED".into();
-        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        let fields = invite_list_fields(
+            &email,
+            Some(&incoming),
+            &user_addrs(&["bob@example.com"]),
+            Some(&stored),
+        );
         assert_eq!(fields.status.as_deref(), Some("ACCEPTED"));
         assert!(!fields.is_updated);
     }
@@ -10046,7 +11172,12 @@ white   = '#fdf6e3'
         incoming.sequence = 1;
         incoming.summary = "Rescheduled".into();
 
-        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        let fields = invite_list_fields(
+            &email,
+            Some(&incoming),
+            &user_addrs(&["bob@example.com"]),
+            Some(&stored),
+        );
         assert!(fields.is_updated);
         assert_eq!(fields.status.as_deref(), Some("NEEDS-ACTION"));
     }
@@ -10056,7 +11187,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "bob@example.com"
         );
     }
@@ -10066,7 +11197,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec![], vec!["carol@example.com"]);
         let event = test_calendar_event(vec!["carol@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "carol@example.com"
         );
     }
@@ -10076,7 +11207,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec!["carol@example.com"]);
         let event = test_calendar_event(vec!["bob@example.com", "carol@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "bob@example.com"
         );
     }
@@ -10086,7 +11217,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["Bob@Example.COM"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "Bob@Example.COM"
         );
     }
@@ -10096,7 +11227,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["unrelated@example.com"], vec![]);
         let event = test_calendar_event(vec!["someone@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "fallback@example.com"
         );
     }
@@ -10106,8 +11237,269 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec![], vec![]);
         let event = test_calendar_event(vec!["someone@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "user@fastmail.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["user@fastmail.com"])),
             "user@fastmail.com"
+        );
+    }
+
+    // =========================================================================
+    // Alias-domain identity tests: Fastmail accounts send/receive as
+    // addresses on other managed domains (e.g. @mattcoburn.ai, @mattgpt.ai),
+    // each a separate JMAP identity. Invites addressed to those aliases must
+    // resolve to the alias — for the RSVP's ATTENDEE line, the list chip,
+    // and the PARTSTAT lookup — never to another guest or the login address.
+    // =========================================================================
+
+    #[test]
+    fn merge_user_addresses_keeps_username_first_and_dedupes_case_insensitively() {
+        let identities = vec![
+            crate::types::Identity {
+                id: "i1".into(),
+                email: "Matt.Coburn@Fastmail.com".into(),
+                name: "Matt".into(),
+            },
+            crate::types::Identity {
+                id: "i2".into(),
+                email: "matt@mattcoburn.ai".into(),
+                name: "Matt".into(),
+            },
+            crate::types::Identity {
+                id: "i3".into(),
+                email: "matt@mattgpt.ai".into(),
+                name: "Matt".into(),
+            },
+        ];
+        let addresses = merge_user_addresses("matt.coburn@fastmail.com", &identities);
+        assert_eq!(
+            addresses,
+            vec![
+                "matt.coburn@fastmail.com".to_string(),
+                "matt@mattcoburn.ai".to_string(),
+                "matt@mattgpt.ai".to_string(),
+            ],
+            "username stays first (it is the fallback); identity casing duplicates collapse"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_prefers_identity_alias_over_first_guest() {
+        // Multi-guest invite to an alias: every guest is in To, and the
+        // alias is NOT the first recipient. Resolution must pick the user's
+        // alias, not borrow the first guest's ATTENDEE line — an RSVP built
+        // from a guest's line answers on their behalf.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "matt@mattcoburn.ai"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "matt@mattcoburn.ai"]);
+        assert_eq!(
+            determine_attendee_email(
+                &email,
+                &event,
+                &user_addrs(&["matt.coburn@fastmail.com", "matt@mattcoburn.ai"]),
+            ),
+            "matt@mattcoburn.ai"
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_recognizes_alias_identity_on_multi_guest_invite() {
+        // Same shape via the list chip: with the alias known as an identity
+        // the invite is unambiguously "to me" even though the login address
+        // appears nowhere, and the chip must show the alias's own status.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "matt@mattgpt.ai"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com", "matt@mattgpt.ai"]);
+        event.attendees[0].status = "ACCEPTED".into();
+        event.attendees[1].status = "TENTATIVE".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattgpt.ai"]),
+            None,
+        );
+        assert!(fields.is_invite_to_me, "alias identity invite is to me");
+        assert_eq!(
+            fields.status.as_deref(),
+            Some("TENTATIVE"),
+            "the chip must show the alias's status, not the first guest's"
+        );
+    }
+
+    #[test]
+    fn attendee_email_for_event_resolves_bcc_delivered_alias_from_ics() {
+        // Bcc delivery: To/Cc never mention the user, but the ICS names the
+        // alias explicitly. The identity list is what makes the ICS attendee
+        // recognizable as "me".
+        let email = test_email_with_recipients(vec!["list@example.com"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "matt@mattgpt.ai"]);
+        let resolution = attendee_email_for_event(
+            &email,
+            &event,
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattgpt.ai"]),
+        )
+        .expect("alias named in the ICS must resolve");
+        assert_eq!(resolution.email, "matt@mattgpt.ai");
+        assert!(resolution.plausibly_user);
+    }
+
+    #[test]
+    fn attendee_resolution_matches_wildcard_identity_domain() {
+        // Fastmail models catch-all domains as wildcard identities — the
+        // live /api/identities returns "*@mattcoburn.ai", not an enumerable
+        // address list — so pattern entries must match any local part on
+        // that domain.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "anything@mattcoburn.ai"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "anything@mattcoburn.ai"]);
+        assert_eq!(
+            determine_attendee_email(
+                &email,
+                &event,
+                &user_addrs(&["matt.coburn@aristoi.ai", "*@mattcoburn.ai"]),
+            ),
+            "anything@mattcoburn.ai"
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_recognizes_wildcard_alias_invite() {
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "hello@mattgpt.ai"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com", "hello@mattgpt.ai"]);
+        event.attendees[0].status = "ACCEPTED".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@mattgpt.ai"]),
+            None,
+        );
+        assert!(
+            fields.is_invite_to_me,
+            "catch-all domain invite must be recognized as to-me"
+        );
+        assert_eq!(
+            fields.status.as_deref(),
+            Some("NEEDS-ACTION"),
+            "status must come from the wildcard-matched attendee, not the first guest"
+        );
+    }
+
+    #[test]
+    fn wildcard_pattern_must_not_match_other_domains_or_organizer() {
+        // "*@mattgpt.ai" must not swallow lookalike domains, and a wildcard
+        // in the list must not hide a genuinely foreign organizer's invite.
+        let email = test_email_with_recipients(vec!["me@mattgpt.ai"], vec![]);
+        let event = test_calendar_event(vec!["me@mattgpt.ai"]);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@notmattgpt.ai"]),
+            None,
+        );
+        // me@mattgpt.ai is NOT covered by *@notmattgpt.ai: resolution falls
+        // through to the historical single-recipient alias heuristic.
+        let resolution = attendee_email_for_event(
+            &email,
+            &event,
+            &user_addrs(&["matt.coburn@aristoi.ai", "*@notmattgpt.ai"]),
+        )
+        .expect("recipient attendee still resolves via the alias heuristic");
+        assert_eq!(resolution.email, "me@mattgpt.ai");
+        assert!(fields.is_invite_to_me, "single-alias heuristic unchanged");
+    }
+
+    #[test]
+    fn invite_list_fields_hide_request_organized_by_users_alias() {
+        // A REQUEST the user organized from an alias identity must not offer
+        // RSVP buttons back to themselves.
+        let email = test_email_with_recipients(vec!["guest@example.com"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com"]);
+        event.organizer_email = "matt@mattcoburn.ai".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattcoburn.ai"]),
+            None,
+        );
+        assert!(
+            !fields.is_invite_to_me,
+            "own alias-organized event must not render as an actionable invite"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_identities_cache_miss_fetches_once_and_backfills() {
+        // roborev 537 #3: the RSVP click's miss path — live fetch through
+        // the held session, backfill into the prefetch cache, and no second
+        // provider round-trip once the cache is warm.
+        use crate::jmap::caldav_recorder;
+        let canned = serde_json::json!({
+            "methodResponses": [
+                ["Identity/get", {"list": [
+                    {"id": "ident-wild", "email": "*@mattcoburn.ai", "name": "mattcoburn.ai"}
+                ]}, "0"]
+            ]
+        });
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
+                .await;
+        let state = test_state(&["acct"], "acct");
+
+        let mut jmap = crate::jmap::JmapSession::new("matt.coburn@aristoi.ai", "tok", None);
+        jmap.api_url = Some(format!("{base}/jmap"));
+        jmap.account_id = Some("acc1".into());
+        let mut session = provider::ProviderSession::Fastmail(Box::new(jmap));
+
+        let identities = rsvp_identities(&state, "acct", &mut session).await;
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].email, "*@mattcoburn.ai");
+        assert_eq!(
+            state
+                .prefetch
+                .get_identities("acct")
+                .await
+                .expect("the live result must backfill the prefetch cache")
+                .len(),
+            1
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "exactly one live fetch on the miss"
+        );
+
+        // Warm cache: a FRESH session (api_url: None — any provider dispatch
+        // would fail NotConnected) must be served without provider I/O.
+        let mut session2 = provider::ProviderSession::Fastmail(Box::new(
+            crate::jmap::JmapSession::new("matt.coburn@aristoi.ai", "tok", None),
+        ));
+        let identities = rsvp_identities(&state, "acct", &mut session2).await;
+        assert_eq!(
+            identities.len(),
+            1,
+            "cache hit must resolve without touching the provider"
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "no second live fetch once the cache is warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_identities_fetch_failure_degrades_to_empty_and_does_not_cache() {
+        let state = test_state(&["acct"], "acct");
+        // No api_url / account_id: the live fetch fails NotConnected.
+        let mut session = provider::ProviderSession::Fastmail(Box::new(
+            crate::jmap::JmapSession::new("u@example.com", "tok", None),
+        ));
+        let identities = rsvp_identities(&state, "acct", &mut session).await;
+        assert!(
+            identities.is_empty(),
+            "a failed fetch must degrade to login-address-only resolution"
+        );
+        assert!(
+            state.prefetch.get_identities("acct").await.is_none(),
+            "a failed fetch must not poison the cache with an empty list"
         );
     }
 
@@ -10993,6 +12385,7 @@ white   = '#fdf6e3'
                 accounts::AccountConfig::Outlook {
                     client_id: "test-client".into(),
                     email: Some("boss@example.com".into()),
+                    identity_signatures: std::collections::BTreeMap::new(),
                     signature: None,
                 },
             );
@@ -13241,14 +14634,25 @@ white   = '#fdf6e3'
 
 // External dep for theme path
 mod dirs_next {
-    pub fn config_dir() -> Option<std::path::PathBuf> {
-        std::env::var("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
+    // XDG Base Directory spec: an empty variable must be treated as unset.
+    fn xdg_dir(var: &str, home_suffix: &str) -> Option<std::path::PathBuf> {
+        std::env::var(var)
             .ok()
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
             .or_else(|| {
                 std::env::var("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".config"))
                     .ok()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| std::path::PathBuf::from(h).join(home_suffix))
             })
+    }
+
+    pub fn config_dir() -> Option<std::path::PathBuf> {
+        xdg_dir("XDG_CONFIG_HOME", ".config")
+    }
+
+    pub fn state_dir() -> Option<std::path::PathBuf> {
+        xdg_dir("XDG_STATE_HOME", ".local/state")
     }
 }

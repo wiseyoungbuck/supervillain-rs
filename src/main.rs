@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use supervillain::{
     accounts::{self, AccountConfig},
-    gmail, jmap, outlook, platform,
+    gmail, jmap, oauth, outlook, platform,
     platform::{FsTokenStore, TokenStore},
     prefetch, provider,
     provider::ProviderSession,
-    reminders, routes, splits, timezone,
+    reminders, routes, scheduled_send, splits, timezone, tracking,
     types::{AccountError, AccountRegistry, AppState, SessionLock},
 };
 
@@ -29,6 +29,8 @@ async fn main() {
     let prefetch_cache_path = config_dir.join("supervillain/prefetch-cache.json");
     let reminders_path = config_dir.join("supervillain/reminders.json");
     let reminder_settings_path = config_dir.join("supervillain/reminder-settings.json");
+    let scheduled_sends_path = config_dir.join("supervillain/scheduled-sends.json");
+    let tracking_path = config_dir.join("supervillain/tracking.json");
 
     platform::init_tracing();
 
@@ -128,6 +130,14 @@ async fn main() {
         prefetch_cache_path,
         reminders: reminders::ReminderStore::load(&reminders_path),
         reminder_settings_path,
+        scheduled_sends: scheduled_send::ScheduledSendStore::load(&scheduled_sends_path),
+        tracking: tracking::TrackingStore::load(&tracking_path),
+        // Tracking is inert without an explicitly configured public base —
+        // a pixel URL nobody can reach would only leak intent, never opens.
+        tracking_base: std::env::var("SUPERVILLAIN_TRACKING_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty()),
     });
 
     // Kick off the background prefetch warmer. The first pass starts
@@ -138,6 +148,8 @@ async fn main() {
     // split-count requests.
     prefetch::spawn_warmer(state.clone(), std::time::Duration::from_secs(300));
     reminders::spawn_daemon(state.clone());
+    scheduled_send::spawn_daemon(state.clone());
+    accounts::spawn_fastmail_token_refresher(state.clone());
 
     let app = routes::router(state).layer(routes::compression_layer());
 
@@ -220,6 +232,28 @@ async fn load_session(
         });
     }
     match account {
+        AccountConfig::Fastmail {
+            auth: accounts::FastmailAuthMode::Oauth,
+            ..
+        } => {
+            // OAuth mode: rebuild from stored tokens (refreshing first if
+            // stale). Missing tokens surface the same Authorize affordance
+            // as Outlook/Gmail — never a blocking browser flow at startup.
+            let session = oauth::load_fastmail_oauth_session(name, token_store)
+                .await
+                .map_err(|e| AccountError {
+                    account: name.into(),
+                    provider: "fastmail".into(),
+                    error: e.to_string(),
+                })?;
+            tracing::info!(
+                "[{name}] Connected Fastmail (OAuth) as {}, {} mailboxes",
+                session.username,
+                session.mailbox_cache.len()
+            );
+            Ok(ProviderSession::Fastmail(Box::new(session)))
+        }
+
         AccountConfig::Fastmail {
             username,
             api_token,

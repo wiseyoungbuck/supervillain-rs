@@ -230,8 +230,82 @@ pub fn load_from_theme_dir(theme_dir: &std::path::Path) -> Option<ThemeColors> {
 }
 
 /// Check if the theme directory indicates a light theme.
+///
+/// Mirrors `resolve_theme_mode` in Omarchy 4.0's omarchy-theme-color, in its
+/// precedence order: the colors.toml `mode` key, the legacy `theme_type`
+/// key, the 3.x `light.mode` marker file, then a background-luminance
+/// heuristic (r+g+b > 382 reads as light), defaulting to dark. As upstream,
+/// ANY non-empty mode/theme_type value is authoritative and suppresses the
+/// fallbacks — an unrecognized value (`mode = "auto"`) resolves dark there
+/// too, since only an exact "light" ever reads as light downstream.
 pub fn is_light_theme(theme_dir: &std::path::Path) -> bool {
-    theme_dir.join("light.mode").exists()
+    let toml = std::fs::read_to_string(theme_dir.join("colors.toml")).unwrap_or_default();
+
+    let raw_value = |wanted: &str| -> Option<&str> {
+        toml.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == wanted).then_some(value)
+        })
+    };
+    // mode/theme_type values are bare words, safe to strip `# comment` from.
+    let mode_word = |raw: &str| -> Option<String> {
+        let word = raw
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['"', '\'']);
+        (!word.is_empty()).then(|| word.to_ascii_lowercase())
+    };
+
+    if let Some(mode) = raw_value("mode")
+        .and_then(mode_word)
+        .or_else(|| raw_value("theme_type").and_then(mode_word))
+    {
+        return mode == "light";
+    }
+
+    if theme_dir.join("light.mode").exists() {
+        return true;
+    }
+
+    // normalize_hex (not mode_word) here: hex values contain `#`.
+    if let Some(bg) = raw_value("background").and_then(normalize_hex) {
+        let sum: u32 = [&bg[1..3], &bg[3..5], &bg[5..7]]
+            .iter()
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .map(u32::from)
+            .sum();
+        return sum > 382;
+    }
+
+    false
+}
+
+/// Serve-ready CSS for one theme directory, or None if it holds no usable
+/// theme. Prefers the template-rendered supervillain.css (Omarchy renders
+/// `~/.config/omarchy/themed/supervillain.css.tpl` into the theme dir),
+/// falling back to CSS generated from the theme's terminal color config.
+/// Both paths are sanitized, and both carry the `--light-mode` marker the
+/// frontend keys on: the template pipeline has no conditionals, so the
+/// marker is appended here from the theme's own mode signal rather than
+/// expected from the template.
+pub fn css_for_theme_dir(theme_dir: &std::path::Path) -> Option<String> {
+    if let Ok(css) = std::fs::read_to_string(theme_dir.join("supervillain.css"))
+        && !css.is_empty()
+    {
+        let mut css = sanitize_theme_css(&css);
+        if is_light_theme(theme_dir) && !css.contains("--light-mode") {
+            css.push_str("\n\n/* --light-mode */");
+        }
+        return Some(css);
+    }
+
+    let colors = load_from_theme_dir(theme_dir)?;
+    Some(sanitize_theme_css(&generate_theme_css(
+        &colors,
+        is_light_theme(theme_dir),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1111,107 @@ white   =   '#cccccc'
 
         std::fs::write(dir.path().join("light.mode"), "# light theme").unwrap();
         assert!(is_light_theme(dir.path()));
+    }
+
+    #[test]
+    fn is_light_theme_detects_colors_toml_mode() {
+        // Omarchy 4.0: no light.mode file, mode lives in colors.toml.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "background = \"#1d2021\"\nmode = \"dark\"\n",
+        )
+        .unwrap();
+        assert!(!is_light_theme(dir.path()));
+
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "background = \"#eff1f5\"\nmode = \"light\" # catppuccin-latte\n",
+        )
+        .unwrap();
+        assert!(is_light_theme(dir.path()));
+    }
+
+    #[test]
+    fn is_light_theme_matches_omarchy_mode_precedence() {
+        // omarchy-theme-color's resolve_theme_mode: mode key > theme_type
+        // key > light.mode file > background luminance > dark.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Legacy theme_type key counts like mode.
+        std::fs::write(dir.path().join("colors.toml"), "theme_type = \"light\"\n").unwrap();
+        assert!(is_light_theme(dir.path()));
+
+        // TOML single-quoted literal strings parse too (roborev 531).
+        std::fs::write(dir.path().join("colors.toml"), "mode = 'light'\n").unwrap();
+        assert!(is_light_theme(dir.path()));
+
+        // With both keys present, mode wins over theme_type (roborev 532).
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "mode = \"dark\"\ntheme_type = \"light\"\n",
+        )
+        .unwrap();
+        assert!(!is_light_theme(dir.path()));
+
+        // An explicit dark mode key beats a stale 3.x light.mode file.
+        std::fs::write(dir.path().join("light.mode"), "").unwrap();
+        std::fs::write(dir.path().join("colors.toml"), "mode = \"dark\"\n").unwrap();
+        assert!(!is_light_theme(dir.path()));
+        std::fs::remove_file(dir.path().join("light.mode")).unwrap();
+
+        // No mode signal at all: background luminance decides (r+g+b > 382).
+        std::fs::write(
+            dir.path().join("colors.toml"),
+            "background = \"#fdf6e3\" # solarized paper\n",
+        )
+        .unwrap();
+        assert!(is_light_theme(dir.path()));
+        std::fs::write(dir.path().join("colors.toml"), "background = \"#1d2021\"\n").unwrap();
+        assert!(!is_light_theme(dir.path()));
+    }
+
+    #[test]
+    fn css_for_theme_dir_appends_light_marker_to_template_css() {
+        // The themed-template pipeline has no conditionals, so the rendered
+        // supervillain.css carries no mode marker; the serve path must add
+        // it for light themes or app.js keeps the dark chrome.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("supervillain.css"),
+            ":root { --bg: #eff1f5; --fg: #4c4f69; }",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("colors.toml"), "mode = \"light\"\n").unwrap();
+        let css = css_for_theme_dir(dir.path()).unwrap();
+        assert!(css.contains("--light-mode"));
+
+        std::fs::write(dir.path().join("colors.toml"), "mode = \"dark\"\n").unwrap();
+        let css = css_for_theme_dir(dir.path()).unwrap();
+        assert!(!css.contains("--light-mode"));
+    }
+
+    #[test]
+    fn css_for_theme_dir_does_not_duplicate_light_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("supervillain.css"),
+            ":root { --bg: #eff1f5; }\n/* --light-mode */",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("colors.toml"), "mode = \"light\"\n").unwrap();
+        let css = css_for_theme_dir(dir.path()).unwrap();
+        assert_eq!(css.matches("--light-mode").count(), 1);
+    }
+
+    #[test]
+    fn css_for_theme_dir_falls_back_to_terminal_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(css_for_theme_dir(dir.path()).is_none());
+
+        std::fs::write(dir.path().join("ghostty.conf"), GHOSTTY_EVERFOREST).unwrap();
+        let css = css_for_theme_dir(dir.path()).unwrap();
+        assert!(css.contains("--bg: #2d353b"));
     }
 
     // -----------------------------------------------------------------------

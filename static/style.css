@@ -2418,3 +2418,387 @@ body:not(.light-theme) .compose-quote a * {
     font-size: 12.5px;
 }
 .wiz-default-row input[type=checkbox] { accent-color: var(--accent); }
+
+/* Undo Send toast (kata vj6k) — same shell as #undo-toast */
+#send-undo-toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    z-index: 1000;
+}
+
+#send-undo-toast.hidden {
+    display: none;
+}
+
+#send-undo-button {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+
+/* Send Later picker / Scheduled list (kata acag) — same overlay shell as
+   #remind-modal (kept as its own appended block for seam discipline) */
+#send-later-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+
+#send-later-modal.hidden {
+    display: none;
+}
+
+.scheduled-send-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 50vh;
+    overflow-y: auto;
+    margin: 12px 0;
+}
+
+.scheduled-send-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.scheduled-send-subject {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.scheduled-send-time {
+    color: var(--fg-muted);
+    font-size: 12.5px;
+}
+
+.scheduled-send-empty {
+    color: var(--fg-muted);
+    margin: 12px 0;
+}
+
+/* Move to Folder / Apply Label picker (kata e993). Overlay pattern matches
+   #remind-modal; rules are standalone appends (seam discipline) rather than
+   additions to the shared selector lists above. */
+#move-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+
+#move-modal.hidden {
+    display: none;
+}
+
+#move-filter {
+    width: 100%;
+    margin-bottom: 10px;
+}
+
+#move-picker-list {
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.move-picker-item {
+    padding: 6px 8px;
+    cursor: pointer;
+}
+
+.move-picker-item.selected,
+.move-picker-item:hover {
+    background: var(--bg-secondary);
+    color: var(--accent);
+}
+
+/* Bulk selection (kata pakx): the selection bar above the list and the
+   per-row marker. Standalone appends (seam discipline). */
+#bulk-bar {
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+}
+
+#bulk-bar.hidden {
+    display: none;
+}
+
+.email-row.bulk-selected {
+    background: var(--bg-secondary);
+    box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* ============================================================================
+   Contact insights sidebar (kata wcsg)
+   ========================================================================= */
+
+/* The detail view becomes a row: main column (existing header/body flow)
+   plus the insights sidebar on the right. */
+#email-detail-view.active {
+    flex-direction: row;
+}
+
+#email-detail-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#contact-sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    padding: 16px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-size: 12.5px;
+    color: var(--fg-muted);
+}
+
+#contact-sidebar.hidden {
+    display: none;
+}
+
+.contact-sidebar-name {
+    font-weight: bold;
+    color: var(--fg);
+}
+
+.contact-sidebar-email {
+    word-break: break-all;
+}
+
+.contact-sidebar-stats {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.contact-sidebar-section {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 11px;
+}
+
+.contact-thread {
+    margin-top: 8px;
+}
+
+.contact-thread-subject {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.contact-thread-date {
+    color: var(--fg-dim);
+    font-size: 11.5px;
+}
+
+.contact-sidebar-loading,
+.contact-sidebar-empty {
+    color: var(--fg-dim);
+    font-style: italic;
+    margin-top: 8px;
+}
+
+/* ============================================================================
+   AI assist (kata 6rhw)
+   ========================================================================= */
+
+#ai-summary {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-size: 13px;
+}
+
+#ai-summary.hidden {
+    display: none;
+}
+
+.ai-summary-label {
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+
+.ai-summary-text {
+    white-space: pre-wrap;
+    color: var(--fg);
+}
+
+.ai-summary-loading {
+    color: var(--fg-dim);
+    font-style: italic;
+}
+
+.ai-summary-error {
+    color: var(--error, #c66);
+}
+/* ============================================================
+   Calendar peek (kata j6e4) — C-key day/week pane
+   ============================================================ */
+#calendar-peek {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(760px, 70vw);
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+    z-index: 90;
+    display: flex;
+    flex-direction: column;
+    font-size: 12.5px;
+}
+#calendar-peek.hidden { display: none; }
+.peek-head {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    flex: none;
+}
+.peek-head-title {
+    color: var(--accent);
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.peek-head-range { color: var(--fg); }
+.peek-head-hint { margin-left: auto; color: var(--fg-dim); font-size: 11px; }
+.peek-status { padding: 8px 14px; color: var(--fg-muted); flex: none; }
+.peek-status-error { color: var(--error, #ff5555); }
+.peek-grid {
+    --peek-hour-h: 40px;
+    display: flex;
+    flex: 1;
+    overflow-y: auto;
+    align-items: flex-start;
+}
+.peek-hours { width: 52px; flex: none; color: var(--fg-dim); }
+.peek-hours-spacer-head { height: 26px; }
+.peek-hours-spacer-allday { height: 28px; border-bottom: 1px solid var(--border); }
+.peek-hour-rail { height: calc(24 * var(--peek-hour-h)); }
+.peek-hour-label {
+    height: var(--peek-hour-h);
+    font-size: 10.5px;
+    text-align: right;
+    padding-right: 6px;
+    transform: translateY(-6px);
+}
+.peek-day {
+    flex: 1;
+    min-width: 0;
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+}
+.peek-day-head {
+    height: 26px;
+    line-height: 26px;
+    padding: 0 6px;
+    color: var(--fg-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.peek-allday {
+    min-height: 28px;
+    border-bottom: 1px solid var(--border);
+    padding: 2px 3px;
+}
+.peek-timed {
+    position: relative;
+    height: calc(24 * var(--peek-hour-h));
+    background: repeating-linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent calc(var(--peek-hour-h) - 1px),
+        var(--border) calc(var(--peek-hour-h) - 1px),
+        var(--border) var(--peek-hour-h)
+    );
+}
+.peek-event {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    top: calc(var(--peek-start) / 60 * var(--peek-hour-h));
+    height: max(calc(var(--peek-dur) / 60 * var(--peek-hour-h)), 14px);
+    background: var(--bg-tertiary);
+    border-left: 2px solid var(--accent);
+    border-radius: 2px;
+    padding: 1px 4px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--fg);
+}
+.peek-event-allday {
+    position: static;
+    height: auto;
+    display: block;
+    margin: 1px 0;
+    border-left-color: var(--accent-dim);
+}
+.peek-event-time { color: var(--fg-muted); font-size: 10.5px; }
+
+/* Share Availability picker (kata mtqp) — same overlay treatment as the
+   Remind Me / Reminder Settings modals. */
+#avail-modal {
+    position: fixed;
+    inset: 0;
+    background: var(--overlay);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+}
+#avail-modal.hidden { display: none; }
+.avail-status-error { color: var(--error, #ff5555); }
+
+/* Triage progress (kata 5np4): the Get-Me-To-Zero counter in the statusbar. */
+#triage-progress {
+    color: var(--accent);
+    font-weight: 600;
+    margin-left: auto;
+}
+
+#triage-progress.hidden {
+    display: none;
+}

@@ -434,6 +434,23 @@ pub async fn get_calendar_event(
     }
 }
 
+/// Raw ICS calendar objects overlapping `[start, end)` for this account, or
+/// `None` when the provider has no range-query support yet — Outlook Graph
+/// and Google Calendar event listing are out of scope for the wave-0 peek
+/// backend (kata j6e4); callers skip those accounts rather than erroring.
+pub async fn get_calendar_ics_in_range(
+    s: &ProviderSession,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Vec<String>>, Error> {
+    match s {
+        ProviderSession::Fastmail(s) => jmap::get_calendar_ics_in_range(s, start, end)
+            .await
+            .map(Some),
+        ProviderSession::Outlook(_) | ProviderSession::Gmail(_) => Ok(None),
+    }
+}
+
 // =============================================================================
 // Blob upload/download dispatch
 // =============================================================================
@@ -594,6 +611,7 @@ pub async fn rsvp(
                 in_reply_to: None,
                 references: None,
                 attachments: vec![],
+                send_at: None,
                 calendar_ics: Some(rsvp_ics),
             };
 
@@ -805,6 +823,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         }
     }
@@ -1078,6 +1097,113 @@ END:VCALENDAR</C:calendar-data></D:prop>
             pos("PUT") < pos("REPORT") && pos("REPORT") < pos("DELETE"),
             "wire order must be PUT then REPORT then DELETE: {:?}",
             rec.iter().map(|r| r.method.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Maybe on an alias-domain invite (kata 8gn5 follow-up): the invite is
+    /// addressed to an identity on another Fastmail-managed domain, and —
+    /// like real Google invites — its ATTENDEE line carries no PARTSTAT
+    /// param at all (RFC 5545 default NEEDS-ACTION). The stored copy must
+    /// still come back with PARTSTAT=TENTATIVE on the alias's line.
+    #[tokio::test]
+    async fn rsvp_fastmail_tentative_alias_attendee_without_partstat() {
+        use crate::jmap::caldav_recorder;
+        let uid = "uid-alias-tentative";
+        let (base, recorded) = caldav_recorder::spawn_scripted(move |method, _path| {
+            if method == "REPORT" {
+                // Empty schedule-inbox: nothing queued for this UID.
+                (
+                    axum::http::StatusCode::MULTI_STATUS,
+                    br#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:"></D:multistatus>"#
+                        .to_vec(),
+                )
+            } else {
+                (axum::http::StatusCode::NO_CONTENT, Vec::new())
+            }
+        })
+        .await;
+
+        let mut jmap_sess =
+            crate::jmap::JmapSession::new("matt.coburn@fastmail.test", "token", Some("app-pass"));
+        jmap_sess.caldav_base = base.clone();
+        jmap_sess
+            .caldav_collection_url
+            .set(crate::jmap::DiscoveredCalendars {
+                default_collection: format!("{base}/dav/calendars/user/u/coll"),
+                schedule_inbox: Some(format!("{base}/dav/calendars/user/u/Inbox")),
+            })
+            .expect("prefill discovery");
+        let mut session = ProviderSession::Fastmail(Box::new(jmap_sess));
+
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n\
+             ORGANIZER:mailto:org@example.com\r\n\
+             ATTENDEE;CN=Guest;PARTSTAT=ACCEPTED:mailto:guest@example.com\r\n\
+             ATTENDEE;CN=Matt;RSVP=TRUE:mailto:matt@mattcoburn.ai\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let event = CalendarEvent {
+            uid: uid.into(),
+            summary: "alias maybe".into(),
+            dtstart: chrono::DateTime::parse_from_rfc3339("2026-08-21T15:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            dtend: None,
+            location: None,
+            description: None,
+            organizer_email: "org@example.com".into(),
+            organizer_name: None,
+            attendees: vec![
+                crate::types::Attendee {
+                    email: "guest@example.com".into(),
+                    name: None,
+                    status: "ACCEPTED".into(),
+                },
+                crate::types::Attendee {
+                    email: "matt@mattcoburn.ai".into(),
+                    name: None,
+                    status: "NEEDS-ACTION".into(),
+                },
+            ],
+            sequence: 0,
+            method: "REQUEST".into(),
+            raw_ics: ics.clone(),
+            user_rsvp_status: None,
+            is_update: false,
+        };
+
+        rsvp(
+            &mut session,
+            &ics,
+            &event,
+            "matt@mattcoburn.ai",
+            &crate::types::RsvpStatus::Tentative,
+            chrono_tz::UTC,
+        )
+        .await
+        .expect("fastmail rsvp must succeed against the loopback");
+
+        let rec = recorded.lock().unwrap();
+        let puts: Vec<_> = rec.iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(puts.len(), 1, "exactly one PARTSTAT PUT expected: {rec:?}");
+        let put_body = std::str::from_utf8(&puts[0].body).unwrap_or("");
+        let alias_line = put_body
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("alias ATTENDEE line must be in the stored copy");
+        assert!(
+            alias_line.contains("PARTSTAT=TENTATIVE"),
+            "Maybe must land on the alias's ATTENDEE line even when the \
+             invite omitted PARTSTAT: {alias_line}"
+        );
+        let guest_line = put_body
+            .lines()
+            .find(|l| l.contains("mailto:guest@example.com"))
+            .expect("guest ATTENDEE line must survive");
+        assert!(
+            guest_line.contains("PARTSTAT=ACCEPTED"),
+            "the other guest's PARTSTAT must be untouched: {guest_line}"
         );
     }
 

@@ -124,6 +124,7 @@
             <span id="mode-indicator">NORMAL</span>
             <span id="mailbox-name">INBOX</span>
             <span id="status-message"></span>
+            <span id="triage-progress" class="hidden" role="status"></span>
         </div>
 
         <!-- Main content area -->
@@ -149,15 +150,19 @@
                     <div id="active-filter-chips"></div>
                     <button id="clear-all-filters" class="clear-filters-btn">Clear</button>
                 </div>
+                <div id="bulk-bar" class="hidden" role="status"></div>
                 <div id="email-list"></div>
             </div>
 
-            <!-- Email detail view -->
+            <!-- Email detail view: main column + contact insights sidebar (kata wcsg) -->
             <div id="email-detail-view" class="view">
+                <div id="email-detail-main">
                 <div id="email-header">
                     <div id="email-subject"></div>
                     <div id="email-meta"></div>
                 </div>
+                <!-- On-demand AI summary panel (kata 6rhw) -->
+                <div id="ai-summary" class="hidden"></div>
                 <!-- Calendar event card -->
                 <div id="calendar-event" class="hidden">
                     <div class="calendar-card">
@@ -180,6 +185,8 @@
                     <div id="attachments-list"></div>
                 </div>
                 <div id="email-body"></div>
+                </div>
+                <aside id="contact-sidebar" class="hidden"></aside>
             </div>
 
             <!-- Settings view: account management -->
@@ -515,6 +522,7 @@
 
         <!-- Remind Me picker (H) -->
         <div id="remind-modal" class="hidden" role="dialog" aria-label="Remind Me"></div>
+        <div id="move-modal" class="hidden" role="dialog" aria-label="Move to folder"></div>
 
         <!-- Reminder Settings -->
         <div id="reminder-settings-modal" class="hidden" role="dialog" aria-label="Reminder Settings">
@@ -578,6 +586,7 @@
                     <div class="shortcut"><kbd>g s</kbd> Open account settings</div>
                     <div class="shortcut"><kbd>?</kbd> This help</div>
                     <div class="shortcut"><kbd>R</kbd> Refresh</div>
+                    <div class="shortcut"><kbd>C</kbd> Calendar peek (d/w day-week, [ ] move)</div>
                 </div>
                 <div class="help-section">
                     <h3>Compose (vim modes)</h3>
@@ -585,6 +594,7 @@
                     <div class="shortcut"><kbd>i</kbd> Insert mode (edit body)</div>
                     <div class="shortcut"><kbd>Ctrl+Enter</kbd> Send</div>
                     <div class="shortcut"><kbd>a</kbd> Attach file (normal mode)</div>
+                    <div class="shortcut"><kbd>Ctrl+Shift+H</kbd> Share availability (insert free times)</div>
                 </div>
                 <div class="help-section">
                     <h3>Settings (account management)</h3>
@@ -597,11 +607,26 @@
             </div>
         </div>
 
+        <!-- Calendar peek (kata j6e4, C) -->
+        <div id="calendar-peek" class="hidden" role="complementary" aria-label="Calendar peek"></div>
+
+        <!-- Share Availability picker (kata mtqp, Ctrl+Shift+H in compose) -->
+        <div id="avail-modal" class="hidden" role="dialog" aria-label="Share Availability"></div>
+
         <!-- Undo toast -->
         <div id="undo-toast" class="hidden">
             <span id="undo-message"></span>
             <button id="undo-button">Undo (z)</button>
         </div>
+
+        <!-- Undo Send countdown toast (kata vj6k) -->
+        <div id="send-undo-toast" class="hidden">
+            <span id="send-undo-message"></span>
+            <button id="send-undo-button">Undo</button>
+        </div>
+
+        <!-- Send Later picker / Scheduled list (kata acag) -->
+        <div id="send-later-modal" class="hidden" role="dialog" aria-label="Send Later"></div>
 
         <!-- Split modal -->
         <div id="split-modal" class="hidden">

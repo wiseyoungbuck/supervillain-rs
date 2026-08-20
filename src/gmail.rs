@@ -4611,6 +4611,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: None,
         }
     }
@@ -4762,6 +4763,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             attachments: vec![],
+            send_at: None,
             calendar_ics: Some(invite_ics()),
         }
     }
