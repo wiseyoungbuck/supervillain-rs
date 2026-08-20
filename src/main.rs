@@ -174,7 +174,11 @@ async fn main() {
         .layer(axum::middleware::from_fn_with_state(
             allowed_hosts,
             routes::host_allowlist,
-        ));
+        ))
+        // Outermost of all: even a 421 from host_allowlist must carry the
+        // security headers (roborev 542). Idempotent re-stamp over the
+        // router-internal layer.
+        .layer(axum::middleware::from_fn(routes::security_headers_mw));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));

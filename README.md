@@ -362,12 +362,13 @@ All optional when using the config file.
 
 ### Serving over the tailnet (HTTPS)
 
-Every response (the app shell and all `/api/*` routes) carries a restrictive
-`Content-Security-Policy` (including `frame-ancestors 'none'`) plus
+Every response (the app shell and all `/api/*` routes) carries
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
-`Cross-Origin-Resource-Policy: same-origin` — defense-in-depth so a clicked
-link inside an email body can't leak your private tailnet URL and this app
-can't be framed or MIME-sniffed by another origin.
+`Cross-Origin-Resource-Policy: same-origin`; the app-shell HTML additionally
+carries a restrictive `Content-Security-Policy` (including
+`frame-ancestors 'none'`) — defense-in-depth so a clicked link inside an
+email body can't leak your private tailnet URL and this app can't be framed
+or MIME-sniffed by another origin.
 
 Supervillain binds to loopback by default — no LAN exposure, no auth layer
 to worry about. To reach it securely from another device (e.g. your phone),
@@ -417,7 +418,12 @@ Network Access checks mitigate this; Firefox does not, so the allowlist is
 the actual defense, not a Chrome-only nicety.
 
 **Breaking change:** previously the launcher bound `0.0.0.0`. If you
-relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly.
+relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly —
+AND list the address(es) LAN clients actually type in
+`SUPERVILLAIN_ALLOWED_HOSTS` (e.g. `192.168.1.20:8000`). A wildcard bind
+alone is no longer enough: the Host allowlist above rejects any request
+whose `Host` header it doesn't recognize with `421`, and a LAN client's
+browser sends the machine's LAN address as the Host, not the bind address.
 
 **Identity check for a shared tailnet.** Today's default assumes the
 tailnet is single-user, so reaching the node over `tailscale serve` already

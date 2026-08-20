@@ -155,15 +155,23 @@ pub async fn host_allowlist(
     req: Request,
     next: Next,
 ) -> axum::response::Response {
+    // HTTP/2 carries the authority in the :authority pseudo-header — axum
+    // surfaces it on the URI, not the header map, and an h2c client sends no
+    // Host header at all. Fall back so legitimate h2 tooling isn't 421'd
+    // (roborev 542); the check applied to it is identical, so this is not a
+    // bypass.
     let host = req
         .headers()
         .get(header::HOST)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
     let is_allowed = host.is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)));
     if !is_allowed {
         return (
             StatusCode::MISDIRECTED_REQUEST,
-            "This server does not recognize the Host header on this request.\n",
+            "This server does not recognize the Host header on this request. \
+             If you are serving beyond loopback deliberately, list the \
+             hostname clients use in SUPERVILLAIN_ALLOWED_HOSTS.\n",
         )
             .into_response();
     }
@@ -503,7 +511,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/icon-512.png", get(icon_512))
         // Must come after every .route()/.merge() above — axum only applies
         // a layer to routes already registered at the point it's added.
-        .layer(axum::middleware::from_fn(security_headers_mw))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let extra_allowed_hosts = extra_allowed_hosts.clone();
@@ -516,6 +523,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             ts_gate_state,
             require_ts_user_middleware,
         ))
+        // Added LAST so it is the OUTERMOST router layer: the guards above
+        // short-circuit with 403s, and those rejections must still carry the
+        // security headers (roborev 542). main.rs re-stamps outside
+        // host_allowlist for the same reason; the insert is idempotent.
+        .layer(axum::middleware::from_fn(security_headers_mw))
 }
 
 // Restrictive CSP for the app shell: defense-in-depth so that any future
@@ -564,7 +576,7 @@ const SECURITY_HEADERS: [(&str, &str); 3] = [
     ("cross-origin-resource-policy", "same-origin"),
 ];
 
-async fn security_headers_mw(
+pub async fn security_headers_mw(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -5430,10 +5442,14 @@ mod tests {
     // reimplementation) so these tests pin the actual request path, mirroring
     // how tests/compression_test.rs exercises `compression_layer()`.
     fn host_allowlist_router(state: AppState, allowed: Vec<String>) -> Router {
-        router(Arc::new(state)).layer(axum::middleware::from_fn_with_state(
-            Arc::new(allowed),
-            host_allowlist,
-        ))
+        router(Arc::new(state))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(allowed),
+                host_allowlist,
+            ))
+            // Mirrors main.rs: security headers stamped outside the
+            // allowlist so its 421s carry them too (roborev 542).
+            .layer(axum::middleware::from_fn(security_headers_mw))
     }
 
     fn host_request(method: &str, uri: &str, host: Option<&str>, body: Body) -> Request<Body> {
@@ -5474,6 +5490,81 @@ mod tests {
             StatusCode::MISDIRECTED_REQUEST,
             "an unrecognized Host on a POST mutation route must be rejected \
              before the handler ever runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_authority_accepted_when_host_header_absent() {
+        // HTTP/2 carries the authority in the :authority pseudo-header, which
+        // axum surfaces via req.uri().authority(), NOT the header map — an
+        // h2c client (curl --http2-prior-knowledge) sends no Host header at
+        // all. Absolute-form URIs model the same shape (roborev 542 #6).
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://127.0.0.1:8000/api/build-id")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a request with a matching URI authority and no Host header must \
+             pass the allowlist, not 421"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_authority_still_rejected_when_evil() {
+        // The fallback must not become a bypass: an unrecognized authority is
+        // rejected exactly like an unrecognized Host header.
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = Request::builder()
+            .method("GET")
+            .uri("http://evil.example.com/api/build-id")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn guard_rejections_carry_security_headers() {
+        // The SECURITY_HEADERS doc comment promises uniform coverage, but a
+        // 403 short-circuited by the cross-site guard (or a 421 from
+        // host_allowlist) skips inner layers — the stamp must sit OUTSIDE
+        // the guards so even rejections carry it (roborev 542 #5).
+        let state = Arc::new(test_state(&[], "default"));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/emails/x/archive")
+            .header(header::HOST, "127.0.0.1:8000")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "a cross-site 403 must still carry the security headers"
+        );
+
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("evil.example.com"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "a host-allowlist 421 must still carry the security headers"
         );
     }
 
