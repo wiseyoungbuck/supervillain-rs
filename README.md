@@ -358,6 +358,7 @@ All optional when using the config file.
 | `RUST_LOG` | Log level (`info`, `debug`, `supervillain=debug`) |
 | `SUPERVILLAIN_BIND` | Server bind address (default: `127.0.0.1:8000`, loopback-only) |
 | `SUPERVILLAIN_ALLOWED_HOSTS` | Comma-separated extra hostnames trusted beyond the bind address and `127.0.0.1`/`localhost` — accepted as `Host` headers and as mutation-request origins (e.g. a tailnet MagicDNS name); see "Security model" below |
+| `SUPERVILLAIN_REQUIRE_TS_USER` | Opt-in Tailscale identity check — see "Serving over the tailnet (HTTPS)" below (default: unset, no check) |
 
 ### Serving over the tailnet (HTTPS)
 
@@ -417,6 +418,22 @@ the actual defense, not a Chrome-only nicety.
 
 **Breaking change:** previously the launcher bound `0.0.0.0`. If you
 relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly.
+
+**Identity check for a shared tailnet.** Today's default assumes the
+tailnet is single-user, so reaching the node over `tailscale serve` already
+means it's you. If the tailnet ever gains more users (a shared node, a
+guest invited in), every tailnet member would get full mailbox access once
+Serve is on — set `SUPERVILLAIN_REQUIRE_TS_USER=<your-tailnet-login>` (e.g.
+`alice@example.com`) to require every request to carry a matching
+`Tailscale-User-Login` header (case-insensitive), rejecting everything else
+with a `403`. Unset (the default) means no check at all.
+
+Honest caveat: `tailscale serve` injects `Tailscale-User-Login` at the
+proxy hop for peers reaching the node *through the tailnet* — but nothing
+stops a local process from setting that same header itself when talking
+directly to the loopback bind. So this check gates proxied tailnet peers,
+not local ones — and local processes already have loopback access
+regardless of this setting, the same as they always did.
 
 ### Security model
 

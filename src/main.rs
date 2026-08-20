@@ -138,6 +138,16 @@ async fn main() {
             .ok()
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty()),
+        // Opt-in Tailscale identity gate (kata g926); see AppState field doc
+        // and README "Serving over the tailnet (HTTPS)" for the loopback
+        // caveat. Resolved once here — never re-read per request — so
+        // handler-level tests can pass the value directly instead of racing
+        // on process env.
+        require_ts_user: require_ts_user(
+            std::env::var("SUPERVILLAIN_REQUIRE_TS_USER")
+                .ok()
+                .as_deref(),
+        ),
     });
 
     // Kick off the background prefetch warmer. The first pass starts
@@ -190,6 +200,18 @@ fn bind_addr(env_value: Option<&str>) -> String {
     match env_value.map(str::trim) {
         Some(v) if !v.is_empty() => v.to_string(),
         _ => "127.0.0.1:8000".to_string(),
+    }
+}
+
+/// Resolve `SUPERVILLAIN_REQUIRE_TS_USER` into the login the Tailscale
+/// identity gate must match (kata g926). Blank/unset ⇒ `None`, meaning the
+/// gate is entirely off — same as `bind_addr`'s blank-falls-back-to-default
+/// shape, so a stray `SUPERVILLAIN_REQUIRE_TS_USER=` in the environment
+/// can't accidentally lock every request out.
+fn require_ts_user(env_value: Option<&str>) -> Option<String> {
+    match env_value.map(str::trim) {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => None,
     }
 }
 
@@ -410,6 +432,27 @@ mod tests {
         // Bound to a single non-loopback interface (e.g. a tailnet IP),
         // loopback may not be listening at all — open what we bound.
         assert_eq!(browser_url("100.64.1.5:8000"), "http://100.64.1.5:8000");
+    }
+
+    // ---- require_ts_user (kata g926) ----
+
+    #[test]
+    fn require_ts_user_env_read() {
+        // Unset or blank ⇒ the gate is off; a real login is passed through
+        // verbatim (trimmed). This is the one small test covering the env
+        // read itself — behavior of the resulting gate lives in
+        // routes::tests (router-level, kata g926).
+        assert_eq!(require_ts_user(None), None);
+        assert_eq!(require_ts_user(Some("")), None);
+        assert_eq!(require_ts_user(Some("   ")), None);
+        assert_eq!(
+            require_ts_user(Some("alice@example.com")),
+            Some("alice@example.com".to_string())
+        );
+        assert_eq!(
+            require_ts_user(Some("  alice@example.com  ")),
+            Some("alice@example.com".to_string())
+        );
     }
 
     #[test]

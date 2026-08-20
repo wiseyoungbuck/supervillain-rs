@@ -520,6 +520,19 @@ pub struct AppState {
     /// (`SUPERVILLAIN_TRACKING_BASE`). `None` disables tracking entirely —
     /// no pixel is injected and nothing is recorded.
     pub tracking_base: Option<String>,
+    /// Opt-in Tailscale identity gate (`SUPERVILLAIN_REQUIRE_TS_USER`,
+    /// kata g926). `None` (the default) means zero checks — every request
+    /// passes, exactly as before this field existed. `Some(login)` requires
+    /// every request to carry a `Tailscale-User-Login` header matching
+    /// `login` case-insensitively (see `routes::ts_user_allowed`).
+    ///
+    /// Honest caveat: this header is set by `tailscale serve` at the proxy
+    /// hop for *proxied* tailnet peers — a local process talking straight to
+    /// the loopback bind can set the same header itself, so this check gates
+    /// proxied tailnet peers, not local ones (local processes already have
+    /// loopback access regardless). See README, "Serving over the tailnet
+    /// (HTTPS)".
+    pub require_ts_user: Option<String>,
 }
 
 impl AppState {
