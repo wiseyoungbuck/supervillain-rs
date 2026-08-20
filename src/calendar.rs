@@ -607,6 +607,12 @@ fn parse_vtimezone_rules(data: &str) -> HashMap<String, VtimezoneRule> {
 
 /// Extract TZOFFSETTO and the RRULE's BYMONTH from a STANDARD or DAYLIGHT
 /// sub-block within a VTIMEZONE.
+///
+/// Only the first sub-block of each kind is read. RFC 5545 allows several
+/// (historical transitions, as Google/Apple exports emit), where the first
+/// can carry an obsolete offset — accepted here because this path only
+/// serves TZIDs that are neither IANA nor Windows names, and producers of
+/// such custom TZIDs emit a single current-rule component.
 fn extract_sub_block_transition(tz_block: &str, sub_name: &str) -> Option<TzTransition> {
     let begin = format!("BEGIN:{sub_name}");
     let start = tz_block.find(&begin)?;
@@ -3948,6 +3954,35 @@ END:VCALENDAR";
             reply.contains("DTEND;TZID=America/Chicago:20260820T110000"),
             "REPLY must quote 11:00 CDT (16:00Z), got: {reply}"
         );
+    }
+
+    #[test]
+    fn vtimezone_rule_southern_hemisphere_wraps_across_new_year() {
+        // Australia-style rule: daylight starts in October, standard resumes
+        // in April — the daylight window wraps across the new year, so both
+        // January and November are daylight while June is standard.
+        let rule = VtimezoneRule {
+            standard: Some(TzTransition {
+                offset: FixedOffset::east_opt(10 * 3600).unwrap(),
+                start_month: Some(4),
+            }),
+            daylight: Some(TzTransition {
+                offset: FixedOffset::east_opt(11 * 3600).unwrap(),
+                start_month: Some(10),
+            }),
+        };
+        let at = |month: u32| {
+            NaiveDate::from_ymd_opt(2026, month, 15)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap()
+        };
+        assert_eq!(rule.offset_at(&at(1)).unwrap().local_minus_utc(), 11 * 3600);
+        assert_eq!(
+            rule.offset_at(&at(11)).unwrap().local_minus_utc(),
+            11 * 3600
+        );
+        assert_eq!(rule.offset_at(&at(6)).unwrap().local_minus_utc(), 10 * 3600);
     }
 
     #[test]

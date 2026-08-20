@@ -3267,8 +3267,6 @@ pub async fn get_calendar_event(
     get_calendar_event_with_reader(&reader, uid).await
 }
 
-/// Parse a Graph API event JSON object into a CalendarEvent.
-/// Separated from get_calendar_event for testability.
 /// Convert a Graph `{dateTime, timeZone}` block to a UTC instant.
 ///
 /// Without a `Prefer: outlook.timezone` header (this client never sends
@@ -3291,6 +3289,8 @@ fn graph_datetime_to_utc(block: &serde_json::Value) -> Option<chrono::DateTime<c
     }
 }
 
+/// Parse a Graph API event JSON object into a CalendarEvent.
+/// Separated from get_calendar_event for testability.
 fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<CalendarEvent> {
     let attendees: Vec<crate::types::Attendee> = event_json["attendees"]
         .as_array()
