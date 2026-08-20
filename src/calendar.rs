@@ -2710,6 +2710,54 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn update_partstat_replaces_lowercase_param_without_doubling() {
+        // roborev 538 #1: RFC 5545 names are case-insensitive. A lowercase
+        // `partstat=` must be replaced — not left in place while a second,
+        // conflicting PARTSTAT gets inserted (invalid ICS).
+        let ics = "attendee;partstat=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.to_lowercase().contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert_eq!(
+            line.to_uppercase().matches("PARTSTAT=").count(),
+            1,
+            "exactly one PARTSTAT param — never a conflicting pair: {line}"
+        );
+        assert!(
+            line.to_uppercase().contains("PARTSTAT=TENTATIVE"),
+            "the lowercase param must be updated: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_ignores_address_inside_quoted_param_value() {
+        // roborev 538 #2: the user's address appearing in another attendee's
+        // DELEGATED-FROM/SENT-BY quoted param must not rewrite that line —
+        // only the line whose VALUE is the user's mailto.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:matt@mattcoburn.ai\":mailto:delegate@example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let delegate = result
+            .lines()
+            .find(|l| l.contains("mailto:delegate@example.com"))
+            .expect("delegate line must survive");
+        assert!(
+            delegate.contains("PARTSTAT=NEEDS-ACTION"),
+            "the delegate's own PARTSTAT must be untouched: {delegate}"
+        );
+        let own = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattcoburn.ai"))
+            .expect("own line must survive");
+        assert!(
+            own.contains("PARTSTAT=TENTATIVE"),
+            "the user's own line must be updated: {own}"
+        );
+    }
+
+    #[test]
     fn update_partstat_matches_alias_domain_attendee_case_insensitively() {
         // Invites addressed to a Fastmail-managed alias domain arrive with
         // whatever casing the organizer's client used; the swap must still
