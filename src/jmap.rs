@@ -482,9 +482,11 @@ pub async fn get_identity_for_email(
     email: &str,
 ) -> Result<Option<String>, Error> {
     let identities = get_identities(s).await?;
-    // Exact identity first; a catch-all wildcard identity ("*@domain",
-    // Fastmail's model for managed alias domains) covers the rest of its
-    // domain's local parts.
+    // Exact identity first (the exact pass is deliberately separate from
+    // `matches_address` so specificity wins); a catch-all wildcard identity
+    // ("*@domain", Fastmail's model for managed alias domains) covers the
+    // rest of its domain's local parts. Should Fastmail ever return several
+    // wildcards for one domain, JMAP list order breaks the tie.
     let found = identities
         .iter()
         .find(|i| i.email.eq_ignore_ascii_case(email))

@@ -10,8 +10,10 @@ use std::sync::LazyLock;
 
 // Anchored to the `;` parameter delimiter so vendor lookalikes such as
 // X-PARTSTAT never satisfy the replace path (roborev 537 #1) — on an
-// ATTENDEE line the real PARTSTAT param always follows a `;`.
-static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r";PARTSTAT=\w[\w-]*").unwrap());
+// ATTENDEE line the real PARTSTAT param always follows a `;`. RFC 5545
+// names are case-insensitive (roborev 538 #1), hence `(?i)`.
+static PARTSTAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i);PARTSTAT=\w[\w-]*").unwrap());
 
 /// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
 /// STORED DESCRIPTION we didn't expect to be HTML (see
@@ -793,24 +795,38 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
     let raw_ics = unfold_lines(raw_ics);
     let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
     let email_lower = attendee_email.to_lowercase();
-    // Boundary-checked address match (roborev 537 #2): a bare substring
-    // check would also hit attendees whose address merely starts with this
-    // one (matt@x.ai vs matt@x.ai.example.com). The mailto value must end at
-    // the line end or at a non-address character.
+    // The address must be the property VALUE — everything after the first
+    // colon outside double quotes — not a substring anywhere on the line
+    // (roborev 537 #2, 538 #2): a bare `contains` also hits attendees whose
+    // address merely starts with this one (matt@x.ai vs
+    // matt@x.ai.example.com) and the user's address quoted inside another
+    // attendee's DELEGATED-FROM/SENT-BY param. The value must end at the
+    // line end or a non-address character.
     let needle = format!("mailto:{email_lower}");
-    let line_addresses_attendee = |lower_line: &str| {
-        let mut search_from = 0;
-        while let Some(found) = lower_line[search_from..].find(&needle) {
-            let end = search_from + found + needle.len();
-            match lower_line[end..].chars().next() {
-                None => return true,
-                Some(next) if !next.is_ascii_alphanumeric() && !matches!(next, '.' | '-' | '_') => {
-                    return true;
+    let value_is_attendee = |trimmed: &str| {
+        let mut in_quotes = false;
+        let mut value_start = None;
+        for (index, c) in trimmed.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                ':' if !in_quotes => {
+                    value_start = Some(index + 1);
+                    break;
                 }
-                _ => search_from = end,
+                _ => {}
             }
         }
-        false
+        let Some(start) = value_start else {
+            return false;
+        };
+        let value = trimmed[start..].to_lowercase();
+        let Some(rest) = value.strip_prefix(&needle) else {
+            return false;
+        };
+        match rest.chars().next() {
+            None => true,
+            Some(next) => !next.is_ascii_alphanumeric() && !matches!(next, '.' | '-' | '_'),
+        }
     };
 
     // Split on \n but preserve \r if present to keep original line endings
@@ -818,9 +834,16 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
         .split('\n')
         .map(|line| {
             let trimmed = line.trim_end_matches('\r');
-            if let Some(rest) = trimmed.strip_prefix("ATTENDEE")
-                && (rest.starts_with(';') || rest.starts_with(':'))
-                && line_addresses_attendee(&trimmed.to_lowercase())
+            // RFC 5545 names are case-insensitive (roborev 538 #1): match the
+            // property name without assuming casing, and keep the original
+            // name bytes when inserting.
+            let is_attendee_prop = trimmed.is_char_boundary(8)
+                && trimmed
+                    .get(..8)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"));
+            if is_attendee_prop
+                && (trimmed[8..].starts_with(';') || trimmed[8..].starts_with(':'))
+                && value_is_attendee(trimmed)
             {
                 let updated = if PARTSTAT_RE.is_match(trimmed) {
                     PARTSTAT_RE
@@ -830,7 +853,7 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
                     // RFC 5545 §3.2.12: no PARTSTAT param means NEEDS-ACTION,
                     // and real invites do omit it — a replace-only update
                     // would silently drop the RSVP from the stored copy.
-                    format!("ATTENDEE;{new_partstat}{rest}")
+                    format!("{};{new_partstat}{}", &trimmed[..8], &trimmed[8..])
                 };
                 if line.ends_with('\r') {
                     format!("{updated}\r")
