@@ -2533,6 +2533,33 @@ async fn surface_caldav_spawn_failure(
     }
 }
 
+/// Identities for the RSVP click's attendee resolution. Prefetch cache
+/// first — Gmail's `get_identities` is an uncached HTTP round-trip and the
+/// account's session write guard is held by the caller (roborev 535 #1).
+/// Only a cache miss pays the live fetch, done through the caller's held
+/// guard (no second lock — a `resolve_session` re-lock here would deadlock),
+/// and the result backfills the cache. Best-effort: a fetch failure degrades
+/// to no extra identities, i.e. login-address-only resolution.
+async fn rsvp_identities(
+    state: &AppState,
+    account_id: &str,
+    session: &mut provider::ProviderSession,
+) -> Vec<crate::types::Identity> {
+    match state.prefetch.get_identities(account_id).await {
+        Some(cached) => cached,
+        None => match provider::get_identities(session).await {
+            Ok(live) => {
+                state
+                    .prefetch
+                    .set_identities(account_id, live.clone())
+                    .await;
+                live
+            }
+            Err(_) => Vec::new(),
+        },
+    }
+}
+
 async fn rsvp(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
@@ -2565,24 +2592,7 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-        // Prefetch cache first — Gmail's get_identities is an uncached HTTP
-        // round-trip and the account's write guard is held here (roborev
-        // 535 #1). Only a cache miss pays the live fetch (through the held
-        // guard — no second lock), and the result backfills the cache.
-        // Best-effort: a fetch failure degrades to the login address.
-        let identities = match state.prefetch.get_identities(&account_id).await {
-            Some(cached) => cached,
-            None => match provider::get_identities(&mut session_guard).await {
-                Ok(live) => {
-                    state
-                        .prefetch
-                        .set_identities(&account_id, live.clone())
-                        .await;
-                    live
-                }
-                Err(_) => Vec::new(),
-            },
-        };
+        let identities = rsvp_identities(&state, &account_id, &mut session_guard).await;
         let user_addresses = merge_user_addresses(session_guard.username(), &identities);
         determine_attendee_email(email, &event, &user_addresses)
     };
@@ -11388,6 +11398,83 @@ white   = '#fdf6e3'
         assert!(
             !fields.is_invite_to_me,
             "own alias-organized event must not render as an actionable invite"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_identities_cache_miss_fetches_once_and_backfills() {
+        // roborev 537 #3: the RSVP click's miss path — live fetch through
+        // the held session, backfill into the prefetch cache, and no second
+        // provider round-trip once the cache is warm.
+        use crate::jmap::caldav_recorder;
+        let canned = serde_json::json!({
+            "methodResponses": [
+                ["Identity/get", {"list": [
+                    {"id": "ident-wild", "email": "*@mattcoburn.ai", "name": "mattcoburn.ai"}
+                ]}, "0"]
+            ]
+        });
+        let (base, recorded) =
+            caldav_recorder::spawn(axum::http::StatusCode::OK, canned.to_string().into_bytes())
+                .await;
+        let state = test_state(&["acct"], "acct");
+
+        let mut jmap = crate::jmap::JmapSession::new("matt.coburn@aristoi.ai", "tok", None);
+        jmap.api_url = Some(format!("{base}/jmap"));
+        jmap.account_id = Some("acc1".into());
+        let mut session = provider::ProviderSession::Fastmail(Box::new(jmap));
+
+        let identities = rsvp_identities(&state, "acct", &mut session).await;
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].email, "*@mattcoburn.ai");
+        assert_eq!(
+            state
+                .prefetch
+                .get_identities("acct")
+                .await
+                .expect("the live result must backfill the prefetch cache")
+                .len(),
+            1
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "exactly one live fetch on the miss"
+        );
+
+        // Warm cache: a FRESH session (api_url: None — any provider dispatch
+        // would fail NotConnected) must be served without provider I/O.
+        let mut session2 = provider::ProviderSession::Fastmail(Box::new(
+            crate::jmap::JmapSession::new("matt.coburn@aristoi.ai", "tok", None),
+        ));
+        let identities = rsvp_identities(&state, "acct", &mut session2).await;
+        assert_eq!(
+            identities.len(),
+            1,
+            "cache hit must resolve without touching the provider"
+        );
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "no second live fetch once the cache is warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsvp_identities_fetch_failure_degrades_to_empty_and_does_not_cache() {
+        let state = test_state(&["acct"], "acct");
+        // No api_url / account_id: the live fetch fails NotConnected.
+        let mut session = provider::ProviderSession::Fastmail(Box::new(
+            crate::jmap::JmapSession::new("u@example.com", "tok", None),
+        ));
+        let identities = rsvp_identities(&state, "acct", &mut session).await;
+        assert!(
+            identities.is_empty(),
+            "a failed fetch must degrade to login-address-only resolution"
+        );
+        assert!(
+            state.prefetch.get_identities("acct").await.is_none(),
+            "a failed fetch must not poison the cache with an empty list"
         );
     }
 

@@ -2644,6 +2644,52 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn update_partstat_ignores_x_partstat_lookalike_param() {
+        // roborev 537 #1: an unanchored PARTSTAT match rewrites vendor
+        // params like X-PARTSTAT and then skips the insertion branch — the
+        // line ends up with no real PARTSTAT at all.
+        let ics = "ATTENDEE;X-PARTSTAT=FOO:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("X-PARTSTAT=FOO"),
+            "the vendor param must be untouched: {line}"
+        );
+        assert!(
+            line.contains(";PARTSTAT=TENTATIVE"),
+            "a real PARTSTAT param must be inserted alongside it: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_requires_full_address_match_not_prefix() {
+        // roborev 537 #2: a bare substring check lets one attendee's address
+        // that prefixes another's update both lines.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai.example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        let longer = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattgpt.ai.example.com"))
+            .expect("prefix-colliding line must survive");
+        assert!(
+            longer.contains("PARTSTAT=NEEDS-ACTION"),
+            "the prefix-colliding attendee must be untouched: {longer}"
+        );
+        let exact = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattgpt.ai"))
+            .expect("exact line must survive");
+        assert!(
+            exact.contains("PARTSTAT=TENTATIVE"),
+            "the exact attendee must be updated: {exact}"
+        );
+    }
+
+    #[test]
     fn update_partstat_matches_alias_domain_attendee_case_insensitively() {
         // Invites addressed to a Fastmail-managed alias domain arrive with
         // whatever casing the organizer's client used; the swap must still
