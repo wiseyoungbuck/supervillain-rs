@@ -2829,6 +2829,190 @@ END:VCALENDAR";
         assert_eq!(event.dtstart.minute(), 30);
     }
 
+    /// Regression for kata rq9n: Exchange/Calendly invites carry Windows
+    /// timezone names in TZID. This is a trimmed copy of a real Calendly →
+    /// Microsoft Teams invite: 16:30 "GMT Standard Time" on Aug 20 is 16:30
+    /// BST (UK summer time) = 15:30 UTC. The buggy parser fell through to
+    /// floating-time and read 16:30 as the user's primary zone (Chicago),
+    /// producing 21:30 UTC — a 6-hour skew between the email banner and the
+    /// calendar.
+    const WINDOWS_TZID_ICS: &str = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+PRODID:Microsoft Exchange Server 2010\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:GMT Standard Time\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:16010101T020000\r\n\
+TZOFFSETFROM:+0100\r\n\
+TZOFFSETTO:+0000\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=10\r\n\
+END:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\n\
+DTSTART:16010101T010000\r\n\
+TZOFFSETFROM:+0000\r\n\
+TZOFFSETTO:+0100\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=-1SU;BYMONTH=3\r\n\
+END:DAYLIGHT\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+ORGANIZER;CN=Eoin:mailto:organizer@example.co.uk\r\n\
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Matt:mailt\r\n\
+ o:matt@example.test\r\n\
+UID:windows-tzid-test@example.com\r\n\
+SUMMARY;LANGUAGE=en-GB:Cross-timezone call\r\n\
+DTSTART;TZID=GMT Standard Time:20260820T163000\r\n\
+DTEND;TZID=GMT Standard Time:20260820T170000\r\n\
+SEQUENCE:3\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+
+    #[test]
+    fn parse_windows_tzid_summer_resolves_dst_correct_instant() {
+        let primary_tz = "America/Chicago".parse::<Tz>().unwrap();
+        let event = parse_ics(WINDOWS_TZID_ICS, primary_tz).unwrap();
+        // 16:30 BST == 15:30 UTC (== 10:30 CDT). Not 21:30 UTC (floating
+        // fallback) and not 16:30 UTC (STANDARD offset applied in summer).
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+        assert_eq!(
+            event.dtend.unwrap().to_rfc3339(),
+            "2026-08-20T16:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_windows_tzid_winter_uses_standard_offset() {
+        let ics = WINDOWS_TZID_ICS.replace("20260820T", "20260120T");
+        let primary_tz = "America/Chicago".parse::<Tz>().unwrap();
+        let event = parse_ics(&ics, primary_tz).unwrap();
+        // 16:30 GMT (winter, no DST) == 16:30 UTC.
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-01-20T16:30:00+00:00");
+    }
+
+    #[test]
+    fn parse_windows_tzid_without_vtimezone_block() {
+        // Some producers omit VTIMEZONE entirely and rely on well-known
+        // names. The Windows name alone must still resolve, DST-aware.
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:windows-no-vtz@example.com\r\n\
+SUMMARY:No VTIMEZONE\r\n\
+DTSTART;TZID=Central Standard Time:20260820T103000\r\n\
+DTEND;TZID=Central Standard Time:20260820T110000\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        // Deliberately parse with a *different* primary zone so a floating
+        // fallback can't accidentally produce the right answer.
+        let primary_tz = "Asia/Tokyo".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz).unwrap();
+        // 10:30 America/Chicago in August is CDT (UTC-5) == 15:30 UTC.
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+    }
+
+    #[test]
+    fn parse_quoted_iana_tzid() {
+        // RFC 5545 permits quoted parameter values: TZID="America/New_York".
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+VERSION:2.0\r\n\
+BEGIN:VEVENT\r\n\
+UID:quoted-tzid@example.com\r\n\
+SUMMARY:Quoted TZID\r\n\
+DTSTART;TZID=\"America/New_York\":20260215T100000\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let primary_tz = "Asia/Tokyo".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz).unwrap();
+        // 10:00 EST == 15:00 UTC.
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-02-15T15:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_unknown_tzid_uses_vtimezone_tzoffsetto() {
+        // A TZID that is neither IANA nor a Windows name must fall back to
+        // the VTIMEZONE definition. The real RFC 5545 property is TZOFFSETTO
+        // (the old parser looked for a nonexistent "UTCOFFSETTO" and never
+        // matched real-world ICS).
+        let ics = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Customized Time Zone\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:16010101T000000\r\n\
+TZOFFSETFROM:-0600\r\n\
+TZOFFSETTO:-0600\r\n\
+END:STANDARD\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:custom-tzid@example.com\r\n\
+SUMMARY:Custom zone\r\n\
+DTSTART;TZID=Customized Time Zone:20260215T100000\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let primary_tz = "Asia/Tokyo".parse::<Tz>().unwrap();
+        let event = parse_ics(ics, primary_tz).unwrap();
+        // 10:00 at a fixed -0600 == 16:00 UTC.
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-02-15T16:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_unknown_tzid_vtimezone_picks_daylight_by_month() {
+        // Custom TZID with both STANDARD and DAYLIGHT: the offset must be
+        // chosen by the event's month (via the RRULE BYMONTH transition
+        // boundaries), not by always preferring STANDARD.
+        let ics_template = "\
+BEGIN:VCALENDAR\r\n\
+METHOD:REQUEST\r\n\
+VERSION:2.0\r\n\
+BEGIN:VTIMEZONE\r\n\
+TZID:Customized Time Zone\r\n\
+BEGIN:STANDARD\r\n\
+DTSTART:16010101T020000\r\n\
+TZOFFSETFROM:-0500\r\n\
+TZOFFSETTO:-0600\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11\r\n\
+END:STANDARD\r\n\
+BEGIN:DAYLIGHT\r\n\
+DTSTART:16010101T020000\r\n\
+TZOFFSETFROM:-0600\r\n\
+TZOFFSETTO:-0500\r\n\
+RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3\r\n\
+END:DAYLIGHT\r\n\
+END:VTIMEZONE\r\n\
+BEGIN:VEVENT\r\n\
+UID:custom-dst@example.com\r\n\
+SUMMARY:Custom DST zone\r\n\
+DTSTART;TZID=Customized Time Zone:DATEVAL\r\n\
+ORGANIZER;CN=Alice:mailto:alice@example.com\r\n\
+SEQUENCE:0\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR";
+        let primary_tz = "Asia/Tokyo".parse::<Tz>().unwrap();
+
+        // July: daylight (-0500) applies — 10:00 local == 15:00 UTC.
+        let summer = ics_template.replace("DATEVAL", "20260715T100000");
+        let event = parse_ics(&summer, primary_tz).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-07-15T15:00:00+00:00");
+
+        // December: standard (-0600) applies — 10:00 local == 16:00 UTC.
+        let winter = ics_template.replace("DATEVAL", "20261215T100000");
+        let event = parse_ics(&winter, primary_tz).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-12-15T16:00:00+00:00");
+    }
+
     #[test]
     fn parse_vtimezone_offsets_extracts_multiple() {
         let ics = "\
