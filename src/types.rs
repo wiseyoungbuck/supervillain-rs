@@ -105,6 +105,28 @@ pub struct Identity {
     pub name: String,
 }
 
+/// Whether `address` is covered by an identity address `pattern`. Fastmail
+/// models catch-all domains as wildcard identities (`*@domain`) rather than
+/// enumerable addresses; everything else is an exact (case-insensitive)
+/// address. Only a leading `*@` is a wildcard — no other globbing.
+pub fn address_matches_pattern(address: &str, pattern: &str) -> bool {
+    if pattern.eq_ignore_ascii_case(address) {
+        return true;
+    }
+    pattern.strip_prefix("*@").is_some_and(|domain| {
+        address
+            .rsplit_once('@')
+            .is_some_and(|(_, address_domain)| address_domain.eq_ignore_ascii_case(domain))
+    })
+}
+
+impl Identity {
+    /// Whether this identity can send/receive as `address`.
+    pub fn matches_address(&self, address: &str) -> bool {
+        address_matches_pattern(address, &self.email)
+    }
+}
+
 // =============================================================================
 // Attachment types
 // =============================================================================

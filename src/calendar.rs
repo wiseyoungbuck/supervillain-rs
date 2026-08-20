@@ -8,7 +8,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
+// Anchored to the `;` parameter delimiter so vendor lookalikes such as
+// X-PARTSTAT never satisfy the replace path (roborev 537 #1) — on an
+// ATTENDEE line the real PARTSTAT param always follows a `;`. RFC 5545
+// names are case-insensitive (roborev 538 #1), hence `(?i)`.
+static PARTSTAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i);PARTSTAT=\w[\w-]*").unwrap());
 
 /// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
 /// STORED DESCRIPTION we didn't expect to be HTML (see
@@ -790,22 +795,70 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
     let raw_ics = unfold_lines(raw_ics);
     let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
     let email_lower = attendee_email.to_lowercase();
+    // The address must be the property VALUE — everything after the first
+    // colon outside double quotes — not a substring anywhere on the line
+    // (roborev 537 #2, 538 #2): a bare `contains` also hits attendees whose
+    // address merely starts with this one (matt@x.ai vs
+    // matt@x.ai.example.com) and the user's address quoted inside another
+    // attendee's DELEGATED-FROM/SENT-BY param. The value must end at the
+    // line end or a non-address character.
+    let needle = format!("mailto:{email_lower}");
+    let value_is_attendee = |trimmed: &str| {
+        let mut in_quotes = false;
+        let mut value_start = None;
+        for (index, c) in trimmed.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                ':' if !in_quotes => {
+                    value_start = Some(index + 1);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(start) = value_start else {
+            return false;
+        };
+        let value = trimmed[start..].to_lowercase();
+        let Some(rest) = value.strip_prefix(&needle) else {
+            return false;
+        };
+        match rest.chars().next() {
+            None => true,
+            Some(next) => !next.is_ascii_alphanumeric() && !matches!(next, '.' | '-' | '_'),
+        }
+    };
 
     // Split on \n but preserve \r if present to keep original line endings
     raw_ics
         .split('\n')
         .map(|line| {
             let trimmed = line.trim_end_matches('\r');
-            if trimmed.starts_with("ATTENDEE")
+            // RFC 5545 names are case-insensitive (roborev 538 #1): match the
+            // property name without assuming casing, and keep the original
+            // name bytes when inserting.
+            let is_attendee_prop = trimmed.is_char_boundary(8)
                 && trimmed
-                    .to_lowercase()
-                    .contains(&format!("mailto:{email_lower}"))
+                    .get(..8)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"));
+            if is_attendee_prop
+                && (trimmed[8..].starts_with(';') || trimmed[8..].starts_with(':'))
+                && value_is_attendee(trimmed)
             {
-                let updated = PARTSTAT_RE.replace(trimmed, new_partstat.as_str());
+                let updated = if PARTSTAT_RE.is_match(trimmed) {
+                    PARTSTAT_RE
+                        .replace(trimmed, format!(";{new_partstat}"))
+                        .into_owned()
+                } else {
+                    // RFC 5545 §3.2.12: no PARTSTAT param means NEEDS-ACTION,
+                    // and real invites do omit it — a replace-only update
+                    // would silently drop the RSVP from the stored copy.
+                    format!("{};{new_partstat}{}", &trimmed[..8], &trimmed[8..])
+                };
                 if line.ends_with('\r') {
                     format!("{updated}\r")
                 } else {
-                    updated.to_string()
+                    updated
                 }
             } else {
                 line.to_string()
@@ -2584,6 +2637,160 @@ END:VCALENDAR";
                 );
             }
         }
+    }
+
+    #[test]
+    fn update_partstat_inserts_param_when_attendee_line_has_none() {
+        // RFC 5545 §3.2.12: an ATTENDEE with no PARTSTAT param defaults to
+        // NEEDS-ACTION, and real-world invites do omit it. A replace-only
+        // update silently no-ops on such a line, so the RSVP never reaches
+        // the stored calendar copy — the "Maybe doesn't update my calendar"
+        // symptom with nothing in the logs.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n\
+                   ATTENDEE;CN=Matt;RSVP=TRUE:mailto:matt@mattcoburn.ai\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("PARTSTAT=TENTATIVE"),
+            "PARTSTAT must be inserted when the invite omitted it: {line}"
+        );
+        assert!(
+            line.contains("CN=Matt") && line.contains("RSVP=TRUE"),
+            "existing params must survive the insertion: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_insertion_only_touches_attendee_properties() {
+        // The insertion path must not fire on non-ATTENDEE lines that happen
+        // to mention the address (ORGANIZER, X-props, DESCRIPTION).
+        let ics = "ORGANIZER:mailto:matt@mattgpt.ai\r\n\
+                   DESCRIPTION:contact mailto:matt@mattgpt.ai\r\n\
+                   ATTENDEE:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("ORGANIZER:mailto:matt@mattgpt.ai"),
+            "ORGANIZER must be untouched: {result}"
+        );
+        assert!(
+            result.contains("DESCRIPTION:contact mailto:matt@mattgpt.ai"),
+            "DESCRIPTION must be untouched: {result}"
+        );
+        assert!(
+            result.contains("ATTENDEE;PARTSTAT=TENTATIVE:mailto:matt@mattgpt.ai"),
+            "the bare ATTENDEE must gain the param: {result}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_ignores_x_partstat_lookalike_param() {
+        // roborev 537 #1: an unanchored PARTSTAT match rewrites vendor
+        // params like X-PARTSTAT and then skips the insertion branch — the
+        // line ends up with no real PARTSTAT at all.
+        let ics = "ATTENDEE;X-PARTSTAT=FOO:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("X-PARTSTAT=FOO"),
+            "the vendor param must be untouched: {line}"
+        );
+        assert!(
+            line.contains(";PARTSTAT=TENTATIVE"),
+            "a real PARTSTAT param must be inserted alongside it: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_requires_full_address_match_not_prefix() {
+        // roborev 537 #2: a bare substring check lets one attendee's address
+        // that prefixes another's update both lines.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai.example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        let longer = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattgpt.ai.example.com"))
+            .expect("prefix-colliding line must survive");
+        assert!(
+            longer.contains("PARTSTAT=NEEDS-ACTION"),
+            "the prefix-colliding attendee must be untouched: {longer}"
+        );
+        let exact = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattgpt.ai"))
+            .expect("exact line must survive");
+        assert!(
+            exact.contains("PARTSTAT=TENTATIVE"),
+            "the exact attendee must be updated: {exact}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_replaces_lowercase_param_without_doubling() {
+        // roborev 538 #1: RFC 5545 names are case-insensitive. A lowercase
+        // `partstat=` must be replaced — not left in place while a second,
+        // conflicting PARTSTAT gets inserted (invalid ICS).
+        let ics = "attendee;partstat=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.to_lowercase().contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert_eq!(
+            line.to_uppercase().matches("PARTSTAT=").count(),
+            1,
+            "exactly one PARTSTAT param — never a conflicting pair: {line}"
+        );
+        assert!(
+            line.to_uppercase().contains("PARTSTAT=TENTATIVE"),
+            "the lowercase param must be updated: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_ignores_address_inside_quoted_param_value() {
+        // roborev 538 #2: the user's address appearing in another attendee's
+        // DELEGATED-FROM/SENT-BY quoted param must not rewrite that line —
+        // only the line whose VALUE is the user's mailto.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:matt@mattcoburn.ai\":mailto:delegate@example.com\r\n\
+                   ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:matt@mattcoburn.ai\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let delegate = result
+            .lines()
+            .find(|l| l.contains("mailto:delegate@example.com"))
+            .expect("delegate line must survive");
+        assert!(
+            delegate.contains("PARTSTAT=NEEDS-ACTION"),
+            "the delegate's own PARTSTAT must be untouched: {delegate}"
+        );
+        let own = result
+            .lines()
+            .find(|l| l.ends_with("mailto:matt@mattcoburn.ai"))
+            .expect("own line must survive");
+        assert!(
+            own.contains("PARTSTAT=TENTATIVE"),
+            "the user's own line must be updated: {own}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_matches_alias_domain_attendee_case_insensitively() {
+        // Invites addressed to a Fastmail-managed alias domain arrive with
+        // whatever casing the organizer's client used; the swap must still
+        // find the line.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:Matt@MattGPT.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("PARTSTAT=TENTATIVE"),
+            "alias attendee must be updated regardless of casing: {result}"
+        );
     }
 
     #[test]

@@ -482,9 +482,15 @@ pub async fn get_identity_for_email(
     email: &str,
 ) -> Result<Option<String>, Error> {
     let identities = get_identities(s).await?;
+    // Exact identity first (the exact pass is deliberately separate from
+    // `matches_address` so specificity wins); a catch-all wildcard identity
+    // ("*@domain", Fastmail's model for managed alias domains) covers the
+    // rest of its domain's local parts. Should Fastmail ever return several
+    // wildcards for one domain, JMAP list order breaks the tie.
     let found = identities
         .iter()
         .find(|i| i.email.eq_ignore_ascii_case(email))
+        .or_else(|| identities.iter().find(|i| i.matches_address(email)))
         .map(|i| i.id.clone());
     Ok(found)
 }
@@ -6115,6 +6121,128 @@ END:VCALENDAR";
         assert!(
             rcpt.iter().any(|r| r["email"] == "observer@example.com"),
             "envelope rcptTo must include the cc recipient: {rcpt:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_resolves_alias_identity_for_from_address() {
+        // An iTIP REPLY for an invite addressed to an alias on another
+        // Fastmail-managed domain must go out under that alias's identity —
+        // matched case-insensitively against the cached identity list, not
+        // silently downgraded to the default identity.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        s.identities = Some(vec![
+            Identity {
+                id: "ident1".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+            },
+            Identity {
+                id: "ident-alias".into(),
+                email: "Matt@MattGPT.ai".into(),
+                name: "Matt".into(),
+            },
+        ]);
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        send_email(&mut s, &sub, "matt@mattgpt.ai", None)
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body["methodCalls"][1][1]["create"]["send"]["identityId"], "ident-alias",
+            "the submission must carry the alias's identityId: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_lookup_prefers_exact_match_then_wildcard_domain() {
+        // The live account models catch-all domains as wildcard identities
+        // ("*@mattgpt.ai") alongside exact ones ("contact@mattgpt.ai").
+        // Exact wins for its own address; anything else on the domain falls
+        // back to the wildcard; foreign domains resolve to nothing.
+        let mut s = JmapSession::new("matt.coburn@aristoi.ai", "token", None);
+        s.identities = Some(vec![
+            Identity {
+                id: "ident-exact".into(),
+                email: "contact@mattgpt.ai".into(),
+                name: "Contact".into(),
+            },
+            Identity {
+                id: "ident-wild".into(),
+                email: "*@mattgpt.ai".into(),
+                name: "mattgpt.ai".into(),
+            },
+        ]);
+        assert_eq!(
+            get_identity_for_email(&mut s, "Contact@MattGPT.ai")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ident-exact"),
+            "exact identity must win over the domain wildcard"
+        );
+        assert_eq!(
+            get_identity_for_email(&mut s, "hello@mattgpt.ai")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ident-wild"),
+            "any other local part on the domain must fall back to the wildcard"
+        );
+        assert_eq!(
+            get_identity_for_email(&mut s, "hello@notmattgpt.ai")
+                .await
+                .unwrap(),
+            None,
+            "a lookalike domain must not match the wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_email_resolves_wildcard_identity_for_alias_from_address() {
+        // The iTIP REPLY for an invite addressed to a catch-all alias must
+        // ride the wildcard identity, not the default one.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        s.identities = Some(vec![
+            Identity {
+                id: "ident1".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+            },
+            Identity {
+                id: "ident-wild".into(),
+                email: "*@mattcoburn.ai".into(),
+                name: "mattcoburn.ai".into(),
+            },
+        ]);
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        send_email(&mut s, &sub, "anything@mattcoburn.ai", None)
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body["methodCalls"][1][1]["create"]["send"]["identityId"], "ident-wild",
+            "the submission must carry the wildcard identity's id: {body}"
         );
     }
 
