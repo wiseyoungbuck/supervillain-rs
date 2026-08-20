@@ -112,9 +112,9 @@ pub fn parse_ics(data: &str, primary_tz: Tz) -> Option<CalendarEvent> {
     // Unfold lines (RFC 5545: continuation lines start with space or tab)
     let unfolded = unfold_lines(vevent);
 
-    // Extract VTIMEZONE UTC offsets from the full calendar data so we can
+    // Extract VTIMEZONE definitions from the full calendar data so we can
     // resolve TZID references on DTSTART/DTEND inside the VEVENT.
-    let tz_offsets = parse_vtimezone_offsets(data);
+    let tz_rules = parse_vtimezone_rules(data);
 
     let uid = extract_property(&unfolded, "UID")?;
     let summary = extract_property(&unfolded, "SUMMARY").unwrap_or_default();
@@ -124,8 +124,8 @@ pub fn parse_ics(data: &str, primary_tz: Tz) -> Option<CalendarEvent> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", &tz_offsets, primary_tz)?;
-    let dtend = parse_ics_datetime_property(&unfolded, "DTEND", &tz_offsets, primary_tz);
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", &tz_rules, primary_tz)?;
+    let dtend = parse_ics_datetime_property(&unfolded, "DTEND", &tz_rules, primary_tz);
 
     let status = extract_property(&unfolded, "STATUS");
 
@@ -509,15 +509,62 @@ fn extract_property(text: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Parse VTIMEZONE blocks from the full ICS data. Returns a map from TZID
-/// to the STANDARD component's UTCOFFSETTO (falls back to DAYLIGHT if no STANDARD).
+/// One STANDARD or DAYLIGHT component of a VTIMEZONE: the offset it puts the
+/// zone at, and (when its RRULE carries BYMONTH) the month the transition
+/// into it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TzTransition {
+    offset: FixedOffset,
+    start_month: Option<u32>,
+}
+
+/// A VTIMEZONE definition reduced to its STANDARD/DAYLIGHT offsets.
 ///
-/// This is the fallback path used only when a TZID is not a recognized IANA
-/// name (e.g. Outlook's "Pacific Standard Time"). For IANA-named TZIDs, the
-/// parser uses chrono-tz directly, which resolves DST correctly at the
-/// event's instant.
-fn parse_vtimezone_offsets(data: &str) -> HashMap<String, FixedOffset> {
-    let mut offsets = HashMap::new();
+/// This is the fallback path used only when a TZID is neither a recognized
+/// IANA name nor a mappable Windows name (e.g. Outlook's "Customized Time
+/// Zone"). For those, chrono-tz resolves DST correctly at the event's
+/// instant instead.
+#[derive(Debug, Clone, Copy, Default)]
+struct VtimezoneRule {
+    standard: Option<TzTransition>,
+    daylight: Option<TzTransition>,
+}
+
+impl VtimezoneRule {
+    /// Pick the offset in force at `dt` (a wall-clock value in this zone).
+    ///
+    /// When both components declare a BYMONTH transition, choose by the
+    /// event's month: daylight applies from its start month up to the
+    /// standard start month, wrapping across the new year for the southern
+    /// hemisphere. Month granularity misplaces only events inside a
+    /// transition month, and only by the DST delta — far better than the
+    /// old behavior of always using STANDARD (wrong for half the year).
+    fn offset_at(&self, dt: &NaiveDateTime) -> Option<FixedOffset> {
+        use chrono::Datelike;
+        match (self.standard, self.daylight) {
+            (Some(std), Some(dst)) => {
+                let (Some(std_month), Some(dst_month)) = (std.start_month, dst.start_month) else {
+                    return Some(std.offset);
+                };
+                let month = dt.month();
+                let in_daylight = if dst_month < std_month {
+                    month >= dst_month && month < std_month
+                } else {
+                    month >= dst_month || month < std_month
+                };
+                Some(if in_daylight { dst.offset } else { std.offset })
+            }
+            (Some(std), None) => Some(std.offset),
+            (None, Some(dst)) => Some(dst.offset),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Parse VTIMEZONE blocks from the full ICS data into a map from TZID to
+/// the zone's STANDARD/DAYLIGHT offsets.
+fn parse_vtimezone_rules(data: &str) -> HashMap<String, VtimezoneRule> {
+    let mut rules = HashMap::new();
     let unfolded = unfold_lines(data);
 
     // Walk through each VTIMEZONE block
@@ -534,26 +581,35 @@ fn parse_vtimezone_offsets(data: &str) -> HashMap<String, FixedOffset> {
             continue;
         };
 
-        // Prefer STANDARD offset; fall back to DAYLIGHT if no STANDARD block
-        let offset = extract_sub_block_offset(tz_block, "STANDARD")
-            .or_else(|| extract_sub_block_offset(tz_block, "DAYLIGHT"));
-
-        if let Some(offset) = offset {
-            offsets.insert(tzid, offset);
+        let rule = VtimezoneRule {
+            standard: extract_sub_block_transition(tz_block, "STANDARD"),
+            daylight: extract_sub_block_transition(tz_block, "DAYLIGHT"),
+        };
+        if rule.standard.is_some() || rule.daylight.is_some() {
+            rules.insert(tzid.trim_matches('"').to_string(), rule);
         }
     }
-    offsets
+    rules
 }
 
-/// Extract UTCOFFSETTO from a STANDARD or DAYLIGHT sub-block within a VTIMEZONE.
-fn extract_sub_block_offset(tz_block: &str, sub_name: &str) -> Option<FixedOffset> {
+/// Extract TZOFFSETTO and the RRULE's BYMONTH from a STANDARD or DAYLIGHT
+/// sub-block within a VTIMEZONE.
+fn extract_sub_block_transition(tz_block: &str, sub_name: &str) -> Option<TzTransition> {
     let begin = format!("BEGIN:{sub_name}");
     let start = tz_block.find(&begin)?;
     let end_marker = format!("END:{sub_name}");
     let end = tz_block[start..].find(&end_marker)?;
     let sub_block = &tz_block[start..start + end];
-    let offset_str = extract_property(sub_block, "UTCOFFSETTO")?;
-    parse_utc_offset(&offset_str)
+    let offset_str = extract_property(sub_block, "TZOFFSETTO")?;
+    let offset = parse_utc_offset(&offset_str)?;
+    let start_month = extract_property(sub_block, "RRULE")
+        .and_then(|rrule| extract_param_from_str(&rrule, "BYMONTH"))
+        .and_then(|m| m.parse::<u32>().ok())
+        .filter(|m| (1..=12).contains(m));
+    Some(TzTransition {
+        offset,
+        start_month,
+    })
 }
 
 /// Parse an ICS UTC offset string like "+0530", "-0800", "+0000" into a FixedOffset.
@@ -572,7 +628,7 @@ fn parse_utc_offset(s: &str) -> Option<FixedOffset> {
 fn parse_ics_datetime_property(
     text: &str,
     name: &str,
-    tz_offsets: &HashMap<String, FixedOffset>,
+    tz_rules: &HashMap<String, VtimezoneRule>,
     primary_tz: Tz,
 ) -> Option<DateTime<Utc>> {
     for line in text.lines() {
@@ -614,15 +670,22 @@ fn parse_ics_datetime_property(
         let dt = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
 
         // Case 2: TZID parameter. Prefer chrono-tz (IANA-aware, handles DST
-        // correctly at the event's instant). Fall back to the VTIMEZONE
-        // offset table for non-IANA TZIDs (e.g. Outlook's "Pacific Standard
-        // Time" labels).
+        // correctly at the event's instant), translating Windows display
+        // names ("GMT Standard Time") to IANA first — Exchange/Outlook ICS
+        // ships those, and chrono-tz rejects them (kata rq9n). Fall back to
+        // the ICS's own VTIMEZONE definition for TZIDs that are neither
+        // (e.g. Outlook's "Customized Time Zone").
         if let Some(tzid) = extract_param_from_str(params, "TZID") {
-            if let Ok(tz) = Tz::from_str(&tzid) {
+            // RFC 5545 parameter values may be double-quoted.
+            let tzid = tzid.trim_matches('"');
+            let tz = Tz::from_str(tzid).ok().or_else(|| {
+                crate::wintz::windows_tz_to_iana(tzid).and_then(|iana| Tz::from_str(iana).ok())
+            });
+            if let Some(tz) = tz {
                 let resolved = resolve_local_datetime_lenient(&tz, dt)?;
                 return Some(resolved.with_timezone(&Utc));
             }
-            if let Some(offset) = tz_offsets.get(&tzid) {
+            if let Some(offset) = tz_rules.get(tzid).and_then(|rule| rule.offset_at(&dt)) {
                 let local = offset.from_local_datetime(&dt).earliest()?;
                 return Some(local.with_timezone(&Utc));
             }
@@ -2752,13 +2815,13 @@ BEGIN:VTIMEZONE\r\n\
 TZID:America/New_York\r\n\
 BEGIN:STANDARD\r\n\
 DTSTART:19701101T020000\r\n\
-UTCOFFSETTO:-0500\r\n\
-UTCOFFSETFROM:-0400\r\n\
+TZOFFSETTO:-0500\r\n\
+TZOFFSETFROM:-0400\r\n\
 END:STANDARD\r\n\
 BEGIN:DAYLIGHT\r\n\
 DTSTART:19700308T020000\r\n\
-UTCOFFSETTO:-0400\r\n\
-UTCOFFSETFROM:-0500\r\n\
+TZOFFSETTO:-0400\r\n\
+TZOFFSETFROM:-0500\r\n\
 END:DAYLIGHT\r\n\
 END:VTIMEZONE\r\n\
 BEGIN:VEVENT\r\n\
@@ -2789,8 +2852,8 @@ BEGIN:VTIMEZONE\r\n\
 TZID:Asia/Kolkata\r\n\
 BEGIN:STANDARD\r\n\
 DTSTART:19700101T000000\r\n\
-UTCOFFSETTO:+0530\r\n\
-UTCOFFSETFROM:+0530\r\n\
+TZOFFSETTO:+0530\r\n\
+TZOFFSETFROM:+0530\r\n\
 END:STANDARD\r\n\
 END:VTIMEZONE\r\n\
 BEGIN:VEVENT\r\n\
@@ -3014,28 +3077,30 @@ END:VCALENDAR";
     }
 
     #[test]
-    fn parse_vtimezone_offsets_extracts_multiple() {
+    fn parse_vtimezone_rules_extracts_multiple() {
         let ics = "\
 BEGIN:VCALENDAR\r\n\
 BEGIN:VTIMEZONE\r\n\
 TZID:America/New_York\r\n\
 BEGIN:STANDARD\r\n\
-UTCOFFSETTO:-0500\r\n\
-UTCOFFSETFROM:-0400\r\n\
+TZOFFSETTO:-0500\r\n\
+TZOFFSETFROM:-0400\r\n\
 END:STANDARD\r\n\
 END:VTIMEZONE\r\n\
 BEGIN:VTIMEZONE\r\n\
 TZID:Europe/London\r\n\
 BEGIN:STANDARD\r\n\
-UTCOFFSETTO:+0000\r\n\
-UTCOFFSETFROM:+0100\r\n\
+TZOFFSETTO:+0000\r\n\
+TZOFFSETFROM:+0100\r\n\
 END:STANDARD\r\n\
 END:VTIMEZONE\r\n\
 END:VCALENDAR";
-        let offsets = parse_vtimezone_offsets(ics);
-        assert_eq!(offsets.len(), 2);
-        assert_eq!(offsets["America/New_York"].local_minus_utc(), -5 * 3600);
-        assert_eq!(offsets["Europe/London"].local_minus_utc(), 0);
+        let rules = parse_vtimezone_rules(ics);
+        assert_eq!(rules.len(), 2);
+        let ny = rules["America/New_York"].standard.unwrap();
+        assert_eq!(ny.offset.local_minus_utc(), -5 * 3600);
+        let london = rules["Europe/London"].standard.unwrap();
+        assert_eq!(london.offset.local_minus_utc(), 0);
     }
 
     #[test]

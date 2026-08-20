@@ -20,3 +20,4 @@ pub mod theme;
 pub mod timezone;
 pub mod types;
 pub mod validate;
+pub mod wintz;
