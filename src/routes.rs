@@ -116,7 +116,9 @@ const FONT_JBM_BOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Bold.
 /// `127.0.0.1:8000`), `localhost:<port>` for the same port, and the bare
 /// (port-elided) `127.0.0.1` / `localhost` forms some loopback clients send.
 /// Extra hosts (e.g. a tailnet MagicDNS name) come from
-/// `SUPERVILLAIN_ALLOWED_HOSTS`, trimmed and comma-split.
+/// `SUPERVILLAIN_ALLOWED_HOSTS` via `parse_allowed_hosts_env` — the same
+/// parse the cross-site mutation guard (kata mbxt) uses for its Origin
+/// fallback, so the env var has exactly one interpretation.
 pub fn build_allowed_hosts(bind_addr: &str, env_hosts: Option<&str>) -> Vec<String> {
     let port = bind_addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("8000");
     let mut hosts = vec![
@@ -125,15 +127,7 @@ pub fn build_allowed_hosts(bind_addr: &str, env_hosts: Option<&str>) -> Vec<Stri
         "127.0.0.1".to_string(),
         "localhost".to_string(),
     ];
-    if let Some(env_hosts) = env_hosts {
-        hosts.extend(
-            env_hosts
-                .split(',')
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .map(str::to_string),
-        );
-    }
+    hosts.extend(parse_allowed_hosts_env(env_hosts));
     hosts
 }
 
