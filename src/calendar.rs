@@ -796,16 +796,26 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
         .split('\n')
         .map(|line| {
             let trimmed = line.trim_end_matches('\r');
-            if trimmed.starts_with("ATTENDEE")
+            let rest = trimmed.strip_prefix("ATTENDEE");
+            if rest.is_some_and(|r| r.starts_with(';') || r.starts_with(':'))
                 && trimmed
                     .to_lowercase()
                     .contains(&format!("mailto:{email_lower}"))
             {
-                let updated = PARTSTAT_RE.replace(trimmed, new_partstat.as_str());
+                let updated = if PARTSTAT_RE.is_match(trimmed) {
+                    PARTSTAT_RE
+                        .replace(trimmed, new_partstat.as_str())
+                        .into_owned()
+                } else {
+                    // RFC 5545 §3.2.12: no PARTSTAT param means NEEDS-ACTION,
+                    // and real invites do omit it — a replace-only update
+                    // would silently drop the RSVP from the stored copy.
+                    format!("ATTENDEE;{new_partstat}{}", rest.unwrap_or_default())
+                };
                 if line.ends_with('\r') {
                     format!("{updated}\r")
                 } else {
-                    updated.to_string()
+                    updated
                 }
             } else {
                 line.to_string()

@@ -829,7 +829,6 @@ fn attendee_email_for_event(
     event: &CalendarEvent,
     user_addresses: &[String],
 ) -> Option<AttendeeResolution> {
-    let fallback = user_addresses.first().map(String::as_str).unwrap_or("");
     let recipients: Vec<&EmailAddress> = email.to.iter().chain(email.cc.iter()).collect();
     let is_attendee = |address: &str| {
         event
@@ -837,12 +836,20 @@ fn attendee_email_for_event(
             .iter()
             .any(|attendee| attendee.email.eq_ignore_ascii_case(address))
     };
+    // "Is this address the user" — any of the login username or the
+    // account's sending identities, so invites addressed to aliases on other
+    // Fastmail-managed domains resolve to the alias, not another guest.
+    let is_user = |address: &str| {
+        user_addresses
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(address))
+    };
 
     // Multi-guest invites routinely put every attendee in To. Prefer the
-    // account address rather than borrowing the first guest's PARTSTAT.
+    // account's own address rather than borrowing the first guest's PARTSTAT.
     if let Some(address) = recipients
         .iter()
-        .find(|address| address.email.eq_ignore_ascii_case(fallback) && is_attendee(&address.email))
+        .find(|address| is_user(&address.email) && is_attendee(&address.email))
     {
         return Some(AttendeeResolution {
             email: address.email.clone(),
@@ -852,30 +859,31 @@ fn attendee_email_for_event(
 
     // Bcc delivery can omit the account from To/Cc even though the ICS names
     // it explicitly. That attendee identity is still stronger evidence than
-    // another guest's earlier recipient position.
-    if let Some(attendee) = event
-        .attendees
-        .iter()
-        .find(|attendee| attendee.email.eq_ignore_ascii_case(fallback))
-    {
+    // another guest's earlier recipient position. Addresses earlier in
+    // `user_addresses` win (the login username is first).
+    if let Some(attendee) = user_addresses.iter().find_map(|known| {
+        event
+            .attendees
+            .iter()
+            .find(|attendee| attendee.email.eq_ignore_ascii_case(known))
+    }) {
         return Some(AttendeeResolution {
             email: attendee.email.clone(),
             plausibly_user: true,
         });
     }
 
-    // Keep the historical first To/Cc attendee heuristic for aliases and the
-    // RSVP fallback, but be conservative when deciding whether to show a list
-    // chip. One attendee-addressed recipient with no explicit account address
-    // is plausibly an alias. Multiple matching guests are ambiguous, while an
-    // explicit account recipient absent from ATTENDEE is an FYI copy.
+    // Keep the historical first To/Cc attendee heuristic for unknown aliases
+    // and the RSVP fallback, but be conservative when deciding whether to
+    // show a list chip. One attendee-addressed recipient with no explicit
+    // account address is plausibly an alias. Multiple matching guests are
+    // ambiguous, while an explicit account recipient absent from ATTENDEE is
+    // an FYI copy.
     if let Some(address) = recipients
         .iter()
         .find(|address| is_attendee(&address.email))
     {
-        let username_is_recipient = recipients
-            .iter()
-            .any(|recipient| recipient.email.eq_ignore_ascii_case(fallback));
+        let username_is_recipient = recipients.iter().any(|recipient| is_user(&recipient.email));
         let matching_attendees: std::collections::HashSet<String> = recipients
             .iter()
             .filter(|recipient| is_attendee(&recipient.email))
@@ -918,8 +926,12 @@ fn invite_list_fields(
         method: Some(method.clone()),
         ..InviteListFields::default()
     };
-    let username = user_addresses.first().map(String::as_str).unwrap_or("");
-    if method != "REQUEST" || event.organizer_email.eq_ignore_ascii_case(username) {
+    // Organizer check spans every identity: a REQUEST the user sent from an
+    // alias must not render RSVP buttons back at them.
+    let organized_by_user = user_addresses
+        .iter()
+        .any(|known| event.organizer_email.eq_ignore_ascii_case(known));
+    if method != "REQUEST" || organized_by_user {
         return fields;
     }
 
