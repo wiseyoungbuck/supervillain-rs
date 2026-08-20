@@ -360,6 +360,13 @@ All optional when using the config file.
 
 ### Serving over the tailnet (HTTPS)
 
+Every response (the app shell and all `/api/*` routes) carries a restrictive
+`Content-Security-Policy` (including `frame-ancestors 'none'`) plus
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
+`Cross-Origin-Resource-Policy: same-origin` — defense-in-depth so a clicked
+link inside an email body can't leak your private tailnet URL and this app
+can't be framed or MIME-sniffed by another origin.
+
 Supervillain binds to loopback by default — no LAN exposure, no auth layer
 to worry about. To reach it securely from another device (e.g. your phone),
 serve the loopback port over your [Tailscale](https://tailscale.com/)
