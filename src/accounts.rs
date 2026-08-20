@@ -3077,6 +3077,7 @@ api-token = tok
             ),
             tracking_base: None,
             require_ts_user: None,
+            pending_mailto: std::sync::Mutex::new(None),
         };
         state.reset_config_error_baseline();
         assert!(state.config_error_baseline.read().unwrap().is_empty());
@@ -3258,6 +3259,7 @@ api-token = tok
             ),
             tracking_base: None,
             require_ts_user: None,
+            pending_mailto: std::sync::Mutex::new(None),
         });
 
         let incoming = AccountConfig::Fastmail {
@@ -3589,6 +3591,7 @@ api-token = tok
             ),
             tracking_base: None,
             require_ts_user: None,
+            pending_mailto: std::sync::Mutex::new(None),
         })
     }
 

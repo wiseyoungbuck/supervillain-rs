@@ -6,6 +6,12 @@
 
 set -euo pipefail
 
+# Optional mailto: argument from the .desktop entry's %u (kata h69x).
+# Delivered to the server's consume-once /api/mailto slot right before the
+# window is opened or focused; the frontend reads it on init/focus and
+# opens compose prefilled. Non-mailto arguments are ignored.
+MAILTO_URL="${1:-}"
+
 # The binary defaults to loopback (no auth layer); this launcher mirrors
 # that default. Opt in to LAN/tailnet reachability by exporting
 # SUPERVILLAIN_BIND (e.g. 0.0.0.0:8000), or better, serve the loopback
@@ -46,6 +52,14 @@ port_listening() {
 # window instead of opening a duplicate. Elsewhere on Linux, xdg-open
 # consults the system default.
 open_webapp() {
+    # Both open_webapp call sites run with the server up (port check just
+    # passed, or the startup loop saw it listening), so delivering here
+    # covers the focus-running-app case and the cold start uniformly. Raw
+    # URL as a text body — no JSON quoting layer between shell and server.
+    # Best-effort: a failed delivery must not block opening the app.
+    if [[ "$MAILTO_URL" == mailto:* ]] && command -v curl &>/dev/null; then
+        curl -fsS -X POST --data-binary "$MAILTO_URL" "$URL/api/mailto" &>/dev/null || true
+    fi
     if [[ "$OSTYPE" == darwin* ]]; then
         open "$URL"
     elif command -v omarchy-launch-or-focus-webapp &>/dev/null; then

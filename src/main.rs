@@ -148,6 +148,7 @@ async fn main() {
                 .ok()
                 .as_deref(),
         ),
+        pending_mailto: std::sync::Mutex::new(None),
     });
 
     // Kick off the background prefetch warmer. The first pass starts

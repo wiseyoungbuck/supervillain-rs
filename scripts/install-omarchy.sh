@@ -34,10 +34,19 @@ cat > "$HOME/.local/share/applications/Supervillain.desktop" << EOF
 Version=1.0
 Name=Supervillain
 Comment=Supervillain
-Exec=supervillain-launcher
+Exec=supervillain-launcher %u
 Terminal=false
 Type=Application
 Icon=$HOME/.local/share/applications/icons/Supervillain.png
 StartupNotify=true
 MimeType=x-scheme-handler/mailto;
 EOF
+
+# Claiming the MimeType above only advertises capability; the xdg default
+# is what makes mailto: clicks actually land here (kata h69x).
+if command -v xdg-mime &>/dev/null; then
+    xdg-mime default Supervillain.desktop x-scheme-handler/mailto || true
+fi
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$HOME/.local/share/applications" || true
+fi

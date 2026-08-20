@@ -400,6 +400,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/accounts", get(list_accounts))
         .route("/api/identities", get(list_identities))
         .route("/api/theme", get(get_theme))
+        .route("/api/mailto", post(set_pending_mailto))
+        .route("/api/mailto/pending", get(take_pending_mailto))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/emails", get(list_emails))
         .route("/api/upload", post(upload_blob))
@@ -1005,6 +1007,37 @@ async fn list_identities(
         })
         .await?;
     Ok(Json(serde_json::json!(identities)))
+}
+
+/// Store an OS mailto: link for the frontend to pick up (kata h69x).
+///
+/// The launcher POSTs the raw URL as the request body — plain text, not
+/// JSON, so a shell caller needs no quoting/escaping layer for URLs that
+/// may contain arbitrary percent-encoded characters.
+async fn set_pending_mailto(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> Result<impl IntoResponse, Error> {
+    if !body.starts_with("mailto:") {
+        return Err(Error::BadRequest("not a mailto: URL".into()));
+    }
+    *state
+        .pending_mailto
+        .lock()
+        .expect("pending_mailto lock poisoned") = Some(body);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Read-and-clear the pending mailto: link. Consume-once: the frontend
+/// checks on every window focus, and a slot that didn't clear would reopen
+/// the same compose on each alt-tab back.
+async fn take_pending_mailto(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let url = state
+        .pending_mailto
+        .lock()
+        .expect("pending_mailto lock poisoned")
+        .take();
+    Json(serde_json::json!({ "url": url }))
 }
 
 /// CSS from the first candidate theme dir that holds a usable theme.
@@ -3800,6 +3833,123 @@ mod tests {
     // tests/compression_test.rs pins the layer gzips; this pins it's applied).
     const MAIN_RS: &str = include_str!("main.rs");
 
+    // ---- OS mailto: handoff (kata h69x) ----
+    // The .desktop entry hands mailto: links to the launcher, which POSTs the
+    // raw URL to /api/mailto; the frontend reads-and-clears it on init and on
+    // window focus (the launcher focuses an already-open window rather than
+    // navigating it, so a query param could never reach a running app).
+
+    #[tokio::test]
+    async fn mailto_pending_is_consume_once() {
+        let state = Arc::new(test_state(&["acct"], "acct"));
+        let post = Request::builder()
+            .method("POST")
+            .uri("/api/mailto")
+            .body(Body::from("mailto:a@example.com?subject=Hi%20there"))
+            .unwrap();
+        let response = router(state.clone()).oneshot(post).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let pending = || {
+            Request::builder()
+                .uri("/api/mailto/pending")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = router(state.clone()).oneshot(pending()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["url"], "mailto:a@example.com?subject=Hi%20there");
+
+        let response = router(state).oneshot(pending()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["url"].is_null(),
+            "pending mailto must clear on first read — a stale one would \
+             reopen compose on every window focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailto_rejects_non_mailto_url() {
+        let state = Arc::new(test_state(&["acct"], "acct"));
+        let post = Request::builder()
+            .method("POST")
+            .uri("/api/mailto")
+            .body(Body::from("https://example.com/not-a-mailto"))
+            .unwrap();
+        let response = router(state.clone()).oneshot(post).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let pending = Request::builder()
+            .uri("/api/mailto/pending")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(pending).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["url"].is_null(), "rejected URL must not be stored");
+    }
+
+    #[test]
+    fn app_js_consumes_pending_mailto_on_init_and_focus() {
+        assert!(
+            APP_JS.contains("function consumePendingMailto"),
+            "consumePendingMailto must exist"
+        );
+        assert!(
+            APP_JS.contains("'/api/mailto/pending'"),
+            "frontend must read the pending-mailto slot"
+        );
+        // Two call sites: init (cold start delivers before the page loads)
+        // and the window-focus listener (launcher focuses a running app).
+        assert!(
+            APP_JS.matches("consumePendingMailto()").count() >= 2,
+            "consumePendingMailto must run on init and on window focus"
+        );
+        let start = APP_JS
+            .find("function consumePendingMailto")
+            .expect("consumePendingMailto must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("consumePendingMailto must close");
+        let block = &rest[..end];
+        assert!(
+            block.contains("startCompose()"),
+            "a delivered mailto must open a fresh compose via startCompose"
+        );
+    }
+
+    #[test]
+    fn app_js_mailto_parse_covers_rfc6068_fields() {
+        let start = APP_JS
+            .find("function parseMailtoUrl")
+            .expect("parseMailtoUrl must exist");
+        let rest = &APP_JS[start..];
+        let end = rest.find("\n}").expect("parseMailtoUrl must close");
+        let block = &rest[..end];
+        for field in ["'cc'", "'subject'", "'body'"] {
+            assert!(block.contains(field), "parseMailtoUrl must handle {field}");
+        }
+        assert!(
+            block.contains("decodeURIComponent"),
+            "hvalues are percent-encoded (RFC 6068) and must be decoded"
+        );
+        assert!(
+            !block.contains("URLSearchParams"),
+            "URLSearchParams decodes '+' as space, corrupting addresses \
+             like a+b@example.com — parse hvalues manually"
+        );
+    }
+
     #[tokio::test]
     async fn index_html_contains_html() {
         let resp = index_html().await.into_response();
@@ -5174,6 +5324,7 @@ mod tests {
             // SUPERVILLAIN_REQUIRE_TS_USER is unset; individual tests opt in
             // by overriding this field (see ts_user_* tests, kata g926).
             require_ts_user: None,
+            pending_mailto: std::sync::Mutex::new(None),
         }
     }
 

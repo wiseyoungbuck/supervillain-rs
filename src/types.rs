@@ -533,6 +533,12 @@ pub struct AppState {
     /// loopback access regardless). See README, "Serving over the tailnet
     /// (HTTPS)".
     pub require_ts_user: Option<String>,
+
+    /// Consume-once slot for an OS mailto: link (kata h69x). The launcher
+    /// POSTs the raw URL to /api/mailto; the frontend reads-and-clears it
+    /// via /api/mailto/pending on init and window focus. Sync mutex: the
+    /// critical sections are a store and a take, never held across `.await`.
+    pub pending_mailto: std::sync::Mutex<Option<String>>,
 }
 
 impl AppState {

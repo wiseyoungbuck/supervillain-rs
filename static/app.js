@@ -598,6 +598,9 @@ function init() {
         // upgrading, then alt-tabbing back — a poll here surfaces the banner
         // immediately instead of waiting up to DEPLOY_POLL_INTERVAL_MS.
         checkDeploy();
+        // An OS mailto: click on a running app arrives as a focus event —
+        // the launcher POSTs the URL then focuses this window (kata h69x).
+        consumePendingMailto();
     });
 
     // Timezone listeners
@@ -633,6 +636,9 @@ function init() {
     // is deployed (Linear / Monarch Money style). Captures the boot build id
     // first, then re-checks on an interval and on window focus.
     startDeployPoll();
+    // Cold-start mailto delivery: the launcher POSTs the URL before the
+    // page finishes loading, so check once at boot too (kata h69x).
+    consumePendingMailto();
 }
 
 // Theme
@@ -5589,6 +5595,59 @@ function startCompose() {
     state.replyContext = null;
     clearCompose();
     showView('compose');
+}
+
+// ---- OS mailto: handoff (kata h69x) ----
+
+// RFC 6068 parse: mailto:addr1,addr2?cc=...&subject=...&body=... Manual
+// hvalue parsing instead of URLSearchParams — that API decodes '+' as a
+// space, which corrupts plus-addressed recipients like a+b@example.com.
+// bcc is parsed but unused: the compose UI has no bcc field, and folding
+// bcc into cc would expose recipients the sender meant to hide.
+function parseMailtoUrl(url) {
+    const rest = url.slice('mailto:'.length);
+    const qIdx = rest.indexOf('?');
+    const addrPart = qIdx === -1 ? rest : rest.slice(0, qIdx);
+    const splitAddrs = s => s.split(',').map(a => a.trim()).filter(Boolean);
+    const out = { to: [], cc: [], subject: '', body: '' };
+    if (addrPart) out.to = splitAddrs(decodeURIComponent(addrPart));
+    if (qIdx === -1) return out;
+    for (const pair of rest.slice(qIdx + 1).split('&')) {
+        if (!pair) continue;
+        const eq = pair.indexOf('=');
+        const key = decodeURIComponent(eq === -1 ? pair : pair.slice(0, eq)).toLowerCase();
+        const value = eq === -1 ? '' : decodeURIComponent(pair.slice(eq + 1));
+        if (key === 'to') out.to.push(...splitAddrs(value));
+        else if (key === 'cc') out.cc.push(...splitAddrs(value));
+        else if (key === 'subject') out.subject = value;
+        else if (key === 'body') out.body = value;
+    }
+    return out;
+}
+
+// Read-and-clear the server's pending mailto slot (the launcher fills it
+// from the .desktop entry's %u) and open compose prefilled. Runs on init
+// and on window focus: the launcher focuses an already-open window rather
+// than navigating it, so focus is the only delivery signal a running app
+// gets. The endpoint is consume-once, making repeat focus events no-ops.
+async function consumePendingMailto() {
+    let url;
+    try {
+        ({ url } = await fetch('/api/mailto/pending').then(r => r.json()));
+    } catch {
+        return; // unreachable/misparsed — nothing to deliver
+    }
+    if (!url) return;
+    const parsed = parseMailtoUrl(url);
+    startCompose();
+    els.composeTo.value = parsed.to.join(', ');
+    els.composeCc.value = parsed.cc.join(', ');
+    els.composeSubject.value = parsed.subject;
+    if (parsed.body) {
+        // Above the signature clearCompose planted; the baseline stays as
+        // clearCompose set it, so a mailto body reads as dirty and autosaves.
+        els.composeBody.value = parsed.body + '\n' + els.composeBody.value;
+    }
 }
 
 function getComposeEmail() {
