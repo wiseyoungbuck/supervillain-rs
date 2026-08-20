@@ -537,9 +537,19 @@ mod tests {
         }
     }
 
+    // Store backed by a per-test tempdir: a fixed /tmp path would collide
+    // with other users' test runs on a shared machine (and leak if a future
+    // change makes these paths ever get written). The TempDir must stay
+    // bound in the test so the dir outlives the store.
+    fn temp_store() -> (tempfile::TempDir, ReminderStore) {
+        let dir = tempdir().unwrap();
+        let store = ReminderStore::new(dir.path().join("reminders.json"));
+        (dir, store)
+    }
+
     #[test]
     fn reminder_store_due_filter() {
-        let store = ReminderStore::new(PathBuf::from("/tmp/dd0d-due.json"));
+        let (_dir, store) = temp_store();
         let now = Utc::now();
         store.insert(record(
             "past",
@@ -569,7 +579,7 @@ mod tests {
 
     #[test]
     fn reminder_store_rehydrate_orphans() {
-        let store = ReminderStore::new(PathBuf::from("/tmp/dd0d-orphans.json"));
+        let (_dir, store) = temp_store();
         let email = Email {
             id: "orphan".into(),
             blob_id: "blob".into(),

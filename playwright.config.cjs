@@ -53,7 +53,9 @@ function sweepStaleConfigDirs() {
     if (!name.startsWith('sv-e2e-')) continue;
     const dir = path.join(os.tmpdir(), name);
     try {
-      const st = fs.statSync(dir);
+      // lstat, not stat: judge the entry's own age, and keep dangling
+      // symlinks reapable (statSync would throw ENOENT on them forever).
+      const st = fs.lstatSync(dir);
       if (Date.now() - st.mtimeMs > CONFIG_DIR_STALE_MS) {
         fs.rmSync(dir, { recursive: true, force: true });
       }
