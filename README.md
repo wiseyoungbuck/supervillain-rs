@@ -357,6 +357,7 @@ All optional when using the config file.
 | `XDG_CONFIG_HOME` | Config directory (default: `~/.config`) |
 | `RUST_LOG` | Log level (`info`, `debug`, `supervillain=debug`) |
 | `SUPERVILLAIN_BIND` | Server bind address (default: `127.0.0.1:8000`, loopback-only) |
+| `SUPERVILLAIN_ALLOWED_HOSTS` | Comma-separated extra hostnames trusted as request origins (e.g. a tailnet name), beyond `127.0.0.1`/`localhost` — see "Security model" below |
 
 ### Serving over the tailnet (HTTPS)
 
@@ -388,6 +389,28 @@ ways to reach a loopback-only server from elsewhere.
 
 **Breaking change:** previously the launcher bound `0.0.0.0`. If you
 relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly.
+
+### Security model
+
+Supervillain has no login and no auth token — every mutation endpoint
+(archive, trash, send, RSVP, etc.) is an unauthenticated POST/PUT/DELETE.
+That's fine for a loopback-only server nothing else can reach, but any page
+open in the same browser could otherwise try to forge those requests.
+
+To stop that, every state-changing request is checked against the
+`Sec-Fetch-Site` header browsers attach to fetches and form submissions — a
+header pages cannot set or spoof themselves. A cross-site (or same-site,
+i.e. a different origin) request is rejected with `403`; `same-origin` and
+`none` (a typed URL, bookmark, or other direct navigation) are allowed. If a
+client sends no fetch metadata at all, the `Origin` header is checked
+instead against `127.0.0.1`/`localhost` and any hosts listed in
+`SUPERVILLAIN_ALLOWED_HOSTS`. If neither header is present — curl, scripts,
+and other non-browser clients — the request goes through unchanged, since
+there's no origin to distrust. `GET`/`HEAD` requests are never affected.
+
+This closes cross-site request forgery without any token plumbing, at the
+cost of trusting the browser to stamp fetch metadata honestly (every modern
+browser does).
 
 ## Search syntax
 

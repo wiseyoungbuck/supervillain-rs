@@ -142,7 +142,136 @@ pub fn compression_layer() -> tower_http::compression::CompressionLayer {
     CompressionLayer::new().gzip(true).no_br().no_deflate()
 }
 
+// =============================================================================
+// Cross-site mutation guard (kata mbxt)
+// =============================================================================
+//
+// Mutation endpoints (POST/PUT/DELETE) carry no auth token of their own — the
+// only thing between an unrelated page the user has open and a POST to this
+// local server is the browser's same-origin machinery. Every fetch/form
+// submission a browser makes is stamped with `Sec-Fetch-Site`, added by the
+// browser itself after the request leaves script, so a page cannot forge it.
+// Trusting that header closes cross-site request forgery without any token
+// plumbing. Where a client sends no fetch metadata at all (older browsers),
+// fall back to `Origin`. Where neither header is present (curl, scripts,
+// same-machine tooling) there's no origin to distrust, so the request is
+// allowed through — this guard targets browser-borne CSRF, not scripting.
+
+/// Decide whether a request is allowed through, purely from its method and
+/// the two headers describing cross-origin intent. No I/O — the router-level
+/// middleware (`cross_site_guard`) is the only caller that reads real headers.
+fn cross_site_verdict(
+    method: &axum::http::Method,
+    sec_fetch_site: Option<&str>,
+    origin: Option<&str>,
+    extra_allowed_hosts: &[String],
+) -> bool {
+    use axum::http::Method;
+    if !matches!(*method, Method::POST | Method::PUT | Method::DELETE) {
+        return true;
+    }
+    if let Some(site) = sec_fetch_site {
+        // Only same-origin (a fetch from this exact origin) and none (a
+        // user-typed URL, bookmark, or other browser-initiated navigation
+        // with no initiating page) are safe; cross-site and same-site (a
+        // sibling subdomain, still a different origin) are both rejected.
+        return site == "same-origin" || site == "none";
+    }
+    match origin {
+        Some(origin) => parse_origin_host(origin)
+            .is_some_and(|host| is_allowed_local_host(&host, extra_allowed_hosts)),
+        // Neither header present: curl, scripts, same-machine tooling. No
+        // origin to distrust, so allow through.
+        None => true,
+    }
+}
+
+/// Pull the `host[:port]` portion out of an `Origin` header value
+/// (`scheme://host[:port]`, no path). Kept as its own standalone pure
+/// function: kata 3ghj (a parallel branch) parses the same
+/// `SUPERVILLAIN_ALLOWED_HOSTS`-driven allowlist shape for Host-header
+/// middleware, and an isolated function here is what makes unifying the two
+/// trivial at merge time instead of requiring a shared type now.
+fn parse_origin_host(origin: &str) -> Option<String> {
+    let after_scheme = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// True if `host` (an already-lowercased `host[:port]`) is a local origin
+/// this server trusts: loopback (`127.0.0.1[:port]`), `localhost[:port]`, or
+/// an exact match against `extra_allowed_hosts` (the parsed
+/// `SUPERVILLAIN_ALLOWED_HOSTS` env var — e.g. a tailnet hostname).
+fn is_allowed_local_host(host: &str, extra_allowed_hosts: &[String]) -> bool {
+    let bare = host.split(':').next().unwrap_or(host);
+    if bare == "127.0.0.1" || bare == "localhost" {
+        return true;
+    }
+    extra_allowed_hosts
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Parse the comma-separated `SUPERVILLAIN_ALLOWED_HOSTS` env var into extra
+/// allowed Origin hosts. Called once per `router()` build (startup, in
+/// practice) — never per-request, so a mid-flight env change can't create a
+/// test race or a per-request syscall.
+fn parse_allowed_hosts_env(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_ascii_lowercase())
+        .collect()
+}
+
+/// Thin axum middleware wiring `cross_site_verdict` into the router. All the
+/// decision logic lives in the pure function above; this only reads the two
+/// headers off the request, calls it, and either forwards to `next` or
+/// returns a 403 naming the header that failed the check.
+async fn cross_site_guard(
+    extra_allowed_hosts: Arc<Vec<String>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let sec_fetch_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok());
+    let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+
+    if cross_site_verdict(req.method(), sec_fetch_site, origin, &extra_allowed_hosts) {
+        return next.run(req).await;
+    }
+
+    let body = match sec_fetch_site {
+        Some(site) => format!("Cross-site request rejected: Sec-Fetch-Site: {site}"),
+        None => {
+            "Cross-site request rejected: Origin header is not an allowed local host".to_string()
+        }
+    };
+    (
+        StatusCode::FORBIDDEN,
+        [("content-type", "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    // Read once per router build (startup, in practice) — never per-request;
+    // see cross_site_guard's rationale above.
+    let extra_allowed_hosts = Arc::new(parse_allowed_hosts_env(
+        std::env::var("SUPERVILLAIN_ALLOWED_HOSTS").ok().as_deref(),
+    ));
     Router::new()
         .merge(accounts::router())
         .route("/api/accounts", get(list_accounts))
@@ -250,6 +379,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/icon-180.png", get(icon_180))
         .route("/mobile/icon-192.png", get(icon_192))
         .route("/mobile/icon-512.png", get(icon_512))
+        // Must come after every .route()/.merge() above — axum only applies
+        // a layer to routes already registered at the point it's added.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let extra_allowed_hosts = extra_allowed_hosts.clone();
+                async move { cross_site_guard(extra_allowed_hosts, req, next).await }
+            },
+        ))
 }
 
 // Restrictive CSP for the app shell: defense-in-depth so that any future
@@ -14632,6 +14769,235 @@ white   = '#fdf6e3'
         };
         crate::reminders::save_settings(&path, &settings).unwrap();
         assert_eq!(crate::reminders::load_settings(&path), settings);
+    }
+
+    // =========================================================================
+    // Cross-site mutation guard (kata mbxt)
+    // =========================================================================
+
+    #[test]
+    fn cross_site_verdict_get_is_never_blocked() {
+        // GET/HEAD carry no state change, so the guard doesn't even look at
+        // the headers — a cross-site GET (e.g. an <img> tag) must load.
+        assert!(cross_site_verdict(
+            &axum::http::Method::GET,
+            Some("cross-site"),
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_blocks_cross_site_post() {
+        assert!(!cross_site_verdict(
+            &axum::http::Method::POST,
+            Some("cross-site"),
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_blocks_same_site_post() {
+        // same-site (a sibling subdomain) is NOT same-origin — reject it too.
+        assert!(!cross_site_verdict(
+            &axum::http::Method::POST,
+            Some("same-site"),
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_allows_same_origin_post() {
+        assert!(cross_site_verdict(
+            &axum::http::Method::POST,
+            Some("same-origin"),
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_allows_none_post() {
+        // "none" = user-typed URL / bookmark / browser-initiated navigation.
+        assert!(cross_site_verdict(
+            &axum::http::Method::POST,
+            Some("none"),
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_falls_back_to_origin_when_metadata_absent() {
+        assert!(!cross_site_verdict(
+            &axum::http::Method::PUT,
+            None,
+            Some("http://evil.example"),
+            &[],
+        ));
+        assert!(cross_site_verdict(
+            &axum::http::Method::PUT,
+            None,
+            Some("http://127.0.0.1:8000"),
+            &[],
+        ));
+        assert!(cross_site_verdict(
+            &axum::http::Method::PUT,
+            None,
+            Some("http://localhost:8000"),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_origin_honors_extra_allowed_hosts() {
+        let extra = vec!["mail.tailnet.example".to_string()];
+        assert!(cross_site_verdict(
+            &axum::http::Method::DELETE,
+            None,
+            Some("https://mail.tailnet.example"),
+            &extra,
+        ));
+        assert!(!cross_site_verdict(
+            &axum::http::Method::DELETE,
+            None,
+            Some("https://other.tailnet.example"),
+            &extra,
+        ));
+    }
+
+    #[test]
+    fn cross_site_verdict_allows_when_no_metadata_and_no_origin() {
+        // curl / scripts: no Sec-Fetch-Site, no Origin. Nothing to distrust.
+        assert!(cross_site_verdict(
+            &axum::http::Method::DELETE,
+            None,
+            None,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn parse_origin_host_strips_scheme_and_path() {
+        assert_eq!(
+            parse_origin_host("http://127.0.0.1:8000"),
+            Some("127.0.0.1:8000".to_string())
+        );
+        assert_eq!(
+            parse_origin_host("https://Evil.Example/path?x=1"),
+            Some("evil.example".to_string())
+        );
+        assert_eq!(parse_origin_host(""), None);
+    }
+
+    #[test]
+    fn parse_allowed_hosts_env_splits_and_trims() {
+        assert_eq!(
+            parse_allowed_hosts_env(Some(" Foo.example , bar.example ,,")),
+            vec!["foo.example".to_string(), "bar.example".to_string()]
+        );
+        assert_eq!(parse_allowed_hosts_env(None), Vec::<String>::new());
+        assert_eq!(parse_allowed_hosts_env(Some("")), Vec::<String>::new());
+    }
+
+    // ---- HTTP boundary: real router, real 403 (kata mbxt) ----
+
+    #[tokio::test]
+    async fn post_with_cross_site_fetch_metadata_is_rejected() {
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/emails/e1/mark-read")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("Sec-Fetch-Site"),
+            "403 body must name the offending header, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_with_same_origin_fetch_metadata_reaches_handler() {
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/emails/e1/mark-read")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        // No account configured, so the handler itself 400s — the point is
+        // it's NOT the guard's 403.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_with_none_fetch_metadata_reaches_handler() {
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/emails/e1/mark-read")
+            .header("sec-fetch-site", "none")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_with_no_metadata_and_evil_origin_is_rejected() {
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/emails/e1/mark-read")
+            .header("origin", "http://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("Origin"),
+            "403 body must explain the Origin rejection, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_with_no_metadata_and_no_origin_reaches_handler() {
+        // curl/scripts: neither header present at all.
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/emails/e1/mark-read")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_with_cross_site_fetch_metadata_is_not_blocked() {
+        let state = Arc::new(test_state(&[], ""));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/accounts")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 
