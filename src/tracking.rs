@@ -249,9 +249,19 @@ mod tests {
 
     const BASE: &str = "https://mail.example.com";
 
+    // Store backed by a per-test tempdir: track_outgoing() persists via
+    // save(), and a fixed /tmp path would leak the file after the run and
+    // collide with other users' test runs on a shared machine. The TempDir
+    // must stay bound in the test so the dir outlives the store.
+    fn temp_store() -> (tempfile::TempDir, TrackingStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TrackingStore::new(dir.path().join("tracking.json"));
+        (dir, store)
+    }
+
     #[test]
     fn injected_pixel_is_unique_per_send() {
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-unique.json"));
+        let (_dir, store) = temp_store();
         let mut first = submission(Some("<p>hi</p>"));
         let mut second = submission(Some("<p>hi</p>"));
         track_outgoing(&store, BASE, "acct", &mut first).unwrap();
@@ -279,7 +289,7 @@ mod tests {
         // The daemon may re-enter the send path for a queued submission that
         // was already pixeled at enqueue time — the body must not grow a
         // second pixel and the store must not grow a second record.
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-idem.json"));
+        let (_dir, store) = temp_store();
         let mut sub = submission(Some("<p>hi</p>"));
         track_outgoing(&store, BASE, "acct", &mut sub).unwrap();
         let once = sub.html_body.clone().unwrap();
@@ -299,7 +309,7 @@ mod tests {
 
     #[test]
     fn text_only_sends_are_never_tracked() {
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-text.json"));
+        let (_dir, store) = temp_store();
         let mut sub = submission(None);
         track_outgoing(&store, BASE, "acct", &mut sub).unwrap();
         assert_eq!(sub.html_body, None, "no HTML body may be fabricated");
@@ -358,7 +368,7 @@ mod tests {
 
     #[test]
     fn opens_append_per_event_and_unknown_tokens_record_nothing() {
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-opens.json"));
+        let (_dir, store) = temp_store();
         let mut sub = submission(Some("<p>hi</p>"));
         track_outgoing(&store, BASE, "acct", &mut sub).unwrap();
         let token = extract_token(sub.html_body.as_deref().unwrap()).unwrap();
@@ -373,7 +383,7 @@ mod tests {
 
     #[test]
     fn email_id_attaches_after_dispatch() {
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-emailid.json"));
+        let (_dir, store) = temp_store();
         let mut sub = submission(Some("<p>hi</p>"));
         track_outgoing(&store, BASE, "acct", &mut sub).unwrap();
         let token = extract_token(sub.html_body.as_deref().unwrap()).unwrap();
@@ -398,7 +408,7 @@ mod tests {
 
     #[test]
     fn records_list_most_recent_first() {
-        let store = TrackingStore::new(PathBuf::from("/tmp/e2h4-order.json"));
+        let (_dir, store) = temp_store();
         let now = Utc::now();
         for (token, age_mins) in [("a", 30i64), ("b", 10), ("c", 20)] {
             store.insert(TrackedSend {

@@ -30,9 +30,47 @@ const fs = require('node:fs');
 // A temp config dir so the server boots with NO real accounts. The app's
 // first-run path (no accounts) lands in settings; we then mock /api/accounts
 // to inject fixture accounts before the app reads them.
+//
+// Lifecycle (the dir must not outlive the run in ANY end state):
+//   - success/failure: tests/e2e/global-teardown.cjs removes the dir recorded
+//     in SV_E2E_CONFIG_DIR (Playwright runs globalTeardown on both).
+//   - hung/SIGKILLed run (teardown never fires): the next run's
+//     sweepStaleConfigDirs() removes any sv-e2e-* dir older than 2 hours —
+//     far longer than a healthy run of this fast sequential suite.
+//   - worker processes: they re-evaluate this config but never launch the
+//     webServer, so they must not mkdtemp at all (this used to leak one
+//     empty dir per worker per run).
+const CONFIG_DIR_STALE_MS = 2 * 60 * 60 * 1000;
+
+function sweepStaleConfigDirs() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(os.tmpdir());
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!name.startsWith('sv-e2e-')) continue;
+    const dir = path.join(os.tmpdir(), name);
+    try {
+      const st = fs.statSync(dir);
+      if (Date.now() - st.mtimeMs > CONFIG_DIR_STALE_MS) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // Another user's dir (EACCES) or removed mid-scan — never abort the run.
+    }
+  }
+}
+
 function tempConfigDir() {
+  // Workers evaluate the config but never start the webServer; only the
+  // runner needs (and should clean up) a real config dir.
+  if (process.env.TEST_WORKER_INDEX !== undefined) return os.tmpdir();
+  sweepStaleConfigDirs();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sv-e2e-'));
   fs.mkdirSync(path.join(dir, 'supervillain'), { recursive: true });
+  process.env.SV_E2E_CONFIG_DIR = dir; // consumed by global-teardown.cjs
   return dir;
 }
 
@@ -81,6 +119,7 @@ function workspaceBinary() {
 
 module.exports = defineConfig({
   testDir: './tests/e2e',
+  globalTeardown: require.resolve('./tests/e2e/global-teardown.cjs'),
   fullyParallel: false, // one server at a time; specs are fast and sequential
   // Note: the app logs provider warnings on an empty config during boot;
   // that's expected and specs must not assert console silence.

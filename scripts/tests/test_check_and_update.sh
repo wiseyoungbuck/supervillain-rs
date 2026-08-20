@@ -7,6 +7,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 
+# run_test tears down per test; this trap covers a set -e abort (or Ctrl-C)
+# mid-test, which would otherwise leak the current $TMP.
+trap 'rm -rf "${TMP:-}"' EXIT
+
 setup() {
     TMP="$(mktemp -d)"
     BIN="$TMP/bin"

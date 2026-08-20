@@ -746,7 +746,10 @@ mod tests {
         }))
     }
 
-    fn make_gmail_session() -> ProviderSession {
+    // Returns the TempDir alongside the session: the caller must keep it
+    // bound so the token dir lives for the test and is removed on drop
+    // (success or panic) instead of leaking into /tmp.
+    fn make_gmail_session() -> (tempfile::TempDir, ProviderSession) {
         let dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn TokenStore> = Arc::new(FsTokenStore::new(dir.path().to_path_buf()));
         // Seed a token file so the session has something to load
@@ -763,9 +766,7 @@ mod tests {
             .unwrap();
         let session = crate::gmail::load_session(store, "gmail", "client-id", "client-secret")
             .expect("session should load");
-        // Keep tempdir alive for the test (intentional leak; tests are short-lived)
-        std::mem::forget(dir);
-        ProviderSession::Gmail(Box::new(session))
+        (dir, ProviderSession::Gmail(Box::new(session)))
     }
 
     #[test]
@@ -782,13 +783,13 @@ mod tests {
 
     #[test]
     fn username_returns_gmail_email() {
-        let s = make_gmail_session();
+        let (_dir, s) = make_gmail_session();
         assert_eq!(s.username(), "user@gmail.com");
     }
 
     #[test]
     fn provider_name_gmail() {
-        let s = make_gmail_session();
+        let (_dir, s) = make_gmail_session();
         assert_eq!(s.provider_name(), "gmail");
     }
 
@@ -800,7 +801,7 @@ mod tests {
 
     #[test]
     fn sends_rsvp_automatically_true_for_gmail() {
-        let s = make_gmail_session();
+        let (_dir, s) = make_gmail_session();
         assert!(s.sends_rsvp_automatically());
     }
 
@@ -842,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_draft_rejected_for_gmail() {
-        let s = make_gmail_session();
+        let (_dir, s) = make_gmail_session();
         let err = create_draft(&s, &draft_submission(), "me@gmail.com")
             .await
             .expect_err("gmail must reject draft creation in v1");
@@ -860,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_draft_rejected_for_gmail() {
-        let s = make_gmail_session();
+        let (_dir, s) = make_gmail_session();
         let err = destroy_draft(&s, "draft-1")
             .await
             .expect_err("gmail must reject draft destroy in v1");

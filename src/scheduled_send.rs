@@ -295,9 +295,19 @@ mod tests {
         assert_eq!(restored, value);
     }
 
+    // Store backed by a per-test tempdir: a fixed /tmp path would collide
+    // with other users' test runs on a shared machine (and leak if a future
+    // change makes these paths ever get written). The TempDir must stay
+    // bound in the test so the dir outlives the store.
+    fn temp_store() -> (tempfile::TempDir, ScheduledSendStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ScheduledSendStore::new(dir.path().join("scheduled-sends.json"));
+        (dir, store)
+    }
+
     #[test]
     fn store_due_filters_and_orders_by_send_at() {
-        let store = ScheduledSendStore::new(PathBuf::from("/tmp/vj6k-due.json"));
+        let (_dir, store) = temp_store();
         let now = Utc::now();
         // Inserted out of order: due records must come back ordered by
         // send_at, and not-yet-due records must not leak into the due list.
@@ -324,7 +334,7 @@ mod tests {
 
     #[test]
     fn cancel_before_due_removes_the_record_and_returns_it() {
-        let store = ScheduledSendStore::new(PathBuf::from("/tmp/vj6k-cancel.json"));
+        let (_dir, store) = temp_store();
         let now = Utc::now();
         store.insert(record("undo-me", now + Duration::seconds(15)));
         let cancelled = store.remove("undo-me").expect("record must come back");
@@ -338,7 +348,7 @@ mod tests {
         // Perf budget from the plan table: one daemon tick scan over 10,000
         // queued sends < 50ms. Locally this is well under 5ms; the budget
         // leaves ~10x headroom for CI. Synthetic records, no I/O.
-        let store = ScheduledSendStore::new(PathBuf::from("/tmp/vj6k-perf.json"));
+        let (_dir, store) = temp_store();
         let now = Utc::now();
         for i in 0..10_000 {
             store.insert(record(
