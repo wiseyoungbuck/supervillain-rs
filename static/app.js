@@ -5605,18 +5605,23 @@ function startCompose() {
 // bcc is parsed but unused: the compose UI has no bcc field, and folding
 // bcc into cc would expose recipients the sender meant to hide.
 function parseMailtoUrl(url) {
+    // decodeURIComponent throws URIError on malformed percent-encoding
+    // (e.g. mailto:a%zz@b), and by parse time the server slot is already
+    // consumed — an uncaught throw here would silently lose the compose.
+    // Fall back to the raw string instead (roborev 542 #3).
+    const decode = s => { try { return decodeURIComponent(s); } catch { return s; } };
     const rest = url.slice('mailto:'.length);
     const qIdx = rest.indexOf('?');
     const addrPart = qIdx === -1 ? rest : rest.slice(0, qIdx);
     const splitAddrs = s => s.split(',').map(a => a.trim()).filter(Boolean);
     const out = { to: [], cc: [], subject: '', body: '' };
-    if (addrPart) out.to = splitAddrs(decodeURIComponent(addrPart));
+    if (addrPart) out.to = splitAddrs(decode(addrPart));
     if (qIdx === -1) return out;
     for (const pair of rest.slice(qIdx + 1).split('&')) {
         if (!pair) continue;
         const eq = pair.indexOf('=');
-        const key = decodeURIComponent(eq === -1 ? pair : pair.slice(0, eq)).toLowerCase();
-        const value = eq === -1 ? '' : decodeURIComponent(pair.slice(eq + 1));
+        const key = decode(eq === -1 ? pair : pair.slice(0, eq)).toLowerCase();
+        const value = eq === -1 ? '' : decode(pair.slice(eq + 1));
         if (key === 'to') out.to.push(...splitAddrs(value));
         else if (key === 'cc') out.cc.push(...splitAddrs(value));
         else if (key === 'subject') out.subject = value;
@@ -5633,7 +5638,10 @@ function parseMailtoUrl(url) {
 async function consumePendingMailto() {
     let url;
     try {
-        ({ url } = await fetch('/api/mailto/pending').then(r => r.json()));
+        // POST: the consume mutates server state, so it must go through
+        // the cross-site mutation guard like every other mutation.
+        ({ url } = await fetch('/api/mailto/pending', { method: 'POST' })
+            .then(r => r.json()));
     } catch {
         return; // unreachable/misparsed — nothing to deliver
     }

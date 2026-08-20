@@ -395,7 +395,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/identities", get(list_identities))
         .route("/api/theme", get(get_theme))
         .route("/api/mailto", post(set_pending_mailto))
-        .route("/api/mailto/pending", get(take_pending_mailto))
+        // POST, not GET: the consume mutates state (take), and only
+        // POST/PUT/DELETE pass through the cross-site mutation guard — a
+        // GET here could be drained cross-site via <img> (roborev 542 #2).
+        .route("/api/mailto/pending", post(take_pending_mailto))
         .route("/api/mailboxes", get(list_mailboxes))
         .route("/api/emails", get(list_emails))
         .route("/api/upload", post(upload_blob))
@@ -3844,12 +3847,27 @@ mod tests {
         let response = router(state.clone()).oneshot(post).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // The consume is state-mutating, so it must be POST: GET would slip
+        // past the cross-site mutation guard, letting a cross-site page
+        // silently drain the slot via <img src=...> (roborev 542 #2).
         let pending = || {
             Request::builder()
+                .method("POST")
                 .uri("/api/mailto/pending")
                 .body(Body::empty())
                 .unwrap()
         };
+        let get_pending = Request::builder()
+            .uri("/api/mailto/pending")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state.clone()).oneshot(get_pending).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GET must not consume the slot — it bypasses the mutation guard"
+        );
+
         let response = router(state.clone()).oneshot(pending()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -3883,6 +3901,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let pending = Request::builder()
+            .method("POST")
             .uri("/api/mailto/pending")
             .body(Body::empty())
             .unwrap();
@@ -3920,6 +3939,11 @@ mod tests {
             block.contains("startCompose()"),
             "a delivered mailto must open a fresh compose via startCompose"
         );
+        assert!(
+            block.contains("method: 'POST'"),
+            "the consume must be a POST — the endpoint mutates (take), and \
+             GET would bypass the cross-site mutation guard (roborev 542 #2)"
+        );
     }
 
     #[test]
@@ -3936,6 +3960,13 @@ mod tests {
         assert!(
             block.contains("decodeURIComponent"),
             "hvalues are percent-encoded (RFC 6068) and must be decoded"
+        );
+        assert!(
+            block.contains("catch"),
+            "the decode must be guarded: decodeURIComponent throws URIError \
+             on malformed percent-encoding, and by parse time the slot is \
+             already consumed — a throw silently loses the compose \
+             (roborev 542 #3)"
         );
         assert!(
             !block.contains("URLSearchParams"),
