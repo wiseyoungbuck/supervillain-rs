@@ -32,8 +32,9 @@ const fs = require('node:fs');
 // to inject fixture accounts before the app reads them.
 //
 // Lifecycle (the dir must not outlive the run in ANY end state):
-//   - success/failure: tests/e2e/global-teardown.cjs removes the dir recorded
-//     in SV_E2E_CONFIG_DIR (Playwright runs globalTeardown on both).
+//   - success/failure: tests/e2e/global-teardown.cjs recovers the dir from
+//     config.webServer.env.XDG_CONFIG_HOME and removes it (Playwright runs
+//     globalTeardown on both).
 //   - hung/SIGKILLed run (teardown never fires): the next run's
 //     sweepStaleConfigDirs() removes any sv-e2e-* dir older than 2 hours —
 //     far longer than a healthy run of this fast sequential suite.

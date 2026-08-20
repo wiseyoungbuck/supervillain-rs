@@ -12,14 +12,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 module.exports = async (config) => {
-  const servers = [config.webServer].flat().filter(Boolean);
-  for (const server of servers) {
-    const dir = server.env && server.env.XDG_CONFIG_HOME;
-    if (!dir || !path.basename(dir).startsWith('sv-e2e-')) continue;
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } catch {
-      // Best effort — the stale sweep on the next run is the backstop.
-    }
+  // Single-server form on purpose: FullConfig.webServer is null when the
+  // user config supplies an ARRAY of webServers (Playwright keeps those in
+  // an internal field), so an array-handling loop here would be illusory.
+  // If this suite ever grows multiple webServers, their dirs fall through
+  // to the stale sweep until this teardown learns the new shape.
+  const dir = config.webServer && config.webServer.env
+    && config.webServer.env.XDG_CONFIG_HOME;
+  if (!dir || !path.basename(dir).startsWith('sv-e2e-')) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Best effort — the stale sweep on the next run is the backstop.
   }
 };
