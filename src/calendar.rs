@@ -546,6 +546,13 @@ impl VtimezoneRule {
                 let (Some(std_month), Some(dst_month)) = (std.start_month, dst.start_month) else {
                     return Some(std.offset);
                 };
+                // Degenerate: both transitions claim the same month. No
+                // month can distinguish them, so fall back to STANDARD like
+                // the missing-BYMONTH case (rather than the wrap-around arm
+                // treating every month as daylight).
+                if dst_month == std_month {
+                    return Some(std.offset);
+                }
                 let month = dt.month();
                 let in_daylight = if dst_month < std_month {
                     month >= dst_month && month < std_month
@@ -602,9 +609,11 @@ fn extract_sub_block_transition(tz_block: &str, sub_name: &str) -> Option<TzTran
     let sub_block = &tz_block[start..start + end];
     let offset_str = extract_property(sub_block, "TZOFFSETTO")?;
     let offset = parse_utc_offset(&offset_str)?;
+    // BYMONTH may legally be a comma-separated list; a VTIMEZONE transition
+    // has a single start month, so take the first element.
     let start_month = extract_property(sub_block, "RRULE")
         .and_then(|rrule| extract_param_from_str(&rrule, "BYMONTH"))
-        .and_then(|m| m.parse::<u32>().ok())
+        .and_then(|m| m.split(',').next()?.parse::<u32>().ok())
         .filter(|m| (1..=12).contains(m));
     Some(TzTransition {
         offset,
@@ -732,6 +741,11 @@ fn resolve_local_datetime_lenient<TZ: TimeZone>(
 /// Extract a parameter value from the params portion of an ICS property line.
 /// e.g. extract_param_from_str("TZID=America/New_York;VALUE=DATE-TIME", "TZID")
 /// returns Some("America/New_York")
+///
+/// Splitting is not quote-aware: a quoted value *containing* `;` or `:`
+/// (which RFC 5545 quoting exists to permit) would be cut short. Callers
+/// trim surrounding quotes from plain quoted values (`TZID="Europe/London"`),
+/// which is the only quoted form known producers emit for TZID.
 fn extract_param_from_str(params: &str, param_name: &str) -> Option<String> {
     let search = format!("{param_name}=");
     let pos = params.find(&search)?;
@@ -3074,6 +3088,42 @@ END:VCALENDAR";
         let winter = ics_template.replace("DATEVAL", "20261215T100000");
         let event = parse_ics(&winter, primary_tz).unwrap();
         assert_eq!(event.dtstart.to_rfc3339(), "2026-12-15T16:00:00+00:00");
+    }
+
+    #[test]
+    fn vtimezone_rule_equal_transition_months_falls_back_to_standard() {
+        // Degenerate VTIMEZONE where both transitions claim the same month:
+        // no month can tell them apart, so STANDARD must win — the
+        // wrap-around arm would otherwise mark every month as daylight.
+        let rule = VtimezoneRule {
+            standard: Some(TzTransition {
+                offset: FixedOffset::east_opt(-6 * 3600).unwrap(),
+                start_month: Some(3),
+            }),
+            daylight: Some(TzTransition {
+                offset: FixedOffset::east_opt(-5 * 3600).unwrap(),
+                start_month: Some(3),
+            }),
+        };
+        let dt = NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        assert_eq!(rule.offset_at(&dt).unwrap().local_minus_utc(), -6 * 3600);
+    }
+
+    #[test]
+    fn extract_sub_block_transition_bymonth_list_uses_first_element() {
+        // RRULE BYMONTH may legally be a comma-separated list; the first
+        // element is the transition's start month.
+        let tz_block = "\
+BEGIN:STANDARD\r\n\
+TZOFFSETTO:-0600\r\n\
+RRULE:FREQ=YEARLY;BYDAY=1SU;BYMONTH=11,12\r\n\
+END:STANDARD";
+        let transition = extract_sub_block_transition(tz_block, "STANDARD").unwrap();
+        assert_eq!(transition.start_month, Some(11));
+        assert_eq!(transition.offset.local_minus_utc(), -6 * 3600);
     }
 
     #[test]
