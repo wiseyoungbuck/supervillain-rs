@@ -357,6 +357,7 @@ All optional when using the config file.
 | `XDG_CONFIG_HOME` | Config directory (default: `~/.config`) |
 | `RUST_LOG` | Log level (`info`, `debug`, `supervillain=debug`) |
 | `SUPERVILLAIN_BIND` | Server bind address (default: `127.0.0.1:8000`, loopback-only) |
+| `SUPERVILLAIN_ALLOWED_HOSTS` | Comma-separated extra `Host` headers to accept, beyond the bind address and `localhost` (e.g. a tailnet MagicDNS name) |
 
 ### Serving over the tailnet (HTTPS)
 
@@ -381,6 +382,17 @@ valid cert — no port-forwarding, no `0.0.0.0` bind. Serve must be enabled
 once for the tailnet in the Tailscale admin console; the CLI prints the
 enablement link if it isn't.
 
+Supervillain rejects any request whose `Host` header isn't recognized (DNS
+rebinding defense — see below), so once you're serving over a tailnet name
+you also need to allowlist it:
+
+```sh
+SUPERVILLAIN_ALLOWED_HOSTS=<host>.<tailnet>.ts.net supervillain
+```
+
+Without this, requests arriving via `tailscale serve` get `421 Misdirected
+Request` — the server doesn't yet know that hostname is you.
+
 Not on Tailscale? Any TLS-terminating reverse proxy works, e.g.
 [Caddy](https://caddyserver.com/):
 
@@ -390,8 +402,18 @@ mail.example.com {
 }
 ```
 
+Set `SUPERVILLAIN_ALLOWED_HOSTS=mail.example.com` the same way.
+
 Nothing in Supervillain assumes Tailscale — both of these just describe
 ways to reach a loopback-only server from elsewhere.
+
+**Why the Host allowlist exists:** DNS rebinding lets a malicious website
+point its own domain's DNS record at `127.0.0.1`; the victim's browser then
+treats requests to that domain as reaching this server, same-origin, and
+CORS protects nothing. The rebound request still carries the attacker's
+hostname in `Host`, so an allowlist rejects it outright. Chrome's Private
+Network Access checks mitigate this; Firefox does not, so the allowlist is
+the actual defense, not a Chrome-only nicety.
 
 **Breaking change:** previously the launcher bound `0.0.0.0`. If you
 relied on LAN exposure, set `SUPERVILLAIN_BIND=0.0.0.0:8000` explicitly.
