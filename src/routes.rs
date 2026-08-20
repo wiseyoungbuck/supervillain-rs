@@ -250,6 +250,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/mobile/icon-180.png", get(icon_180))
         .route("/mobile/icon-192.png", get(icon_192))
         .route("/mobile/icon-512.png", get(icon_512))
+        .layer(axum::middleware::from_fn(security_headers_mw))
 }
 
 // Restrictive CSP for the app shell: defense-in-depth so that any future
@@ -272,7 +273,44 @@ const APP_CSP: &str = "default-src 'self'; \
     frame-src 'self'; \
     object-src 'none'; \
     base-uri 'none'; \
-    form-action 'self'";
+    form-action 'self'; \
+    frame-ancestors 'none'";
+
+/// Defense-in-depth response headers (kata pkyt), applied uniformly to the
+/// app shell AND every /api/* response by the single middleware layer below
+/// — the same "headers are data" idiom APP_CSP and html_headers already use
+/// in this file.
+///
+/// - X-Content-Type-Options: nosniff — stops the browser from MIME-sniffing
+///   a response into something more dangerous than its declared content-type.
+/// - Referrer-Policy: no-referrer — this app is typically served over a
+///   private Tailscale ts.net URL (see README, "Serving over the tailnet");
+///   without this, clicking a link inside a rendered email body leaks that
+///   private URL to the destination site via the Referer header.
+/// - Cross-Origin-Resource-Policy: same-origin — blocks other origins from
+///   loading this app's responses cross-site (Spectre-style leaks, embedding).
+///
+/// Three static headers don't earn a tower_http dependency (its set-header
+/// layer isn't in Cargo.toml) — a hand-rolled `axum::middleware::from_fn` is
+/// one screen and needs no new feature flag.
+const SECURITY_HEADERS: [(&str, &str); 3] = [
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    ("cross-origin-resource-policy", "same-origin"),
+];
+
+async fn security_headers_mw(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    for (name, value) in SECURITY_HEADERS {
+        response
+            .headers_mut()
+            .insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    response
+}
 
 fn html_headers() -> [(&'static str, &'static str); 3] {
     // no-cache: the app shell (index.html + app.js + style.css + api.js) is
@@ -10879,6 +10917,84 @@ white   = '#fdf6e3'
             .to_str()
             .unwrap();
         assert!(csp.contains("script-src 'self'"));
+    }
+
+    // kata pkyt: defense-in-depth response headers, applied uniformly to the
+    // app shell and every /api/* response by a single middleware layer (see
+    // SECURITY_HEADERS). Routed through the real router (not the bare
+    // handler fns) because the headers are added by that layer, not by the
+    // individual handlers.
+    #[tokio::test]
+    async fn security_headers_present_on_app_shell_and_api_routes() {
+        let state = Arc::new(test_state(&["known"], "known"));
+        for (label, uri) in [
+            ("desktop shell", "/"),
+            ("mobile shell", "/mobile"),
+            ("mobile app.js", "/mobile/app.js"),
+            ("mobile manifest", "/mobile/manifest.json"),
+            ("api build-id", "/api/build-id"),
+        ] {
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            let headers = response.headers();
+            assert_eq!(
+                headers
+                    .get("x-content-type-options")
+                    .map(|v| v.to_str().unwrap()),
+                Some("nosniff"),
+                "{label} ({uri}) must set X-Content-Type-Options: nosniff"
+            );
+            assert_eq!(
+                headers.get("referrer-policy").map(|v| v.to_str().unwrap()),
+                Some("no-referrer"),
+                "{label} ({uri}) must set Referrer-Policy: no-referrer — otherwise the \
+                 private ts.net tailnet URL leaks via the Referer header when a link \
+                 inside an email body is clicked"
+            );
+            assert_eq!(
+                headers
+                    .get("cross-origin-resource-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("same-origin"),
+                "{label} ({uri}) must set Cross-Origin-Resource-Policy: same-origin"
+            );
+        }
+    }
+
+    // kata pkyt: frame-ancestors 'none' blocks clickjacking (this app being
+    // framed by someone else's page). CRITICAL: append-only — every
+    // pre-existing directive must survive byte-identical, since the
+    // sandboxed email iframe and img-src rules are load-bearing.
+    #[tokio::test]
+    async fn csp_gains_frame_ancestors_none_without_touching_existing_directives() {
+        let resp = index_html().await.into_response();
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("index.html must set Content-Security-Policy")
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "CSP must add frame-ancestors 'none' to block clickjacking"
+        );
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self'",
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data: https: http:",
+            "font-src 'self' data:",
+            "connect-src 'self'",
+            "frame-src 'self'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'self'",
+        ] {
+            assert!(
+                csp.contains(directive),
+                "pre-existing CSP directive {directive:?} must remain byte-identical"
+            );
+        }
     }
 
     #[test]
