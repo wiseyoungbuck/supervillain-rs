@@ -482,9 +482,13 @@ pub async fn get_identity_for_email(
     email: &str,
 ) -> Result<Option<String>, Error> {
     let identities = get_identities(s).await?;
+    // Exact identity first; a catch-all wildcard identity ("*@domain",
+    // Fastmail's model for managed alias domains) covers the rest of its
+    // domain's local parts.
     let found = identities
         .iter()
         .find(|i| i.email.eq_ignore_ascii_case(email))
+        .or_else(|| identities.iter().find(|i| i.matches_address(email)))
         .map(|i| i.id.clone());
     Ok(found)
 }

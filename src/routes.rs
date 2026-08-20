@@ -803,7 +803,9 @@ struct AttendeeResolution {
 }
 
 /// Merge the login username with the account's sending identities into the
-/// list of addresses that all mean "this user". Fastmail aliases on other
+/// list of address patterns that all mean "this user" — exact addresses or
+/// Fastmail catch-all wildcards ("*@domain"), matched via
+/// `types::address_matches_pattern`. Fastmail aliases on other
 /// managed domains (e.g. @mattcoburn.ai, @mattgpt.ai) are separate JMAP
 /// identities, and invites addressed to them must resolve to the alias, not
 /// the login address. The username stays first — callers use it as the
@@ -839,10 +841,12 @@ fn attendee_email_for_event(
     // "Is this address the user" — any of the login username or the
     // account's sending identities, so invites addressed to aliases on other
     // Fastmail-managed domains resolve to the alias, not another guest.
+    // Entries may be wildcard patterns ("*@mattcoburn.ai") — Fastmail's
+    // model for catch-all domains.
     let is_user = |address: &str| {
         user_addresses
             .iter()
-            .any(|known| known.eq_ignore_ascii_case(address))
+            .any(|known| crate::types::address_matches_pattern(address, known))
     };
 
     // Multi-guest invites routinely put every attendee in To. Prefer the
@@ -865,7 +869,7 @@ fn attendee_email_for_event(
         event
             .attendees
             .iter()
-            .find(|attendee| attendee.email.eq_ignore_ascii_case(known))
+            .find(|attendee| crate::types::address_matches_pattern(&attendee.email, known))
     }) {
         return Some(AttendeeResolution {
             email: attendee.email.clone(),
@@ -930,7 +934,7 @@ fn invite_list_fields(
     // alias must not render RSVP buttons back at them.
     let organized_by_user = user_addresses
         .iter()
-        .any(|known| event.organizer_email.eq_ignore_ascii_case(known));
+        .any(|known| crate::types::address_matches_pattern(&event.organizer_email, known));
     if method != "REQUEST" || organized_by_user {
         return fields;
     }
