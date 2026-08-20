@@ -2587,6 +2587,66 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn update_partstat_inserts_param_when_attendee_line_has_none() {
+        // RFC 5545 §3.2.12: an ATTENDEE with no PARTSTAT param defaults to
+        // NEEDS-ACTION, and real-world invites do omit it. A replace-only
+        // update silently no-ops on such a line, so the RSVP never reaches
+        // the stored calendar copy — the "Maybe doesn't update my calendar"
+        // symptom with nothing in the logs.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\n\
+                   ATTENDEE;CN=Matt;RSVP=TRUE:mailto:matt@mattcoburn.ai\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let result = update_partstat(ics, "matt@mattcoburn.ai", &RsvpStatus::Tentative);
+        let line = result
+            .lines()
+            .find(|l| l.contains("mailto:matt@mattcoburn.ai"))
+            .expect("attendee line must survive");
+        assert!(
+            line.contains("PARTSTAT=TENTATIVE"),
+            "PARTSTAT must be inserted when the invite omitted it: {line}"
+        );
+        assert!(
+            line.contains("CN=Matt") && line.contains("RSVP=TRUE"),
+            "existing params must survive the insertion: {line}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_insertion_only_touches_attendee_properties() {
+        // The insertion path must not fire on non-ATTENDEE lines that happen
+        // to mention the address (ORGANIZER, X-props, DESCRIPTION).
+        let ics = "ORGANIZER:mailto:matt@mattgpt.ai\r\n\
+                   DESCRIPTION:contact mailto:matt@mattgpt.ai\r\n\
+                   ATTENDEE:mailto:matt@mattgpt.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("ORGANIZER:mailto:matt@mattgpt.ai"),
+            "ORGANIZER must be untouched: {result}"
+        );
+        assert!(
+            result.contains("DESCRIPTION:contact mailto:matt@mattgpt.ai"),
+            "DESCRIPTION must be untouched: {result}"
+        );
+        assert!(
+            result.contains("ATTENDEE;PARTSTAT=TENTATIVE:mailto:matt@mattgpt.ai"),
+            "the bare ATTENDEE must gain the param: {result}"
+        );
+    }
+
+    #[test]
+    fn update_partstat_matches_alias_domain_attendee_case_insensitively() {
+        // Invites addressed to a Fastmail-managed alias domain arrive with
+        // whatever casing the organizer's client used; the swap must still
+        // find the line.
+        let ics = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:Matt@MattGPT.ai\r\n";
+        let result = update_partstat(ics, "matt@mattgpt.ai", &RsvpStatus::Tentative);
+        assert!(
+            result.contains("PARTSTAT=TENTATIVE"),
+            "alias attendee must be updated regardless of casing: {result}"
+        );
+    }
+
+    #[test]
     fn update_partstat_preserves_full_ics() {
         let result = update_partstat(SAMPLE_ICS, "bob@example.com", &RsvpStatus::Accepted);
         assert!(result.contains("LOCATION:Conference Room B"));

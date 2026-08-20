@@ -802,11 +802,34 @@ struct AttendeeResolution {
     plausibly_user: bool,
 }
 
+/// Merge the login username with the account's sending identities into the
+/// list of addresses that all mean "this user". Fastmail aliases on other
+/// managed domains (e.g. @mattcoburn.ai, @mattgpt.ai) are separate JMAP
+/// identities, and invites addressed to them must resolve to the alias, not
+/// the login address. The username stays first — callers use it as the
+/// fallback when no attendee matches.
+fn merge_user_addresses(username: &str, identities: &[crate::types::Identity]) -> Vec<String> {
+    let mut addresses = vec![username.to_string()];
+    for identity in identities {
+        if identity.email.is_empty() {
+            continue;
+        }
+        if !addresses
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&identity.email))
+        {
+            addresses.push(identity.email.clone());
+        }
+    }
+    addresses
+}
+
 fn attendee_email_for_event(
     email: &Email,
     event: &CalendarEvent,
-    fallback: &str,
+    user_addresses: &[String],
 ) -> Option<AttendeeResolution> {
+    let fallback = user_addresses.first().map(String::as_str).unwrap_or("");
     let recipients: Vec<&EmailAddress> = email.to.iter().chain(email.cc.iter()).collect();
     let is_attendee = |address: &str| {
         event
@@ -884,7 +907,7 @@ fn canonical_invite_status(status: &str) -> String {
 fn invite_list_fields(
     email: &Email,
     event: Option<&CalendarEvent>,
-    username: &str,
+    user_addresses: &[String],
     stored: Option<&CalendarEvent>,
 ) -> InviteListFields {
     let Some(event) = event else {
@@ -895,11 +918,12 @@ fn invite_list_fields(
         method: Some(method.clone()),
         ..InviteListFields::default()
     };
+    let username = user_addresses.first().map(String::as_str).unwrap_or("");
     if method != "REQUEST" || event.organizer_email.eq_ignore_ascii_case(username) {
         return fields;
     }
 
-    let Some(attendee) = attendee_email_for_event(email, event, username) else {
+    let Some(attendee) = attendee_email_for_event(email, event, user_addresses) else {
         return fields;
     };
     if !attendee.plausibly_user {
@@ -982,6 +1006,19 @@ async fn invite_fields_for_list(
         let session = session_lock.read().await;
         session.username().to_string()
     };
+    // Cache-only identity lookup: this function's contract is zero extra
+    // provider requests on a warm list (see the split/refresh cache tests),
+    // so no live fetch on a miss. The warmer and /api/identities keep the
+    // cache hot; a cold miss degrades to the login address, the pre-alias
+    // behavior.
+    let user_addresses = merge_user_addresses(
+        &username,
+        &state
+            .prefetch
+            .get_identities(account_id)
+            .await
+            .unwrap_or_default(),
+    );
     let primary_tz = configured_primary_tz(state);
     let events: Vec<Option<CalendarEvent>> = emails
         .iter()
@@ -995,7 +1032,7 @@ async fn invite_fields_for_list(
     let mut fields: Vec<InviteListFields> = emails
         .iter()
         .zip(events.iter())
-        .map(|(email, event)| invite_list_fields(email, event.as_ref(), &username, None))
+        .map(|(email, event)| invite_list_fields(email, event.as_ref(), &user_addresses, None))
         .collect();
 
     // A disk-restored stale snapshot exists specifically for instant first
@@ -1016,7 +1053,7 @@ async fn invite_fields_for_list(
                 fields[index] = invite_list_fields(
                     &emails[index],
                     events[index].as_ref(),
-                    &username,
+                    &user_addresses,
                     stored.as_ref(),
                 );
             }
@@ -1061,7 +1098,7 @@ async fn invite_fields_for_list(
                     fields[index] = invite_list_fields(
                         &emails[index],
                         events[index].as_ref(),
-                        &username,
+                        &user_addresses,
                         stored.as_ref(),
                     );
                 }
@@ -1623,7 +1660,19 @@ async fn get_email(
         // Set user_rsvp_status from the (now-merged) attendee list — but not on
         // an Update, where the response was intentionally reset to None.
         if event.method == "REQUEST" && !event.is_update {
-            let attendee_email = determine_attendee_email(email, &event, session.username());
+            // Cache-only identity lookup: a session read guard is held here,
+            // so a miss must NOT try to write-lock the session for a live
+            // fetch (deadlock). The warmer and /api/identities keep the cache
+            // hot; a cold miss degrades to the login address.
+            let user_addresses = merge_user_addresses(
+                session.username(),
+                &state
+                    .prefetch
+                    .get_identities(&account_key)
+                    .await
+                    .unwrap_or_default(),
+            );
+            let attendee_email = determine_attendee_email(email, &event, &user_addresses);
             if let Some(att) = event
                 .attendees
                 .iter()
@@ -2414,10 +2463,14 @@ async fn upload_blob(
     })))
 }
 
-fn determine_attendee_email(email: &Email, event: &CalendarEvent, fallback: &str) -> String {
-    attendee_email_for_event(email, event, fallback)
+fn determine_attendee_email(
+    email: &Email,
+    event: &CalendarEvent,
+    user_addresses: &[String],
+) -> String {
+    attendee_email_for_event(email, event, user_addresses)
         .map(|attendee| attendee.email)
-        .unwrap_or_else(|| fallback.to_string())
+        .unwrap_or_else(|| user_addresses.first().cloned().unwrap_or_default())
 }
 
 /// Surface a CalDAV failure from a fire-and-forget spawned calendar writer
@@ -2496,7 +2549,14 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-        determine_attendee_email(email, &event, session_guard.username())
+        // The write guard is already held, so fetch identities through it
+        // (Fastmail caches them on the session after the first call).
+        // Best-effort: a fetch failure degrades to the login address.
+        let identities = provider::get_identities(&mut session_guard)
+            .await
+            .unwrap_or_default();
+        let user_addresses = merge_user_addresses(session_guard.username(), &identities);
+        determine_attendee_email(email, &event, &user_addresses)
     };
 
     // Serialize against `get_email`'s background invite-update overwrite for
@@ -10799,6 +10859,10 @@ white   = '#fdf6e3'
     // determine_attendee_email tests
     // =========================================================================
 
+    fn user_addrs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|address| address.to_string()).collect()
+    }
+
     fn test_email_with_recipients(to: Vec<&str>, cc: Vec<&str>) -> Email {
         Email {
             id: "test-id".into(),
@@ -10868,7 +10932,12 @@ white   = '#fdf6e3'
     fn invite_list_fields_require_request_to_matching_attendee() {
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert_eq!(
             fields,
             InviteListFields {
@@ -10881,11 +10950,25 @@ white   = '#fdf6e3'
 
         let mut reply = event.clone();
         reply.method = "REPLY".into();
-        assert!(!invite_list_fields(&email, Some(&reply), "bob@example.com", None).is_invite_to_me);
+        assert!(
+            !invite_list_fields(
+                &email,
+                Some(&reply),
+                &user_addrs(&["bob@example.com"]),
+                None
+            )
+            .is_invite_to_me
+        );
 
         let not_to_me = test_calendar_event(vec!["carol@example.com"]);
         assert!(
-            !invite_list_fields(&email, Some(&not_to_me), "bob@example.com", None).is_invite_to_me
+            !invite_list_fields(
+                &email,
+                Some(&not_to_me),
+                &user_addrs(&["bob@example.com"]),
+                None
+            )
+            .is_invite_to_me
         );
     }
 
@@ -10904,7 +10987,12 @@ white   = '#fdf6e3'
         event.attendees[1].status = "NEEDS-ACTION".into();
         event.attendees[2].status = "DECLINED".into();
 
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert!(fields.is_invite_to_me);
         assert_eq!(
             fields.status.as_deref(),
@@ -10920,7 +11008,12 @@ white   = '#fdf6e3'
         let mut event = test_calendar_event(vec!["alice@example.com"]);
         event.attendees[0].status = "ACCEPTED".into();
 
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert!(
             !fields.is_invite_to_me,
             "an FYI recipient must not inherit another guest's actionable chip"
@@ -10932,7 +11025,12 @@ white   = '#fdf6e3'
     fn invite_list_fields_accepts_unambiguous_account_alias() {
         let email = test_email_with_recipients(vec!["alias@example.com"], vec![]);
         let event = test_calendar_event(vec!["alias@example.com"]);
-        let fields = invite_list_fields(&email, Some(&event), "primary@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["primary@example.com"]),
+            None,
+        );
         assert!(fields.is_invite_to_me);
     }
 
@@ -10974,7 +11072,12 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let mut event = test_calendar_event(vec!["bob@example.com"]);
         event.organizer_email = "bob@example.com".into();
-        let fields = invite_list_fields(&email, Some(&event), "bob@example.com", None);
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["bob@example.com"]),
+            None,
+        );
         assert_eq!(fields.method.as_deref(), Some("REQUEST"));
         assert!(!fields.is_invite_to_me);
         assert!(fields.status.is_none());
@@ -10986,7 +11089,12 @@ white   = '#fdf6e3'
         let incoming = test_calendar_event(vec!["bob@example.com"]);
         let mut stored = incoming.clone();
         stored.attendees[0].status = "ACCEPTED".into();
-        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        let fields = invite_list_fields(
+            &email,
+            Some(&incoming),
+            &user_addrs(&["bob@example.com"]),
+            Some(&stored),
+        );
         assert_eq!(fields.status.as_deref(), Some("ACCEPTED"));
         assert!(!fields.is_updated);
     }
@@ -11001,7 +11109,12 @@ white   = '#fdf6e3'
         incoming.sequence = 1;
         incoming.summary = "Rescheduled".into();
 
-        let fields = invite_list_fields(&email, Some(&incoming), "bob@example.com", Some(&stored));
+        let fields = invite_list_fields(
+            &email,
+            Some(&incoming),
+            &user_addrs(&["bob@example.com"]),
+            Some(&stored),
+        );
         assert!(fields.is_updated);
         assert_eq!(fields.status.as_deref(), Some("NEEDS-ACTION"));
     }
@@ -11011,7 +11124,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "bob@example.com"
         );
     }
@@ -11021,7 +11134,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec![], vec!["carol@example.com"]);
         let event = test_calendar_event(vec!["carol@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "carol@example.com"
         );
     }
@@ -11031,7 +11144,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["bob@example.com"], vec!["carol@example.com"]);
         let event = test_calendar_event(vec!["bob@example.com", "carol@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "bob@example.com"
         );
     }
@@ -11041,7 +11154,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["Bob@Example.COM"], vec![]);
         let event = test_calendar_event(vec!["bob@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "Bob@Example.COM"
         );
     }
@@ -11051,7 +11164,7 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec!["unrelated@example.com"], vec![]);
         let event = test_calendar_event(vec!["someone@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "fallback@example.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["fallback@example.com"])),
             "fallback@example.com"
         );
     }
@@ -11061,8 +11174,126 @@ white   = '#fdf6e3'
         let email = test_email_with_recipients(vec![], vec![]);
         let event = test_calendar_event(vec!["someone@example.com"]);
         assert_eq!(
-            determine_attendee_email(&email, &event, "user@fastmail.com"),
+            determine_attendee_email(&email, &event, &user_addrs(&["user@fastmail.com"])),
             "user@fastmail.com"
+        );
+    }
+
+    // =========================================================================
+    // Alias-domain identity tests: Fastmail accounts send/receive as
+    // addresses on other managed domains (e.g. @mattcoburn.ai, @mattgpt.ai),
+    // each a separate JMAP identity. Invites addressed to those aliases must
+    // resolve to the alias — for the RSVP's ATTENDEE line, the list chip,
+    // and the PARTSTAT lookup — never to another guest or the login address.
+    // =========================================================================
+
+    #[test]
+    fn merge_user_addresses_keeps_username_first_and_dedupes_case_insensitively() {
+        let identities = vec![
+            crate::types::Identity {
+                id: "i1".into(),
+                email: "Matt.Coburn@Fastmail.com".into(),
+                name: "Matt".into(),
+            },
+            crate::types::Identity {
+                id: "i2".into(),
+                email: "matt@mattcoburn.ai".into(),
+                name: "Matt".into(),
+            },
+            crate::types::Identity {
+                id: "i3".into(),
+                email: "matt@mattgpt.ai".into(),
+                name: "Matt".into(),
+            },
+        ];
+        let addresses = merge_user_addresses("matt.coburn@fastmail.com", &identities);
+        assert_eq!(
+            addresses,
+            vec![
+                "matt.coburn@fastmail.com".to_string(),
+                "matt@mattcoburn.ai".to_string(),
+                "matt@mattgpt.ai".to_string(),
+            ],
+            "username stays first (it is the fallback); identity casing duplicates collapse"
+        );
+    }
+
+    #[test]
+    fn determine_attendee_email_prefers_identity_alias_over_first_guest() {
+        // Multi-guest invite to an alias: every guest is in To, and the
+        // alias is NOT the first recipient. Resolution must pick the user's
+        // alias, not borrow the first guest's ATTENDEE line — an RSVP built
+        // from a guest's line answers on their behalf.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "matt@mattcoburn.ai"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "matt@mattcoburn.ai"]);
+        assert_eq!(
+            determine_attendee_email(
+                &email,
+                &event,
+                &user_addrs(&["matt.coburn@fastmail.com", "matt@mattcoburn.ai"]),
+            ),
+            "matt@mattcoburn.ai"
+        );
+    }
+
+    #[test]
+    fn invite_list_fields_recognizes_alias_identity_on_multi_guest_invite() {
+        // Same shape via the list chip: with the alias known as an identity
+        // the invite is unambiguously "to me" even though the login address
+        // appears nowhere, and the chip must show the alias's own status.
+        let email =
+            test_email_with_recipients(vec!["guest@example.com", "matt@mattgpt.ai"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com", "matt@mattgpt.ai"]);
+        event.attendees[0].status = "ACCEPTED".into();
+        event.attendees[1].status = "TENTATIVE".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattgpt.ai"]),
+            None,
+        );
+        assert!(fields.is_invite_to_me, "alias identity invite is to me");
+        assert_eq!(
+            fields.status.as_deref(),
+            Some("TENTATIVE"),
+            "the chip must show the alias's status, not the first guest's"
+        );
+    }
+
+    #[test]
+    fn attendee_email_for_event_resolves_bcc_delivered_alias_from_ics() {
+        // Bcc delivery: To/Cc never mention the user, but the ICS names the
+        // alias explicitly. The identity list is what makes the ICS attendee
+        // recognizable as "me".
+        let email = test_email_with_recipients(vec!["list@example.com"], vec![]);
+        let event = test_calendar_event(vec!["guest@example.com", "matt@mattgpt.ai"]);
+        let resolution = attendee_email_for_event(
+            &email,
+            &event,
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattgpt.ai"]),
+        )
+        .expect("alias named in the ICS must resolve");
+        assert_eq!(resolution.email, "matt@mattgpt.ai");
+        assert!(resolution.plausibly_user);
+    }
+
+    #[test]
+    fn invite_list_fields_hide_request_organized_by_users_alias() {
+        // A REQUEST the user organized from an alias identity must not offer
+        // RSVP buttons back to themselves.
+        let email = test_email_with_recipients(vec!["guest@example.com"], vec![]);
+        let mut event = test_calendar_event(vec!["guest@example.com"]);
+        event.organizer_email = "matt@mattcoburn.ai".into();
+        let fields = invite_list_fields(
+            &email,
+            Some(&event),
+            &user_addrs(&["matt.coburn@fastmail.com", "matt@mattcoburn.ai"]),
+            None,
+        );
+        assert!(
+            !fields.is_invite_to_me,
+            "own alias-organized event must not render as an actionable invite"
         );
     }
 

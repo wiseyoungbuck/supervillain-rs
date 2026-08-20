@@ -6119,6 +6119,46 @@ END:VCALENDAR";
     }
 
     #[tokio::test]
+    async fn send_email_resolves_alias_identity_for_from_address() {
+        // An iTIP REPLY for an invite addressed to an alias on another
+        // Fastmail-managed domain must go out under that alias's identity —
+        // matched case-insensitively against the cached identity list, not
+        // silently downgraded to the default identity.
+        let (mut s, recorded) = spawn_jmap_loopback().await;
+        s.identities = Some(vec![
+            Identity {
+                id: "ident1".into(),
+                email: "bob@example.com".into(),
+                name: "Bob".into(),
+            },
+            Identity {
+                id: "ident-alias".into(),
+                email: "Matt@MattGPT.ai".into(),
+                name: "Matt".into(),
+            },
+        ]);
+        let mut sub = invite_submission();
+        sub.attachments = vec![];
+        send_email(&mut s, &sub, "matt@mattgpt.ai", None)
+            .await
+            .unwrap();
+
+        let reqs = recorded.lock().unwrap().clone();
+        let body: serde_json::Value = serde_json::from_slice(
+            &reqs
+                .iter()
+                .find(|r| r.path.ends_with("/jmap"))
+                .expect("one JMAP call")
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body["methodCalls"][1][1]["create"]["send"]["identityId"], "ident-alias",
+            "the submission must carry the alias's identityId: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn invite_upload_carries_bcc_in_envelope_only() {
         let (mut s, recorded) = spawn_jmap_loopback().await;
         let mut sub = invite_submission();
