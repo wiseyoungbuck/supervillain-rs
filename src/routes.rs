@@ -2565,12 +2565,24 @@ async fn rsvp(
         let email = emails
             .first()
             .ok_or_else(|| Error::NotFound("Email not found".into()))?;
-        // The write guard is already held, so fetch identities through it
-        // (Fastmail caches them on the session after the first call).
+        // Prefetch cache first — Gmail's get_identities is an uncached HTTP
+        // round-trip and the account's write guard is held here (roborev
+        // 535 #1). Only a cache miss pays the live fetch (through the held
+        // guard — no second lock), and the result backfills the cache.
         // Best-effort: a fetch failure degrades to the login address.
-        let identities = provider::get_identities(&mut session_guard)
-            .await
-            .unwrap_or_default();
+        let identities = match state.prefetch.get_identities(&account_id).await {
+            Some(cached) => cached,
+            None => match provider::get_identities(&mut session_guard).await {
+                Ok(live) => {
+                    state
+                        .prefetch
+                        .set_identities(&account_id, live.clone())
+                        .await;
+                    live
+                }
+                Err(_) => Vec::new(),
+            },
+        };
         let user_addresses = merge_user_addresses(session_guard.username(), &identities);
         determine_attendee_email(email, &event, &user_addresses)
     };
