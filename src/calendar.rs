@@ -1375,9 +1375,9 @@ pub fn events_in_range(
         if !data.contains("BEGIN:VCALENDAR") {
             continue;
         }
-        let tz_offsets = parse_vtimezone_offsets(data);
+        let tz_rules = parse_vtimezone_rules(data);
         for block in vevent_blocks(data) {
-            let Some(ev) = parse_range_vevent(block, &tz_offsets, primary_tz) else {
+            let Some(ev) = parse_range_vevent(block, &tz_rules, primary_tz) else {
                 continue;
             };
             if ev.recurrence_id.is_some() {
@@ -1564,7 +1564,7 @@ fn property_is_date_only(text: &str, name: &str) -> bool {
 /// `parse_ics_datetime_property`.
 fn parse_exdates(
     unfolded: &str,
-    tz_offsets: &HashMap<String, FixedOffset>,
+    tz_rules: &HashMap<String, VtimezoneRule>,
     primary_tz: Tz,
 ) -> Vec<DateTime<Utc>> {
     let mut out = Vec::new();
@@ -1589,8 +1589,7 @@ fn parse_exdates(
             } else {
                 format!("EXDATE;{params}:{value}")
             };
-            if let Some(dt) = parse_ics_datetime_property(&synth, "EXDATE", tz_offsets, primary_tz)
-            {
+            if let Some(dt) = parse_ics_datetime_property(&synth, "EXDATE", tz_rules, primary_tz) {
                 out.push(dt);
             }
         }
@@ -1600,25 +1599,25 @@ fn parse_exdates(
 
 fn parse_range_vevent(
     block: &str,
-    tz_offsets: &HashMap<String, FixedOffset>,
+    tz_rules: &HashMap<String, VtimezoneRule>,
     primary_tz: Tz,
 ) -> Option<RangeVevent> {
     let unfolded = unfold_lines(block);
     let uid = extract_property(&unfolded, "UID")?;
-    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", tz_offsets, primary_tz)?;
+    let dtstart = parse_ics_datetime_property(&unfolded, "DTSTART", tz_rules, primary_tz)?;
     Some(RangeVevent {
         uid,
         summary: extract_property(&unfolded, "SUMMARY").unwrap_or_default(),
         location: extract_property(&unfolded, "LOCATION"),
         dtstart,
-        dtend: parse_ics_datetime_property(&unfolded, "DTEND", tz_offsets, primary_tz),
+        dtend: parse_ics_datetime_property(&unfolded, "DTEND", tz_rules, primary_tz),
         all_day: property_is_date_only(&unfolded, "DTSTART"),
         rrule: extract_property(&unfolded, "RRULE").and_then(|v| parse_rrule(&v, primary_tz)),
-        exdates: parse_exdates(&unfolded, tz_offsets, primary_tz),
+        exdates: parse_exdates(&unfolded, tz_rules, primary_tz),
         recurrence_id: parse_ics_datetime_property(
             &unfolded,
             "RECURRENCE-ID",
-            tz_offsets,
+            tz_rules,
             primary_tz,
         ),
         cancelled: extract_property(&unfolded, "STATUS").as_deref() == Some("CANCELLED"),

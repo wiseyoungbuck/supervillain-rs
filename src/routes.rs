@@ -11018,18 +11018,21 @@ white   = '#fdf6e3'
         // to an alias domain, not the account's login domain). The list chip
         // must recognize the invite, and the RSVP must go out as the alias
         // the organizer invited, never the account username.
+        // Deliberately no identity entry for the alias domain: even when the
+        // identity list hasn't surfaced the alias (or the provider has no
+        // identity concept), the single-recipient heuristic must carry it.
         let email = test_email_with_recipients(vec!["matt@alias-domain.test"], vec![]);
         let event = test_calendar_event(vec!["matt@alias-domain.test"]);
-        let username = "matt.coburn@primary-domain.test";
+        let addrs = user_addrs(&["matt.coburn@primary-domain.test"]);
 
-        let fields = invite_list_fields(&email, Some(&event), username, None);
+        let fields = invite_list_fields(&email, Some(&event), &addrs, None);
         assert!(
             fields.is_invite_to_me,
             "alias-domain invite must show the chip"
         );
 
         assert_eq!(
-            determine_attendee_email(&email, &event, username),
+            determine_attendee_email(&email, &event, &addrs),
             "matt@alias-domain.test",
             "RSVP must use the invited alias, not the account username"
         );
