@@ -11,6 +11,15 @@
 //! verified to parse with chrono-tz by the test below, so a tzdb rename can
 //! never silently break resolution.
 
+/// Resolve a timezone name that may be either IANA ("Europe/London") or a
+/// Windows display name ("GMT Standard Time") to a chrono-tz zone.
+pub fn resolve_tz_name(name: &str) -> Option<chrono_tz::Tz> {
+    use std::str::FromStr;
+    chrono_tz::Tz::from_str(name)
+        .ok()
+        .or_else(|| windows_tz_to_iana(name).and_then(|iana| chrono_tz::Tz::from_str(iana).ok()))
+}
+
 /// Map a Windows timezone display name to its canonical IANA zone name.
 /// Returns `None` for names not in CLDR (e.g. Outlook's "Customized Time
 /// Zone"), which callers should resolve from the ICS's own VTIMEZONE block.

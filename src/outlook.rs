@@ -3269,6 +3269,28 @@ pub async fn get_calendar_event(
 
 /// Parse a Graph API event JSON object into a CalendarEvent.
 /// Separated from get_calendar_event for testability.
+/// Convert a Graph `{dateTime, timeZone}` block to a UTC instant.
+///
+/// Without a `Prefer: outlook.timezone` header (this client never sends
+/// one) Graph returns start/end in UTC, but the payload declares its zone
+/// in `timeZone` — honor it rather than assuming, so a non-UTC zone (IANA
+/// or a Windows display name like "GMT Standard Time", kata rq9n) still
+/// yields the right instant. An unrecognized zone name falls back to the
+/// UTC assumption rather than dropping the event.
+fn graph_datetime_to_utc(block: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let naive = block["dateTime"]
+        .as_str()
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())?;
+    let declared_zone = block["timeZone"]
+        .as_str()
+        .filter(|name| !name.eq_ignore_ascii_case("UTC"));
+    match declared_zone.and_then(crate::wintz::resolve_tz_name) {
+        Some(tz) => crate::calendar::resolve_local_datetime_lenient(&tz, naive)
+            .map(|dt| dt.with_timezone(&chrono::Utc)),
+        None => Some(naive.and_utc()),
+    }
+}
+
 fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<CalendarEvent> {
     let attendees: Vec<crate::types::Attendee> = event_json["attendees"]
         .as_array()
@@ -3303,18 +3325,8 @@ fn parse_graph_event(uid: &str, event_json: &serde_json::Value) -> Option<Calend
 
     let summary = event_json["subject"].as_str().unwrap_or("").to_string();
 
-    // Parse start/end datetimes (Graph returns ISO 8601 without timezone, always UTC when timeZone is UTC)
-    let dtstart = event_json["start"]["dateTime"].as_str().and_then(|s| {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-            .ok()
-            .map(|dt| dt.and_utc())
-    })?;
-
-    let dtend = event_json["end"]["dateTime"].as_str().and_then(|s| {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-            .ok()
-            .map(|dt| dt.and_utc())
-    });
+    let dtstart = graph_datetime_to_utc(&event_json["start"])?;
+    let dtend = graph_datetime_to_utc(&event_json["end"]);
 
     let location = event_json["location"]["displayName"]
         .as_str()

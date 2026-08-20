@@ -3,7 +3,6 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Offset,
 use chrono_tz::Tz;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
-use std::str::FromStr;
 use std::sync::LazyLock;
 
 static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
@@ -687,10 +686,7 @@ fn parse_ics_datetime_property(
         if let Some(tzid) = extract_param_from_str(params, "TZID") {
             // RFC 5545 parameter values may be double-quoted.
             let tzid = tzid.trim_matches('"');
-            let tz = Tz::from_str(tzid).ok().or_else(|| {
-                crate::wintz::windows_tz_to_iana(tzid).and_then(|iana| Tz::from_str(iana).ok())
-            });
-            if let Some(tz) = tz {
+            if let Some(tz) = crate::wintz::resolve_tz_name(tzid) {
                 let resolved = resolve_local_datetime_lenient(&tz, dt)?;
                 return Some(resolved.with_timezone(&Utc));
             }
@@ -725,7 +721,7 @@ fn parse_ics_datetime_property(
 /// steps until it lands on a real instant — reporting the event a little
 /// later beats losing it outright. Capped at 4 hours, comfortably above any
 /// real-world DST jump (nearly all are exactly one hour).
-fn resolve_local_datetime_lenient<TZ: TimeZone>(
+pub(crate) fn resolve_local_datetime_lenient<TZ: TimeZone>(
     tz: &TZ,
     dt: NaiveDateTime,
 ) -> Option<DateTime<TZ>> {
