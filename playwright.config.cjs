@@ -67,12 +67,18 @@ function sweepStaleConfigDirs() {
 
 function tempConfigDir() {
   // Workers evaluate the config but never start the webServer; only the
-  // runner needs (and should clean up) a real config dir.
-  if (process.env.TEST_WORKER_INDEX !== undefined) return os.tmpdir();
+  // runner needs (and should clean up) a real config dir. The worker value
+  // is deliberately a nonexistent sv-e2e- path: never created, inside the
+  // sweep's namespace if anything ever does create it, and obviously wrong
+  // if a worker somehow used it as a real XDG_CONFIG_HOME.
+  if (process.env.TEST_WORKER_INDEX !== undefined) {
+    return path.join(os.tmpdir(), 'sv-e2e-worker-unused');
+  }
   sweepStaleConfigDirs();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sv-e2e-'));
   fs.mkdirSync(path.join(dir, 'supervillain'), { recursive: true });
-  process.env.SV_E2E_CONFIG_DIR = dir; // consumed by global-teardown.cjs
+  // global-teardown.cjs finds this dir via config.webServer.env — no side
+  // channel needed.
   return dir;
 }
 

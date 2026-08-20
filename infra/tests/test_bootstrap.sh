@@ -11,13 +11,15 @@ pass=0
 fail=0
 
 # run_test rm's its mktemp files after each case; this trap covers an abort
-# (unbound var under set -u, Ctrl-C) mid-test, where run_test's current
-# log/stdout/stderr are still in scope and would otherwise leak.
+# (unbound var under set -u, Ctrl-C) mid-test. log/stdout/stderr are script
+# globals (not locals of run_test) so the trap sees them regardless of where
+# the exit fires.
+log= stdout= stderr=
 trap 'rm -f "${log:-}" "${stdout:-}" "${stderr:-}"' EXIT
 
 run_test() {
   local name=$1
-  local log stdout stderr exit_code
+  local exit_code
   log=$(mktemp)
   stdout=$(mktemp)
   stderr=$(mktemp)
