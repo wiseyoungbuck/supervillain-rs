@@ -3527,6 +3527,40 @@ mod tests {
         assert!(invite_ics_from_body_values(&named_only, &values).is_none());
     }
 
+    #[test]
+    fn invite_ics_windows_tzid_from_body_values_parses_to_correct_instant() {
+        // kata rq9n provider parity: an Exchange-produced invite (Windows
+        // timezone name in TZID) arriving through Fastmail's JMAP body values
+        // must survive extraction and parse to the DST-correct instant:
+        // 16:30 "GMT Standard Time" on Aug 20 is 16:30 BST = 15:30 UTC.
+        const WINDOWS_TZID_ICS: &str = "BEGIN:VCALENDAR\r\n\
+            METHOD:REQUEST\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+            UID:win-tz@example.com\r\nSUMMARY:Cross-timezone call\r\n\
+            DTSTART;TZID=GMT Standard Time:20260820T163000\r\n\
+            DTEND;TZID=GMT Standard Time:20260820T170000\r\n\
+            ORGANIZER;CN=Eoin:mailto:org@example.co.uk\r\n\
+            ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:matt@example.test\r\n\
+            SEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let body = deser_bs(serde_json::json!({
+            "type": "text/calendar; method=REQUEST",
+            "partId": "invite"
+        }));
+        let values = HashMap::from([(
+            "invite".to_string(),
+            BodyValue {
+                value: WINDOWS_TZID_ICS.into(),
+            },
+        )]);
+        let ics = invite_ics_from_body_values(&body, &values).expect("ICS extracted");
+        let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
+        let event = crate::calendar::parse_ics(&ics, tz).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+        assert_eq!(
+            event.dtend.unwrap().to_rfc3339(),
+            "2026-08-20T16:00:00+00:00"
+        );
+    }
+
     #[tokio::test]
     async fn list_fetch_downloads_only_bounded_calendar_body_value() {
         let ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR";

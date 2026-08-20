@@ -3798,6 +3798,83 @@ mod tests {
         })
     }
 
+    /// Same Windows-TZID invite fixture as the calendar.rs rq9n regression
+    /// tests: 16:30 "GMT Standard Time" on Aug 20 is 16:30 BST = 15:30 UTC.
+    const WINDOWS_TZID_ICS: &str = "BEGIN:VCALENDAR\r\n\
+        METHOD:REQUEST\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n\
+        UID:win-tz@example.com\r\nSUMMARY:Cross-timezone call\r\n\
+        DTSTART;TZID=GMT Standard Time:20260820T163000\r\n\
+        DTEND;TZID=GMT Standard Time:20260820T170000\r\n\
+        ORGANIZER;CN=Eoin:mailto:org@example.co.uk\r\n\
+        ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:matt@example.test\r\n\
+        SEQUENCE:0\r\nEND:VEVENT\r\nEND:VCALENDAR";
+
+    #[test]
+    fn graph_windows_tzid_invite_attachment_parses_to_correct_instant() {
+        // kata rq9n provider parity: the ICS delivered as a Graph attachment
+        // must survive extraction and parse to the DST-correct instant.
+        use base64::Engine;
+        let mut j = graph_message_minimal();
+        j["hasAttachments"] = serde_json::json!(true);
+        j["attachments"] = serde_json::json!([{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "id": "ATT_ICS",
+            "name": "invite.ics",
+            "contentType": "application/ics",
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(WINDOWS_TZID_ICS),
+            "size": WINDOWS_TZID_ICS.len()
+        }]);
+        let m = parse_graph_message(&j, true);
+        let ics = m.calendar_ics.expect("attachment ICS extracted");
+        let tz: chrono_tz::Tz = "America/Chicago".parse().unwrap();
+        let event = crate::calendar::parse_ics(&ics, tz).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+        assert_eq!(
+            event.dtend.unwrap().to_rfc3339(),
+            "2026-08-20T16:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_graph_event_honors_windows_timezone_name() {
+        // Graph normally returns start/end in UTC, but the payload declares
+        // its zone in `timeZone` — honor it when it isn't UTC. Exchange uses
+        // Windows display names there.
+        let json = serde_json::json!({
+            "subject": "Cross-tz",
+            "start": { "dateTime": "2026-08-20T16:30:00.0000000", "timeZone": "GMT Standard Time" },
+            "end": { "dateTime": "2026-08-20T17:00:00.0000000", "timeZone": "GMT Standard Time" },
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+        assert_eq!(
+            event.dtend.unwrap().to_rfc3339(),
+            "2026-08-20T16:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn parse_graph_event_honors_iana_timezone_name() {
+        let json = serde_json::json!({
+            "subject": "Cross-tz",
+            "start": { "dateTime": "2026-08-20T16:30:00.0000000", "timeZone": "Europe/London" },
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T15:30:00+00:00");
+    }
+
+    #[test]
+    fn parse_graph_event_unknown_timezone_assumes_utc() {
+        // An unrecognized zone name must not drop the event; fall back to
+        // Graph's default UTC interpretation.
+        let json = serde_json::json!({
+            "subject": "Cross-tz",
+            "start": { "dateTime": "2026-08-20T16:30:00.0000000", "timeZone": "Customized Time Zone" },
+        });
+        let event = parse_graph_event("uid", &json).unwrap();
+        assert_eq!(event.dtstart.to_rfc3339(), "2026-08-20T16:30:00+00:00");
+    }
+
     #[test]
     fn parse_graph_event_full() {
         let json = graph_event_json();

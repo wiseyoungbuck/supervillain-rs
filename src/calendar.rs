@@ -2935,8 +2935,8 @@ END:DAYLIGHT\r\n\
 END:VTIMEZONE\r\n\
 BEGIN:VEVENT\r\n\
 ORGANIZER;CN=Eoin:mailto:organizer@example.co.uk\r\n\
-ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Matt:mailt\r\n\
- o:matt@example.test\r\n\
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Matthew Co\r\n\
+\x20burn:mailto:matt@example.test\r\n\
 UID:windows-tzid-test@example.com\r\n\
 SUMMARY;LANGUAGE=en-GB:Cross-timezone call\r\n\
 DTSTART;TZID=GMT Standard Time:20260820T163000\r\n\
@@ -3088,6 +3088,34 @@ END:VCALENDAR";
         let winter = ics_template.replace("DATEVAL", "20261215T100000");
         let event = parse_ics(&winter, primary_tz).unwrap();
         assert_eq!(event.dtstart.to_rfc3339(), "2026-12-15T16:00:00+00:00");
+    }
+
+    #[test]
+    fn rsvp_reply_for_alias_recipient_quotes_correct_local_time() {
+        // Fastmail accounts receive at alias addresses on entirely different
+        // domains (the account username shares no domain with the invited
+        // address). The REPLY must RSVP as the alias the organizer invited —
+        // never the account username — and quote the DST-corrected instant
+        // in the responder's zone: 10:30 CDT, not the wall-clock 16:30 the
+        // Windows-TZID DTSTART carries.
+        let primary: Tz = "America/Chicago".parse().unwrap();
+        let event = parse_ics(WINDOWS_TZID_ICS, primary).unwrap();
+        let reply =
+            generate_rsvp_with_tz(&event, "matt@example.test", &RsvpStatus::Accepted, primary);
+        assert!(
+            reply.contains(
+                "ATTENDEE;CN=\"Matthew Coburn\";PARTSTAT=ACCEPTED:mailto:matt@example.test"
+            ),
+            "REPLY must RSVP as the invited alias: {reply}"
+        );
+        assert!(
+            reply.contains("DTSTART;TZID=America/Chicago:20260820T103000"),
+            "REPLY must quote 10:30 CDT (15:30Z), got: {reply}"
+        );
+        assert!(
+            reply.contains("DTEND;TZID=America/Chicago:20260820T110000"),
+            "REPLY must quote 11:00 CDT (16:00Z), got: {reply}"
+        );
     }
 
     #[test]

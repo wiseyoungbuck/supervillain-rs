@@ -9910,6 +9910,31 @@ white   = '#fdf6e3'
     }
 
     #[test]
+    fn invite_to_fastmail_alias_domain_recognized_and_rsvps_as_alias() {
+        // Fastmail accounts receive at alias addresses on entirely different
+        // domains — the account username shares no domain with the invited
+        // address (kata rq9n follow-up: the real problem invite was addressed
+        // to an alias domain, not the account's login domain). The list chip
+        // must recognize the invite, and the RSVP must go out as the alias
+        // the organizer invited, never the account username.
+        let email = test_email_with_recipients(vec!["matt@alias-domain.test"], vec![]);
+        let event = test_calendar_event(vec!["matt@alias-domain.test"]);
+        let username = "matt.coburn@primary-domain.test";
+
+        let fields = invite_list_fields(&email, Some(&event), username, None);
+        assert!(
+            fields.is_invite_to_me,
+            "alias-domain invite must show the chip"
+        );
+
+        assert_eq!(
+            determine_attendee_email(&email, &event, username),
+            "matt@alias-domain.test",
+            "RSVP must use the invited alias, not the account username"
+        );
+    }
+
+    #[test]
     fn invite_list_fields_prefers_account_attendee_on_multi_guest_invites() {
         let email = test_email_with_recipients(
             vec!["alice@example.com", "BOB@example.com", "carol@example.com"],
