@@ -8,7 +8,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"PARTSTAT=\w[\w-]*").unwrap());
+// Anchored to the `;` parameter delimiter so vendor lookalikes such as
+// X-PARTSTAT never satisfy the replace path (roborev 537 #1) — on an
+// ATTENDEE line the real PARTSTAT param always follows a `;`.
+static PARTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r";PARTSTAT=\w[\w-]*").unwrap());
 
 /// Crude tag stripper used only to detect/clean a residual HTML wrapper on a
 /// STORED DESCRIPTION we didn't expect to be HTML (see
@@ -790,6 +793,25 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
     let raw_ics = unfold_lines(raw_ics);
     let new_partstat = format!("PARTSTAT={}", status.as_ics_str());
     let email_lower = attendee_email.to_lowercase();
+    // Boundary-checked address match (roborev 537 #2): a bare substring
+    // check would also hit attendees whose address merely starts with this
+    // one (matt@x.ai vs matt@x.ai.example.com). The mailto value must end at
+    // the line end or at a non-address character.
+    let needle = format!("mailto:{email_lower}");
+    let line_addresses_attendee = |lower_line: &str| {
+        let mut search_from = 0;
+        while let Some(found) = lower_line[search_from..].find(&needle) {
+            let end = search_from + found + needle.len();
+            match lower_line[end..].chars().next() {
+                None => return true,
+                Some(next) if !next.is_ascii_alphanumeric() && !matches!(next, '.' | '-' | '_') => {
+                    return true;
+                }
+                _ => search_from = end,
+            }
+        }
+        false
+    };
 
     // Split on \n but preserve \r if present to keep original line endings
     raw_ics
@@ -798,13 +820,11 @@ pub fn update_partstat(raw_ics: &str, attendee_email: &str, status: &RsvpStatus)
             let trimmed = line.trim_end_matches('\r');
             if let Some(rest) = trimmed.strip_prefix("ATTENDEE")
                 && (rest.starts_with(';') || rest.starts_with(':'))
-                && trimmed
-                    .to_lowercase()
-                    .contains(&format!("mailto:{email_lower}"))
+                && line_addresses_attendee(&trimmed.to_lowercase())
             {
                 let updated = if PARTSTAT_RE.is_match(trimmed) {
                     PARTSTAT_RE
-                        .replace(trimmed, new_partstat.as_str())
+                        .replace(trimmed, format!(";{new_partstat}"))
                         .into_owned()
                 } else {
                     // RFC 5545 §3.2.12: no PARTSTAT param means NEEDS-ACTION,
