@@ -151,7 +151,19 @@ async fn main() {
     scheduled_send::spawn_daemon(state.clone());
     accounts::spawn_fastmail_token_refresher(state.clone());
 
-    let app = routes::router(state).layer(routes::compression_layer());
+    // DNS-rebinding defense (kata 3ghj): outermost layer so no route — the
+    // static shell or /api/* alike — can be reached through an unrecognized
+    // Host header. See `routes::host_allowlist` for the full rationale.
+    let allowed_hosts = std::sync::Arc::new(routes::build_allowed_hosts(
+        &addr,
+        std::env::var("SUPERVILLAIN_ALLOWED_HOSTS").ok().as_deref(),
+    ));
+    let app = routes::router(state)
+        .layer(routes::compression_layer())
+        .layer(axum::middleware::from_fn_with_state(
+            allowed_hosts,
+            routes::host_allowlist,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
         panic!("Failed to bind to {addr}: {e}. Is another instance of supervillain already running? Try: kill $(lsof -ti :{port})", port = addr.split(':').next_back().unwrap_or("8000"));

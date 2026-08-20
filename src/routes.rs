@@ -1,8 +1,9 @@
 use axum::{
     Router,
     body::Bytes,
-    extract::{Json, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Json, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::Next,
     response::IntoResponse,
     routing::{get, post, put},
 };
@@ -105,6 +106,75 @@ const FONT_JBM_BOLD: &[u8] = include_bytes!("../static/fonts/JetBrainsMono-Bold.
 // =============================================================================
 // Router
 // =============================================================================
+
+/// Build the Host-header allowlist from the bind address and
+/// `SUPERVILLAIN_ALLOWED_HOSTS` (comma-separated), once at startup. Plain
+/// data — see `host_allowlist` below for why this exists and what it
+/// defends against.
+///
+/// Always includes: the bind address itself (host:port, e.g.
+/// `127.0.0.1:8000`), `localhost:<port>` for the same port, and the bare
+/// (port-elided) `127.0.0.1` / `localhost` forms some loopback clients send.
+/// Extra hosts (e.g. a tailnet MagicDNS name) come from
+/// `SUPERVILLAIN_ALLOWED_HOSTS`, trimmed and comma-split.
+pub fn build_allowed_hosts(bind_addr: &str, env_hosts: Option<&str>) -> Vec<String> {
+    let port = bind_addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("8000");
+    let mut hosts = vec![
+        bind_addr.to_string(),
+        format!("localhost:{port}"),
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+    ];
+    if let Some(env_hosts) = env_hosts {
+        hosts.extend(
+            env_hosts
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string),
+        );
+    }
+    hosts
+}
+
+/// Host-header allowlist middleware — DNS-rebinding defense (kata 3ghj).
+///
+/// DNS rebinding: a malicious website can point its own domain's DNS record
+/// at 127.0.0.1, after which the victim's browser resolves that domain to
+/// this server and happily fetches from it as same-origin — CORS protects
+/// nothing, because the browser genuinely believes the attacker's page and
+/// this server share an origin. But the rebound request always carries the
+/// ATTACKER's hostname in `Host` (the browser has no reason to rewrite it to
+/// match the DNS target), so rejecting any request whose `Host` isn't on an
+/// explicit allowlist closes the hole regardless of what CORS/CSRF headers
+/// are or aren't set. Chrome's Private Network Access checks mitigate this
+/// class already; Firefox ships no equivalent, so this can't be skipped as
+/// "Chrome already handles it" — this server is reachable from Firefox too.
+///
+/// Applied as the outermost layer on the whole router in `main` (wraps
+/// static shell routes and `/api/*` alike) so nothing can bypass it. A
+/// missing `Host` header is rejected the same as an unrecognized one — HTTP/1.1
+/// requires it, so its absence is itself a signal of a malformed or hostile
+/// client.
+pub async fn host_allowlist(
+    State(allowed): State<Arc<Vec<String>>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let is_allowed = host.is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)));
+    if !is_allowed {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "This server does not recognize the Host header on this request.\n",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
 
 /// Response compression for the app shell + API JSON (kata 7dmx).
 ///
@@ -4867,6 +4937,171 @@ mod tests {
             // sends without an html_body stay untracked either way.
             tracking_base: Some("https://track.example.com".into()),
         }
+    }
+
+    // =========================================================================
+    // Host-header allowlist middleware (kata 3ghj) — DNS-rebinding defense
+    // =========================================================================
+
+    // Builds the REAL router wrapped in the SAME layer main.rs applies (not a
+    // reimplementation) so these tests pin the actual request path, mirroring
+    // how tests/compression_test.rs exercises `compression_layer()`.
+    fn host_allowlist_router(state: AppState, allowed: Vec<String>) -> Router {
+        router(Arc::new(state)).layer(axum::middleware::from_fn_with_state(
+            Arc::new(allowed),
+            host_allowlist,
+        ))
+    }
+
+    fn host_request(method: &str, uri: &str, host: Option<&str>, body: Body) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(h) = host {
+            builder = builder.header(header::HOST, h);
+        }
+        builder.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn evil_host_rejected_on_get_route() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("evil.example.com"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "an unrecognized Host on a GET route must be rejected, not routed"
+        );
+    }
+
+    #[tokio::test]
+    async fn evil_host_rejected_on_post_mutation_route() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/splits")
+            .header(header::HOST, "evil.example.com")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "an unrecognized Host on a POST mutation route must be rejected \
+             before the handler ever runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_bind_host_allowed() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("127.0.0.1:8000"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "the configured bind host:port must pass the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn localhost_with_port_allowed() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("localhost:8000"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "localhost:<port> must pass the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_loopback_host_allowed() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("127.0.0.1"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "bare (port-elided) 127.0.0.1 must pass the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_localhost_host_allowed() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("localhost"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "bare (port-elided) localhost must pass the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn env_allowed_host_permitted() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", Some("pittard.tailnet.ts.net"));
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("pittard.tailnet.ts.net"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "a SUPERVILLAIN_ALLOWED_HOSTS entry must pass the allowlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_check_is_case_insensitive() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", Some("LOCALHOST:8000"), Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "Host comparison must be case-insensitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_host_header_rejected() {
+        let allowed = build_allowed_hosts("127.0.0.1:8000", None);
+        let app = host_allowlist_router(test_state(&[], "default"), allowed);
+        let req = host_request("GET", "/", None, Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::MISDIRECTED_REQUEST,
+            "a missing Host header must be rejected, not treated as allowed"
+        );
+    }
+
+    #[test]
+    fn build_allowed_hosts_parses_env_csv() {
+        // Pure-function coverage of env parsing (no env var mutation — tests
+        // pass the value straight in, avoiding cross-test races on a shared
+        // process-wide env var).
+        let hosts = build_allowed_hosts("127.0.0.1:8000", Some(" a.example.com, b.example.com,, "));
+        assert!(hosts.contains(&"a.example.com".to_string()));
+        assert!(hosts.contains(&"b.example.com".to_string()));
+        assert!(
+            hosts.iter().all(|h| !h.is_empty()),
+            "blank CSV entries must be dropped, not kept as empty-string hosts"
+        );
+        // Defaults are still present alongside the extras.
+        assert!(hosts.contains(&"127.0.0.1:8000".to_string()));
+        assert!(hosts.contains(&"localhost:8000".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+        assert!(hosts.contains(&"localhost".to_string()));
     }
 
     #[test]
